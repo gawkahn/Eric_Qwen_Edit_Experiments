@@ -21,6 +21,7 @@ from .eric_qwen_edit_spectrum import EricQwenEditSpectrum
 from .eric_qwen_image_loader import EricQwenImageLoader, EricQwenImageUnload
 from .eric_qwen_image_component_loader import EricQwenImageComponentLoader
 from .eric_qwen_image_generate import EricQwenImageGenerate
+from .eric_qwen_image_lora import EricQwenImageApplyLoRA, EricQwenImageUnloadLoRA
 
 NODE_CLASS_MAPPINGS = {
     # Edit
@@ -42,6 +43,8 @@ NODE_CLASS_MAPPINGS = {
     "Eric Qwen-Image Unload": EricQwenImageUnload,
     "Eric Qwen-Image Component Loader": EricQwenImageComponentLoader,
     "Eric Qwen-Image Generate": EricQwenImageGenerate,
+    "Eric Qwen-Image Apply LoRA": EricQwenImageApplyLoRA,
+    "Eric Qwen-Image Unload LoRA": EricQwenImageUnloadLoRA,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -64,4 +67,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Eric Qwen-Image Unload": "Eric Qwen-Image Unload",
     "Eric Qwen-Image Component Loader": "Eric Qwen-Image Component Loader",
     "Eric Qwen-Image Generate": "Eric Qwen-Image Generate",
+    "Eric Qwen-Image Apply LoRA": "Eric Qwen-Image Apply LoRA",
+    "Eric Qwen-Image Unload LoRA": "Eric Qwen-Image Unload LoRA",
 }
