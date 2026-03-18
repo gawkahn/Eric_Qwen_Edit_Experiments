@@ -26,19 +26,19 @@ from .eric_qwen_edit_utils import pil_to_tensor
 
 DIMENSION_ALIGNMENT = 16  # Qwen requires dimensions divisible by 16
 
-# Aspect ratios: label → (width_ratio, height_ratio)
+# Aspect ratios ordered wide-landscape → square → tall-portrait
 ASPECT_RATIOS = {
-    "1:1":   (1, 1),
-    "3:2":   (3, 2),
-    "2:3":   (2, 3),
-    "4:3":   (4, 3),
-    "3:4":   (3, 4),
-    "5:4":   (5, 4),
-    "4:5":   (4, 5),
-    "7:5":   (7, 5),
-    "5:7":   (5, 7),
-    "16:9":  (16, 9),
-    "9:16":  (9, 16),
+    "16:9  Wide Landscape":   (16, 9),
+    "7:5   Landscape":        (7, 5),
+    "3:2   Landscape":        (3, 2),
+    "4:3   Landscape":        (4, 3),
+    "5:4   Landscape":        (5, 4),
+    "1:1   Square":           (1, 1),
+    "4:5   Portrait":         (4, 5),
+    "3:4   Portrait":         (3, 4),
+    "2:3   Portrait":         (2, 3),
+    "5:7   Portrait":         (5, 7),
+    "9:16  Tall Portrait":    (9, 16),
 }
 
 
@@ -104,7 +104,7 @@ class EricQwenImageGenerate:
                     "tooltip": "What to avoid in the output"
                 }),
                 "aspect_ratio": (ratio_names, {
-                    "default": "1:1",
+                    "default": "1:1   Square",
                     "tooltip": "Aspect ratio of the generated image"
                 }),
                 "target_mp": ("FLOAT", {
@@ -142,7 +142,7 @@ class EricQwenImageGenerate:
         pipeline: dict,
         prompt: str,
         negative_prompt: str = "",
-        aspect_ratio: str = "1:1",
+        aspect_ratio: str = "1:1   Square",
         target_mp: float = 4.0,
         steps: int = 50,
         true_cfg_scale: float = 4.0,
