@@ -90,6 +90,67 @@ def _check_cancelled():
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  Scheduler-aware sigma helpers
+# ═══════════════════════════════════════════════════════════════════════
+
+def _packed_seq_len(height: int, width: int, vae_scale_factor: int) -> int:
+    """Compute the packed latent sequence length for given pixel dimensions."""
+    h_lat = 2 * (int(height) // (vae_scale_factor * 2))
+    w_lat = 2 * (int(width) // (vae_scale_factor * 2))
+    return (h_lat // 2) * (w_lat // 2)
+
+
+def _compute_mu(seq_len: int, scheduler) -> float:
+    """Compute the time-shift mu for a given sequence length.
+
+    Mirrors the ``calculate_shift`` call inside QwenImagePipeline.__call__.
+    """
+    base_seq = scheduler.config.get("base_image_seq_len", 256)
+    max_seq = scheduler.config.get("max_image_seq_len", 4096)
+    base_shift = scheduler.config.get("base_shift", 0.5)
+    max_shift = scheduler.config.get("max_shift", 1.15)
+    m = (max_shift - base_shift) / (max_seq - base_seq)
+    b = base_shift - m * base_seq
+    return m * seq_len + b
+
+
+def _compute_actual_start_sigma(
+    scheduler, raw_sigmas: list, mu: float
+) -> float:
+    """Replicate the scheduler's sigma transforms to find the actual start sigma.
+
+    Steps applied by ``FlowMatchEulerDiscreteScheduler.set_timesteps``:
+    1. Dynamic time shift (exponential or linear) based on *mu*.
+    2. Terminal stretch — rescale so the last sigma equals ``shift_terminal``.
+
+    We replicate these on the raw sigmas so we can noise the latent at
+    exactly the level the scheduler will expect on its first step.
+    """
+    sigmas = np.array(raw_sigmas, dtype=np.float64)
+
+    # 1. Dynamic time shift
+    if scheduler.config.get("use_dynamic_shifting", False):
+        shift_type = scheduler.config.get("time_shift_type", "exponential")
+        if shift_type == "exponential":
+            exp_mu = math.exp(mu)
+            sigmas = exp_mu / (exp_mu + (1.0 / sigmas - 1.0))
+        else:  # "linear"
+            sigmas = mu / (mu + (1.0 / sigmas - 1.0))
+    else:
+        static_shift = scheduler.config.get("shift", 1.0)
+        sigmas = static_shift * sigmas / (1.0 + (static_shift - 1.0) * sigmas)
+
+    # 2. Terminal stretch
+    shift_terminal = scheduler.config.get("shift_terminal", None)
+    if shift_terminal:
+        one_minus_z = 1.0 - sigmas
+        scale_factor = one_minus_z[-1] / (1.0 - shift_terminal)
+        sigmas = 1.0 - (one_minus_z / scale_factor)
+
+    return float(sigmas[0])
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  Multi-Stage Generation Node
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -310,6 +371,14 @@ class EricQwenImageMultiStage:
 
         vae_scale_factor = pipe.vae_scale_factor if hasattr(pipe, "vae_scale_factor") else 8
 
+        # ── Compute mu for each active refine stage ──────────────────────
+        if do_stage2:
+            s2_seq = _packed_seq_len(s2_h, s2_w, vae_scale_factor)
+            s2_mu = _compute_mu(s2_seq, pipe.scheduler)
+        if do_stage3:
+            s3_seq = _packed_seq_len(s3_h, s3_w, vae_scale_factor)
+            s3_mu = _compute_mu(s3_seq, pipe.scheduler)
+
         # ── Move VAE to GPU if offloaded ────────────────────────────────
         if offload_vae and hasattr(pipe, "vae"):
             vae_device = next(pipe.transformer.parameters()).device
@@ -337,10 +406,12 @@ class EricQwenImageMultiStage:
 
             if not do_stage2:
                 pil_image = s1_result.images[0]
+                print(f"[EricQwenImage-MS] Output: {pil_image.size[0]}x{pil_image.size[1]}")
                 tensor = pil_to_tensor(pil_image).unsqueeze(0)
                 return (tensor,)
 
             s1_latents = s1_result.images  # packed latents
+            print(f"[EricQwenImage-MS]   S1 latents shape: {s1_latents.shape}")
 
             # ════════════════════════════════════════════════════════════
             #  STAGE 2 — Refine
@@ -351,8 +422,18 @@ class EricQwenImageMultiStage:
             s2_latents = _upscale_latents(
                 s1_latents, s1_h, s1_w, s2_h, s2_w, vae_scale_factor
             )
+            print(f"[EricQwenImage-MS]   S2 latents after upscale: {s2_latents.shape}")
+
+            raw_sigmas_s2 = self._build_sigmas(s2_steps, s2_denoise)
+            actual_sigma_s2 = _compute_actual_start_sigma(
+                pipe.scheduler, raw_sigmas_s2, s2_mu
+            )
+            print(f"[EricQwenImage-MS]   S2 mu={s2_mu:.4f}, "
+                  f"raw_start={raw_sigmas_s2[0]:.4f}, "
+                  f"actual_start={actual_sigma_s2:.4f}")
+
             s2_latents = self._apply_denoise_noise(
-                s2_latents, s2_denoise, generator, device
+                s2_latents, s2_denoise, actual_sigma_s2, generator, device
             )
 
             s2_output_type = "latent" if do_stage3 else "pil"
@@ -362,7 +443,7 @@ class EricQwenImageMultiStage:
                 height=s2_h,
                 width=s2_w,
                 num_inference_steps=s2_steps,
-                sigmas=self._build_sigmas(s2_steps, s2_denoise),
+                sigmas=raw_sigmas_s2,
                 true_cfg_scale=s2_cfg,
                 generator=generator,
                 latents=s2_latents,
@@ -372,10 +453,12 @@ class EricQwenImageMultiStage:
 
             if not do_stage3:
                 pil_image = s2_result.images[0]
+                print(f"[EricQwenImage-MS] Output: {pil_image.size[0]}x{pil_image.size[1]}")
                 tensor = pil_to_tensor(pil_image).unsqueeze(0)
                 return (tensor,)
 
             s2_final_latents = s2_result.images
+            print(f"[EricQwenImage-MS]   S2 final latents shape: {s2_final_latents.shape}")
 
             # ════════════════════════════════════════════════════════════
             #  STAGE 3 — Final
@@ -386,8 +469,18 @@ class EricQwenImageMultiStage:
             s3_latents = _upscale_latents(
                 s2_final_latents, s2_h, s2_w, s3_h, s3_w, vae_scale_factor
             )
+            print(f"[EricQwenImage-MS]   S3 latents after upscale: {s3_latents.shape}")
+
+            raw_sigmas_s3 = self._build_sigmas(s3_steps, s3_denoise)
+            actual_sigma_s3 = _compute_actual_start_sigma(
+                pipe.scheduler, raw_sigmas_s3, s3_mu
+            )
+            print(f"[EricQwenImage-MS]   S3 mu={s3_mu:.4f}, "
+                  f"raw_start={raw_sigmas_s3[0]:.4f}, "
+                  f"actual_start={actual_sigma_s3:.4f}")
+
             s3_latents = self._apply_denoise_noise(
-                s3_latents, s3_denoise, generator, device
+                s3_latents, s3_denoise, actual_sigma_s3, generator, device
             )
 
             s3_result = pipe(
@@ -396,7 +489,7 @@ class EricQwenImageMultiStage:
                 height=s3_h,
                 width=s3_w,
                 num_inference_steps=s3_steps,
-                sigmas=self._build_sigmas(s3_steps, s3_denoise),
+                sigmas=raw_sigmas_s3,
                 true_cfg_scale=s3_cfg,
                 generator=generator,
                 latents=s3_latents,
@@ -405,6 +498,7 @@ class EricQwenImageMultiStage:
             )
 
             pil_image = s3_result.images[0]
+            print(f"[EricQwenImage-MS] Output: {pil_image.size[0]}x{pil_image.size[1]}")
             tensor = pil_to_tensor(pil_image).unsqueeze(0)
             return (tensor,)
 
@@ -434,18 +528,19 @@ class EricQwenImageMultiStage:
 
     @staticmethod
     def _apply_denoise_noise(latents: torch.Tensor, denoise: float,
+                             actual_sigma: float,
                              generator, device: str) -> torch.Tensor:
         """Add flow-matching noise to latents for partial denoise.
 
         At denoise=1.0 the latents are replaced with pure noise.
-        At denoise<1.0 we blend the upscaled latents with noise at the
-        starting sigma level.
+        At denoise<1.0 we blend the upscaled latents with noise at
+        ``actual_sigma`` — the mu-shifted + terminal-stretched starting
+        sigma that the scheduler will expect on its first step.
         """
         if denoise >= 1.0:
             noise = torch.randn_like(latents)
             return noise
 
-        sigma = denoise
         noise = torch.randn(latents.shape, generator=generator,
                             device=latents.device, dtype=latents.dtype)
-        return _add_noise_flowmatch(latents, noise, sigma)
+        return _add_noise_flowmatch(latents, noise, actual_sigma)
