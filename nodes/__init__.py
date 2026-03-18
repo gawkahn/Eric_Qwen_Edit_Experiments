@@ -22,6 +22,7 @@ from .eric_qwen_image_loader import EricQwenImageLoader, EricQwenImageUnload
 from .eric_qwen_image_component_loader import EricQwenImageComponentLoader
 from .eric_qwen_image_generate import EricQwenImageGenerate
 from .eric_qwen_image_lora import EricQwenImageApplyLoRA, EricQwenImageUnloadLoRA
+from .eric_qwen_image_multistage import EricQwenImageMultiStage
 
 NODE_CLASS_MAPPINGS = {
     # Edit
@@ -45,6 +46,7 @@ NODE_CLASS_MAPPINGS = {
     "Eric Qwen-Image Generate": EricQwenImageGenerate,
     "Eric Qwen-Image Apply LoRA": EricQwenImageApplyLoRA,
     "Eric Qwen-Image Unload LoRA": EricQwenImageUnloadLoRA,
+    "Eric Qwen-Image Multi-Stage": EricQwenImageMultiStage,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -69,4 +71,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Eric Qwen-Image Generate": "Eric Qwen-Image Generate",
     "Eric Qwen-Image Apply LoRA": "Eric Qwen-Image Apply LoRA",
     "Eric Qwen-Image Unload LoRA": "Eric Qwen-Image Unload LoRA",
+    "Eric Qwen-Image Multi-Stage": "Eric Qwen-Image Multi-Stage Generate",
 }
