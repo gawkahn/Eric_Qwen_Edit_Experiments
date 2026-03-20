@@ -1,5 +1,7 @@
 # Eric Qwen-Edit & Qwen-Image Nodes
 
+## 🖼️ Up to 17 MP image editing · 50 MP+ text-to-image generation
+
 ComfyUI custom nodes for **Qwen-Image-Edit-2511** (image editing) and **Qwen-Image-2512** (text-to-image generation) — 20-billion-parameter MMDiT models by Qwen (Alibaba).  
 24 nodes covering loading, single-image editing, multi-image fusion, style transfer, inpainting, inpaint-with-transfer, LoRA, Spectrum acceleration, delta overlay, mask utilities, **text-to-image generation**, multi-stage generation, prompt rewriting, and **2× VAE super-resolution upscaling**.
 
