@@ -60,8 +60,7 @@ def _apply_lora_stage_weights(pipe, pipeline: dict, stage: int) -> None:
     """Set LoRA adapter weights for the given UltraGen stage (1, 2, or 3).
 
     Reads ``pipeline["applied_loras"]`` and calls ``pipe.set_adapters()``
-    with the per-stage weight for each loaded adapter.  If no per-stage
-    weight was configured (value < 0), the global ``weight`` is used.
+    with the per-stage weight for each loaded adapter.
 
     This is a no-op when no LoRAs are applied.
     """
@@ -73,10 +72,8 @@ def _apply_lora_stage_weights(pipe, pipeline: dict, stage: int) -> None:
     names = []
     weights = []
     for adapter_name, info in applied_loras.items():
-        stage_w = info.get(stage_key, -1.0)
-        effective_w = info["weight"] if stage_w < 0 else stage_w
         names.append(adapter_name)
-        weights.append(effective_w)
+        weights.append(info.get(stage_key, 0.0))
 
     try:
         pipe.set_adapters(names, adapter_weights=weights)

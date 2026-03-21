@@ -36,19 +36,19 @@ class EricQwenImageApplyLoRA:
     Workflow example:
     [Load Model] → [Apply LoRA (style)] → [Apply LoRA (subject)] → [Generate]
 
-    LoRA weight:
+    Per-stage LoRA weights (for UltraGen multi-stage generation):
+    - weight_stage1: strength for Stage 1 (draft / composition)
+    - weight_stage2: strength for Stage 2 (refinement)
+    - weight_stage3: strength for Stage 3 (final polish)
+    - 0.0 = LoRA disabled for that stage (default)
     - 1.0 = full strength
-    - 0.5 = half strength
-    - 0.0 = no effect (disabled)
     - >1.0 = amplified (may cause artifacts)
+    - For non-UltraGen nodes, weight_stage1 is used as the effective weight.
 
-    Per-stage weights (for UltraGen multi-stage generation):
-    - weight_stage1/2/3 override the global weight for each UltraGen stage
-    - Default -1 = use global weight for that stage
-    - 0.0 = disable this LoRA for that stage
-    - Example: detail LoRA at [0, 0.8, 1.0] — no detail in draft, full in polish
-    - Example: lightning LoRA at [0.5, 1.0, 0] — skip the fast-LoRA in the short final stage
-    - Non-UltraGen nodes ignore these and use the global weight
+    Examples:
+    - Detail LoRA:    S1=0, S2=0.8, S3=1.0 — no detail in draft, full in polish
+    - Lightning LoRA:  S1=0.5, S2=1.0, S3=0 — skip fast-LoRA in short final stage
+    - Style LoRA:      S1=1.0, S2=0.7, S3=0.3 — strong in draft, fade in later stages
 
     LoRAs are loaded from ComfyUI's standard loras folder:
     ComfyUI/models/loras/
@@ -67,39 +67,32 @@ class EricQwenImageApplyLoRA:
                 "lora_name": (get_lora_list(), {
                     "tooltip": "Select LoRA from ComfyUI/models/loras/"
                 }),
-                "weight": ("FLOAT", {
-                    "default": 1.0,
-                    "min": -2.0,
+                "weight_stage1": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
                     "max": 2.0,
                     "step": 0.05,
-                    "tooltip": "LoRA weight strength (1.0 = full, 0.5 = half)"
+                    "tooltip": "Stage 1 (draft/composition) weight. Also used as the weight for non-UltraGen nodes. 0 = disabled."
+                }),
+                "weight_stage2": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 2.0,
+                    "step": 0.05,
+                    "tooltip": "Stage 2 (refinement) weight. 0 = disabled."
+                }),
+                "weight_stage3": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 2.0,
+                    "step": 0.05,
+                    "tooltip": "Stage 3 (final polish) weight. 0 = disabled."
                 }),
             },
             "optional": {
                 "lora_path_override": ("STRING", {
                     "default": "",
                     "tooltip": "Optional: Override with custom path (leave empty to use dropdown)"
-                }),
-                "weight_stage1": ("FLOAT", {
-                    "default": -1.0,
-                    "min": -1.0,
-                    "max": 2.0,
-                    "step": 0.05,
-                    "tooltip": "UltraGen Stage 1 (draft) weight. -1 = use global weight. 0 = disabled for this stage."
-                }),
-                "weight_stage2": ("FLOAT", {
-                    "default": -1.0,
-                    "min": -1.0,
-                    "max": 2.0,
-                    "step": 0.05,
-                    "tooltip": "UltraGen Stage 2 (refine) weight. -1 = use global weight. 0 = disabled for this stage."
-                }),
-                "weight_stage3": ("FLOAT", {
-                    "default": -1.0,
-                    "min": -1.0,
-                    "max": 2.0,
-                    "step": 0.05,
-                    "tooltip": "UltraGen Stage 3 (polish) weight. -1 = use global weight. 0 = disabled for this stage."
                 }),
             }
         }
@@ -113,11 +106,10 @@ class EricQwenImageApplyLoRA:
         self,
         pipeline: dict,
         lora_name: str,
-        weight: float = 1.0,
+        weight_stage1: float = 0.0,
+        weight_stage2: float = 0.0,
+        weight_stage3: float = 0.0,
         lora_path_override: str = "",
-        weight_stage1: float = -1.0,
-        weight_stage2: float = -1.0,
-        weight_stage3: float = -1.0,
     ) -> Tuple[dict]:
         """Apply LoRA to the Qwen-Image pipeline."""
         pipe = pipeline["pipeline"]
@@ -138,9 +130,13 @@ class EricQwenImageApplyLoRA:
         lora_filename = os.path.basename(lora_path)
         adapter_name = os.path.splitext(lora_filename)[0]
 
+        # Use weight_stage1 as the immediate effective weight (for non-UltraGen
+        # single-pass generation).  UltraGen overrides per stage before each pipe() call.
+        effective_weight = weight_stage1
+
         print(f"[EricQwenImage] Applying LoRA: {lora_filename}")
         print(f"[EricQwenImage] Path: {lora_path}")
-        print(f"[EricQwenImage] Weight: {weight}")
+        print(f"[EricQwenImage] Stage weights: S1={weight_stage1}, S2={weight_stage2}, S3={weight_stage3}")
 
         # Check if this adapter is already loaded
         loaded_adapters = set()
@@ -154,15 +150,15 @@ class EricQwenImageApplyLoRA:
         try:
             if adapter_name in loaded_adapters:
                 # Already loaded — just update the weight
-                pipe.set_adapters([adapter_name], adapter_weights=[weight])
-                print(f"[EricQwenImage] LoRA already loaded, updated weight: {adapter_name} -> {weight}")
+                pipe.set_adapters([adapter_name], adapter_weights=[effective_weight])
+                print(f"[EricQwenImage] LoRA already loaded, updated weight: {adapter_name} -> {effective_weight}")
             else:
                 # Load fresh
                 pipe.load_lora_weights(
                     lora_path,
                     adapter_name=adapter_name,
                 )
-                pipe.set_adapters([adapter_name], adapter_weights=[weight])
+                pipe.set_adapters([adapter_name], adapter_weights=[effective_weight])
                 print(f"[EricQwenImage] LoRA applied successfully: {adapter_name}")
 
         except Exception as e:
@@ -174,20 +170,11 @@ class EricQwenImageApplyLoRA:
             pipeline["applied_loras"] = {}
         pipeline["applied_loras"][adapter_name] = {
             "path": lora_path,
-            "weight": weight,
             "filename": lora_filename,
             "weight_stage1": weight_stage1,
             "weight_stage2": weight_stage2,
             "weight_stage3": weight_stage3,
         }
-
-        # Log per-stage weights if any are customized
-        stage_custom = any(w >= 0 for w in [weight_stage1, weight_stage2, weight_stage3])
-        if stage_custom:
-            s1 = weight if weight_stage1 < 0 else weight_stage1
-            s2 = weight if weight_stage2 < 0 else weight_stage2
-            s3 = weight if weight_stage3 < 0 else weight_stage3
-            print(f"[EricQwenImage] Per-stage weights: S1={s1}, S2={s2}, S3={s3}")
 
         return (pipeline,)
 
