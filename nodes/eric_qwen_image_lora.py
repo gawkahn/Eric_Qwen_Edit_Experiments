@@ -69,21 +69,21 @@ class EricQwenImageApplyLoRA:
                 }),
                 "weight_stage1": ("FLOAT", {
                     "default": 0.0,
-                    "min": 0.0,
+                    "min": -2.0,
                     "max": 2.0,
                     "step": 0.05,
                     "tooltip": "Stage 1 (draft/composition) weight. Also used as the weight for non-UltraGen nodes. 0 = disabled."
                 }),
                 "weight_stage2": ("FLOAT", {
                     "default": 0.0,
-                    "min": 0.0,
+                    "min": -2.0,
                     "max": 2.0,
                     "step": 0.05,
                     "tooltip": "Stage 2 (refinement) weight. 0 = disabled."
                 }),
                 "weight_stage3": ("FLOAT", {
                     "default": 0.0,
-                    "min": 0.0,
+                    "min": -2.0,
                     "max": 2.0,
                     "step": 0.05,
                     "tooltip": "Stage 3 (final polish) weight. 0 = disabled."
