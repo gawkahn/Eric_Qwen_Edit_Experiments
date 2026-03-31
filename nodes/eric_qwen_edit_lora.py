@@ -112,12 +112,9 @@ def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
         else:
             cleaned[k] = v
 
-    # Load directly into the transformer, bypassing pipeline-level routing
-    pipe.transformer.load_lora_adapter(
-        cleaned,
-        network_alphas=None,
-        adapter_name=adapter_name,
-    )
+    # Load the cleaned dict through the pipeline's normal load path
+    # so that adapter tracking (set_adapters / get_list_adapters) works.
+    pipe.load_lora_weights(cleaned, adapter_name=adapter_name)
     print(f"{log_prefix} LoRA loaded successfully with key normalization")
 
 
