@@ -18,9 +18,10 @@ subjects, spatial layout, lighting etc.  It then writes a rich descriptive
 prompt that applies the user's creative direction while preserving the
 structural elements the chosen ControlNet type will enforce.
 
-Also outputs a cn_type_index integer (0-3) matching the selected control
-type, which downstream nodes can use via a switch to auto-select the
-correct preprocessor.
+Also outputs a cn_type_index integer (1-5) matching the selected control
+type (1=Softline, 2=DWPose, 3=Depth, 4=CannyEdge, 5=PyraCanny), which
+downstream nodes can use via a switch to auto-select the correct
+preprocessor.
 
 Works with any OpenAI-compatible vision API:
   - Ollama  (qwen3-vl, llava, gemma3, etc.)
@@ -53,24 +54,24 @@ from .eric_qwen_prompt_rewriter import (
 #  ControlNet type definitions
 # ═══════════════════════════════════════════════════════════════════════
 
-CN_TYPES = ["Canny", "SoftEdge", "Depth", "Pose"]
-CN_TYPE_INDEX = {name: idx for idx, name in enumerate(CN_TYPES)}
+CN_TYPES = ["Softline", "DWPose", "Depth", "CannyEdge", "PyraCanny"]
+CN_TYPE_INDEX = {name: idx + 1 for idx, name in enumerate(CN_TYPES)}  # 1-based
 
 # What each CN type preserves — used to inform the VLM
 CN_TYPE_DESCRIPTIONS = {
-    "Canny": (
-        "Canny edge detection. Preserves hard edges, outlines, and contours "
-        "of all objects. The model will follow the exact edge map — object "
-        "shapes, silhouettes, and boundaries will be maintained. Interior "
-        "textures, colors, materials, and fine surface details are NOT "
-        "preserved and must be described in the prompt."
-    ),
-    "SoftEdge": (
+    "Softline": (
         "Soft edge detection (AnyLine/HED). Preserves softer, more organic "
         "edges and contours with graduated boundaries. Gives the model more "
         "freedom for interior details and subtle shapes than Canny, while "
         "still maintaining the overall composition and major structural "
         "lines. Colors, textures, materials are NOT preserved."
+    ),
+    "DWPose": (
+        "Pose skeleton detection (DWPose/OpenPose). Preserves body pose, "
+        "joint positions, and limb angles for human figures. Does NOT "
+        "preserve face details, clothing, body proportions, background, "
+        "or anything other than the skeletal pose. The model has complete "
+        "freedom to change the person's appearance, outfit, setting, etc."
     ),
     "Depth": (
         "Depth map estimation. Preserves the spatial depth relationships — "
@@ -79,12 +80,20 @@ CN_TYPE_DESCRIPTIONS = {
         "textures — only the depth arrangement. The model has maximum "
         "freedom to change object appearance while keeping spatial layout."
     ),
-    "Pose": (
-        "Pose skeleton detection (DWPose/OpenPose). Preserves body pose, "
-        "joint positions, and limb angles for human figures. Does NOT "
-        "preserve face details, clothing, body proportions, background, "
-        "or anything other than the skeletal pose. The model has complete "
-        "freedom to change the person's appearance, outfit, setting, etc."
+    "CannyEdge": (
+        "Canny edge detection. Preserves hard edges, outlines, and contours "
+        "of all objects. The model will follow the exact edge map — object "
+        "shapes, silhouettes, and boundaries will be maintained. Interior "
+        "textures, colors, materials, and fine surface details are NOT "
+        "preserved and must be described in the prompt."
+    ),
+    "PyraCanny": (
+        "Pyramid Canny edge detection. Multi-scale variant of Canny that "
+        "captures edges at multiple resolutions for richer structural "
+        "guidance. Preserves hard edges and outlines like standard Canny "
+        "but with better coverage of both fine details and large-scale "
+        "contours. Interior textures, colors, and materials are NOT "
+        "preserved and must be described in the prompt."
     ),
 }
 
@@ -166,9 +175,9 @@ class EricQwenControlNetPromptRewriter:
     not appearance.  The prompt must describe everything the diffusion
     model needs to render.
 
-    Also outputs a cn_type_index (0=Canny, 1=SoftEdge, 2=Depth, 3=Pose)
-    that can drive a downstream switch node to auto-select the correct
-    preprocessor.
+    Also outputs a cn_type_index (1=Softline, 2=DWPose, 3=Depth,
+    4=CannyEdge, 5=PyraCanny) that can drive a downstream switch node
+    to auto-select the correct preprocessor.
 
     Works with any OpenAI-compatible vision API (Ollama, LM Studio,
     OpenAI, etc.).  API keys loaded from env vars or api_keys.ini.
@@ -199,15 +208,16 @@ class EricQwenControlNetPromptRewriter:
                     )
                 }),
                 "cn_type": (CN_TYPES, {
-                    "default": "Canny",
+                    "default": "Softline",
                     "tooltip": (
                         "Which ControlNet preprocessor will be used.\n"
                         "Informs the VLM about what structural info\n"
                         "is preserved vs what must be described:\n"
-                        "• Canny — hard edges/outlines (idx 0)\n"
-                        "• SoftEdge — soft contours (idx 1)\n"
-                        "• Depth — spatial depth layout (idx 2)\n"
-                        "• Pose — body skeleton only (idx 3)"
+                        "• Softline — soft contours (idx 1)\n"
+                        "• DWPose — body skeleton only (idx 2)\n"
+                        "• Depth — spatial depth layout (idx 3)\n"
+                        "• CannyEdge — hard edges/outlines (idx 4)\n"
+                        "• PyraCanny — multi-scale edges (idx 5)"
                     )
                 }),
                 "api_url": ("STRING", {
@@ -282,7 +292,7 @@ class EricQwenControlNetPromptRewriter:
         self,
         image: torch.Tensor,
         creative_direction: str,
-        cn_type: str = "Canny",
+        cn_type: str = "Softline",
         api_url: str = "http://localhost:11434/v1",
         model: str = "qwen3-vl",
         # Optional
@@ -294,7 +304,7 @@ class EricQwenControlNetPromptRewriter:
         image_max_side: int = 1024,
     ) -> Tuple[str, int]:
         # Always output the CN type index
-        cn_index = CN_TYPE_INDEX.get(cn_type, 0)
+        cn_index = CN_TYPE_INDEX.get(cn_type, 1)
         print(f"[CNPromptRewriter] CN type: {cn_type} (index={cn_index})")
 
         if passthrough:
