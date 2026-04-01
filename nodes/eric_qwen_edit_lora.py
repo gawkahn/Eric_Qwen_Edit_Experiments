@@ -5,6 +5,8 @@
 Eric Qwen-Edit LoRA Node
 Apply LoRA weights to Qwen-Image-Edit pipeline.
 
+Supports standard LoRA, LoKR (Kronecker), and LoHa (Hadamard) adapter formats.
+
 Model Credits:
 - Qwen-Image-Edit developed by Qwen Team (Alibaba)
 - https://github.com/QwenLM/Qwen-Image
@@ -59,48 +61,25 @@ def get_lora_full_path(lora_name: str) -> str:
     return None
 
 
-def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
-                          log_prefix: str = "[LoRA]") -> None:
-    """Load LoRA with automatic key normalization for diffusers compatibility.
+# ═══════════════════════════════════════════════════════════════════════
+#  Adapter format helpers
+# ═══════════════════════════════════════════════════════════════════════
 
-    Some LoRAs (trained with certain frameworks) have state-dict keys that
-    include a ``transformer.`` component prefix baked into the key path, e.g.
-    ``transformer.transformer_blocks.0.attn.to_q.lora_A.weight``.  Diffusers'
-    ``QwenImageLoraLoaderMixin.load_lora_into_transformer`` passes the
-    state dict directly to PEFT without stripping this prefix, so PEFT
-    looks for a module called ``transformer.transformer_blocks.0.attn.to_q``
-    inside the transformer model — which doesn't exist (the transformer's
-    children start at ``transformer_blocks``, not ``transformer.transformer_blocks``).
-
-    The standard ComfyUI LoRA loader handles this via its own key mapping,
-    which is why the same LoRA loads fine there but fails here.
-
-    This helper tries the standard ``pipe.load_lora_weights()`` first (fast
-    path for well-formatted LoRAs).  On a "Target modules not found" error
-    it falls back to manual key normalization: stripping the ``transformer.``
-    prefix and loading directly into ``pipe.transformer.load_lora_adapter()``.
-    """
-    # ── Fast path: try standard loading ──────────────────────────────
-    try:
-        pipe.load_lora_weights(lora_path, adapter_name=adapter_name)
-        return
-    except ValueError as e:
-        if "Target modules" not in str(e) or "not found" not in str(e):
-            raise
-        print(f"{log_prefix} Standard load failed (key format mismatch), "
-              f"attempting key normalization...")
-
-    # ── Fallback: load state dict and normalize keys ────────────────
-    if lora_path.endswith(".safetensors"):
+def _load_state_dict(path: str) -> dict:
+    """Load a state dict from a safetensors, .bin, .pt, or .pth file."""
+    if path.endswith(".safetensors"):
         from safetensors.torch import load_file
-        state_dict = load_file(lora_path)
-    else:
-        state_dict = torch.load(lora_path, map_location="cpu",
-                                weights_only=True)
+        return load_file(path)
+    return torch.load(path, map_location="cpu", weights_only=True)
 
-    # Strip the component prefix so keys are transformer-relative.
-    # e.g. "transformer.transformer_blocks.0.attn.to_q.lora_A.weight"
-    #   -> "transformer_blocks.0.attn.to_q.lora_A.weight"
+
+def _normalize_keys(state_dict: dict) -> dict:
+    """Strip the ``transformer.`` component prefix from keys.
+
+    Many non-diffusers LoRA files bake in the component prefix, e.g.
+    ``transformer.transformer_blocks.0.attn.to_q.lora_A.weight``.
+    Diffusers expects keys relative to the transformer module itself.
+    """
     prefix = "transformer."
     cleaned = {}
     for k, v in state_dict.items():
@@ -111,11 +90,197 @@ def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
             cleaned[k[len(prefix):]] = v
         else:
             cleaned[k] = v
+    return cleaned
 
-    # Load the cleaned dict through the pipeline's normal load path
-    # so that adapter tracking (set_adapters / get_list_adapters) works.
-    pipe.load_lora_weights(cleaned, adapter_name=adapter_name)
-    print(f"{log_prefix} LoRA loaded successfully with key normalization")
+
+def _detect_adapter_type(state_dict: dict) -> str:
+    """Detect adapter format from state dict keys.
+
+    Returns one of: ``"lokr"``, ``"loha"``, ``"lora"``, ``"unknown"``.
+    """
+    keys = set(state_dict.keys())
+    has_lokr = any("lokr_w1" in k or "lokr_w2" in k for k in keys)
+    has_loha = any("hada_w1_a" in k or "hada_w2_a" in k for k in keys)
+    has_lora = any("lora_A" in k or "lora_B" in k for k in keys)
+
+    if has_lokr:
+        return "lokr"
+    if has_loha:
+        return "loha"
+    if has_lora:
+        return "lora"
+    return "unknown"
+
+
+def _load_lokr_adapter(pipe, state_dict: dict, adapter_name: str,
+                       log_prefix: str = "[LoRA]") -> None:
+    """Inject a LoKR (Kronecker) adapter via PEFT.
+
+    Diffusers' ``load_lora_weights`` only understands standard LoRA format.
+    For LoKR we bypass the pipeline and use PEFT's ``inject_adapter_in_model``
+    + ``set_peft_model_state_dict`` directly on the transformer.
+
+    Scaling convention: for full (non-decomposed) LoKR the effective delta is
+    ``kron(w1, w2) * (alpha / r)``.  We set ``alpha = r`` in the config so
+    that the base scaling is 1.0 (matching ComfyUI / LyCORIS convention).
+    ``set_adapters()`` then multiplies by the user-supplied weight.
+    """
+    from peft import LoKrConfig, inject_adapter_in_model, set_peft_model_state_dict
+
+    transformer = pipe.transformer
+
+    # Use a very large r so that PEFT creates full (non-decomposed) w1/w2
+    # matrices.  alpha = r gives unit scaling (1.0).
+    cfg_r = 100000
+    config = LoKrConfig(
+        r=cfg_r,
+        alpha=float(cfg_r),
+        decompose_both=False,
+        decompose_factor=-1,       # default factorization (near square-root)
+        target_modules=["_dummy"],  # will be overridden by state_dict keys
+    )
+
+    # Inject adapter layers (structure only, random weights)
+    inject_adapter_in_model(config, transformer,
+                            adapter_name=adapter_name,
+                            state_dict=state_dict)
+
+    # Load actual trained weights from state dict
+    incompatible = set_peft_model_state_dict(transformer, state_dict,
+                                             adapter_name=adapter_name)
+
+    # Mark PEFT as active so the pipeline's set_adapters() works
+    if not getattr(transformer, "_hf_peft_config_loaded", False):
+        transformer._hf_peft_config_loaded = True
+
+    # Log incompatible keys (alpha entries are expected here)
+    if incompatible:
+        unexpected = getattr(incompatible, "unexpected_keys", [])
+        missing = getattr(incompatible, "missing_keys", [])
+        if unexpected:
+            # Filter out alpha keys which are expected to be left over
+            non_alpha = [k for k in unexpected if not k.endswith(".alpha")]
+            if non_alpha:
+                print(f"{log_prefix} LoKR unexpected keys: {non_alpha[:5]}...")
+        if missing:
+            print(f"{log_prefix} LoKR missing keys: {missing[:5]}...")
+
+    print(f"{log_prefix} LoKR adapter loaded successfully via PEFT injection")
+
+
+def _load_loha_adapter(pipe, state_dict: dict, adapter_name: str,
+                       log_prefix: str = "[LoRA]") -> None:
+    """Inject a LoHa (Hadamard) adapter via PEFT.
+
+    LoHa always uses decomposed weights (w1_a/w1_b, w2_a/w2_b), so the
+    rank ``r`` is directly available from the weight shapes.
+    """
+    from peft import LoHaConfig, inject_adapter_in_model, set_peft_model_state_dict
+
+    transformer = pipe.transformer
+
+    # Determine rank from the first w1_a tensor shape
+    r_val = None
+    alpha_val = None
+    for key, val in state_dict.items():
+        if ".hada_w1_a" in key and val.ndim >= 2:
+            r_val = val.shape[1]  # (out_dim, rank)
+            break
+        if ".hada_w1_b" in key and val.ndim >= 2:
+            r_val = val.shape[0]  # (rank, in_dim)
+            break
+    if r_val is None:
+        r_val = 8  # fallback default
+
+    # Try to read alpha from state dict
+    for key, val in state_dict.items():
+        if key.endswith(".alpha") and val.numel() == 1:
+            alpha_val = val.item()
+            break
+    if alpha_val is None:
+        alpha_val = float(r_val)
+
+    config = LoHaConfig(
+        r=r_val,
+        alpha=alpha_val,
+        target_modules=["_dummy"],  # overridden by state_dict keys
+    )
+
+    inject_adapter_in_model(config, transformer,
+                            adapter_name=adapter_name,
+                            state_dict=state_dict)
+    incompatible = set_peft_model_state_dict(transformer, state_dict,
+                                             adapter_name=adapter_name)
+
+    if not getattr(transformer, "_hf_peft_config_loaded", False):
+        transformer._hf_peft_config_loaded = True
+
+    if incompatible:
+        unexpected = getattr(incompatible, "unexpected_keys", [])
+        non_alpha = [k for k in unexpected if not k.endswith(".alpha")]
+        if non_alpha:
+            print(f"{log_prefix} LoHa unexpected keys: {non_alpha[:5]}...")
+
+    print(f"{log_prefix} LoHa adapter loaded successfully via PEFT injection")
+
+
+def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
+                          log_prefix: str = "[LoRA]") -> None:
+    """Load a LoRA / LoKR / LoHa adapter with automatic format detection.
+
+    1. **Fast path** — tries ``pipe.load_lora_weights()`` (handles well-
+       formatted standard LoRA files).
+    2. **Fallback** — loads the state dict manually, normalises keys
+       (strips ``transformer.`` prefix), and detects the adapter type:
+
+       * **Standard LoRA** (``lora_A`` / ``lora_B`` keys) — re-loads
+         through the pipeline with cleaned keys.
+       * **LoKR** (``lokr_w1`` / ``lokr_w2`` keys) — injects via PEFT's
+         ``inject_adapter_in_model`` + ``set_peft_model_state_dict``.
+       * **LoHa** (``hada_w1_a`` / ``hada_w2_a`` keys) — same approach
+         as LoKR but with ``LoHaConfig``.
+    """
+    # ── Fast path: try standard loading ──────────────────────────────
+    try:
+        pipe.load_lora_weights(lora_path, adapter_name=adapter_name)
+        return
+    except (ValueError, RuntimeError) as e:
+        err = str(e)
+        # Catch errors that indicate a format we can handle:
+        #  - "Target modules ... not found" → key prefix issue (standard LoRA)
+        #  - "state_dict should be empty" → non-LoRA format (LoKR / LoHa)
+        #  - "lora_A" / "lora_B" in error → shape or format mismatch
+        is_fixable = (
+            ("Target modules" in err and "not found" in err)
+            or "state_dict" in err.lower()
+            or "lora_A" in err
+            or "lora_B" in err
+        )
+        if not is_fixable:
+            raise
+        print(f"{log_prefix} Standard load failed, attempting format "
+              f"detection...  ({err[:120]})")
+
+    # ── Fallback: manual load + format detection ─────────────────────
+    state_dict = _load_state_dict(lora_path)
+    state_dict = _normalize_keys(state_dict)
+
+    adapter_type = _detect_adapter_type(state_dict)
+    print(f"{log_prefix} Detected adapter format: {adapter_type}")
+
+    if adapter_type == "lokr":
+        _load_lokr_adapter(pipe, state_dict, adapter_name, log_prefix)
+    elif adapter_type == "loha":
+        _load_loha_adapter(pipe, state_dict, adapter_name, log_prefix)
+    elif adapter_type == "lora":
+        # Standard LoRA with key prefix issues — re-load via pipeline
+        pipe.load_lora_weights(state_dict, adapter_name=adapter_name)
+        print(f"{log_prefix} LoRA loaded successfully with key normalization")
+    else:
+        raise ValueError(
+            f"{log_prefix} Unrecognised adapter format.  First 5 keys: "
+            f"{list(state_dict.keys())[:5]}"
+        )
 
 
 class EricQwenEditApplyLoRA:
