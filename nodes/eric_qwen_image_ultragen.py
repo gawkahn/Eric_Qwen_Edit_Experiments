@@ -62,6 +62,10 @@ def _apply_lora_stage_weights(pipe, pipeline: dict, stage: int) -> None:
     Reads ``pipeline["applied_loras"]`` and calls ``pipe.set_adapters()``
     with the per-stage weight for each loaded adapter.
 
+    Direct-merge adapters (LoKR/LoHa/LoRA that fell through to weight
+    merging) have their weight baked in at load time and cannot be
+    adjusted per stage.  A note is printed for those.
+
     This is a no-op when no LoRAs are applied.
     """
     applied_loras = pipeline.get("applied_loras")
@@ -71,16 +75,33 @@ def _apply_lora_stage_weights(pipe, pipeline: dict, stage: int) -> None:
     stage_key = f"weight_stage{stage}"  # e.g. "weight_stage2"
     names = []
     weights = []
-    for adapter_name, info in applied_loras.items():
-        names.append(adapter_name)
-        weights.append(info.get(stage_key, 0.0))
+    direct_merge_names = []
 
-    try:
-        pipe.set_adapters(names, adapter_weights=weights)
-        summary = ", ".join(f"{n}={w}" for n, w in zip(names, weights))
-        print(f"[UltraGen] Stage {stage} LoRA weights: {summary}")
-    except Exception as e:
-        print(f"[UltraGen] WARNING: Could not set stage {stage} LoRA weights: {e}")
+    # Check which adapters are direct-merge
+    transformer = getattr(pipe, "transformer", None)
+    peft_cfg = getattr(transformer, "peft_config", {}) if transformer else {}
+
+    for adapter_name, info in applied_loras.items():
+        cfg = peft_cfg.get(adapter_name, {})
+        if isinstance(cfg, dict) and cfg.get("_type", "").endswith("_direct"):
+            direct_merge_names.append(adapter_name)
+        else:
+            names.append(adapter_name)
+            weights.append(info.get(stage_key, 0.0))
+
+    if direct_merge_names:
+        print(f"[UltraGen] Stage {stage}: direct-merge adapters "
+              f"{direct_merge_names} have fixed weight (per-stage "
+              f"adjustment not available)")
+
+    if names:
+        try:
+            pipe.set_adapters(names, adapter_weights=weights)
+            summary = ", ".join(f"{n}={w}" for n, w in zip(names, weights))
+            print(f"[UltraGen] Stage {stage} LoRA weights: {summary}")
+        except Exception as e:
+            print(f"[UltraGen] WARNING: Could not set stage {stage} "
+                  f"LoRA weights: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════

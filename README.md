@@ -1,4 +1,4 @@
-# Eric Qwen-Edit & Qwen-Image Nodes
+ # Eric Qwen-Edit & Qwen-Image Nodes
 
 ## 🖼️ Up to 17 MP image editing · 50 MP+ text-to-image generation
 
@@ -6,7 +6,10 @@ ComfyUI custom nodes for **Qwen-Image-Edit-2511** (image editing) and **Qwen-Ima
 30 nodes covering loading, single-image editing, multi-image fusion, style transfer, inpainting, inpaint-with-transfer, LoRA, Spectrum acceleration, delta overlay, mask utilities, **text-to-image generation**, multi-stage generation, prompt rewriting, **2× VAE super-resolution upscaling**, **ControlNet-guided generation**, and **ControlNet inpainting** *(experimental)*.
 
 ![8 MP image editing in just a few nodes](examples/FireRed11-8mp.png)
-*Edit images at full 8 MP resolution — just a loader, LoRA, and edit node.*
+*Edit images at up to 16 MP resolution — just a loader, LoRA, and edit node.*
+
+![Advanced Qwen-Edit worfflow up to 16mp](workflows\Qwen-Edit-HiRes-Adv.png)
+*Advanced Qwen-Edit workflow - just drop into ComfyUI - I use a lot of my own custom nodes which are all available but you can use the basic workflow too - just check the workflows folder*
 
 ## Features
 
@@ -745,9 +748,31 @@ Enhance image prompts using a local or remote LLM. Rewrites terse prompts into r
 | `temperature` | FLOAT | `0.7` | LLM temperature — lower = more faithful, higher = more creative |
 | `max_tokens` | INT | `2048` | Max tokens for LLM response |
 | `custom_instructions` | STRING | *(empty)* | Additional instructions appended to the system prompt |
+| `lora_triggers` | STRING | *(empty)* | LoRA trigger words/phrases, one per line or comma-separated |
+| `trigger_mode` | COMBO | `off` | How to apply trigger words: `incorporate`, `prepend`, `append`, or `off` |
 | `passthrough` | BOOLEAN | `False` | Skip rewriting and pass prompt through unchanged (for A/B testing) |
 
 **Output:** `enhanced_prompt` (STRING)
+
+#### LoRA Trigger Words
+
+Many LoRAs require specific trigger words or phrases in the prompt to activate their trained style or concept. The `lora_triggers` and `trigger_mode` inputs let you inject these automatically:
+
+| Mode | Behavior |
+|------|----------|
+| `off` | Trigger words are ignored |
+| `incorporate` | The LLM is instructed to weave the trigger words **verbatim** into the rewritten prompt naturally. Falls back to `prepend` when `passthrough` is enabled (no LLM call). |
+| `prepend` | Trigger words are prepended to the prompt (before the rewritten text). Works even in passthrough mode. |
+| `append` | Trigger words are appended to the prompt (after the rewritten text). Works even in passthrough mode. |
+
+**Usage:** Enter one trigger per line, or separate with commas. For example:
+```
+ohwx woman
+cinematic lighting
+film grain
+```
+
+When using `incorporate` mode, the LLM receives an additional system instruction requiring the trigger words to appear verbatim in the output, so they blend naturally into the description rather than being awkwardly tacked on.
 
 ---
 
@@ -872,6 +897,12 @@ Text-to-image generation guided by ControlNet (Canny, SoftEdge, Depth, or Pose) 
 Text-to-image generation without ControlNet using the UltraGen multi-stage pipeline. Produces 30 MP+ output with Spectrum acceleration and upscale VAE.
 
 ![Qwen-Image UltraGen Hi-Res 30MP+ workflow](workflows/Qwen-image-UltraGen-HiRes-30mp-plus.png)
+
+### Qwen-Image UltraGen — Advanced
+
+Advanced UltraGen workflow with Prompt Rewriter, selective sharpening, and several other features for high-quality text-to-image generation.
+
+![Qwen-Image UltraGen Advanced workflow](workflows/Qwen-UltraGen-Adv.png)
 
 See the `examples/` and `workflows/` folders for additional workflow files and screenshots.
 

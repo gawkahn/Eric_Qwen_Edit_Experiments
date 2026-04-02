@@ -466,9 +466,31 @@ class EricQwenPromptRewriter:
                         "Leave empty to use the default Qwen-style rewriting."
                     )
                 }),
+                "lora_triggers": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "tooltip": (
+                        "LoRA trigger words or phrases, one per line or comma-separated.\n"
+                        "These are special tokens that activate LoRA styles or subjects.\n"
+                        "Example:\n"
+                        "  artdeco style\n"
+                        "  ohwx person\n"
+                        "  watercolor painting, soft edges"
+                    )
+                }),
+                "trigger_mode": (["incorporate", "prepend", "append", "off"], {
+                    "default": "incorporate",
+                    "tooltip": (
+                        "How to add LoRA trigger words to the prompt:\n"
+                        "  incorporate — LLM weaves triggers naturally into the rewritten text\n"
+                        "  prepend — add triggers before the prompt text (no LLM needed)\n"
+                        "  append — add triggers after the prompt text (no LLM needed)\n"
+                        "  off — ignore trigger words entirely"
+                    )
+                }),
                 "passthrough": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "If True, skip rewriting and pass the prompt through unchanged (for A/B testing)"
+                    "tooltip": "If True, skip rewriting and pass the prompt through unchanged (for A/B testing). Prepend/append triggers are still applied."
                 }),
             }
         }
@@ -482,11 +504,36 @@ class EricQwenPromptRewriter:
         temperature: float = 0.7,
         max_tokens: int = 2048,
         custom_instructions: str = "",
+        lora_triggers: str = "",
+        trigger_mode: str = "incorporate",
         passthrough: bool = False,
     ) -> Tuple[str]:
+        # Parse trigger words (comma or newline separated, strip blanks)
+        triggers = []
+        if lora_triggers and lora_triggers.strip() and trigger_mode != "off":
+            for line in lora_triggers.replace(",", "\n").split("\n"):
+                t = line.strip()
+                if t:
+                    triggers.append(t)
+            if triggers:
+                print(f"[EricQwenPrompt] LoRA triggers ({trigger_mode}): "
+                      f"{', '.join(triggers)}")
+
+        # Prepend / append work even in passthrough mode
         if passthrough:
-            print("[EricQwenPrompt] Passthrough mode — prompt unchanged")
-            return (prompt,)
+            result = prompt
+            if triggers and trigger_mode == "prepend":
+                result = ", ".join(triggers) + ", " + result
+            elif triggers and trigger_mode == "append":
+                result = result.rstrip("., ") + ", " + ", ".join(triggers)
+            elif triggers and trigger_mode == "incorporate":
+                # Can't incorporate without LLM — fall back to prepend
+                result = ", ".join(triggers) + ", " + result
+                print("[EricQwenPrompt] Passthrough mode — 'incorporate' "
+                      "falls back to prepend (no LLM available)")
+            print("[EricQwenPrompt] Passthrough mode — prompt unchanged"
+                  f"{' (triggers applied)' if triggers else ''}")
+            return (result,)
 
         # Resolve API key from env / config file (never from workflow JSON)
         api_key = _resolve_api_key(api_url)
@@ -505,6 +552,25 @@ class EricQwenPromptRewriter:
         if custom_instructions and custom_instructions.strip():
             sys_prompt += f"\n\n## Additional Instructions\n{custom_instructions.strip()}"
 
+        # Handle trigger words based on mode
+        user_prompt = prompt
+        if triggers:
+            trigger_text = ", ".join(triggers)
+            if trigger_mode == "incorporate":
+                # Tell the LLM to weave these terms into the rewrite
+                sys_prompt += (
+                    f"\n\n## LoRA Trigger Words\n"
+                    f"The following trigger words/phrases MUST appear "
+                    f"verbatim in your output — weave them naturally "
+                    f"into the description. Do not rephrase, "
+                    f"translate, or omit them:\n"
+                    f"{trigger_text}"
+                )
+            elif trigger_mode == "prepend":
+                user_prompt = trigger_text + ", " + prompt
+            elif trigger_mode == "append":
+                user_prompt = prompt.rstrip("., ") + ", " + trigger_text
+
         print(f"[EricQwenPrompt] Rewriting prompt via {api_url} (model={model})")
         print(f"[EricQwenPrompt] Original ({len(prompt.split())} words): "
               f"{prompt[:120]}{'...' if len(prompt) > 120 else ''}")
@@ -514,7 +580,7 @@ class EricQwenPromptRewriter:
                 api_url=api_url,
                 model=model,
                 system_prompt=sys_prompt,
-                user_prompt=prompt,
+                user_prompt=user_prompt,
                 api_key=api_key,
                 temperature=temperature,
                 max_tokens=max_tokens,

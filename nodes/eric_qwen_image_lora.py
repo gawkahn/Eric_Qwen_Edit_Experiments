@@ -19,7 +19,9 @@ import os
 from typing import Tuple
 
 # Re-use the same helpers from the edit LoRA node (they are model-agnostic)
-from .eric_qwen_edit_lora import get_lora_list, get_lora_full_path, load_lora_with_key_fix
+from .eric_qwen_edit_lora import (get_lora_list, get_lora_full_path,
+                                  load_lora_with_key_fix,
+                                  _set_adapters_safe)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -150,13 +152,16 @@ class EricQwenImageApplyLoRA:
         try:
             if adapter_name in loaded_adapters:
                 # Already loaded — just update the weight
-                pipe.set_adapters([adapter_name], adapter_weights=[effective_weight])
+                _set_adapters_safe(pipe, adapter_name, effective_weight,
+                                   log_prefix="[EricQwenImage]")
                 print(f"[EricQwenImage] LoRA already loaded, updated weight: {adapter_name} -> {effective_weight}")
             else:
                 # Load fresh (with automatic key normalization fallback)
                 load_lora_with_key_fix(pipe, lora_path, adapter_name,
-                                      log_prefix="[EricQwenImage]")
-                pipe.set_adapters([adapter_name], adapter_weights=[effective_weight])
+                                      log_prefix="[EricQwenImage]",
+                                      weight=effective_weight)
+                _set_adapters_safe(pipe, adapter_name, effective_weight,
+                                   log_prefix="[EricQwenImage]")
                 print(f"[EricQwenImage] LoRA applied successfully: {adapter_name}")
 
         except Exception as e:

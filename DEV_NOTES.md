@@ -284,4 +284,114 @@ Final stage packed latents (output_type="latent")
 
 ---
 
-*Last updated: March 23, 2026 — Eric Hiss*
+## LoRA / LoKR / LoHa Adapter Loading — Multi-Level Fallback
+
+Updated April 2026.  `eric_qwen_edit_lora.py` provides adapter loading
+for standard LoRA, LoKR (Kronecker), and LoHa (Hadamard) formats with
+automatic format detection and a three-tier fallback strategy.
+
+### Problem History
+
+The Qwen transformer (`QwenImageTransformer2DModel`) uses non-standard
+module paths compared to what many LoRA training tools produce.  Two
+classes of failures were encountered:
+
+1. **Key prefix mismatch** — LoRA files from kohya_ss, LyCORIS, and other
+   tools bake in prefixes like `transformer.`, `diffusion_model.`,
+   `model.diffusion_model.`, or custom prefixes.  Diffusers expects keys
+   relative to the transformer module itself.  The fast path
+   `pipe.load_lora_weights(path)` fails with `"Target modules ... not found"`.
+
+2. **Non-standard adapter formats** — LoKR and LoHa files use different
+   weight keys (`lokr_w1`/`lokr_w2`, `hada_w1_a`/`hada_w2_a`) that
+   diffusers' pipeline loader doesn't handle at all.  PEFT supports them
+   via `inject_adapter_in_model()`, but only if keys are correctly
+   normalised first.
+
+3. **Error matching gap** — PEFT 0.17.0 raises `"No modules were targeted
+   for adaptation"` when zero state-dict keys match model module names.
+   Our original `is_fixable` check only looked for `"Target modules ... not
+   found"`, so this error was re-raised unhandled and the fallback path
+   (manual load + key normalisation) never ran.
+
+### Architecture: Three-Tier Fallback
+
+All adapter formats now follow the same three-tier strategy:
+
+| Tier | Method | Pro | Con |
+|------|--------|-----|-----|
+| 1 | `pipe.load_lora_weights()` | Full diffusers integration, `set_adapters()` works | Only handles standard LoRA with correct keys |
+| 2 | `inject_adapter_in_model()` + `set_peft_model_state_dict()` | PEFT tuner layers created, `set_adapters()` works | Requires PEFT, key matching must succeed |
+| 3 | Direct weight merge (B@A, kron, Hadamard) | Always works regardless of PEFT/key issues | Weight baked in at load time, `set_adapters()` cannot adjust dynamically |
+
+The entry point `load_lora_with_key_fix()` tries:
+1. Fast path: `pipe.load_lora_weights(lora_path)` — succeeds for well-formatted standard LoRA
+2. On failure: loads state dict, normalises keys via `_normalize_keys()`, detects format, dispatches to format-specific handler
+3. Each format handler (LoRA/LoKR/LoHa) tries PEFT injection first, falls back to direct merge
+
+### Key Normalisation (`_normalize_keys`)
+
+Smart prefix auto-detection that compares adapter state-dict module paths
+against the model's `named_modules()`:
+
+1. Check if keys already match model modules → no stripping needed
+2. Try known prefixes in order: `transformer.`, `diffusion_model.`,
+   `model.diffusion_model.`, `model.`
+3. Auto-detect arbitrary prefixes by suffix-matching state-dict paths
+   against model module names (requires >30% hit rate)
+4. Warn and return as-is if nothing matches
+
+### Scaling Conventions
+
+**Standard LoRA:** `delta = B @ A * (alpha / r) * weight`
+
+**LoKR:** `delta = kron(w1, w2) * (alpha / r) * weight`
+
+**LoHa:** `delta = (w1_a @ w1_b) * (w2_a @ w2_b) * (alpha / r) * weight`
+
+When `alpha` is absent from the checkpoint, scale defaults to `1.0 × weight`
+(weights assumed pre-scaled, matching LyCORIS/ComfyUI convention).
+
+> **Bug fix (April 2026):** The original LoKR/LoHa direct merge code always
+> computed `scale = alpha_val / r_val`, defaulting `alpha_val = 1.0` when
+> alpha was absent.  This produced `scale = 1/r` ≈ 0.003–0.25, effectively
+> zeroing out the adapter effect.  Fixed to use `scale = weight` when alpha
+> is not stored.
+
+### Direct-Merge Adapter Limitations
+
+When PEFT injection fails and direct merge is used:
+
+- The user weight is **baked into model parameters** at load time
+- `set_adapters()` calls are intercepted by `_set_adapters_safe()` which
+  detects direct-merge adapters and logs a note instead of crashing
+- UltraGen per-stage weight adjustment is not available for direct-merge
+  adapters (a warning is printed per stage)
+- Weight backups are stored for unloading (`_lokr_backup_`, `_loha_backup_`,
+  `_lora_backup_` attributes on the transformer)
+- Adapters are registered in `transformer.peft_config` with `_type` ending
+  in `_direct` so they can be identified
+
+### `is_fixable` Error Patterns
+
+The fast-path error handler catches these PEFT/diffusers error strings
+to trigger the fallback path:
+
+- `"Target modules" + "not found"` — key prefix issue
+- `"No modules were targeted"` — PEFT 0.17.0 zero-match error
+- `"state_dict"` (case-insensitive) — non-LoRA format in state dict
+- `"lora_A"` / `"lora_B"` — shape or format mismatch
+- `"lokr"` / `"loha"` / `"hada_"` — non-standard adapter format errors
+
+### Files Involved
+
+| File | Role |
+|------|------|
+| `eric_qwen_edit_lora.py` | All shared helpers + Qwen-Edit LoRA nodes |
+| `eric_qwen_image_lora.py` | Qwen-Image LoRA nodes (imports helpers from edit_lora) |
+| `eric_qwen_image_ultragen.py` | UltraGen per-stage weight handling |
+| `eric_qwen_image_ultragen_cn.py` | UltraGen CN per-stage weight handling (same import) |
+
+---
+
+*Last updated: April 1, 2026 — Eric Hiss*

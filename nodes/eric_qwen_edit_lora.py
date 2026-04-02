@@ -84,6 +84,7 @@ def _adapter_module_path(key: str) -> str:
         ".lokr_w1", ".lokr_w2", ".lokr_t2",
         ".lora_A.weight", ".lora_A.default.weight",
         ".lora_B.weight", ".lora_B.default.weight",
+        ".lora_down.weight", ".lora_up.weight",
         ".hada_w1_a", ".hada_w1_b", ".hada_w2_a", ".hada_w2_b",
         ".alpha", ".diff", ".diff_b",
     )
@@ -188,18 +189,20 @@ def _detect_adapter_type(state_dict: dict) -> str:
     has_lokr = any("lokr_w1" in k or "lokr_w2" in k for k in keys)
     has_loha = any("hada_w1_a" in k or "hada_w2_a" in k for k in keys)
     has_lora = any("lora_A" in k or "lora_B" in k for k in keys)
+    has_lora_alt = any("lora_down" in k or "lora_up" in k for k in keys)
 
     if has_lokr:
         return "lokr"
     if has_loha:
         return "loha"
-    if has_lora:
+    if has_lora or has_lora_alt:
         return "lora"
     return "unknown"
 
 
 def _load_lokr_adapter(pipe, state_dict: dict, adapter_name: str,
-                       log_prefix: str = "[LoRA]") -> None:
+                       log_prefix: str = "[LoRA]",
+                       weight: float = 1.0) -> None:
     """Inject a LoKR (Kronecker) adapter via PEFT.
 
     Diffusers' ``load_lora_weights`` only understands standard LoRA format.
@@ -220,7 +223,8 @@ def _load_lokr_adapter(pipe, state_dict: dict, adapter_name: str,
     except (ValueError, RuntimeError) as peft_err:
         print(f"{log_prefix} PEFT injection failed: {peft_err}")
         print(f"{log_prefix} Falling back to direct weight merge...")
-        _load_lokr_adapter_direct(pipe, state_dict, adapter_name, log_prefix)
+        _load_lokr_adapter_direct(pipe, state_dict, adapter_name, log_prefix,
+                                  weight=weight)
 
 
 def _load_lokr_adapter_peft(pipe, state_dict: dict, adapter_name: str,
@@ -270,11 +274,13 @@ def _load_lokr_adapter_peft(pipe, state_dict: dict, adapter_name: str,
 
 
 def _load_lokr_adapter_direct(pipe, state_dict: dict, adapter_name: str,
-                              log_prefix: str = "[LoRA]") -> None:
+                              log_prefix: str = "[LoRA]",
+                              weight: float = 1.0) -> None:
     """Apply LoKR adapter by directly merging weights into the transformer.
 
-    Computes ``kron(w1, w2) * (alpha / r)`` (or ``kron(w1, w2)`` when
-    alpha equals r) and adds the delta to each target parameter.
+    Computes ``kron(w1, w2) * (alpha / r) * weight`` and adds the delta to
+    each target parameter.  When *alpha* is absent from the checkpoint the
+    scale defaults to ``1.0`` (weights are assumed pre-scaled).
 
     This is the same approach ComfyUI's native weight patcher uses.
     The adapter is registered in ``peft_config`` so ``set_adapters()``
@@ -303,14 +309,16 @@ def _load_lokr_adapter_direct(pipe, state_dict: dict, adapter_name: str,
             skipped += 1
             continue
 
-        # Compute scaling factor
+        # Compute scaling factor.
+        # When alpha IS stored, use alpha / r (LyCORIS convention).
+        # When alpha is NOT stored, assume weights are pre-scaled → 1.0.
         alpha = params.get("alpha")
-        alpha_val = alpha.item() if alpha is not None else 1.0
-        # For full LoKR, r is inferred from the matrix dimensions.
-        # ComfyUI convention: the rank dim is the smaller of w1/w2.
-        # If alpha == r, scale = 1.0.
-        r_val = min(w1.shape) if w1.ndim >= 2 else 1
-        scale = alpha_val / r_val if r_val > 0 else 1.0
+        if alpha is not None:
+            alpha_val = alpha.item()
+            r_val = min(w1.shape) if w1.ndim >= 2 else 1
+            scale = (alpha_val / r_val) * weight if r_val > 0 else weight
+        else:
+            scale = weight
 
         # Compute delta = kron(w1, w2) * scale
         w1f = w1.float()
@@ -356,16 +364,24 @@ def _load_lokr_adapter_direct(pipe, state_dict: dict, adapter_name: str,
     transformer.peft_config[adapter_name] = {
         "_type": "lokr_direct",
         "_applied_modules": applied,
+        "_weight": weight,
     }
     if not getattr(transformer, "_hf_peft_config_loaded", False):
         transformer._hf_peft_config_loaded = True
 
-    print(f"{log_prefix} LoKR direct merge: applied={applied}, "
-          f"skipped={skipped}")
+    print(f"{log_prefix} LoKR direct merge (weight={weight}): "
+          f"applied={applied}, skipped={skipped}")
+    if skipped > applied:
+        sample_keys = list(state_dict.keys())[:5]
+        sample_modules = sorted(model_sd.keys())[:5]
+        print(f"{log_prefix} WARNING: Many modules skipped. "
+              f"State-dict keys (sample): {sample_keys}")
+        print(f"{log_prefix}   Model params (sample): {sample_modules}")
 
 
 def _load_loha_adapter(pipe, state_dict: dict, adapter_name: str,
-                       log_prefix: str = "[LoRA]") -> None:
+                       log_prefix: str = "[LoRA]",
+                       weight: float = 1.0) -> None:
     """Inject a LoHa (Hadamard) adapter via PEFT.
 
     LoHa always uses decomposed weights (w1_a/w1_b, w2_a/w2_b), so the
@@ -378,7 +394,8 @@ def _load_loha_adapter(pipe, state_dict: dict, adapter_name: str,
     except (ValueError, RuntimeError) as peft_err:
         print(f"{log_prefix} PEFT injection failed for LoHa: {peft_err}")
         print(f"{log_prefix} Falling back to direct weight merge...")
-        _load_loha_adapter_direct(pipe, state_dict, adapter_name, log_prefix)
+        _load_loha_adapter_direct(pipe, state_dict, adapter_name, log_prefix,
+                                  weight=weight)
 
 
 def _load_loha_adapter_peft(pipe, state_dict: dict, adapter_name: str,
@@ -434,10 +451,12 @@ def _load_loha_adapter_peft(pipe, state_dict: dict, adapter_name: str,
 
 
 def _load_loha_adapter_direct(pipe, state_dict: dict, adapter_name: str,
-                              log_prefix: str = "[LoRA]") -> None:
+                              log_prefix: str = "[LoRA]",
+                              weight: float = 1.0) -> None:
     """Apply LoHa adapter by directly merging weights into the transformer.
 
-    LoHa delta = ``(w1_a @ w1_b) * (w2_a @ w2_b) * (alpha / r)``.
+    LoHa delta = ``(w1_a @ w1_b) * (w2_a @ w2_b) * (alpha / r) * weight``.
+    When *alpha* is absent, scale defaults to ``1.0``.
     """
     transformer = pipe.transformer
     model_sd = dict(transformer.named_parameters())
@@ -460,11 +479,14 @@ def _load_loha_adapter_direct(pipe, state_dict: dict, adapter_name: str,
             skipped += 1
             continue
 
-        # Scaling
+        # Scaling: alpha / r when alpha is present, else 1.0
         alpha = params.get("alpha")
-        alpha_val = alpha.item() if alpha is not None else 1.0
-        r_val = w1_b.shape[0] if w1_b.ndim >= 2 else 1
-        scale = alpha_val / r_val if r_val > 0 else 1.0
+        if alpha is not None:
+            alpha_val = alpha.item()
+            r_val = w1_b.shape[0] if w1_b.ndim >= 2 else 1
+            scale = (alpha_val / r_val) * weight if r_val > 0 else weight
+        else:
+            scale = weight
 
         # delta = (w1_a @ w1_b) * (w2_a @ w2_b) * scale
         w1 = (w1_a.float() @ w1_b.float())
@@ -503,16 +525,261 @@ def _load_loha_adapter_direct(pipe, state_dict: dict, adapter_name: str,
     transformer.peft_config[adapter_name] = {
         "_type": "loha_direct",
         "_applied_modules": applied,
+        "_weight": weight,
     }
     if not getattr(transformer, "_hf_peft_config_loaded", False):
         transformer._hf_peft_config_loaded = True
 
-    print(f"{log_prefix} LoHa direct merge: applied={applied}, "
-          f"skipped={skipped}")
+    print(f"{log_prefix} LoHa direct merge (weight={weight}): "
+          f"applied={applied}, skipped={skipped}")
+    if skipped > applied:
+        sample_keys = list(state_dict.keys())[:5]
+        sample_modules = sorted(model_sd.keys())[:5]
+        print(f"{log_prefix} WARNING: Many modules skipped. "
+              f"State-dict keys (sample): {sample_keys}")
+        print(f"{log_prefix}   Model params (sample): {sample_modules}")
+
+
+def _rename_lora_down_up(state_dict: dict) -> dict:
+    """Rename ``lora_down`` / ``lora_up`` keys to ``lora_A`` / ``lora_B``.
+
+    Some training tools (kohya_ss, diffusers-native) use ``lora_down``/
+    ``lora_up`` instead of the PEFT-standard ``lora_A``/``lora_B``.
+    This normalises them so the rest of the loading pipeline only needs
+    to handle one convention.
+    """
+    if not any("lora_down" in k or "lora_up" in k for k in state_dict):
+        return state_dict
+
+    renamed = {}
+    count = 0
+    for k, v in state_dict.items():
+        new_k = k.replace(".lora_down.weight", ".lora_A.weight") \
+                 .replace(".lora_up.weight", ".lora_B.weight")
+        if new_k != k:
+            count += 1
+        renamed[new_k] = v
+
+    if count:
+        print(f"[LoRA] Renamed {count} lora_down/lora_up keys "
+              f"to lora_A/lora_B")
+    return renamed
+
+
+def _load_lora_adapter(pipe, state_dict: dict, adapter_name: str,
+                       log_prefix: str = "[LoRA]",
+                       weight: float = 1.0) -> None:
+    """Load a standard LoRA adapter with multi-level fallback.
+
+    Handles both ``lora_A``/``lora_B`` and ``lora_down``/``lora_up``
+    naming conventions (the latter is normalised to the former).
+
+    1. ``pipe.load_lora_weights(state_dict)`` — best integration with
+       diffusers' adapter management.
+    2. Direct PEFT ``inject_adapter_in_model`` on the transformer —
+       still supports ``set_adapters()`` for weight control.
+    3. Direct weight merge (B @ A * scale) — last resort, weight is
+       baked in at load time.
+    """
+    # Normalise lora_down/lora_up → lora_A/lora_B
+    state_dict = _rename_lora_down_up(state_dict)
+    # ── Try 1: Pipeline LoRA loading with normalised keys ────────────
+    try:
+        pipe.load_lora_weights(state_dict, adapter_name=adapter_name)
+        print(f"{log_prefix} LoRA loaded via pipeline with normalised keys")
+        return
+    except (ValueError, RuntimeError) as e:
+        print(f"{log_prefix} Pipeline LoRA load with normalised keys "
+              f"failed: {str(e)[:120]}")
+
+    # ── Try 2: Direct PEFT injection on the transformer ──────────────
+    try:
+        _load_lora_adapter_peft(pipe, state_dict, adapter_name, log_prefix)
+        return
+    except (ValueError, RuntimeError) as e:
+        print(f"{log_prefix} Direct PEFT LoRA injection failed: "
+              f"{str(e)[:120]}")
+
+    # ── Try 3: Direct weight merge (last resort) ─────────────────────
+    print(f"{log_prefix} Falling back to direct LoRA weight merge...")
+    _load_lora_adapter_direct(pipe, state_dict, adapter_name, log_prefix,
+                              weight=weight)
+
+
+def _load_lora_adapter_peft(pipe, state_dict: dict, adapter_name: str,
+                            log_prefix: str = "[LoRA]") -> None:
+    """Inject standard LoRA adapter directly via PEFT on the transformer."""
+    from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
+
+    transformer = pipe.transformer
+
+    # Normalise lora_down/lora_up → lora_A/lora_B before PEFT sees them
+    state_dict = _rename_lora_down_up(state_dict)
+
+    # Determine rank from first lora_A tensor
+    r_val = None
+    alpha_val = None
+    for key, val in state_dict.items():
+        if "lora_A" in key and val.ndim >= 2:
+            r_val = val.shape[0]
+            break
+    if r_val is None:
+        r_val = 64  # common default
+
+    for key, val in state_dict.items():
+        if key.endswith(".alpha") and val.numel() == 1:
+            alpha_val = val.item()
+            break
+    if alpha_val is None:
+        alpha_val = float(r_val)
+
+    config = LoraConfig(
+        r=r_val,
+        lora_alpha=alpha_val,
+        target_modules=["_dummy"],  # overridden by state_dict keys
+    )
+
+    inject_adapter_in_model(config, transformer,
+                            adapter_name=adapter_name,
+                            state_dict=state_dict)
+    incompatible = set_peft_model_state_dict(transformer, state_dict,
+                                             adapter_name=adapter_name)
+
+    if not getattr(transformer, "_hf_peft_config_loaded", False):
+        transformer._hf_peft_config_loaded = True
+
+    if incompatible:
+        unexpected = getattr(incompatible, "unexpected_keys", [])
+        non_alpha = [k for k in unexpected if not k.endswith(".alpha")]
+        if non_alpha:
+            print(f"{log_prefix} LoRA unexpected keys: {non_alpha[:5]}...")
+        missing = getattr(incompatible, "missing_keys", [])
+        if missing:
+            print(f"{log_prefix} LoRA missing keys: {missing[:5]}...")
+
+    print(f"{log_prefix} LoRA loaded via direct PEFT injection")
+
+
+def _load_lora_adapter_direct(pipe, state_dict: dict, adapter_name: str,
+                              log_prefix: str = "[LoRA]",
+                              weight: float = 1.0) -> None:
+    """Apply standard LoRA by directly merging B @ A * scale into weights.
+
+    The user *weight* is baked in at merge time.  ``set_adapters()`` will
+    not be able to change it afterwards (a limitation of direct merge).
+    """
+    transformer = pipe.transformer
+    model_sd = dict(transformer.named_parameters())
+
+    modules: dict[str, dict] = {}
+    for k, v in state_dict.items():
+        path = _adapter_module_path(k)
+        param_name = k[len(path) + 1:]
+        modules.setdefault(path, {})[param_name] = v
+
+    applied = 0
+    skipped = 0
+    for mod_path, params in modules.items():
+        lora_A = params.get("lora_A.weight") or params.get(
+            "lora_A.default.weight")
+        lora_B = params.get("lora_B.weight") or params.get(
+            "lora_B.default.weight")
+        if lora_A is None or lora_B is None:
+            skipped += 1
+            continue
+
+        # Scaling: delta = B @ A * (alpha / r) * weight
+        alpha = params.get("alpha")
+        if alpha is not None:
+            alpha_val = alpha.item()
+            r_val = lora_A.shape[0]
+            scale = (alpha_val / r_val) * weight if r_val > 0 else weight
+        else:
+            scale = weight
+
+        delta = (lora_B.float() @ lora_A.float()) * scale
+
+        target_key = mod_path + ".weight"
+        if target_key not in model_sd:
+            target_key = mod_path
+        if target_key not in model_sd:
+            skipped += 1
+            continue
+
+        param = model_sd[target_key]
+        if delta.shape != param.shape:
+            try:
+                delta = delta.reshape(param.shape)
+            except RuntimeError:
+                print(f"{log_prefix} LoRA shape mismatch for {mod_path}: "
+                      f"delta {delta.shape} vs param {param.shape}, skipping")
+                skipped += 1
+                continue
+
+        # Backup for unloading
+        backup_key = f"_lora_backup_{adapter_name}"
+        if not hasattr(transformer, backup_key):
+            setattr(transformer, backup_key, {})
+        backup = getattr(transformer, backup_key)
+        if target_key not in backup:
+            backup[target_key] = param.data.clone()
+
+        param.data.add_(delta.to(dtype=param.dtype, device=param.device))
+        applied += 1
+
+    # Register in peft_config for adapter discovery
+    if not hasattr(transformer, "peft_config"):
+        transformer.peft_config = {}
+    transformer.peft_config[adapter_name] = {
+        "_type": "lora_direct",
+        "_applied_modules": applied,
+        "_weight": weight,
+    }
+    if not getattr(transformer, "_hf_peft_config_loaded", False):
+        transformer._hf_peft_config_loaded = True
+
+    print(f"{log_prefix} LoRA direct merge (weight={weight}): "
+          f"applied={applied}, skipped={skipped}")
+    if skipped > applied:
+        sample_keys = list(state_dict.keys())[:5]
+        sample_modules = sorted(model_sd.keys())[:5]
+        print(f"{log_prefix} WARNING: Many modules skipped. "
+              f"State-dict keys (sample): {sample_keys}")
+        print(f"{log_prefix}   Model params (sample): {sample_modules}")
+
+
+def _set_adapters_safe(pipe, adapter_name: str, weight: float,
+                       log_prefix: str = "[LoRA]") -> None:
+    """Call ``pipe.set_adapters()`` with graceful handling for direct-merge
+    adapters that don't have PEFT tuner layers.
+
+    For PEFT-injected adapters ``set_adapters()`` adjusts the scaling.
+    For direct-merge adapters the weight is already baked into the model
+    parameters at load time, so ``set_adapters()`` is a no-op and we just
+    log a note.
+    """
+    # Check if this is a direct-merge adapter
+    transformer = getattr(pipe, "transformer", None)
+    if transformer is not None:
+        peft_cfg = getattr(transformer, "peft_config", {})
+        cfg = peft_cfg.get(adapter_name, {})
+        if isinstance(cfg, dict) and cfg.get("_type", "").endswith("_direct"):
+            if abs(weight - cfg.get("_weight", 1.0)) > 1e-6:
+                print(f"{log_prefix} NOTE: '{adapter_name}' was loaded via "
+                      f"direct weight merge (weight={cfg.get('_weight', 1.0)})."
+                      f" Changing weight requires reloading the LoRA.")
+            return
+
+    try:
+        pipe.set_adapters([adapter_name], adapter_weights=[weight])
+    except Exception as e:
+        print(f"{log_prefix} set_adapters note: {str(e)[:100]}  "
+              f"(adapter may have been loaded via direct merge)")
 
 
 def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
-                          log_prefix: str = "[LoRA]") -> None:
+                          log_prefix: str = "[LoRA]",
+                          weight: float = 1.0) -> None:
     """Load a LoRA / LoKR / LoHa adapter with automatic format detection.
 
     1. **Fast path** — tries ``pipe.load_lora_weights()`` (handles well-
@@ -533,15 +800,17 @@ def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
         return
     except (ValueError, RuntimeError) as e:
         err = str(e)
-        # Catch errors that indicate a format we can handle:
-        #  - "Target modules ... not found" → key prefix issue (standard LoRA)
-        #  - "state_dict should be empty" → non-LoRA format (LoKR / LoHa)
-        #  - "lora_A" / "lora_B" in error → shape or format mismatch
+        # Catch errors that indicate a format / key-mapping issue we can
+        # potentially work around by manual loading + key normalisation.
         is_fixable = (
             ("Target modules" in err and "not found" in err)
+            or "No modules were targeted" in err
             or "state_dict" in err.lower()
             or "lora_A" in err
             or "lora_B" in err
+            or "lokr" in err.lower()
+            or "loha" in err.lower()
+            or "hada_" in err
         )
         if not is_fixable:
             raise
@@ -557,13 +826,15 @@ def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
     print(f"{log_prefix} Detected adapter format: {adapter_type}")
 
     if adapter_type == "lokr":
-        _load_lokr_adapter(pipe, state_dict, adapter_name, log_prefix)
+        _load_lokr_adapter(pipe, state_dict, adapter_name, log_prefix,
+                           weight=weight)
     elif adapter_type == "loha":
-        _load_loha_adapter(pipe, state_dict, adapter_name, log_prefix)
+        _load_loha_adapter(pipe, state_dict, adapter_name, log_prefix,
+                           weight=weight)
     elif adapter_type == "lora":
-        # Standard LoRA with key prefix issues — re-load via pipeline
-        pipe.load_lora_weights(state_dict, adapter_name=adapter_name)
-        print(f"{log_prefix} LoRA loaded successfully with key normalization")
+        # Standard LoRA with key prefix issues — multi-level fallback
+        _load_lora_adapter(pipe, state_dict, adapter_name, log_prefix,
+                           weight=weight)
     else:
         raise ValueError(
             f"{log_prefix} Unrecognised adapter format.  First 5 keys: "
@@ -667,13 +938,18 @@ class EricQwenEditApplyLoRA:
         try:
             if adapter_name in loaded_adapters:
                 # Already loaded — just update the weight
-                pipe.set_adapters([adapter_name], adapter_weights=[weight])
+                _set_adapters_safe(pipe, adapter_name, weight,
+                                   log_prefix="[EricQwenEdit]")
                 print(f"[EricQwenEdit] LoRA already loaded, updated weight: {adapter_name} -> {weight}")
             else:
                 # Load fresh (with automatic key normalization fallback)
                 load_lora_with_key_fix(pipe, lora_path, adapter_name,
-                                      log_prefix="[EricQwenEdit]")
-                pipe.set_adapters([adapter_name], adapter_weights=[weight])
+                                      log_prefix="[EricQwenEdit]",
+                                      weight=weight)
+                # For PEFT-injected adapters, apply weight via set_adapters.
+                # For direct-merge adapters, weight is already baked in.
+                _set_adapters_safe(pipe, adapter_name, weight,
+                                   log_prefix="[EricQwenEdit]")
                 print(f"[EricQwenEdit] LoRA applied successfully: {adapter_name}")
             
         except Exception as e:
