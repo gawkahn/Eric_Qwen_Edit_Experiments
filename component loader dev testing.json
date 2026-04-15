@@ -1,0 +1,144 @@
+{
+  "5": {
+    "inputs": {
+      "base_pipeline_path": "/comfy/mnt/hf-local/Chroma1-base",
+      "transformer_path": "/basedir/models/diffusion_models/Chroma/Chroma-DC-2K.safetensors",
+      "vae_path": "",
+      "text_encoder_path": "",
+      "text_encoder_2_path": "",
+      "precision": "bf16",
+      "device": "balanced",
+      "keep_in_vram": true,
+      "offload_vae": false,
+      "attention_slicing": false,
+      "sequential_offload": false
+    },
+    "class_type": "Eric Diffusion Component Loader",
+    "_meta": {
+      "title": "Eric Diffusion Component Loader"
+    }
+  },
+  "7": {
+    "inputs": {
+      "lora_1": "Chroma/realistic/FineArtPhoto2.safetensors",
+      "weight_1_s1": 0.8,
+      "weight_1_s2": 0.8,
+      "weight_1_s3": 0.8,
+      "path_1": "",
+      "lora_2": "none",
+      "weight_2_s1": 1,
+      "weight_2_s2": 1,
+      "weight_2_s3": 1,
+      "path_2": "",
+      "lora_3": "none",
+      "weight_3_s1": 1,
+      "weight_3_s2": 1,
+      "weight_3_s3": 1,
+      "path_3": "",
+      "lora_4": "none",
+      "weight_4_s1": 1,
+      "weight_4_s2": 1,
+      "weight_4_s3": 1,
+      "path_4": "",
+      "lora_5": "none",
+      "weight_5_s1": 1,
+      "weight_5_s2": 1,
+      "weight_5_s3": 1,
+      "path_5": "",
+      "lora_6": "none",
+      "weight_6_s1": 1,
+      "weight_6_s2": 1,
+      "weight_6_s3": 1,
+      "path_6": "",
+      "lora_7": "none",
+      "weight_7_s1": 1,
+      "weight_7_s2": 1,
+      "weight_7_s3": 1,
+      "path_7": "",
+      "lora_8": "none",
+      "weight_8_s1": 1,
+      "weight_8_s2": 1,
+      "weight_8_s3": 1,
+      "path_8": "",
+      "min_compatibility": 0,
+      "pipeline": [
+        "5",
+        0
+      ]
+    },
+    "class_type": "Eric Diffusion LoRA Stacker",
+    "_meta": {
+      "title": "Eric Diffusion LoRA Stacker"
+    }
+  },
+  "9": {
+    "inputs": {
+      "text": "Candid realistic photo of a short, petite, athletic woman in her 30s with a narrow frame \nand minimal chest, the dress fabric lying nearly flat against her. Long black hair \npinned back with loose strands falling against her neck and collarbone. She is wearing \nan elegant ivory colored plunge cowl neck halter dress, the fabric draping with visible \nsoft folds across the chest and falling in a deep cowl, with a neckline plunging all \nthe way to her waist. The calf length skirt is slit to the waist. She is at a daytime \nwedding reception standing next to a table with a floral centerpiece of deep red peonies \nand white ranunculus in a clear glass vase. She holds a stemmed wine glass by the stem, \nfingers wrapped around it with fingernails visible, white wine with a slight meniscus, \nlight refracting through the glass onto her hand. She looks directly at the camera. \nWarm daylight from tall windows to her left, slight fill from overhead reception \nlighting. A second guest is blurred in the background. Photorealistic, shot on 85mm."
+    },
+    "class_type": "Text Multiline",
+    "_meta": {
+      "title": "Prompt"
+    }
+  },
+  "10": {
+    "inputs": {
+      "seed": -1
+    },
+    "class_type": "Seed (rgthree)",
+    "_meta": {
+      "title": "Seed (rgthree)"
+    }
+  },
+  "36": {
+    "inputs": {
+      "prompt": [
+        "9",
+        0
+      ],
+      "negative_prompt": [
+        "43",
+        0
+      ],
+      "aspect_ratio": "2:3   Portrait",
+      "target_mp": 2,
+      "steps": 20,
+      "cfg_scale": 4,
+      "sampler": "flow_rk3",
+      "sigma_schedule": "balanced",
+      "max_sequence_length": 512,
+      "seed": [
+        "10",
+        0
+      ],
+      "pipeline": [
+        "7",
+        0
+      ]
+    },
+    "class_type": "Eric Diffusion Advanced Generate",
+    "_meta": {
+      "title": "Eric Diffusion Advanced Generate (Flux/Chroma)"
+    }
+  },
+  "38": {
+    "inputs": {
+      "images": [
+        "36",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "Preview Image"
+    }
+  },
+  "43": {
+    "inputs": {
+      "text": "ugly, bad, wrong, weird, low quality, blurry, out of focus, shallow depth of field, unsharp, unfinished, anime, sketch, drawing, cartoon, vector, boring, horror, disfigured, deformed, mutated, repulsive, unattractive, hideous"
+    },
+    "class_type": "Text Multiline",
+    "_meta": {
+      "title": "Negative Prompt"
+    }
+  }
+}

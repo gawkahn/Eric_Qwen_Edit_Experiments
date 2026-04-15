@@ -1,0 +1,240 @@
+{
+  "6": {
+    "inputs": {
+      "text": "Inside a glassblowing studio, a bearded glassblower in a worn leather apron and \nheat-resistant gloves holds a long iron blowpipe at the furnace opening, turning it \nslowly. At the end of the pipe, a glowing gather of molten glass pulses orange-white \nat its core, fading through amber and deep red at the edges. The furnace opening \nbehind him is a blinding white-orange aperture. Drips and cooled blobs of glass litter \nthe concrete floor near the furnace base, some still faintly glowing, others gone dark \nand translucent. A second person — a younger woman with short dark hair — stands \nseveral feet back observing, partially lit by the furnace glow, her face warm orange \non one side and cool shadow on the other. Behind her, a wooden shelf holds finished \npieces: a deep cobalt blue vase, a clear fluted bowl, two amber-tinted cups, and a \ngreen paperweight with a white spiral interior visible through the glass. The studio \nwalls are exposed brick, soot-darkened. Overhead industrial lighting competes with the \nfurnace glow. The glassblower's hands and the blowpipe are sharply in focus. \nPhotorealistic, high detail.",
+      "clip": [
+        "138",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Positive Prompt)"
+    }
+  },
+  "7": {
+    "inputs": {
+      "text": "ugly, bad, wrong, weird, low quality, blurry, out of focus, shallow depth of field, unsharp, unfinished, anime, sketch, drawing, cartoon, vector, boring, horror, disfigured, deformed, mutated, repulsive, unattractive, hideous",
+      "clip": [
+        "138",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Negative Prompt)"
+    }
+  },
+  "8": {
+    "inputs": {
+      "samples": [
+        "129",
+        0
+      ],
+      "vae": [
+        "143",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "60": {
+    "inputs": {
+      "filename_prefix": "04-13-26/chroma-ultra/ComfyUI",
+      "images": [
+        "8",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "129": {
+    "inputs": {
+      "eta": 0.5,
+      "sampler_name": "exponential/res_3s",
+      "steps_to_run": -1,
+      "cfg": [
+        "136",
+        0
+      ],
+      "sampler_mode": "resample",
+      "bongmath": true,
+      "latent_image": [
+        "174",
+        0
+      ]
+    },
+    "class_type": "ClownsharkChainsampler_Beta",
+    "_meta": {
+      "title": "ClownsharkChainsampler"
+    }
+  },
+  "136": {
+    "inputs": {
+      "value": 4.5
+    },
+    "class_type": "PrimitiveFloat",
+    "_meta": {
+      "title": "CFG"
+    }
+  },
+  "138": {
+    "inputs": {
+      "lora_name": "Chroma/realistic/FineArtPhoto2.safetensors",
+      "strength_model": 0.75,
+      "strength_clip": 0.75,
+      "model": [
+        "178",
+        0
+      ],
+      "clip": [
+        "150",
+        0
+      ]
+    },
+    "class_type": "LoraLoader",
+    "_meta": {
+      "title": "Load LoRA (Model and CLIP)"
+    }
+  },
+  "139": {
+    "inputs": {
+      "resize_to_input": "false",
+      "width": 1280,
+      "height": 1280,
+      "mask_channel": "red",
+      "invert_mask": false,
+      "latent_type": "16_channels"
+    },
+    "class_type": "VAEEncodeAdvanced",
+    "_meta": {
+      "title": "VAEEncodeAdvanced"
+    }
+  },
+  "143": {
+    "inputs": {
+      "vae_name": "chroma/flux.vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "150": {
+    "inputs": {
+      "clip_name": "chroma/GNER-T5-xxl-enc-fp16.gguf",
+      "type": "chroma"
+    },
+    "class_type": "CLIPLoaderGGUF",
+    "_meta": {
+      "title": "CLIPLoader (GGUF)"
+    }
+  },
+  "165": {
+    "inputs": {
+      "eta": 0.5,
+      "sampler_name": "exponential/res_3s",
+      "scheduler": "beta57",
+      "steps": 30,
+      "steps_to_run": 15,
+      "denoise": 1,
+      "cfg": [
+        "136",
+        0
+      ],
+      "seed": 590851641583950,
+      "sampler_mode": "standard",
+      "bongmath": true,
+      "model": [
+        "138",
+        0
+      ],
+      "positive": [
+        "6",
+        0
+      ],
+      "negative": [
+        "7",
+        0
+      ],
+      "latent_image": [
+        "139",
+        3
+      ]
+    },
+    "class_type": "ClownsharKSampler_Beta",
+    "_meta": {
+      "title": "ClownsharKSampler"
+    }
+  },
+  "173": {
+    "inputs": {
+      "upscale_method": "bislerp",
+      "scale_by": 1.5,
+      "samples": [
+        "165",
+        0
+      ]
+    },
+    "class_type": "LatentUpscaleBy",
+    "_meta": {
+      "title": "Upscale Latent By"
+    }
+  },
+  "174": {
+    "inputs": {
+      "eta": 0.5,
+      "sampler_name": "exponential/res_3s",
+      "steps_to_run": 5,
+      "cfg": [
+        "136",
+        0
+      ],
+      "sampler_mode": "resample",
+      "bongmath": true,
+      "latent_image": [
+        "173",
+        0
+      ],
+      "options": [
+        "175",
+        0
+      ]
+    },
+    "class_type": "ClownsharkChainsampler_Beta",
+    "_meta": {
+      "title": "ClownsharkChainsampler"
+    }
+  },
+  "175": {
+    "inputs": {
+      "cycles": 4,
+      "eta_decay_scale": 1,
+      "unsample_eta": 0.5,
+      "unsampler_override": "none",
+      "unsample_steps_to_run": 4,
+      "unsample_cfg": 1,
+      "unsample_bongmath": false
+    },
+    "class_type": "ClownOptions_Cycles_Beta",
+    "_meta": {
+      "title": "Increase #Cycles! (for HQ)"
+    }
+  },
+  "178": {
+    "inputs": {
+      "unet_name": "chroma/Chroma_Realism_NSFW_RMX.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Diffusion Model"
+    }
+  }
+}
