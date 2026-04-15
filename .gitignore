@@ -33,3 +33,7 @@ examples/not public/
 
 # Archives
 *.zip
+
+# Claude session artifacts (not committed — ephemeral per-session state)
+memory/
+session-handoff-*.md
