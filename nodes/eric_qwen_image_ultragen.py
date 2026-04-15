@@ -52,6 +52,7 @@ from .eric_qwen_image_multistage import (
 )
 from .eric_qwen_upscale_vae import (
     decode_latents_with_upscale_vae,
+    decode_latents_with_upscale_vae_safe,
     upscale_between_stages,
 )
 
@@ -630,13 +631,10 @@ class EricQwenImageUltraGen:
 
             if not do_stage2:
                 if use_final_decode:
-                    # Offload transformer to free VRAM for upscale decode
-                    pipe.transformer = pipe.transformer.to("cpu")
-                    torch.cuda.empty_cache()
-                    print(f"[UltraGen] Upscale VAE decode (2×) ...")
-                    tensor = decode_latents_with_upscale_vae(
-                        s1_result.images, upscale_vae, pipe.vae,
+                    tensor = decode_latents_with_upscale_vae_safe(
+                        s1_result.images, upscale_vae, pipe,
                         s1_h, s1_w, vae_scale_factor,
+                        log_prefix="[UltraGen]",
                     )
                     print(f"[UltraGen] Output: {tensor.shape[2]}×{tensor.shape[1]} (2× upscaled)")
                     return (tensor,)
@@ -693,13 +691,10 @@ class EricQwenImageUltraGen:
 
             if not do_stage3:
                 if use_final_decode:
-                    # Offload transformer to free VRAM for upscale decode
-                    pipe.transformer = pipe.transformer.to("cpu")
-                    torch.cuda.empty_cache()
-                    print(f"[UltraGen] Upscale VAE decode (2×) ...")
-                    tensor = decode_latents_with_upscale_vae(
-                        s2_result.images, upscale_vae, pipe.vae,
+                    tensor = decode_latents_with_upscale_vae_safe(
+                        s2_result.images, upscale_vae, pipe,
                         s2_h, s2_w, vae_scale_factor,
+                        log_prefix="[UltraGen]",
                     )
                     print(f"[UltraGen] Output: {tensor.shape[2]}×{tensor.shape[1]} (2× upscaled)")
                     return (tensor,)
@@ -767,13 +762,10 @@ class EricQwenImageUltraGen:
             )
 
             if use_final_decode:
-                # Offload transformer to free VRAM for upscale decode
-                pipe.transformer = pipe.transformer.to("cpu")
-                torch.cuda.empty_cache()
-                print(f"[UltraGen] Upscale VAE decode (2×) ...")
-                tensor = decode_latents_with_upscale_vae(
-                    s3_result.images, upscale_vae, pipe.vae,
+                tensor = decode_latents_with_upscale_vae_safe(
+                    s3_result.images, upscale_vae, pipe,
                     s3_h, s3_w, vae_scale_factor,
+                    log_prefix="[UltraGen]",
                 )
                 print(f"[UltraGen] Output: {tensor.shape[2]}×{tensor.shape[1]} (2× upscaled)")
                 return (tensor,)

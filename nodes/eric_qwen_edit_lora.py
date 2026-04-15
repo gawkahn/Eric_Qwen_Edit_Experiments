@@ -65,6 +65,24 @@ def get_lora_full_path(lora_name: str) -> str:
 #  Adapter format helpers
 # ═══════════════════════════════════════════════════════════════════════
 
+def _make_adapter_name(filename: str) -> str:
+    """Derive a PEFT-safe adapter name from a LoRA filename.
+
+    PEFT uses adapter names as Python identifiers and dict keys internally.
+    Dots in names (e.g. version numbers like 'v1.1' in 'style_v1.1.safetensors')
+    cause failures in PEFT attribute lookups and state-dict key construction.
+    This function strips the file extension and replaces any remaining dots
+    (and other problematic characters) with underscores.
+    """
+    stem = filename
+    for ext in (".safetensors", ".bin", ".pt", ".pth"):
+        if stem.lower().endswith(ext):
+            stem = stem[: -len(ext)]
+            break
+    # Replace characters that PEFT can't use in adapter names
+    return stem.replace(".", "_").replace(" ", "_")
+
+
 def _load_state_dict(path: str) -> dict:
     """Load a state dict from a safetensors, .bin, .pt, or .pth file."""
     if path.endswith(".safetensors"):
@@ -540,6 +558,113 @@ def _load_loha_adapter_direct(pipe, state_dict: dict, adapter_name: str,
         print(f"{log_prefix}   Model params (sample): {sample_modules}")
 
 
+def _decode_kohya_keys(state_dict: dict, model) -> dict:
+    """Convert Kohya underscore-encoded LoRA keys to dot-separated format.
+
+    Kohya trainers encode module paths by replacing dots with underscores
+    and prepending ``lora_transformer_`` or ``lora_unet_``.  This function
+    recovers the original dot-separated paths so that PEFT/diffusers can
+    route the weights to the correct modules.
+
+    Two conventions are handled:
+
+    ``lora_transformer_*``
+        Diffusers-format module names with underscores.  Decoded by matching
+        against the model's actual module tree (unambiguous because the tree
+        tells us which underscores are dots).
+
+    ``lora_unet_*``
+        Original-format module names (``double_blocks``, ``single_blocks``).
+        Decoded via diffusers' built-in Flux Kohya converter, which handles
+        key mapping *and* QKV splitting.  Works for Chroma because it shares
+        Flux's block structure.
+    """
+    if model is None:
+        return state_dict
+
+    has_lora_transformer = any(k.startswith("lora_transformer_") for k in state_dict)
+    has_lora_unet = any(k.startswith("lora_unet_") for k in state_dict)
+
+    if not has_lora_transformer and not has_lora_unet:
+        return state_dict
+
+    # ── lora_unet_* → use diffusers' Flux Kohya converter ──────────────
+    # Chroma shares Flux's block architecture, so the Flux mapping applies.
+    if has_lora_unet:
+        try:
+            from diffusers.loaders.lora_conversion_utils import (
+                _convert_kohya_flux_lora_to_diffusers,
+            )
+            converted = _convert_kohya_flux_lora_to_diffusers(state_dict)
+            if converted:
+                print(f"[LoRA] Converted {len(converted)} lora_unet_ keys "
+                      f"via Flux Kohya converter")
+                return converted
+        except Exception as e:
+            print(f"[LoRA] Flux Kohya converter failed: {e}")
+
+    if not has_lora_transformer:
+        return state_dict
+
+    # ── lora_transformer_* → decode using model module tree ─────────────
+    model_modules = {name for name, _ in model.named_modules() if name}
+
+    # Build lookup: underscore-encoded name → dot-separated name
+    underscore_to_dot = {}
+    for name in model_modules:
+        underscore_to_dot[name.replace(".", "_")] = name
+
+    # Suffixes that mark the boundary between module path and adapter param.
+    # The module path is underscore-encoded; the suffix uses dots.
+    _SUFFIX_MARKERS = (
+        ".lora_down.", ".lora_up.", ".lora_A.", ".lora_B.",
+        ".alpha", ".lokr_", ".hada_", ".diff",
+    )
+
+    decoded = {}
+    converted = 0
+    skipped_modules = set()
+
+    for key, value in state_dict.items():
+        if not key.startswith("lora_transformer_"):
+            decoded[key] = value
+            continue
+
+        remainder = key[len("lora_transformer_"):]
+
+        # Find where the adapter suffix starts
+        split_idx = -1
+        for marker in _SUFFIX_MARKERS:
+            idx = remainder.find(marker)
+            if idx >= 0 and (split_idx < 0 or idx < split_idx):
+                split_idx = idx
+
+        if split_idx < 0:
+            decoded[key] = value
+            continue
+
+        module_encoded = remainder[:split_idx]
+        adapter_suffix = remainder[split_idx:]
+
+        if module_encoded in underscore_to_dot:
+            new_key = underscore_to_dot[module_encoded] + adapter_suffix
+            decoded[new_key] = value
+            converted += 1
+        else:
+            # Module not in this model (e.g. distilled_guidance_layer on
+            # Chroma-HD) — drop the key rather than crash later.
+            skipped_modules.add(module_encoded.split("_")[0])
+
+    if converted > 0:
+        print(f"[LoRA] Decoded {converted} Kohya lora_transformer_ keys "
+              f"to dot-separated format")
+    if skipped_modules:
+        print(f"[LoRA] Skipped keys targeting modules not in this model: "
+              f"{skipped_modules}")
+
+    return decoded
+
+
 def _rename_lora_down_up(state_dict: dict) -> dict:
     """Rename ``lora_down`` / ``lora_up`` keys to ``lora_A`` / ``lora_B``.
 
@@ -680,10 +805,12 @@ def _load_lora_adapter_direct(pipe, state_dict: dict, adapter_name: str,
     applied = 0
     skipped = 0
     for mod_path, params in modules.items():
-        lora_A = params.get("lora_A.weight") or params.get(
-            "lora_A.default.weight")
-        lora_B = params.get("lora_B.weight") or params.get(
-            "lora_B.default.weight")
+        lora_A = params.get("lora_A.weight")
+        if lora_A is None:
+            lora_A = params.get("lora_A.default.weight")
+        lora_B = params.get("lora_B.weight")
+        if lora_B is None:
+            lora_B = params.get("lora_B.default.weight")
         if lora_A is None or lora_B is None:
             skipped += 1
             continue
@@ -748,6 +875,76 @@ def _load_lora_adapter_direct(pipe, state_dict: dict, adapter_name: str,
         print(f"{log_prefix}   Model params (sample): {sample_modules}")
 
 
+def unload_adapters(pipe, adapter_names, log_prefix: str = "[LoRA]") -> None:
+    """Unload a set of adapters from the pipeline's transformer.
+
+    Handles both PEFT-managed and direct-merge adapters.  Direct-merge
+    adapters are restored from backups stored on the transformer during
+    load (``_<kind>_backup_<name>`` dicts mapping param name → original
+    tensor).  PEFT-managed adapters are removed via ``delete_adapters``.
+
+    Use this when the LoRA stacker needs to drop adapters that were
+    loaded in a previous run but aren't in the current stack — otherwise
+    stale adapters remain attached and their weights are still applied.
+    """
+    if not adapter_names:
+        return
+    transformer = getattr(pipe, "transformer", None)
+    if transformer is None:
+        return
+
+    peft_cfg = getattr(transformer, "peft_config", None) or {}
+
+    for adapter_name in list(adapter_names):
+        cfg = peft_cfg.get(adapter_name, None)
+
+        # Direct-merge: cfg is a dict with a ``_type`` key ending in "_direct".
+        if isinstance(cfg, dict) and cfg.get("_type", "").endswith("_direct"):
+            adapter_family = cfg.get("_type", "").replace("_direct", "")
+            backup_key = f"_{adapter_family}_backup_{adapter_name}"
+            backup = getattr(transformer, backup_key, None)
+            if backup:
+                model_sd = dict(transformer.named_parameters())
+                restored = 0
+                for target_key, original_tensor in backup.items():
+                    param = model_sd.get(target_key)
+                    if param is not None:
+                        param.data.copy_(original_tensor.to(
+                            dtype=param.dtype, device=param.device,
+                        ))
+                        restored += 1
+                print(f"{log_prefix} Direct-merge '{adapter_name}' restored "
+                      f"({restored}/{len(backup)} params)")
+                try:
+                    delattr(transformer, backup_key)
+                except AttributeError:
+                    pass
+            else:
+                print(f"{log_prefix} Direct-merge '{adapter_name}' has no "
+                      f"backup to restore — weights may remain baked in")
+            try:
+                del peft_cfg[adapter_name]
+            except (KeyError, TypeError):
+                pass
+            continue
+
+        # PEFT-managed: use delete_adapters
+        try:
+            if hasattr(pipe, "delete_adapters"):
+                pipe.delete_adapters(adapter_name)
+            elif hasattr(transformer, "delete_adapters"):
+                transformer.delete_adapters(adapter_name)
+            else:
+                try:
+                    del peft_cfg[adapter_name]
+                except (KeyError, TypeError):
+                    pass
+            print(f"{log_prefix} PEFT adapter '{adapter_name}' deleted")
+        except Exception as e:
+            print(f"{log_prefix} Failed to delete PEFT adapter "
+                  f"'{adapter_name}': {e}")
+
+
 def _set_adapters_safe(pipe, adapter_name: str, weight: float,
                        log_prefix: str = "[LoRA]") -> None:
     """Call ``pipe.set_adapters()`` with graceful handling for direct-merge
@@ -779,12 +976,18 @@ def _set_adapters_safe(pipe, adapter_name: str, weight: float,
 
 def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
                           log_prefix: str = "[LoRA]",
-                          weight: float = 1.0) -> None:
+                          weight: float = 1.0,
+                          min_compatibility: float = 0.0) -> bool:
     """Load a LoRA / LoKR / LoHa adapter with automatic format detection.
 
-    1. **Fast path** — tries ``pipe.load_lora_weights()`` (handles well-
+    1. **Compatibility check** — reads the LoRA header (no weights loaded) and
+       validates key names and tensor dimensions against the loaded transformer.
+       Always logs warnings; skips loading if ``key_match_pct < min_compatibility``.
+
+    2. **Fast path** — tries ``pipe.load_lora_weights()`` (handles well-
        formatted standard LoRA files).
-    2. **Fallback** — loads the state dict manually, normalises keys
+
+    3. **Fallback** — loads the state dict manually, normalises keys
        (strips ``transformer.`` prefix), and detects the adapter type:
 
        * **Standard LoRA** (``lora_A`` / ``lora_B`` keys) — re-loads
@@ -793,17 +996,46 @@ def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
          ``inject_adapter_in_model`` + ``set_peft_model_state_dict``.
        * **LoHa** (``hada_w1_a`` / ``hada_w2_a`` keys) — same approach
          as LoKR but with ``LoHaConfig``.
+
+    Returns True if the LoRA was loaded, False if it was skipped.
     """
+    from .eric_diffusion_lora_check import check_lora
+
+    # ── Compatibility pre-check (header only — fast) ──────────────────
+    transformer = getattr(pipe, "transformer", None)
+    if transformer is not None:
+        try:
+            result = check_lora(lora_path, transformer=transformer,
+                                log_prefix=log_prefix)
+            for line in result.log_lines(prefix=log_prefix):
+                print(line)
+            if min_compatibility > 0 and result.key_match_pct < min_compatibility * 100:
+                result.skipped = True
+                print(
+                    f"{log_prefix} SKIP {os.path.basename(lora_path)}: "
+                    f"compatibility {result.key_match_pct:.0f}% < "
+                    f"threshold {min_compatibility * 100:.0f}%"
+                )
+                return False
+        except Exception as chk_err:
+            print(f"{log_prefix} Compatibility check failed (non-fatal): {chk_err}")
+
     # ── Fast path: try standard loading ──────────────────────────────
     try:
         pipe.load_lora_weights(lora_path, adapter_name=adapter_name)
-        return
-    except (ValueError, RuntimeError) as e:
+        return True
+    except (ValueError, RuntimeError, KeyError) as e:
+        # KeyError: diffusers' _maybe_expand_lora_state_dict raises this
+        # when a LoRA targets an expanded-format key (e.g. fused QKV)
+        # that doesn't match the model's actual parameter layout.  The
+        # manual-loading fallback below handles this via Kohya decoding
+        # and/or direct PEFT injection, so we treat KeyError as fixable.
         err = str(e)
         # Catch errors that indicate a format / key-mapping issue we can
         # potentially work around by manual loading + key normalisation.
         is_fixable = (
-            ("Target modules" in err and "not found" in err)
+            isinstance(e, KeyError)  # always fall through on KeyError
+            or ("Target modules" in err and "not found" in err)
             or "No modules were targeted" in err
             or "state_dict" in err.lower()
             or "lora_A" in err
@@ -811,15 +1043,19 @@ def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
             or "lokr" in err.lower()
             or "loha" in err.lower()
             or "hada_" in err
+            or "PEFT backend" in err
+            or "not implemented" in err.lower()
+            or "Handling for key" in err
         )
         if not is_fixable:
             raise
         print(f"{log_prefix} Standard load failed, attempting format "
               f"detection...  ({err[:120]})")
 
-    # ── Fallback: manual load + format detection ─────────────────────
+    # ── Fallback: manual load + Kohya decode + key normalisation ─────
     state_dict = _load_state_dict(lora_path)
     transformer = getattr(pipe, "transformer", None)
+    state_dict = _decode_kohya_keys(state_dict, transformer)
     state_dict = _normalize_keys(state_dict, model=transformer)
 
     adapter_type = _detect_adapter_type(state_dict)
@@ -840,6 +1076,7 @@ def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
             f"{log_prefix} Unrecognised adapter format.  First 5 keys: "
             f"{list(state_dict.keys())[:5]}"
         )
+    return True
 
 
 class EricQwenEditApplyLoRA:
@@ -920,7 +1157,7 @@ class EricQwenEditApplyLoRA:
                 raise ValueError(f"LoRA file not found: {lora_name}")
         
         lora_filename = os.path.basename(lora_path)
-        adapter_name = os.path.splitext(lora_filename)[0]  # Remove extension for adapter name
+        adapter_name = _make_adapter_name(lora_filename)
         
         print(f"[EricQwenEdit] Applying LoRA: {lora_filename}")
         print(f"[EricQwenEdit] Path: {lora_path}")

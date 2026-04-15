@@ -106,6 +106,7 @@ def decode_latents_with_upscale_vae(
     height: int,
     width: int,
     vae_scale_factor: int = 8,
+    device=None,
 ) -> torch.Tensor:
     """Decode packed Qwen/Wan latents using the 2× upscale VAE.
 
@@ -123,13 +124,26 @@ def decode_latents_with_upscale_vae(
         height, width  : Pixel dimensions of the stage that produced
                          these latents (before upscale).
         vae_scale_factor : Spatial compression (default 8).
+        device         : Optional explicit device.  If None, uses the
+                         CURRENT device of ``pipe_vae`` (defensive
+                         default that avoids hardcoding ``cuda:0`` and
+                         creating cross-GPU pipeline state when the
+                         pipeline was loaded on cuda:1 or elsewhere).
 
     Returns:
         ComfyUI IMAGE tensor ``[B, 2*H, 2*W, 3]`` in float32, [0, 1].
     """
     from .eric_qwen_image_multistage import _unpack_latents
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Pick device: explicit > pipe_vae's current device > cuda fallback.
+    # Critical fix: never hardcode "cuda" (which aliases to cuda:0) —
+    # that causes cross-GPU pipeline state when the user loaded on
+    # cuda:1 and breaks the next VAE operation with a device mismatch.
+    if device is None:
+        try:
+            device = next(pipe_vae.parameters()).device
+        except (StopIteration, AttributeError):
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = next(upscale_vae.parameters()).dtype
 
     # 1) Move upscale VAE to GPU
@@ -197,6 +211,118 @@ def decode_latents_with_upscale_vae(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  Safe wrapper: transformer offload + upscale VAE decode + guaranteed restore
+# ═══════════════════════════════════════════════════════════════════════
+
+def decode_latents_with_upscale_vae_safe(
+    packed_latents: torch.Tensor,
+    upscale_vae,
+    pipe,
+    height: int,
+    width: int,
+    vae_scale_factor: int = 8,
+    device=None,
+    log_prefix: str = "[EricQwen]",
+) -> torch.Tensor:
+    """Upscale VAE decode with guaranteed transformer offload/restore.
+
+    Wraps ``decode_latents_with_upscale_vae`` with the VRAM-freeing
+    transformer offload that high-resolution decodes need, AND
+    **guarantees the transformer gets restored to its original device
+    on every exit path** (normal return, exception, interrupt).
+
+    Why this helper exists: the naive pattern
+
+        pipe.transformer = pipe.transformer.to("cpu")
+        torch.cuda.empty_cache()
+        tensor = decode_latents_with_upscale_vae(...)
+        return tensor
+
+    leaves the transformer on CPU after the decode returns.  diffusers
+    pipelines do NOT auto-move components back to GPU on the next
+    ``pipe(...)`` call — they run wherever they were last placed.  The
+    next run then either crashes with a device mismatch or silently
+    runs Qwen/Flux 20B inference on CPU at roughly 1/100th the normal
+    speed (GPU idle, CPU pegged, generation advancing at ~1%/minute).
+
+    This helper captures the transformer's device BEFORE the offload,
+    does the decode, and restores the device in a ``finally`` block so
+    the next run starts in the correct state regardless of how this
+    one exited.
+
+    Args:
+        packed_latents   : Latents to decode, shape ``[B, seq, C*4]``.
+        upscale_vae      : The Wan2.1 upscale VAE (AutoencoderKLWan).
+        pipe             : The full pipeline object (needed to access
+                           both ``pipe.transformer`` and ``pipe.vae``).
+                           Note: this differs from the lower-level
+                           ``decode_latents_with_upscale_vae`` which
+                           takes ``pipe_vae`` directly.
+        height, width    : Pixel dimensions of the pre-upscale stage.
+        vae_scale_factor : Spatial compression (default 8).
+        device           : Optional explicit target device for the
+                           decode.  If None, uses pipe_vae's current
+                           device.
+        log_prefix       : Log line prefix for the offload/restore
+                           messages.  Defaults to "[EricQwen]".
+
+    Returns:
+        ComfyUI IMAGE tensor ``[B, 2H, 2W, 3]`` in float32, [0, 1].
+    """
+    # Capture transformer's current device BEFORE offloading.  This is
+    # what we restore to in the finally block.
+    try:
+        transformer_device = next(pipe.transformer.parameters()).device
+    except (StopIteration, AttributeError):
+        transformer_device = None
+
+    try:
+        # Offload transformer to CPU to free VRAM for the decode.
+        # High-resolution Wan2.1 decode is memory-intensive and the
+        # transformer is the biggest component on the GPU at this
+        # point.  Skip if we couldn't read its device.
+        if transformer_device is not None and transformer_device.type != "cpu":
+            try:
+                pipe.transformer = pipe.transformer.to("cpu")
+                torch.cuda.empty_cache()
+            except Exception as e:
+                print(
+                    f"{log_prefix} Transformer offload failed "
+                    f"(continuing with decode anyway): {e}"
+                )
+
+        print(f"{log_prefix} Upscale VAE decode (2×) ...")
+        tensor = decode_latents_with_upscale_vae(
+            packed_latents, upscale_vae, pipe.vae,
+            height, width, vae_scale_factor,
+            device=device,
+        )
+        return tensor
+
+    finally:
+        # CRITICAL: restore transformer to its original device on ALL
+        # exit paths.  Without this, the next pipe() call runs
+        # inference on CPU (silent) or crashes on device mismatch.
+        if transformer_device is not None:
+            try:
+                current = next(pipe.transformer.parameters()).device
+                if current != transformer_device:
+                    pipe.transformer = pipe.transformer.to(transformer_device)
+                    print(
+                        f"{log_prefix} Transformer restored to "
+                        f"{transformer_device} (was {current} after "
+                        f"upscale VAE decode)"
+                    )
+            except Exception as e:
+                print(
+                    f"{log_prefix} WARNING: failed to restore transformer "
+                    f"to {transformer_device}: {e}. Next run may be very "
+                    f"slow or crash — restart ComfyUI if generation is "
+                    f"stuck."
+                )
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  Inter-stage helper: decode 2× with upscale VAE, re-encode to latents
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -207,6 +333,7 @@ def upscale_between_stages(
     height: int,
     width: int,
     vae_scale_factor: int = 8,
+    device=None,
 ) -> tuple:
     """Decode latents at 2× via the upscale VAE, then re-encode with the
     standard Qwen VAE to produce packed latents at 2× spatial resolution.
@@ -234,9 +361,34 @@ def upscale_between_stages(
     """
     from .eric_qwen_image_multistage import _unpack_latents, _pack_latents
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Pick device: explicit > pipe_vae's current device > cuda fallback.
+    # Critical: NEVER hardcode "cuda" here (aliases to cuda:0), because
+    # that moves pipe.vae from wherever it actually is (e.g. cuda:1)
+    # onto cuda:0, leaving pipe.vae and pipe.transformer on different
+    # GPUs.  The next VAE operation then fails with a device mismatch.
+    if device is None:
+        try:
+            device = next(pipe_vae.parameters()).device
+        except (StopIteration, AttributeError):
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     up_dtype = next(upscale_vae.parameters()).dtype
     vae_dtype = next(pipe_vae.parameters()).dtype
+
+    # Detect whether pipe_vae is accelerate-dispatched (balanced mode).
+    # When dispatched, calling pipe_vae.to(device) emits a warning and
+    # leaves the VAE in a half-moved state where the outermost module's
+    # device attribute changed but the per-layer parameters stayed
+    # where accelerate originally placed them.  The next encode call
+    # then crashes because accelerate's per-layer hooks try to route
+    # inputs from one device to weights on another.  Skip the move
+    # entirely when dispatched and trust accelerate's hooks to handle
+    # device routing during encode.
+    pipe_vae_dispatched = hasattr(pipe_vae, "_hf_hook")
+    if not pipe_vae_dispatched:
+        for submodule in pipe_vae.modules():
+            if hasattr(submodule, "_hf_hook"):
+                pipe_vae_dispatched = True
+                break
 
     z_dim = pipe_vae.config.z_dim
 
@@ -273,10 +425,25 @@ def upscale_between_stages(
     new_w = pixels_2x.shape[3]
 
     # ── Step 2: Re-encode with standard Qwen VAE → latents at 2× ─────
-    pipe_vae = pipe_vae.to(device)
+    # Only call pipe_vae.to(device) when it's NOT accelerate-dispatched.
+    # Dispatched VAEs are managed by accelerate's per-layer hooks, and
+    # calling .to() on them creates a half-moved state that crashes the
+    # next encode call.
+    if not pipe_vae_dispatched:
+        pipe_vae = pipe_vae.to(device)
     try:
-        # VAE encode expects [B, C, num_frames, H, W]
-        pixels_5d = pixels_2x.unsqueeze(2).to(dtype=vae_dtype)
+        # VAE encode expects [B, C, num_frames, H, W].  We move pixels
+        # to the SAME device as the VAE's first parameter — for an
+        # accelerate-dispatched VAE that's where accelerate placed the
+        # first layer, and accelerate's hooks will route inputs through
+        # subsequent layers automatically.
+        try:
+            target_device_for_input = next(pipe_vae.parameters()).device
+        except (StopIteration, AttributeError):
+            target_device_for_input = device
+        pixels_5d = pixels_2x.unsqueeze(2).to(
+            device=target_device_for_input, dtype=vae_dtype,
+        )
         del pixels_2x
 
         with torch.no_grad():
@@ -287,8 +454,13 @@ def upscale_between_stages(
 
         # Inverse normalization: packed = (raw - mean) / std
         #   (inverse of decode: vae_input = packed * std + mean)
-        mean_enc = mean_t.to(device=device, dtype=vae_dtype)
-        std_enc = std_t.to(device=device, dtype=vae_dtype)
+        # Place normalization constants on raw_latents' actual device,
+        # not the function's `device` variable — accelerate may have
+        # moved raw_latents to a different device than where pixels_5d
+        # started, and mixing devices in the arithmetic crashes.
+        raw_device = raw_latents.device
+        mean_enc = mean_t.to(device=raw_device, dtype=vae_dtype)
+        std_enc = std_t.to(device=raw_device, dtype=vae_dtype)
         norm_latents = (raw_latents - mean_enc) / std_enc
 
         # Pack to pipeline format [B, seq, C*4]

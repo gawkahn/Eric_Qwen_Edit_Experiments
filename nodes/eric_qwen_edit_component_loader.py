@@ -19,6 +19,12 @@ import os
 import torch
 from typing import Tuple
 
+from .eric_diffusion_component_loader import (
+    _fix_text_encoder_device,
+    available_device_options,
+    resolve_device_with_fallback,
+)
+
 from .eric_qwen_edit_utils import (
     get_pipeline_cache,
     clear_pipeline_cache,
@@ -81,9 +87,22 @@ class EricQwenEditComponentLoader:
                     "default": "bf16",
                     "tooltip": "Model precision (bf16 recommended for RTX 40/50 series)"
                 }),
-                "device": (["cuda", "cuda:0", "cuda:1", "cpu"], {
-                    "default": "cuda",
-                    "tooltip": "Device to load model on"
+                "device": (available_device_options(), {
+                    "default": (
+                        "cuda" if "cuda" in available_device_options()
+                        else "cpu"
+                    ),
+                    "tooltip": (
+                        "Device to load model on.  Options filtered by "
+                        "visible hardware.\n\n"
+                        "• balanced — splits across all visible GPUs.  "
+                        "Component overrides are pre-loaded then passed "
+                        "to from_pretrained; accelerate dispatches the "
+                        "rest of the pipeline alongside them.  ONLY "
+                        "shown when 2+ GPUs are visible.\n"
+                        "• cuda / cuda:N — pin to a single GPU.\n"
+                        "• cpu — CPU-only (very slow, for testing)."
+                    ),
                 }),
                 "keep_in_vram": ("BOOLEAN", {
                     "default": True,
@@ -156,16 +175,22 @@ class EricQwenEditComponentLoader:
         """Load pipeline from base + optional component overrides."""
         from ..pipelines import QwenEditPipeline
 
-        # Build cache key from all relevant params
+        # Runtime device fallback: handles stale workflow JSON.
+        device, use_device_map = resolve_device_with_fallback(
+            device, log_prefix="[EricQwenEdit]",
+        )
+
+        # Build cache key from all relevant params (include device so
+        # switching between single-GPU and balanced invalidates the cache).
         cache_key = (
             f"comp_{base_pipeline_path}_{transformer_path}_{vae_path}_"
-            f"{text_encoder_path}_{offload_vae}_{attention_slicing}_{sequential_offload}"
+            f"{text_encoder_path}_{device}_{offload_vae}_{attention_slicing}_{sequential_offload}"
         )
 
         cache = get_pipeline_cache()
         if cache["pipeline"] is not None and cache.get("cache_key") == cache_key:
             print("[EricQwenEdit] Using cached pipeline (component loader)")
-            return ({"pipeline": cache["pipeline"], "model_path": base_pipeline_path},)
+            return ({"pipeline": cache["pipeline"], "model_path": base_pipeline_path, "offload_vae": offload_vae},)
 
         if cache["pipeline"] is not None:
             print("[EricQwenEdit] Clearing cached pipeline (loading different model/settings)")
@@ -260,18 +285,75 @@ class EricQwenEditComponentLoader:
 
         # --- Load the pipeline ---
         component_info = list(kwargs.keys()) if kwargs else ["all from base"]
-        print(f"[EricQwenEdit] Loading pipeline from base: {base_pipeline_path}")
+        print(f"[EricQwenEdit] Loading pipeline from base: {base_pipeline_path} (device: {device})")
         print(f"[EricQwenEdit] Component overrides: {component_info}")
 
-        pipeline = QwenEditPipeline.from_pretrained(
-            base_pipeline_path,
+        load_kwargs = dict(
             torch_dtype=dtype,
             local_files_only=True,
             **kwargs,
         )
+        if use_device_map:
+            load_kwargs["device_map"] = "balanced"
+            print("[EricQwenEdit] Using device_map='balanced' — splitting across all visible GPUs")
+            if offload_vae:
+                print(
+                    "[EricQwenEdit] NOTE: offload_vae=True is ignored in "
+                    "balanced mode — accelerate manages VAE placement."
+                )
+            if sequential_offload:
+                print(
+                    "[EricQwenEdit] NOTE: sequential_offload=True is "
+                    "ignored in balanced mode."
+                )
+
+        pipeline = QwenEditPipeline.from_pretrained(
+            base_pipeline_path,
+            **load_kwargs,
+        )
 
         # Apply optimizations
-        if sequential_offload:
+        if use_device_map:
+            # Pre-loaded component overrides bypass device_map dispatch —
+            # when a custom component is passed to from_pretrained with
+            # device_map="balanced", diffusers skips dispatching it and
+            # leaves it wherever it was loaded (CPU by default).  Move
+            # any CPU-resident overrides to the execution device so they
+            # match the dispatched rest-of-pipeline.
+            try:
+                exec_dev = pipeline._execution_device
+            except AttributeError:
+                exec_dev = None
+
+            override_components = []
+            if transformer_path:
+                override_components.append("transformer")
+            if text_encoder_path:
+                override_components.append("text_encoder")
+            if vae_path:
+                override_components.append("vae")
+
+            for comp_name in override_components:
+                comp = getattr(pipeline, comp_name, None)
+                if comp is None:
+                    continue
+                if hasattr(comp, "_hf_hook"):
+                    continue  # accelerate will handle it
+                try:
+                    comp_dev = next(comp.parameters()).device
+                except StopIteration:
+                    continue
+                if exec_dev is not None and comp_dev.type == "cpu" and str(exec_dev) != "cpu":
+                    print(
+                        f"[EricQwenEdit] Moving {comp_name} {comp_dev} → {exec_dev} "
+                        f"(was pre-loaded and missed device_map dispatch)"
+                    )
+                    setattr(pipeline, comp_name, comp.to(exec_dev))
+
+            # Install text-encoder forward hooks to handle cross-device
+            # routing of tokenizer/processor outputs.
+            _fix_text_encoder_device(pipeline, "[EricQwenEdit]")
+        elif sequential_offload:
             print("[EricQwenEdit] Enabling sequential CPU offload")
             pipeline.enable_sequential_cpu_offload()
         else:

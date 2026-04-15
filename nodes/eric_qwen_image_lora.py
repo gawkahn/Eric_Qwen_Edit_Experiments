@@ -21,6 +21,7 @@ from typing import Tuple
 # Re-use the same helpers from the edit LoRA node (they are model-agnostic)
 from .eric_qwen_edit_lora import (get_lora_list, get_lora_full_path,
                                   load_lora_with_key_fix,
+                                  _make_adapter_name,
                                   _set_adapters_safe)
 
 
@@ -130,7 +131,7 @@ class EricQwenImageApplyLoRA:
                 raise ValueError(f"LoRA file not found: {lora_name}")
 
         lora_filename = os.path.basename(lora_path)
-        adapter_name = os.path.splitext(lora_filename)[0]
+        adapter_name = _make_adapter_name(lora_filename)
 
         # Use weight_stage1 as the immediate effective weight (for non-UltraGen
         # single-pass generation).  UltraGen overrides per stage before each pipe() call.

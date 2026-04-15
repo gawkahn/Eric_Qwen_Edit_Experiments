@@ -21,6 +21,11 @@ from .eric_qwen_edit_utils import (
     clear_pipeline_cache,
     get_default_paths,
 )
+from .eric_diffusion_component_loader import (
+    _fix_text_encoder_device,
+    available_device_options,
+    resolve_device_with_fallback,
+)
 
 
 class EricQwenEditLoader:
@@ -63,9 +68,22 @@ class EricQwenEditLoader:
                     "default": "bf16",
                     "tooltip": "Model precision (bf16 recommended for RTX 40/50 series)"
                 }),
-                "device": (["cuda", "cuda:0", "cuda:1", "cpu"], {
-                    "default": "cuda",
-                    "tooltip": "Device to load model on"
+                "device": (available_device_options(), {
+                    "default": (
+                        "cuda" if "cuda" in available_device_options()
+                        else "cpu"
+                    ),
+                    "tooltip": (
+                        "Device to load model on.  Options filtered by "
+                        "visible hardware.\n\n"
+                        "• balanced — splits across all visible GPUs via "
+                        "accelerate device_map='balanced'.  Use this for "
+                        "large 20B models on multi-GPU setups.  ONLY "
+                        "shown when 2+ GPUs are visible — provides no "
+                        "benefit on single-GPU systems.\n"
+                        "• cuda / cuda:N — pin to a single GPU.\n"
+                        "• cpu — CPU-only (very slow, for testing)."
+                    ),
                 }),
                 "keep_in_vram": ("BOOLEAN", {
                     "default": True,
@@ -73,7 +91,11 @@ class EricQwenEditLoader:
                 }),
                 "offload_vae": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Move VAE to CPU during transformer inference (saves ~2GB VRAM)"
+                    "tooltip": (
+                        "Move VAE to CPU during transformer inference "
+                        "(saves ~2GB VRAM).  Ignored in balanced mode "
+                        "— accelerate handles component placement there."
+                    ),
                 }),
                 "attention_slicing": ("BOOLEAN", {
                     "default": False,
@@ -112,22 +134,33 @@ class EricQwenEditLoader:
             Tuple containing the pipeline wrapper
         """
         from ..pipelines import QwenEditPipeline
-        
+
         print(f"[EricQwenEdit] Loading model from: {model_path}")
-        
-        # Check cache - include optimization settings
+
+        # Runtime device fallback: handles stale workflow JSON (e.g.
+        # balanced selected on 2-GPU host, loaded on 1-GPU host).
+        device, use_device_map = resolve_device_with_fallback(
+            device, log_prefix="[EricQwenEdit]",
+        )
+
+        # Check cache - include optimization settings AND device so
+        # switching from cuda:1 → balanced (or vice versa) invalidates
+        # the cache correctly.
         cache = get_pipeline_cache()
-        cache_key = f"{model_path}_{offload_vae}_{attention_slicing}_{sequential_offload}"
-        if (cache["pipeline"] is not None and 
+        cache_key = (
+            f"{model_path}_{device}_{offload_vae}_"
+            f"{attention_slicing}_{sequential_offload}"
+        )
+        if (cache["pipeline"] is not None and
             cache.get("cache_key") == cache_key):
             print("[EricQwenEdit] Using cached pipeline")
-            return ({"pipeline": cache["pipeline"], "model_path": model_path},)
-        
+            return ({"pipeline": cache["pipeline"], "model_path": model_path, "offload_vae": offload_vae},)
+
         # Clear existing cache if loading different model/settings
         if cache["pipeline"] is not None:
             print("[EricQwenEdit] Clearing cached pipeline (loading different model/settings)")
             clear_pipeline_cache()
-        
+
         # Set precision
         dtype_map = {
             "bf16": torch.bfloat16,
@@ -135,23 +168,47 @@ class EricQwenEditLoader:
             "fp32": torch.float32,
         }
         dtype = dtype_map.get(precision, torch.bfloat16)
-        
+
         # Load pipeline
-        print(f"[EricQwenEdit] Loading pipeline with precision: {precision}")
-        pipeline = QwenEditPipeline.from_pretrained(
-            model_path,
+        print(f"[EricQwenEdit] Loading pipeline with precision: {precision}, device: {device}")
+        load_kwargs = dict(
             torch_dtype=dtype,
             local_files_only=True,
         )
-        
+        if use_device_map:
+            load_kwargs["device_map"] = "balanced"
+            print("[EricQwenEdit] Using device_map='balanced' — splitting across all visible GPUs")
+            if offload_vae:
+                print(
+                    "[EricQwenEdit] NOTE: offload_vae=True is ignored in "
+                    "balanced mode — accelerate manages VAE placement."
+                )
+            if sequential_offload:
+                print(
+                    "[EricQwenEdit] NOTE: sequential_offload=True is "
+                    "ignored in balanced mode — the device_map already "
+                    "handles component dispatch."
+                )
+
+        pipeline = QwenEditPipeline.from_pretrained(
+            model_path,
+            **load_kwargs,
+        )
+
         # Apply optimizations before moving to device
-        if sequential_offload:
+        if use_device_map:
+            # Already dispatched via device_map — skip the explicit .to()
+            # and skip sequential_offload (incompatible).  Install the
+            # text-encoder device-fix hooks so cross-GPU dispatch of the
+            # VL processor inputs lands on the correct device.
+            _fix_text_encoder_device(pipeline, "[EricQwenEdit]")
+        elif sequential_offload:
             print("[EricQwenEdit] Enabling sequential CPU offload (slow but handles large images)")
             pipeline.enable_sequential_cpu_offload()
         else:
             # Move to device normally
             pipeline = pipeline.to(device)
-            
+
             # Optional: offload VAE to CPU
             if offload_vae:
                 print("[EricQwenEdit] Moving VAE to CPU (will transfer for encode/decode)")
@@ -217,9 +274,9 @@ class EricQwenEditUnload:
     def unload(self, pipeline=None, images=None):
         """Unload the pipeline and free VRAM."""
         import gc
-        
+
         unloaded_items = []
-        
+
         # If a pipeline dict was passed, clean it up directly
         if pipeline is not None and isinstance(pipeline, dict):
             pipe = pipeline.get("pipeline")
@@ -232,21 +289,48 @@ class EricQwenEditUnload:
                         unloaded_items.append("LoRA adapters")
                 except Exception:
                     pass
-                
-                # Move to CPU to free VRAM
-                try:
-                    pipe.to("cpu")
-                    unloaded_items.append("pipeline (moved to CPU)")
-                except Exception:
+
+                # Detect accelerate dispatch (balanced mode).  If the
+                # pipeline was loaded with device_map="balanced", calling
+                # .to("cpu") directly raises "You shouldn't move a model
+                # that is dispatched using accelerate hooks."  The
+                # correct path is to reset the device map first.
+                using_device_map = (
+                    hasattr(pipe, "hf_device_map") and pipe.hf_device_map
+                )
+
+                if using_device_map:
+                    # Accelerate-dispatched path: reset_device_map()
+                    # removes the hooks and allows normal .to() calls.
+                    # If reset_device_map isn't available on this
+                    # diffusers version, fall through to component-level
+                    # deletion as a last resort.
                     try:
-                        for attr_name in ["transformer", "vae", "text_encoder"]:
-                            component = getattr(pipe, attr_name, None)
-                            if component is not None:
-                                component.to("cpu")
-                        unloaded_items.append("pipeline components (moved to CPU)")
+                        pipe.reset_device_map()
+                        pipe.to("cpu")
+                        unloaded_items.append("pipeline (accelerate reset + moved to CPU)")
+                    except Exception as e:
+                        print(
+                            f"[EricQwenEdit] accelerate reset_device_map "
+                            f"unavailable ({e}) — relying on GC to free "
+                            f"dispatched pipeline memory"
+                        )
+                        unloaded_items.append("pipeline (accelerate-dispatched, GC only)")
+                else:
+                    # Single-device path: regular .to("cpu").
+                    try:
+                        pipe.to("cpu")
+                        unloaded_items.append("pipeline (moved to CPU)")
                     except Exception:
-                        pass
-                
+                        try:
+                            for attr_name in ["transformer", "vae", "text_encoder"]:
+                                component = getattr(pipe, attr_name, None)
+                                if component is not None:
+                                    component.to("cpu")
+                            unloaded_items.append("pipeline components (moved to CPU)")
+                        except Exception:
+                            pass
+
                 # Clear tracking data from the pipeline dict
                 pipeline.pop("applied_loras", None)
         

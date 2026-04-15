@@ -20,6 +20,12 @@ import os
 import torch
 from typing import Tuple
 
+from .eric_diffusion_component_loader import (
+    _fix_text_encoder_device,
+    available_device_options,
+    resolve_device_with_fallback,
+)
+
 
 # ── Separate cache for the generation pipeline ──────────────────────────
 _GEN_PIPELINE_CACHE = {
@@ -38,16 +44,38 @@ def clear_gen_pipeline_cache() -> bool:
     global _GEN_PIPELINE_CACHE
     if _GEN_PIPELINE_CACHE["pipeline"] is not None:
         pipe = _GEN_PIPELINE_CACHE["pipeline"]
-        try:
-            pipe.to("cpu")
-        except Exception:
-            for attr in ("transformer", "vae", "text_encoder"):
-                comp = getattr(pipe, attr, None)
-                if comp is not None:
-                    try:
-                        comp.to("cpu")
-                    except Exception:
-                        pass
+
+        # Detect accelerate dispatch (balanced mode) — calling .to("cpu")
+        # directly on a dispatched pipeline raises "You shouldn't move a
+        # model that is dispatched using accelerate hooks."  The correct
+        # path is to reset the device map first, or rely on GC to free
+        # the dispatched memory after we null the cache reference.
+        using_device_map = (
+            hasattr(pipe, "hf_device_map") and pipe.hf_device_map
+        )
+
+        if using_device_map:
+            try:
+                pipe.reset_device_map()
+                pipe.to("cpu")
+            except Exception as e:
+                print(
+                    f"[EricQwenImage] accelerate reset_device_map "
+                    f"unavailable ({e}) — relying on GC to free "
+                    f"dispatched pipeline memory"
+                )
+        else:
+            try:
+                pipe.to("cpu")
+            except Exception:
+                for attr in ("transformer", "vae", "text_encoder"):
+                    comp = getattr(pipe, attr, None)
+                    if comp is not None:
+                        try:
+                            comp.to("cpu")
+                        except Exception:
+                            pass
+
         del _GEN_PIPELINE_CACHE["pipeline"]
         _GEN_PIPELINE_CACHE["pipeline"] = None
         _GEN_PIPELINE_CACHE["model_path"] = None
@@ -113,9 +141,20 @@ class EricQwenImageLoader:
                     "default": "bf16",
                     "tooltip": "Model precision (bf16 recommended for RTX 40/50 series)"
                 }),
-                "device": (["cuda", "cuda:0", "cuda:1", "cpu"], {
-                    "default": "cuda",
-                    "tooltip": "Device to load model on"
+                "device": (available_device_options(), {
+                    "default": (
+                        "cuda" if "cuda" in available_device_options()
+                        else "cpu"
+                    ),
+                    "tooltip": (
+                        "Device to load model on.  Options filtered by "
+                        "visible hardware.\n\n"
+                        "• balanced — splits across all visible GPUs via "
+                        "accelerate device_map='balanced'.  ONLY shown "
+                        "when 2+ GPUs are visible.\n"
+                        "• cuda / cuda:N — pin to a single GPU.\n"
+                        "• cpu — CPU-only (very slow, for testing)."
+                    ),
                 }),
                 "keep_in_vram": ("BOOLEAN", {
                     "default": True,
@@ -123,7 +162,11 @@ class EricQwenImageLoader:
                 }),
                 "offload_vae": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Move VAE to CPU during transformer inference (saves ~1 GB)"
+                    "tooltip": (
+                        "Move VAE to CPU during transformer inference "
+                        "(saves ~1 GB).  Ignored in balanced mode — "
+                        "accelerate manages component placement there."
+                    ),
                 }),
                 "attention_slicing": ("BOOLEAN", {
                     "default": False,
@@ -148,12 +191,17 @@ class EricQwenImageLoader:
     ) -> Tuple:
         from diffusers import QwenImagePipeline
 
+        # Runtime device fallback: handles stale workflow JSON.
+        device, use_device_map = resolve_device_with_fallback(
+            device, log_prefix="[EricQwenImage]",
+        )
+
         cache_key = f"{model_path}_{precision}_{device}_{offload_vae}_{attention_slicing}_{sequential_offload}"
         cache = get_gen_pipeline_cache()
 
         if cache["pipeline"] is not None and cache.get("cache_key") == cache_key:
             print("[EricQwenImage] Using cached generation pipeline")
-            return ({"pipeline": cache["pipeline"], "model_path": model_path},)
+            return ({"pipeline": cache["pipeline"], "model_path": model_path, "offload_vae": offload_vae},)
 
         if cache["pipeline"] is not None:
             print("[EricQwenImage] Clearing old generation pipeline cache")
@@ -162,15 +210,36 @@ class EricQwenImageLoader:
         dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
         dtype = dtype_map.get(precision, torch.bfloat16)
 
-        print(f"[EricQwenImage] Loading QwenImagePipeline from {model_path}")
-        pipeline = QwenImagePipeline.from_pretrained(
-            model_path,
+        print(f"[EricQwenImage] Loading QwenImagePipeline from {model_path} (device: {device})")
+        load_kwargs = dict(
             torch_dtype=dtype,
             local_files_only=True,
         )
+        if use_device_map:
+            load_kwargs["device_map"] = "balanced"
+            print("[EricQwenImage] Using device_map='balanced' — splitting across all visible GPUs")
+            if offload_vae:
+                print(
+                    "[EricQwenImage] NOTE: offload_vae=True is ignored in "
+                    "balanced mode — accelerate manages VAE placement."
+                )
+            if sequential_offload:
+                print(
+                    "[EricQwenImage] NOTE: sequential_offload=True is "
+                    "ignored in balanced mode."
+                )
+
+        pipeline = QwenImagePipeline.from_pretrained(
+            model_path,
+            **load_kwargs,
+        )
 
         # Optimizations
-        if sequential_offload:
+        if use_device_map:
+            # Already dispatched via device_map — install text-encoder
+            # hooks to handle cross-GPU tokenizer-output routing.
+            _fix_text_encoder_device(pipeline, "[EricQwenImage]")
+        elif sequential_offload:
             print("[EricQwenImage] Enabling sequential CPU offload")
             pipeline.enable_sequential_cpu_offload()
         else:

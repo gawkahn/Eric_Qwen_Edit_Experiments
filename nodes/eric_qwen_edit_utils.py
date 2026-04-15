@@ -41,21 +41,41 @@ def clear_pipeline_cache() -> bool:
                 print("[EricQwenEdit] LoRA adapters unloaded")
         except Exception as e:
             print(f"[EricQwenEdit] Note during LoRA cleanup: {e}")
-        
-        # 2. Move all components to CPU to free GPU memory
-        try:
-            pipe.to("cpu")
-            print("[EricQwenEdit] Pipeline moved to CPU")
-        except Exception as e:
-            # If sequential offload was used, .to() may not work normally
-            print(f"[EricQwenEdit] Note during CPU move: {e}")
+
+        # 2. Move all components to CPU to free GPU memory.
+        # Detect accelerate dispatch (balanced mode) — calling .to("cpu")
+        # directly on a dispatched pipeline raises "You shouldn't move a
+        # model that is dispatched using accelerate hooks" and leaves
+        # the pipeline in a partial state.  Use reset_device_map() first.
+        using_device_map = (
+            hasattr(pipe, "hf_device_map") and pipe.hf_device_map
+        )
+
+        if using_device_map:
             try:
-                for attr_name in ["transformer", "vae", "text_encoder"]:
-                    component = getattr(pipe, attr_name, None)
-                    if component is not None:
-                        component.to("cpu")
-            except Exception:
-                pass
+                pipe.reset_device_map()
+                pipe.to("cpu")
+                print("[EricQwenEdit] Pipeline reset from device_map and moved to CPU")
+            except Exception as e:
+                print(
+                    f"[EricQwenEdit] accelerate reset_device_map "
+                    f"unavailable ({e}) — relying on GC to free "
+                    f"dispatched pipeline memory"
+                )
+        else:
+            try:
+                pipe.to("cpu")
+                print("[EricQwenEdit] Pipeline moved to CPU")
+            except Exception as e:
+                # If sequential offload was used, .to() may not work normally
+                print(f"[EricQwenEdit] Note during CPU move: {e}")
+                try:
+                    for attr_name in ["transformer", "vae", "text_encoder"]:
+                        component = getattr(pipe, attr_name, None)
+                        if component is not None:
+                            component.to("cpu")
+                except Exception:
+                    pass
         
         # 3. Clear references
         del _PIPELINE_CACHE["pipeline"]

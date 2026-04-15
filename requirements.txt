@@ -2,6 +2,7 @@ torch>=2.0.0
 diffusers>=0.30.0
 transformers>=4.40.0
 accelerate
+peft
 safetensors
 pillow
 numpy
