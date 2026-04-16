@@ -299,6 +299,66 @@ def cmd_check(args, cfg: dict) -> int:
     for line in result.log_lines(prefix="[check]"):
         print(line)
 
+    # ── Slice 4 augmentation: re-check after conversion if a plan exists ─
+    # When the raw LoRA shows 0% match AND a registered ConversionPlan
+    # covers (LoRA family, model family), apply the conversion in memory
+    # and re-run check_lora() against the converted state dict.  This
+    # is the cheap, model-load-free version of what slice 4's loader
+    # path does at LoRA-load time.
+    if result.matched == 0 and result.total_layers > 0:
+        from nodes.eric_lora_format_convert_apply import (
+            convert_state_dict, find_matching_plan,
+        )
+        # Load the raw state dict (no torch model, just safetensors)
+        from safetensors.torch import load_file
+        source_sd = load_file(str(lora_path))
+        model_param_names = [
+            k[len("transformer."):] if k.startswith("transformer.") else k
+            for k in param_dict if not k.startswith("_")
+        ]
+        plan = find_matching_plan(source_sd, model_param_names)
+        if plan is None:
+            print(
+                f"\n[check] No registered ConversionPlan covers this "
+                f"(LoRA, model) combination — skipping converted-check."
+            )
+        else:
+            print(
+                f"\n[check] Plan available: "
+                f"{plan.source_family} → {plan.target_family}.  "
+                f"Re-checking after in-memory conversion …"
+            )
+            converted = convert_state_dict(
+                source_sd, plan, log_prefix="[check-convert]",
+            )
+            # Write converted state dict to a temp safetensors so we can
+            # re-use check_lora() (which reads headers).  Cheaper than
+            # building a parallel checker that takes a state dict directly.
+            import tempfile
+            from safetensors.torch import save_file
+            with tempfile.NamedTemporaryFile(
+                suffix=".safetensors", delete=False,
+            ) as tmp:
+                tmp_path = tmp.name
+            try:
+                save_file(converted, tmp_path)
+                converted_result = check_lora(
+                    tmp_path, param_dict=param_dict,
+                    log_prefix="[check-converted]",
+                )
+                for line in converted_result.log_lines(
+                    prefix="[check-converted]",
+                ):
+                    print(line)
+                if converted_result.verdict in ("OK", "NORM_TARGETING"):
+                    return 0
+            finally:
+                import os as _os
+                try:
+                    _os.unlink(tmp_path)
+                except OSError:
+                    pass
+
     return 0 if result.verdict in ("OK", "NORM_TARGETING") else 2
 
 

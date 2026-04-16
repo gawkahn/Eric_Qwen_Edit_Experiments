@@ -138,6 +138,15 @@ class ConversionPlan:
     # Fused-QKV modules that must be split into 3 separate outputs
     # AFTER rename.  Each entry binds a pattern → 3 target fragments.
     qkv_splits: List[QKVSplitSpec] = field(default_factory=list)
+    # Substring that uniquely identifies the diffusers TARGET model.
+    # Slice 4's plan-matching code searches for this in the loaded
+    # transformer's parameter names; non-empty → required-match,
+    # empty → match-anything (use sparingly — risks false positives).
+    # Example: Klein-9B has `single_transformer_blocks.X.attn.
+    # to_qkv_mlp_proj.weight` (a fused QKV+MLP layer that vanilla
+    # Flux.1 diffusers does not have), so model_signature='to_qkv_mlp_proj'
+    # cleanly distinguishes Klein/Flux2 from Flux.1.
+    model_signature: str = ""
     # Optional notes for users / debugging.
     notes: str = ""
 
@@ -293,14 +302,32 @@ def split_fused_qkv_via_svd(
                          ("k", out_dim, 2 * out_dim),
                          ("v", 2 * out_dim, 3 * out_dim)):
         block = merged_delta[lo:hi].float()
-        U, S, Vh = torch.linalg.svd(block, full_matrices=False)
-        r = min(target_rank, S.shape[0])
+        full_rank = min(block.shape[-2], block.shape[-1])
+        r = min(target_rank, full_rank)
+
+        # Truncated (randomised) SVD when target_rank << full_rank.
+        # Full SVD on Klein-9B's biggest fused QKV slice is minutes on
+        # CPU; svd_lowrank is ~100× faster for typical target_rank=16.
+        if r * 4 <= full_rank and r >= 1:
+            q = min(r + 8, full_rank)
+            U, S, V = torch.svd_lowrank(block, q=q)
+            U  = U[:, :r]
+            S  = S[:r]
+            Vh = V[:, :r].t()
+        else:
+            U, S, Vh = torch.linalg.svd(block, full_matrices=False)
+            U  = U[:, :r]
+            S  = S[:r]
+            Vh = Vh[:r]
+
         # Distribute singular values as sqrt(S) across both factors so
         # neither side blows up numerically and the (alpha/rank) scaling
         # at inference comes out to exactly 1.0 when alpha = rank.
-        S_root = S[:r].sqrt()
-        lora_B = (U[:, :r] * S_root).to(merged_delta.dtype)
-        lora_A = (Vh[:r] * S_root.unsqueeze(1)).to(merged_delta.dtype)
+        # .contiguous() — svd_lowrank's V.t() is a non-contiguous view
+        # that safetensors won't serialise.
+        S_root = S.sqrt()
+        lora_B = (U * S_root).contiguous().to(merged_delta.dtype)
+        lora_A = (Vh * S_root.unsqueeze(1)).contiguous().to(merged_delta.dtype)
         parts[name] = {
             "lora_A": lora_A,
             "lora_B": lora_B,

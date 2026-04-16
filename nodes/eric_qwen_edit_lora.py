@@ -1021,25 +1021,81 @@ def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
     Returns True if the LoRA was loaded, False if it was skipped.
     """
     from .eric_diffusion_lora_check import check_lora
+    from .eric_lora_format_convert_apply import (
+        convert_state_dict, find_matching_plan,
+    )
 
     # ── Compatibility pre-check (header only — fast) ──────────────────
     transformer = getattr(pipe, "transformer", None)
+    pre_check = None
     if transformer is not None:
         try:
-            result = check_lora(lora_path, transformer=transformer,
-                                log_prefix=log_prefix)
-            for line in result.log_lines(prefix=log_prefix):
+            pre_check = check_lora(lora_path, transformer=transformer,
+                                   log_prefix=log_prefix)
+            for line in pre_check.log_lines(prefix=log_prefix):
                 print(line)
-            if min_compatibility > 0 and result.key_match_pct < min_compatibility * 100:
-                result.skipped = True
+            if min_compatibility > 0 and pre_check.key_match_pct < min_compatibility * 100:
+                pre_check.skipped = True
                 print(
                     f"{log_prefix} SKIP {os.path.basename(lora_path)}: "
-                    f"compatibility {result.key_match_pct:.0f}% < "
+                    f"compatibility {pre_check.key_match_pct:.0f}% < "
                     f"threshold {min_compatibility * 100:.0f}%"
                 )
                 return False
         except Exception as chk_err:
             print(f"{log_prefix} Compatibility check failed (non-fatal): {chk_err}")
+
+    # ── Conversion attempt (slice 4) ─────────────────────────────────
+    # When the compatibility check shows 0% module match AND a registered
+    # ConversionPlan covers (LoRA family, model family), do the in-memory
+    # rename + LoKR/LoHa→LoRA SVD compression up front and route the
+    # result through the standard-LoRA loader.  This catches the
+    # "original BFL Klein/Flux2 LoRA loaded against diffusers Klein"
+    # case that previously fell through to a silent direct-merge no-op.
+    if (transformer is not None and pre_check is not None
+            and pre_check.matched == 0 and pre_check.total_layers > 0):
+        try:
+            source_sd = _load_state_dict(lora_path)
+            model_param_names = [n for n, _ in transformer.named_parameters()]
+            plan = find_matching_plan(source_sd, model_param_names)
+            if plan is not None:
+                print(
+                    f"{log_prefix} 0% match + registered plan available: "
+                    f"converting {plan.source_family} → {plan.target_family}"
+                )
+                converted = convert_state_dict(
+                    source_sd, plan, log_prefix=log_prefix,
+                )
+                if converted:
+                    success = _load_lora_adapter(
+                        pipe, converted, adapter_name, log_prefix,
+                        weight=weight,
+                    )
+                    if success:
+                        print(
+                            f"{log_prefix} Converted adapter loaded "
+                            f"({plan.target_family} target)"
+                        )
+                        return True
+                    print(
+                        f"{log_prefix} Conversion produced a state dict "
+                        f"but loader could not apply it — falling back to "
+                        f"standard paths"
+                    )
+                else:
+                    print(
+                        f"{log_prefix} Conversion produced an empty state "
+                        f"dict — falling back to standard paths"
+                    )
+        except Exception as conv_err:
+            # Any exception during conversion is non-fatal; we fall
+            # through to the existing fast-path / fallback chain so a
+            # broken plan doesn't break LoRAs that the legacy paths
+            # could have handled.
+            print(
+                f"{log_prefix} Conversion path failed (non-fatal — "
+                f"continuing with standard load): {conv_err}"
+            )
 
     # ── Fast path: try standard loading ──────────────────────────────
     try:

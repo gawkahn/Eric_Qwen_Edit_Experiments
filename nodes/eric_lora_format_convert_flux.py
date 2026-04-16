@@ -158,6 +158,12 @@ _KLEIN_PLAN = ConversionPlan(
                      ".attn.add_v_proj"),
         ),
     ],
+    # Klein-9B and Flux.2-dev are the only Flux variants whose diffusers
+    # form has the fused `to_qkv_mlp_proj` in single blocks.  Flux.1's
+    # diffusers form keeps proj_mlp and proj_out separate.  This single
+    # substring cleanly disambiguates Klein/Flux2 from Flux.1 at
+    # plan-match time (slice 4).
+    model_signature="to_qkv_mlp_proj",
     notes=(
         "Klein-9B / Flux.2-dev — shared diffusers layout.  Original "
         "Flux.1 has a different single_block structure (proj_mlp + "

@@ -122,6 +122,9 @@ def test_klein_plan_is_registered():
     assert plan.target_family == "diffusers_klein"
     assert len(plan.rename_rules) > 0
     assert len(plan.qkv_splits) == 2  # img stream + txt stream
+    # Slice 4 plan-matching uses model_signature to distinguish Klein/Flux2
+    # from Flux.1 diffusers (which lacks the fused to_qkv_mlp_proj layer).
+    assert plan.model_signature == "to_qkv_mlp_proj"
 
 
 def test_klein_plan_qkv_splits_use_distinct_targets():
