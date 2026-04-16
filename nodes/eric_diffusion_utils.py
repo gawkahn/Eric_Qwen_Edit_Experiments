@@ -207,22 +207,64 @@ def _diagnose_slot_mismatch(ckpt_keys: set, target_slot: str) -> str:
     """
     sample = list(ckpt_keys)[:50]
 
-    # ── Check 1: Quantized checkpoint (bitsandbytes NF4 / INT8 / etc.) ──
-    is_quantized = any(
+    # ── Check 1a: bitsandbytes-quantized (NF4 / INT8) ───────────────────
+    # Detect bnb-specific key suffixes.  Scan ALL keys (not just sample)
+    # because the quantization markers may not appear in the first 50
+    # for large checkpoints.
+    is_bnb_quantized = any(
         ".quant_state." in k or ".absmax" in k or ".bitsandbytes" in k
         or k.endswith(".SCB") or k.endswith(".weight_format")
-        for k in sample
+        for k in ckpt_keys
     )
-    if is_quantized:
-        quant_type = "bitsandbytes NF4" if any("nf4" in k.lower() for k in sample) else "quantized (bitsandbytes)"
+    if is_bnb_quantized:
+        quant_type = "bitsandbytes NF4" if any("nf4" in k.lower() for k in ckpt_keys) else "quantized (bitsandbytes)"
         return (
             f"\n\nThis is a {quant_type} checkpoint — single-file loading "
             f"does NOT support quantized models. You have two options:\n"
-            f"  1. Use the un-quantized version of this checkpoint.\n"
-            f"  2. If the quantized version is in a full diffusers directory "
-            f"(with model_index.json, config.json, etc.), point the main "
-            f"'Eric Diffusion Load Model' node at that directory instead — "
-            f"it can load bnb-quantized diffusers directories via from_pretrained."
+            f"  1. Use the un-quantized version of this checkpoint, OR\n"
+            f"  2. Run dequantize_nf4.py (in this repo's root) once to convert "
+            f"the NF4 checkpoint to bf16, then use the bf16 output in the "
+            f"Component Loader as a normal single-file transformer override."
+        )
+
+    # ── Check 1b: ComfyUI FP8 quantization ──────────────────────────────
+    # ComfyUI has its own FP8 quantization format, distinct from bnb.
+    # Distinctive markers:
+    #   - .comfy_quant suffix (metadata/flag per quantized tensor)
+    #   - .weight_scale (per-tensor weight scale factor)
+    #   - .input_scale (activation scale factor)
+    # These coexist with some plain .weight tensors (not every layer is
+    # quantized — norm layers and small linears often stay in bf16).
+    #
+    # Diffusers' converters don't recognize these suffixes; they expect
+    # plain .weight / .bias / .scale.  When the converter walks to
+    # `img_mlp.0.weight` but finds only `img_mlp.0.weight_scale` +
+    # `img_mlp.0.comfy_quant` instead, it raises KeyError — the exact
+    # symptom user hit on pornmasterFlux2Klein_v2.safetensors.
+    is_comfy_fp8 = any(
+        k.endswith(".comfy_quant") or k.endswith(".weight_scale")
+        or k.endswith(".input_scale")
+        for k in ckpt_keys
+    )
+    if is_comfy_fp8:
+        return (
+            f"\n\nThis is a ComfyUI FP8-quantized checkpoint (detected "
+            f".comfy_quant / .weight_scale / .input_scale markers).  "
+            f"Our loader + diffusers' converters don't support ComfyUI's "
+            f"FP8 format — the quantized tensors need to be dequantized "
+            f"back to bf16 before the single-file loading path can "
+            f"handle them.\n\n"
+            f"Options:\n"
+            f"  1. Use the un-quantized version of this checkpoint if "
+            f"one is available (civitai uploaders often have both).\n"
+            f"  2. Use ComfyUI's native UNETLoader or CheckpointLoaderSimple "
+            f"with the standard KSampler workflow — ComfyUI can consume "
+            f"its own FP8 format directly.  You lose access to this "
+            f"node pack's Advanced Generate/Multistage/Edit features "
+            f"for this model, but the checkpoint will run.\n"
+            f"  3. A dequantize_comfy.py standalone tool is on the "
+            f"backlog but not yet implemented — analogous to the "
+            f"existing dequantize_nf4.py for bitsandbytes."
         )
 
     # ── Check 2: Full-pipeline CivitAI-style checkpoint ─────────────────
