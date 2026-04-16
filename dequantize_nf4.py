@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 """Dequantize a bitsandbytes NF4 Flux transformer checkpoint.
 
+╔══════════════════════════════════════════════════════════════════════╗
+║  STATUS: KNOWN BROKEN — needs a debugging cycle.                      ║
+║                                                                       ║
+║  This script was written but never validated end-to-end.  When the    ║
+║  user ran it on a real NF4 Flux checkpoint, it failed.  Detailed      ║
+║  failure mode wasn't captured.  Do NOT recommend this tool to users   ║
+║  in its current state — point them at the open backlog task           ║
+║  instead and offer to debug.                                          ║
+║                                                                       ║
+║  Tracked in task #52 (combined NF4 + ComfyUI FP8 dequant work) and    ║
+║  in memory at project_dequantize_status.md.  Both tools should be     ║
+║  debugged in one session because they share infrastructure.           ║
+╚══════════════════════════════════════════════════════════════════════╝
+
 Loads a CivitAI-style single-file NF4 quantized Flux transformer via
 bitsandbytes, dequantizes every 4-bit parameter back to full precision,
 and saves the result as a single .safetensors file with diffusers-format
