@@ -180,6 +180,16 @@ class EricDiffusionLoRAStacker:
                 f"(s1={w1}, s2={w2}, s3={w3}, adapter={adapter_name})"
             )
 
+            # Skip when all stage weights are 0 — loading + (potentially
+            # expensive) format conversion serves no purpose for an
+            # adapter that's about to be scaled to 0 in every stage.
+            if w1 == 0 and w2 == 0 and w3 == 0:
+                print(
+                    f"{log}   All stage weights are 0; skipping load "
+                    f"(adapter is effectively disabled)"
+                )
+                continue
+
             try:
                 if adapter_name in loaded_adapters:
                     # Already loaded from a prior run — just reset its weight.

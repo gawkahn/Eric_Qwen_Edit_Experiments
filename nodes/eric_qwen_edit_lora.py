@@ -1022,7 +1022,7 @@ def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
     """
     from .eric_diffusion_lora_check import check_lora
     from .eric_lora_format_convert_apply import (
-        convert_state_dict, find_matching_plan,
+        convert_state_dict, find_matching_plan, load_converted_lora,
     )
 
     # ── Compatibility pre-check (header only — fast) ──────────────────
@@ -1067,7 +1067,11 @@ def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
                     source_sd, plan, log_prefix=log_prefix,
                 )
                 if converted:
-                    success = _load_lora_adapter(
+                    # load_converted_lora handles diffusers' transformer-
+                    # prefix expectation and falls back to direct delta
+                    # merge if PEFT silently no-ops (which it did for
+                    # the Klein LoKR case in the first slice-4 trial).
+                    success = load_converted_lora(
                         pipe, converted, adapter_name, log_prefix,
                         weight=weight,
                     )
@@ -1079,8 +1083,8 @@ def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
                         return True
                     print(
                         f"{log_prefix} Conversion produced a state dict "
-                        f"but loader could not apply it — falling back to "
-                        f"standard paths"
+                        f"but neither pipeline-load nor direct-merge "
+                        f"applied it — falling back to standard paths"
                     )
                 else:
                     print(

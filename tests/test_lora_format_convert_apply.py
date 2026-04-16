@@ -47,6 +47,7 @@ import torch  # noqa: E402
 
 from nodes.eric_lora_format_convert import get_plan  # noqa: E402
 from nodes.eric_lora_format_convert_apply import (  # noqa: E402
+    _apply_converted_lora_as_delta,
     convert_state_dict,
     find_matching_plan,
     reconstruct_lokr_delta,
@@ -171,7 +172,12 @@ def _make_synthetic_klein_lokr_module(base_path: str, w1_dim: int = 4,
 
 
 def test_convert_klein_lokr_qkv_emits_three_lora_outputs():
-    """A single fused-QKV LoKR module should produce 3 split outputs after convert."""
+    """A single fused-QKV LoKR module should produce 3 split outputs after convert.
+
+    Note: convert_state_dict deliberately emits NO .alpha keys (alpha is
+    baked into the factors) because diffusers' fast-path loader rejects
+    state dicts whose keys don't all contain 'lora'.
+    """
     plan = get_plan("bfl_klein", "diffusers_klein")
     # Klein img_attn.qkv: w2 shape (3*4096/4, 4096/4) = (3072, 1024) given w1=(4,4)
     sd = _make_synthetic_klein_lokr_module(
@@ -188,9 +194,11 @@ def test_convert_klein_lokr_qkv_emits_three_lora_outputs():
     for base in expected_bases:
         assert f"{base}.lora_A.weight" in out, f"missing {base}.lora_A.weight"
         assert f"{base}.lora_B.weight" in out, f"missing {base}.lora_B.weight"
-        assert f"{base}.alpha"        in out, f"missing {base}.alpha"
+        assert f"{base}.alpha"   not in out, f"unexpected {base}.alpha"
     # No placeholder leakage
     assert not any("__QKV_IMG__" in k for k in out)
+    # And no .alpha keys anywhere
+    assert not any(k.endswith(".alpha") for k in out)
 
 
 def test_convert_klein_lokr_qkv_txt_emits_add_proj_outputs():
@@ -220,8 +228,8 @@ def test_convert_klein_lokr_non_qkv_passes_through_via_svd():
     base = "transformer_blocks.0.attn.to_out.0"
     assert f"{base}.lora_A.weight" in out
     assert f"{base}.lora_B.weight" in out
-    assert f"{base}.alpha"        in out
-    # Single output, no spurious extra keys
+    assert f"{base}.alpha"   not in out
+    # Single output, two keys (.lora_A.weight + .lora_B.weight)
     assert sum(1 for k in out if k.startswith(base + ".lora")) == 2
 
 
@@ -239,7 +247,10 @@ def test_convert_klein_single_block_lokr_renames_and_compresses():
 
 
 def test_convert_standard_lora_qkv_split_is_exact():
-    """Standard LoRA (not LoKR) on a QKV module: split is exact (no SVD)."""
+    """Standard LoRA (not LoKR) on a QKV module: split is exact (no SVD).
+
+    No alpha provided ⇒ no baking; A and B should pass through unchanged.
+    """
     plan = get_plan("bfl_klein", "diffusers_klein")
     rank, in_dim, head_dim = 8, 1024, 1024  # synthetic
     A = torch.randn(rank, in_dim)
@@ -264,6 +275,40 @@ def test_convert_standard_lora_qkv_split_is_exact():
     assert torch.allclose(B_v, B[2*head_dim:3*head_dim])
 
 
+def test_convert_standard_lora_pass_through_bakes_alpha():
+    """A non-QKV standard LoRA with alpha != rank should bake the alpha
+    scaling factor into the emitted factors (so PEFT default scale=1.0
+    yields the original delta).
+
+    Original effective delta = (B @ A) * (alpha/rank)
+    Baked emission:       A' = A * sqrt(alpha/rank)
+                          B' = B * sqrt(alpha/rank)
+    Reconstructed:    B' @ A' = (alpha/rank) * (B @ A) ✓
+    """
+    plan = get_plan("bfl_klein", "diffusers_klein")
+    rank, in_dim, out_dim = 8, 1024, 1024
+    A = torch.randn(rank, in_dim, dtype=torch.float64)
+    B = torch.randn(out_dim, rank, dtype=torch.float64)
+    alpha = torch.tensor(32.0, dtype=torch.float64)  # alpha != rank
+    sd = {
+        "diffusion_model.double_blocks.0.img_attn.proj.lora_A.weight": A,
+        "diffusion_model.double_blocks.0.img_attn.proj.lora_B.weight": B,
+        "diffusion_model.double_blocks.0.img_attn.proj.alpha":         alpha,
+    }
+    out = convert_state_dict(sd, plan, target_rank=999)
+
+    A_out = out["transformer_blocks.0.attn.to_out.0.lora_A.weight"]
+    B_out = out["transformer_blocks.0.attn.to_out.0.lora_B.weight"]
+    assert "transformer_blocks.0.attn.to_out.0.alpha" not in out
+
+    # Original effective delta: (B @ A) * (alpha/rank)
+    expected = (B @ A) * (alpha.item() / rank)
+    # Baked reconstruction: B' @ A'
+    actual = B_out @ A_out
+    assert torch.allclose(actual, expected, atol=1e-5), \
+        f"max err: {(actual - expected).abs().max()}"
+
+
 def test_convert_full_klein_lora_module_count():
     """Converting a synthetic full Klein LoRA produces the expected key count.
 
@@ -272,8 +317,9 @@ def test_convert_full_klein_lora_module_count():
       - 8 double_blocks × 2 QKV modules (img, txt)                     = 16 modules → 16 × 3 = 48 outputs
       - 24 single_blocks × 2 modules (linear1, linear2)                = 48 modules → 48 single outputs
       Total module-level outputs: 48 + 48 + 48 = 144
-      Each output emits 3 keys (.lora_A.weight, .lora_B.weight, .alpha)
-      → Total state-dict keys = 144 × 3 = 432
+      Each output emits 2 keys (.lora_A.weight + .lora_B.weight; alpha
+      is baked into factors, no .alpha key)
+      → Total state-dict keys = 144 × 2 = 288
     """
     plan = get_plan("bfl_klein", "diffusers_klein")
 
@@ -311,15 +357,90 @@ def test_convert_full_klein_lora_module_count():
     # Module-level output counts
     output_modules = set()
     for k in out:
-        for sfx in (".lora_A.weight", ".lora_B.weight", ".alpha"):
+        for sfx in (".lora_A.weight", ".lora_B.weight"):
             if k.endswith(sfx):
                 output_modules.add(k[: -len(sfx)])
                 break
     assert len(output_modules) == 144, (
         f"expected 144 unique output modules, got {len(output_modules)}"
     )
-    # 3 keys per module
-    assert len(out) == 144 * 3, f"expected 432 keys, got {len(out)}"
+    # 2 keys per module (no .alpha — baked into factors)
+    assert len(out) == 144 * 2, f"expected 288 keys, got {len(out)}"
+    assert not any(k.endswith(".alpha") for k in out)
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  Direct delta merge (the reliable fallback path)
+# ════════════════════════════════════════════════════════════════════════
+
+class _FakeTransformer(torch.nn.Module):
+    """Minimal stand-in for a real transformer with two named parameters."""
+    def __init__(self):
+        super().__init__()
+        # Two nested linear-style params at known paths
+        self.transformer_blocks = torch.nn.Module()
+        self.transformer_blocks._modules["0"] = torch.nn.Module()
+        block = self.transformer_blocks._modules["0"]
+        block.attn = torch.nn.Module()
+        block.attn.to_q = torch.nn.Linear(8, 8, bias=False)
+        block.attn.to_q.weight.data.zero_()  # so the delta is the only contribution
+
+
+def test_direct_delta_merge_applies_correct_delta():
+    """Direct merge: model.weight ← model.weight + (B @ A) * weight."""
+    transformer = _FakeTransformer()
+    target_key = "transformer_blocks.0.attn.to_q.weight"
+    A = torch.randn(4, 8)  # rank=4, in=8
+    B = torch.randn(8, 4)  # out=8, rank=4
+    state_dict = {
+        "transformer_blocks.0.attn.to_q.lora_A.weight": A,
+        "transformer_blocks.0.attn.to_q.lora_B.weight": B,
+    }
+    expected_delta = (B @ A) * 1.5
+
+    success = _apply_converted_lora_as_delta(
+        transformer, state_dict, "test_adapter",
+        weight=1.5, log_prefix="[test]",
+    )
+    assert success
+    # Original was zeros; param now equals the delta
+    actual = dict(transformer.named_parameters())[target_key]
+    assert torch.allclose(actual, expected_delta, atol=1e-5)
+
+
+def test_direct_delta_merge_skips_unmatched_modules():
+    """Direct merge silently skips state-dict entries with no matching param."""
+    transformer = _FakeTransformer()
+    state_dict = {
+        # Real path → matched
+        "transformer_blocks.0.attn.to_q.lora_A.weight": torch.randn(2, 8),
+        "transformer_blocks.0.attn.to_q.lora_B.weight": torch.randn(8, 2),
+        # Fake path → skipped
+        "nonexistent.path.lora_A.weight": torch.randn(2, 8),
+        "nonexistent.path.lora_B.weight": torch.randn(8, 2),
+    }
+    success = _apply_converted_lora_as_delta(
+        transformer, state_dict, "skip_test",
+        weight=1.0, log_prefix="[test]",
+    )
+    assert success  # at least one module applied
+
+
+def test_direct_delta_merge_registers_in_peft_config():
+    """The merged adapter should be discoverable via peft_config."""
+    transformer = _FakeTransformer()
+    state_dict = {
+        "transformer_blocks.0.attn.to_q.lora_A.weight": torch.randn(2, 8),
+        "transformer_blocks.0.attn.to_q.lora_B.weight": torch.randn(8, 2),
+    }
+    _apply_converted_lora_as_delta(
+        transformer, state_dict, "registered",
+        weight=1.0, log_prefix="[test]",
+    )
+    assert hasattr(transformer, "peft_config")
+    assert "registered" in transformer.peft_config
+    assert transformer.peft_config["registered"]["_type"] == "converted_lora_direct"
+    assert transformer.peft_config["registered"]["_applied_modules"] == 1
 
 
 # ════════════════════════════════════════════════════════════════════════

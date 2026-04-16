@@ -204,9 +204,15 @@ def svd_compress_to_lora(
 # ════════════════════════════════════════════════════════════════════════
 
 # Standard-LoRA suffixes we emit (canonical: the ".weight" form).
+# Note: we deliberately do NOT emit ".alpha" keys.  Diffusers' fast-path
+# pipe.load_lora_weights enforces a "every key must contain 'lora'"
+# substring check that .alpha keys fail; emitting them was making the
+# fast path silently reject our converted state dicts.  Instead, we
+# bake the alpha/rank scaling into the lora_A/lora_B factors, and
+# downstream PEFT consumers see a state dict where the default scale
+# of 1.0 produces exactly the intended delta.
 _OUT_LORA_A = ".lora_A.weight"
 _OUT_LORA_B = ".lora_B.weight"
-_OUT_ALPHA  = ".alpha"
 
 
 def _group_by_module(state_dict: Dict[str, "torch.Tensor"]) -> Dict[str, Dict[str, "torch.Tensor"]]:
@@ -218,6 +224,38 @@ def _group_by_module(state_dict: Dict[str, "torch.Tensor"]) -> Dict[str, Dict[st
     return modules
 
 
+def _bake_alpha(
+    lora_A: "torch.Tensor",
+    lora_B: "torch.Tensor",
+    alpha: Optional["torch.Tensor"],
+) -> Tuple["torch.Tensor", "torch.Tensor"]:
+    """Distribute the alpha/rank scaling factor evenly into A and B.
+
+    Standard PEFT runtime scaling is (alpha/rank) — when alpha == rank
+    (or no alpha is recorded), the scale is 1.0 and the raw `B @ A`
+    product becomes the delta.  For LoRAs whose stored alpha differs
+    from rank, we multiply both A and B by sqrt(alpha/rank) so that
+    `(B' @ A') = (alpha/rank) * (B @ A)` — i.e. the trained scaling
+    is baked in, and consumers can rely on a default scale of 1.0.
+
+    Returns (A, B) unchanged when alpha is None or matches rank.
+    """
+    if alpha is None or lora_A.ndim < 2:
+        return lora_A, lora_B
+    rank = lora_A.shape[0]
+    if rank == 0:
+        return lora_A, lora_B
+    alpha_val = float(alpha.item()) if hasattr(alpha, "item") else float(alpha)
+    scale = alpha_val / rank
+    if abs(scale - 1.0) < 1e-6:
+        return lora_A, lora_B
+    s_root = scale ** 0.5
+    return (
+        (lora_A * s_root).contiguous(),
+        (lora_B * s_root).contiguous(),
+    )
+
+
 def _emit_lora_module(
     out_state_dict: Dict[str, "torch.Tensor"],
     base: str,
@@ -225,31 +263,38 @@ def _emit_lora_module(
     lora_B: "torch.Tensor",
     alpha: Optional["torch.Tensor"] = None,
 ) -> None:
-    """Add canonical .lora_A.weight / .lora_B.weight / .alpha entries."""
-    out_state_dict[base + _OUT_LORA_A] = lora_A
-    out_state_dict[base + _OUT_LORA_B] = lora_B
-    if alpha is not None:
-        out_state_dict[base + _OUT_ALPHA] = alpha
+    """Add canonical .lora_A.weight / .lora_B.weight entries.
+
+    Bakes alpha into the factors so we can omit the .alpha key
+    entirely (see _OUT_LORA_A / _OUT_LORA_B comment for why).
+    """
+    A, B = _bake_alpha(lora_A, lora_B, alpha)
+    out_state_dict[base + _OUT_LORA_A] = A
+    out_state_dict[base + _OUT_LORA_B] = B
 
 
 def convert_state_dict(
     source_state_dict: Dict[str, "torch.Tensor"],
     plan: ConversionPlan,
     *,
-    target_rank: int = 16,
+    target_rank: int = 64,
     log_prefix: str = "[LoRA-Convert]",
 ) -> Dict[str, "torch.Tensor"]:
     """Apply a ConversionPlan to a state dict.
 
-    Returns a state dict containing ONLY standard-LoRA keys
-    (.lora_A.weight / .lora_B.weight / .alpha) at the plan's
-    rename-target paths.
+    Returns a state dict containing ONLY canonical standard-LoRA keys
+    (.lora_A.weight / .lora_B.weight) at the plan's rename-target
+    paths.  Alpha is baked into the factors via sqrt(alpha/rank)
+    distribution — no separate .alpha keys are emitted (diffusers'
+    fast-path loader rejects state dicts with non-"lora" keys).
 
     target_rank governs the SVD-truncation rank for LoKR/LoHa modules.
-    Higher rank = better fidelity but larger output.  16 is a reasonable
-    default for typical LoRA usage; bump to 32–64 if reconstruction
-    error matters.  Standard LoRAs are not SVD-touched and keep their
-    original rank.
+    Higher rank = better fidelity but larger output.  Default 64 was
+    chosen after rank-16 produced visible noise on Klein-9B LoKRs whose
+    underlying delta has effective rank > 64.  For LoRAs whose trained
+    rank is small, higher target_rank is harmless (extra singular
+    components are zero-magnitude and contribute nothing).  Standard
+    LoRAs are not SVD-touched — they keep their original rank.
     """
     # Phase 1: rename keys (preserves all suffixes)
     renamed = apply_rename_rules(source_state_dict, plan)
@@ -351,3 +396,156 @@ def convert_state_dict(
             "still apply for these modules.)"
         )
     return out
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  Loader: apply a converted state dict to a pipeline
+# ════════════════════════════════════════════════════════════════════════
+
+def _apply_converted_lora_as_delta(
+    transformer,
+    state_dict: Dict[str, "torch.Tensor"],
+    adapter_name: str,
+    weight: float,
+    log_prefix: str,
+) -> bool:
+    """Direct weight merge — bypass PEFT entirely.
+
+    For each module path in `state_dict` with both lora_A and lora_B,
+    compute `delta = (lora_B @ lora_A) * weight` and add it to the
+    corresponding model parameter at `<path>.weight`.  Alpha is already
+    baked into the factors by convert_state_dict, so the runtime scale
+    factor is simply `weight`.
+
+    Used as the reliable fallback when pipe.load_lora_weights and PEFT
+    injection both fail to actually register the adapter.  Trades off
+    per-stage runtime weight changes (you'd have to reload to change
+    weight) for guaranteed correctness — same compromise the existing
+    _load_lokr_adapter_direct path makes.
+    """
+    model_sd = dict(transformer.named_parameters())
+    modules: Dict[str, Dict[str, "torch.Tensor"]] = {}
+    for k, v in state_dict.items():
+        base, sfx = split_state_key(k)
+        modules.setdefault(base, {})[sfx] = v
+
+    backup_attr = f"_converted_lora_backup_{adapter_name}"
+    backup = getattr(transformer, backup_attr, None)
+    if backup is None:
+        backup = {}
+        setattr(transformer, backup_attr, backup)
+
+    applied = skipped = 0
+    for base, parts in modules.items():
+        # Explicit None-test — `tensor or other` triggers tensor's
+        # ambiguous-boolean error on multi-element tensors.
+        A = parts[".lora_A.weight"] if ".lora_A.weight" in parts else parts.get(".lora_A")
+        B = parts[".lora_B.weight"] if ".lora_B.weight" in parts else parts.get(".lora_B")
+        if A is None or B is None:
+            skipped += 1
+            continue
+        target_key = base + ".weight"
+        if target_key not in model_sd:
+            target_key = base  # rare: parameter without .weight suffix
+        if target_key not in model_sd:
+            skipped += 1
+            continue
+
+        param = model_sd[target_key]
+        delta = (B.float() @ A.float()) * float(weight)
+        if delta.shape != param.shape:
+            try:
+                delta = delta.reshape(param.shape)
+            except RuntimeError:
+                skipped += 1
+                continue
+
+        # Snapshot original weights so unload_adapters can restore them
+        if target_key not in backup:
+            backup[target_key] = param.data.clone()
+
+        param.data.add_(delta.to(dtype=param.dtype, device=param.device))
+        applied += 1
+
+    # Mark the adapter so set_adapters() can find it (matches how
+    # _load_lokr_adapter_direct registers its direct-merge adapters).
+    if not hasattr(transformer, "peft_config"):
+        transformer.peft_config = {}
+    transformer.peft_config[adapter_name] = {
+        "_type": "converted_lora_direct",
+        "_applied_modules": applied,
+        "_weight": weight,
+    }
+    if not getattr(transformer, "_hf_peft_config_loaded", False):
+        transformer._hf_peft_config_loaded = True
+
+    print(
+        f"{log_prefix} direct delta merge: applied={applied}, "
+        f"skipped={skipped} (weight={weight})"
+    )
+    return applied > 0
+
+
+def load_converted_lora(
+    pipe,
+    converted_state_dict: Dict[str, "torch.Tensor"],
+    adapter_name: str,
+    log_prefix: str,
+    weight: float = 1.0,
+) -> bool:
+    """Load an already-converted LoRA state dict onto the pipeline.
+
+    Tries two paths in order:
+
+      1. pipe.load_lora_weights with `transformer.` prefix prepended.
+         Diffusers' Flux/Flux2/Qwen pipelines filter LoRA keys by this
+         prefix when matching against the transformer module — without
+         it, the call returns silently with zero modules registered.
+         We verify post-load via get_list_adapters() because the
+         silent-no-op path doesn't raise.
+
+      2. Direct weight merge (_apply_converted_lora_as_delta).  Bypasses
+         PEFT machinery entirely; same trade-off as the existing
+         _load_lokr_adapter_direct (no per-stage runtime weight change,
+         but reliably registers and applies).
+
+    Returns True if at least one path succeeded.
+    """
+    transformer = getattr(pipe, "transformer", None)
+    if transformer is None:
+        print(f"{log_prefix} pipe has no .transformer attribute")
+        return False
+
+    # ── Attempt 1: pipeline path with `transformer.` prefix ───────────
+    prefixed = {f"transformer.{k}": v for k, v in converted_state_dict.items()}
+    try:
+        pipe.load_lora_weights(prefixed, adapter_name=adapter_name)
+        # Verify registration — diffusers can silently no-op when no
+        # keys match the expected module structure.
+        try:
+            adapter_lists = pipe.get_list_adapters()
+            present = any(
+                adapter_name in v for v in adapter_lists.values()
+            )
+        except Exception:
+            present = True  # can't verify; assume success
+        if present:
+            print(
+                f"{log_prefix} converted adapter registered via "
+                f"pipe.load_lora_weights (PEFT-managed)"
+            )
+            return True
+        print(
+            f"{log_prefix} pipe.load_lora_weights returned without "
+            f"registering '{adapter_name}' — falling back to direct merge"
+        )
+    except (ValueError, RuntimeError) as e:
+        print(
+            f"{log_prefix} pipe.load_lora_weights raised "
+            f"({str(e)[:120]}) — falling back to direct merge"
+        )
+
+    # ── Attempt 2: direct weight merge ────────────────────────────────
+    return _apply_converted_lora_as_delta(
+        transformer, converted_state_dict, adapter_name, weight, log_prefix,
+    )
