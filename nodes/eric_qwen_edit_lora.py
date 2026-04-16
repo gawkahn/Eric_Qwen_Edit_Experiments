@@ -220,7 +220,7 @@ def _detect_adapter_type(state_dict: dict) -> str:
 
 def _load_lokr_adapter(pipe, state_dict: dict, adapter_name: str,
                        log_prefix: str = "[LoRA]",
-                       weight: float = 1.0) -> None:
+                       weight: float = 1.0) -> bool:
     """Inject a LoKR (Kronecker) adapter via PEFT.
 
     Diffusers' ``load_lora_weights`` only understands standard LoRA format.
@@ -235,14 +235,23 @@ def _load_lokr_adapter(pipe, state_dict: dict, adapter_name: str,
     ``kron(w1, w2) * (alpha / r)``.  We set ``alpha = r`` in the config so
     that the base scaling is 1.0 (matching ComfyUI / LyCORIS convention).
     ``set_adapters()`` then multiplies by the user-supplied weight.
+
+    Returns True if at least one module was patched (PEFT path always
+    returns True on success since PEFT doesn't expose a per-module count;
+    direct-merge path returns True only if applied > 0).  Returns False
+    if direct merge ran and patched zero modules — caller should treat
+    as a failed load (e.g. architecture mismatch like a Klein/Flux LoRA
+    targeting modules diffusers reorganized into transformer_blocks).
     """
     try:
         _load_lokr_adapter_peft(pipe, state_dict, adapter_name, log_prefix)
+        return True
     except (ValueError, RuntimeError) as peft_err:
         print(f"{log_prefix} PEFT injection failed: {peft_err}")
         print(f"{log_prefix} Falling back to direct weight merge...")
-        _load_lokr_adapter_direct(pipe, state_dict, adapter_name, log_prefix,
-                                  weight=weight)
+        return _load_lokr_adapter_direct(
+            pipe, state_dict, adapter_name, log_prefix, weight=weight,
+        )
 
 
 def _load_lokr_adapter_peft(pipe, state_dict: dict, adapter_name: str,
@@ -395,25 +404,31 @@ def _load_lokr_adapter_direct(pipe, state_dict: dict, adapter_name: str,
         print(f"{log_prefix} WARNING: Many modules skipped. "
               f"State-dict keys (sample): {sample_keys}")
         print(f"{log_prefix}   Model params (sample): {sample_modules}")
+    return applied > 0
 
 
 def _load_loha_adapter(pipe, state_dict: dict, adapter_name: str,
                        log_prefix: str = "[LoRA]",
-                       weight: float = 1.0) -> None:
+                       weight: float = 1.0) -> bool:
     """Inject a LoHa (Hadamard) adapter via PEFT.
 
     LoHa always uses decomposed weights (w1_a/w1_b, w2_a/w2_b), so the
     rank ``r`` is directly available from the weight shapes.
 
     Falls back to direct weight merge if PEFT injection fails.
+
+    Returns True if at least one module was patched (see _load_lokr_adapter
+    docstring for return-value semantics).
     """
     try:
         _load_loha_adapter_peft(pipe, state_dict, adapter_name, log_prefix)
+        return True
     except (ValueError, RuntimeError) as peft_err:
         print(f"{log_prefix} PEFT injection failed for LoHa: {peft_err}")
         print(f"{log_prefix} Falling back to direct weight merge...")
-        _load_loha_adapter_direct(pipe, state_dict, adapter_name, log_prefix,
-                                  weight=weight)
+        return _load_loha_adapter_direct(
+            pipe, state_dict, adapter_name, log_prefix, weight=weight,
+        )
 
 
 def _load_loha_adapter_peft(pipe, state_dict: dict, adapter_name: str,
@@ -556,6 +571,7 @@ def _load_loha_adapter_direct(pipe, state_dict: dict, adapter_name: str,
         print(f"{log_prefix} WARNING: Many modules skipped. "
               f"State-dict keys (sample): {sample_keys}")
         print(f"{log_prefix}   Model params (sample): {sample_modules}")
+    return applied > 0
 
 
 def _decode_kohya_keys(state_dict: dict, model) -> dict:
@@ -693,7 +709,7 @@ def _rename_lora_down_up(state_dict: dict) -> dict:
 
 def _load_lora_adapter(pipe, state_dict: dict, adapter_name: str,
                        log_prefix: str = "[LoRA]",
-                       weight: float = 1.0) -> None:
+                       weight: float = 1.0) -> bool:
     """Load a standard LoRA adapter with multi-level fallback.
 
     Handles both ``lora_A``/``lora_B`` and ``lora_down``/``lora_up``
@@ -705,6 +721,9 @@ def _load_lora_adapter(pipe, state_dict: dict, adapter_name: str,
        still supports ``set_adapters()`` for weight control.
     3. Direct weight merge (B @ A * scale) — last resort, weight is
        baked in at load time.
+
+    Returns True if at least one module was patched (see _load_lokr_adapter
+    docstring for return-value semantics).
     """
     # Normalise lora_down/lora_up → lora_A/lora_B
     state_dict = _rename_lora_down_up(state_dict)
@@ -712,7 +731,7 @@ def _load_lora_adapter(pipe, state_dict: dict, adapter_name: str,
     try:
         pipe.load_lora_weights(state_dict, adapter_name=adapter_name)
         print(f"{log_prefix} LoRA loaded via pipeline with normalised keys")
-        return
+        return True
     except (ValueError, RuntimeError) as e:
         print(f"{log_prefix} Pipeline LoRA load with normalised keys "
               f"failed: {str(e)[:120]}")
@@ -720,15 +739,16 @@ def _load_lora_adapter(pipe, state_dict: dict, adapter_name: str,
     # ── Try 2: Direct PEFT injection on the transformer ──────────────
     try:
         _load_lora_adapter_peft(pipe, state_dict, adapter_name, log_prefix)
-        return
+        return True
     except (ValueError, RuntimeError) as e:
         print(f"{log_prefix} Direct PEFT LoRA injection failed: "
               f"{str(e)[:120]}")
 
     # ── Try 3: Direct weight merge (last resort) ─────────────────────
     print(f"{log_prefix} Falling back to direct LoRA weight merge...")
-    _load_lora_adapter_direct(pipe, state_dict, adapter_name, log_prefix,
-                              weight=weight)
+    return _load_lora_adapter_direct(
+        pipe, state_dict, adapter_name, log_prefix, weight=weight,
+    )
 
 
 def _load_lora_adapter_peft(pipe, state_dict: dict, adapter_name: str,
@@ -873,6 +893,7 @@ def _load_lora_adapter_direct(pipe, state_dict: dict, adapter_name: str,
         print(f"{log_prefix} WARNING: Many modules skipped. "
               f"State-dict keys (sample): {sample_keys}")
         print(f"{log_prefix}   Model params (sample): {sample_modules}")
+    return applied > 0
 
 
 def unload_adapters(pipe, adapter_names, log_prefix: str = "[LoRA]") -> None:
@@ -1062,20 +1083,33 @@ def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
     print(f"{log_prefix} Detected adapter format: {adapter_type}")
 
     if adapter_type == "lokr":
-        _load_lokr_adapter(pipe, state_dict, adapter_name, log_prefix,
-                           weight=weight)
+        success = _load_lokr_adapter(pipe, state_dict, adapter_name, log_prefix,
+                                     weight=weight)
     elif adapter_type == "loha":
-        _load_loha_adapter(pipe, state_dict, adapter_name, log_prefix,
-                           weight=weight)
+        success = _load_loha_adapter(pipe, state_dict, adapter_name, log_prefix,
+                                     weight=weight)
     elif adapter_type == "lora":
         # Standard LoRA with key prefix issues — multi-level fallback
-        _load_lora_adapter(pipe, state_dict, adapter_name, log_prefix,
-                           weight=weight)
+        success = _load_lora_adapter(pipe, state_dict, adapter_name, log_prefix,
+                                     weight=weight)
     else:
         raise ValueError(
             f"{log_prefix} Unrecognised adapter format.  First 5 keys: "
             f"{list(state_dict.keys())[:5]}"
         )
+
+    # When all of the fallback paths bottomed out into direct merge and
+    # the merge applied 0 modules (e.g. architecture mismatch), success
+    # will be False.  Don't let the stacker claim "Loaded OK" / "active"
+    # for an adapter that isn't actually patched anywhere.
+    if not success:
+        print(
+            f"{log_prefix} FAILED — direct merge applied 0 modules; "
+            f"this adapter is NOT active.  Most likely: original-format "
+            f"LoRA targeting modules diffusers reorganized into a "
+            f"different structure (see WRONG_ARCH diagnostic above)."
+        )
+        return False
     return True
 
 
