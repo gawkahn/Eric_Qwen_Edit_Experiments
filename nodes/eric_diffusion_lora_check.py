@@ -68,6 +68,7 @@ class LoRACheckResult:
     unmatched: int      # layers not found in model at all
     dim_mismatches: List[str] = field(default_factory=list)  # base keys with bad dims
     skipped: bool = False  # set True when loader skips this LoRA
+    arch_hint: Optional[str] = None  # human-readable format detection for 0% matches
 
     @property
     def key_match_pct(self) -> float:
@@ -97,10 +98,19 @@ class LoRACheckResult:
             f"dims={self.dim_ok_pct:.0f}%  verdict={self.verdict}"
         ]
         if self.verdict == "WRONG_ARCH":
-            lines.append(
-                f"{prefix}   !! Architecture mismatch — likely SD1/SDXL LoRA, "
-                "will produce garbage or no effect"
+            # Prefer the architecture-specific hint computed at check
+            # time over the old generic "likely SD1/SDXL" message — that
+            # was misdiagnosing original-format Flux/Klein LoRAs as a
+            # different model family entirely.
+            hint_text = self.arch_hint or (
+                "Architecture mismatch — LoRA targets modules not "
+                "present in the loaded model. Will produce no effect."
             )
+            import textwrap
+            wrapped = textwrap.wrap(hint_text, width=70)
+            for i, segment in enumerate(wrapped):
+                marker = "!! " if i == 0 else "   "
+                lines.append(f"{prefix}   {marker}{segment}")
         elif self.verdict == "POOR_MATCH":
             lines.append(
                 f"{prefix}   !! Only {self.matched}/{self.total_layers} layers "
@@ -246,6 +256,83 @@ def check_lora(lora_path, transformer=None, param_dict: Optional[Dict] = None,
         else:
             dim_ok += 1  # not enough info to check
 
+    # When nothing matched, detect what architecture this LoRA actually
+    # targets so we can give a more accurate hint than the generic
+    # "likely SD1/SDXL".  Pattern-match on the LoRA's stripped key
+    # paths AND the model's parameter paths to disambiguate "wrong
+    # arch entirely" vs "right family but wrong layout convention."
+    arch_hint = None
+    if matched == 0 and layers:
+        sample_lora = list(layers.keys())[:3]
+        sample_model = [k for k in param_dict if not k.startswith("_")][:3]
+        print(f"{log_prefix} 0% match — sample LoRA base keys:  {sample_lora}")
+        print(f"{log_prefix} 0% match — sample model param keys: {sample_model}")
+
+        # Architecture detection from LoRA's own key patterns.
+        all_lora_paths = list(layers.keys())
+        has_double_blocks = any("double_blocks" in p for p in all_lora_paths)
+        has_single_blocks = any("single_blocks" in p for p in all_lora_paths)
+        has_unet_blocks = any(
+            ("up_blocks" in p) or ("down_blocks" in p) or ("mid_block" in p)
+            for p in all_lora_paths
+        )
+        has_diffusers_flux = any(
+            ("transformer_blocks" in p) or ("single_transformer_blocks" in p)
+            for p in all_lora_paths
+        )
+        # Model side detection: do we KNOW we're loading into a diffusers
+        # Flux/Flux2 model that has the reorganized structure?  If yes,
+        # the user's "original Flux/Klein LoRA" needs conversion rather
+        # than being plain incompatible.
+        all_model_paths = [k for k in param_dict if not k.startswith("_")]
+        model_is_diffusers_flux = any(
+            ("transformer_blocks" in p) or ("single_transformer_blocks" in p)
+            for p in all_model_paths
+        )
+
+        if (has_double_blocks or has_single_blocks) and model_is_diffusers_flux:
+            arch_hint = (
+                "Original Flux/Klein/Chroma LoRA format detected "
+                "(targets `double_blocks`/`single_blocks`).  This is the "
+                "ComfyUI-native layout — the diffusers model loaded here "
+                "uses the reorganized `transformer_blocks` / "
+                "`single_transformer_blocks` layout, with the fused QKV "
+                "projection split into separate to_q/to_k/to_v.  The "
+                "LoRA is NOT incompatible with the underlying model "
+                "weights, just with the diffusers module structure.  "
+                "Conversion (key rename + QKV split) is required.  Until "
+                "a converter tool lands, use ComfyUI's native LoRA loader "
+                "for this file."
+            )
+        elif has_double_blocks or has_single_blocks:
+            arch_hint = (
+                "Flux/Klein/Chroma LoRA (original format with "
+                "`double_blocks`/`single_blocks`).  The currently-loaded "
+                "model doesn't have the matching module names — confirm "
+                "you've loaded the right model family for this LoRA."
+            )
+        elif has_diffusers_flux and not model_is_diffusers_flux:
+            arch_hint = (
+                "Diffusers-format Flux/Flux2 LoRA, but the loaded model "
+                "doesn't have the matching `transformer_blocks` modules.  "
+                "Likely loaded into a non-Flux model family by mistake."
+            )
+        elif has_unet_blocks:
+            arch_hint = (
+                "SD1/SDXL/SD3-style UNet LoRA (targets `up_blocks` / "
+                "`down_blocks` / `mid_block`).  Not compatible with the "
+                "Flux/Qwen-family transformer architecture — wrong model "
+                "type entirely."
+            )
+        else:
+            arch_hint = (
+                "Unrecognized LoRA architecture.  Sample target keys "
+                "above don't match any known pattern (Flux/Klein/Chroma "
+                "original or diffusers, SD UNet).  Could be a custom "
+                "fine-tune format or a newly-supported architecture not "
+                "yet recognized by this checker."
+            )
+
     result = LoRACheckResult(
         path=str(lora_path),
         total_layers=len(layers),
@@ -254,15 +341,8 @@ def check_lora(lora_path, transformer=None, param_dict: Optional[Dict] = None,
         norm_layers=norm_count,
         unmatched=unmatched,
         dim_mismatches=dim_mismatch_keys,
+        arch_hint=arch_hint,
     )
-
-    # When nothing matched, log sample LoRA keys AND model keys so any
-    # unknown format can be diagnosed without guessing.
-    if matched == 0 and layers:
-        sample_lora = list(layers.keys())[:3]
-        sample_model = [k for k in param_dict if not k.startswith("_")][:3]
-        print(f"{log_prefix} 0% match — sample LoRA base keys:  {sample_lora}")
-        print(f"{log_prefix} 0% match — sample model param keys: {sample_model}")
 
     return result
 
