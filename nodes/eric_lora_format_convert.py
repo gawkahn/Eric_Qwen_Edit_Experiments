@@ -102,6 +102,27 @@ class RenameRule:
         return key.replace(self.pattern, self.replacement)
 
 
+@dataclass(frozen=True)
+class QKVSplitSpec:
+    """Identifies a fused-QKV module that must be split into 3 outputs.
+
+    `pattern` is a substring matched against base module paths AFTER
+    rename_rules have been applied.  When the substring matches, the
+    framework replaces it with each of `targets` in turn (one for Q,
+    K, V) to produce the three output module paths.
+
+    Examples (Klein-9B double_blocks have two distinct QKV groups):
+        QKVSplitSpec(".attn.qkv",
+                     targets=(".attn.to_q", ".attn.to_k", ".attn.to_v"))
+        QKVSplitSpec(".attn.qkv_txt",
+                     targets=(".attn.add_q_proj",
+                              ".attn.add_k_proj",
+                              ".attn.add_v_proj"))
+    """
+    pattern: str
+    targets: Tuple[str, str, str]
+
+
 @dataclass
 class ConversionPlan:
     """Recipe for mapping a LoRA from source_family layout → target_family.
@@ -110,17 +131,13 @@ class ConversionPlan:
     their respective families and register the resulting plan in
     CONVERSION_PLANS via the (source_family, target_family) key.
     """
-    source_family: str            # e.g. 'bfl_original'
-    target_family: str            # e.g. 'diffusers_flux2'
+    source_family: str            # e.g. 'bfl_klein'
+    target_family: str            # e.g. 'diffusers_klein'
     # Ordered substitutions on base module paths.  ALL apply, in order.
     rename_rules: List[RenameRule] = field(default_factory=list)
-    # Base-module-path substring patterns whose `lora_B` (or merged
-    # delta) must be split into 3 separate Q/K/V outputs after rename.
-    # Typical entry: '.attn.qkv' (matched against the renamed key).
-    qkv_split_modules: List[str] = field(default_factory=list)
-    # Per-pattern rename rules used when emitting the 3 split keys.
-    # Maps the q/k/v split name → final fragment.  Defaults below.
-    qkv_split_targets: Tuple[str, str, str] = (".to_q", ".to_k", ".to_v")
+    # Fused-QKV modules that must be split into 3 separate outputs
+    # AFTER rename.  Each entry binds a pattern → 3 target fragments.
+    qkv_splits: List[QKVSplitSpec] = field(default_factory=list)
     # Optional notes for users / debugging.
     notes: str = ""
 
@@ -290,3 +307,15 @@ def split_fused_qkv_via_svd(
             "alpha":  torch.tensor(float(r)),
         }
     return parts
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  Auto-register family plans
+# ════════════════════════════════════════════════════════════════════════
+#
+# Importing the framework module registers every family plan as a
+# side effect.  This MUST sit at the bottom of the module — the family
+# files import `register_plan` from here, so they need this module to
+# be fully defined before they execute.
+from . import eric_lora_format_convert_flux  # noqa: E402, F401  (registers Klein/Flux2)
+# Slice 5 will add: from . import eric_lora_format_convert_chroma
