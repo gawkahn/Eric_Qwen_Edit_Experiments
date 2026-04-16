@@ -353,10 +353,82 @@ def _load_single_weights(component_class, weights_path: str, dtype,
     weights_path = resolve_component_path(weights_path)
     config_path = os.path.join(base_path, subfolder_hint)
 
+    # ── Peek at checkpoint keys to detect SGM prefix ─────────────────────
+    # Some architecture converters in diffusers (e.g. Flux.2's
+    # convert_flux2_transformer_checkpoint_to_diffusers) parse keys by
+    # splitting on '.' and indexing positions, assuming keys start with
+    # `double_blocks.{N}...` or `single_blocks.{N}...`.  When checkpoints
+    # have a `model.diffusion_model.` prefix (ComfyUI/SGM convention), the
+    # position-based parsing breaks: parts[1] becomes "diffusion_model"
+    # instead of the block index, and the converter raises KeyError on a
+    # nonsense within_block_name.  Pre-stripping the prefix at our level
+    # before handing the checkpoint to from_single_file sidesteps the
+    # upstream bug without patching diffusers.
+    #
+    # Detection is the same logic used by the direct-load fallback below:
+    # a prefix is "dominant" if it appears on >=50% of checkpoint keys.
+    def _peek_dominant_prefix(path: str):
+        try:
+            if path.lower().endswith(".safetensors"):
+                from safetensors import safe_open
+                with safe_open(path, framework="pt") as f:
+                    peek_keys = list(f.keys())
+            else:
+                peek_keys = list(
+                    torch.load(path, map_location="cpu", weights_only=True).keys()
+                )
+        except Exception:
+            return None
+
+        if not peek_keys:
+            return None
+
+        candidate_prefixes = [
+            "model.diffusion_model.",
+            "diffusion_model.",
+            "first_stage_model.",
+            "cond_stage_model.",
+        ]
+        for prefix in candidate_prefixes:
+            n_with_prefix = sum(1 for k in peek_keys if k.startswith(prefix))
+            if n_with_prefix >= len(peek_keys) * 0.5:
+                return prefix
+        return None
+
+    detected_prefix = _peek_dominant_prefix(weights_path)
+
+    def _write_prefix_stripped_temp(src_path: str, prefix: str) -> str:
+        """Load src_path, strip prefix from all matching keys, save to a
+        temp .safetensors file, and return the temp path.  Caller owns
+        cleanup via the returned temp directory.
+        """
+        from safetensors.torch import load_file as st_load
+        from safetensors.torch import save_file as st_save
+        state_dict = st_load(src_path) if src_path.lower().endswith(".safetensors") \
+            else torch.load(src_path, map_location="cpu", weights_only=True)
+        stripped = {}
+        for k, v in state_dict.items():
+            if k.startswith(prefix):
+                stripped[k[len(prefix):]] = v
+            else:
+                stripped[k] = v
+        import tempfile
+        temp_dir = tempfile.mkdtemp(prefix="eric_diffusion_strip_")
+        temp_path = os.path.join(temp_dir, "transformer_stripped.safetensors")
+        st_save(stripped, temp_path)
+        del state_dict, stripped
+        return temp_dir, temp_path
+
     # ── Primary: from_single_file (handles key conversion) ──────────────
     if hasattr(component_class, "from_single_file"):
         print(f"[EricDiffusion] Loading {subfolder_hint} via from_single_file "
               f"(key conversion enabled)")
+        if detected_prefix is not None:
+            print(
+                f"[EricDiffusion] Detected dominant SGM prefix "
+                f"{detected_prefix!r} on checkpoint keys — will also try "
+                f"the pre-stripped variant if standard loading fails"
+            )
         has_config = os.path.isdir(config_path)
 
         # Attempt 1: use base model config (fastest, no network)
@@ -374,8 +446,52 @@ def _load_single_weights(component_class, weights_path: str, dtype,
                 return component
             except Exception as e:
                 print(f"[EricDiffusion] from_single_file with base config failed: {e}")
-                print(f"[EricDiffusion] Retrying without base config (will auto-detect "
-                      f"or fetch config from HuggingFace)...")
+
+        # Attempt 1b: if we detected an SGM prefix and the base config
+        # is available, pre-strip the prefix to a temp file and retry.
+        # Handles the diffusers Flux2 converter bug where position-based
+        # parsing breaks on prefixed keys.  Uses a temp directory that
+        # gets cleaned up in a finally block regardless of outcome.
+        if detected_prefix is not None and has_config:
+            print(
+                f"[EricDiffusion] Retrying from_single_file with prefix "
+                f"{detected_prefix!r} pre-stripped (workaround for "
+                f"upstream converter parsing bug)..."
+            )
+            temp_dir = None
+            try:
+                temp_dir, stripped_path = _write_prefix_stripped_temp(
+                    weights_path, detected_prefix,
+                )
+                component = component_class.from_single_file(
+                    stripped_path,
+                    config=base_path,
+                    subfolder=subfolder_hint,
+                    torch_dtype=dtype,
+                    local_files_only=True,
+                )
+                print(
+                    f"[EricDiffusion] {subfolder_hint} loaded successfully via "
+                    f"from_single_file (prefix pre-stripped, base config)"
+                )
+                return component
+            except Exception as e:
+                print(
+                    f"[EricDiffusion] from_single_file (prefix pre-stripped) "
+                    f"failed: {e}"
+                )
+            finally:
+                if temp_dir is not None:
+                    import shutil
+                    try:
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+
+        print(
+            f"[EricDiffusion] Retrying without base config (will auto-detect "
+            f"or fetch config from HuggingFace)..."
+        )
 
         # Attempt 2: let diffusers infer the config from the checkpoint keys.
         # This handles the case where the checkpoint architecture differs from
@@ -391,6 +507,41 @@ def _load_single_weights(component_class, weights_path: str, dtype,
             return component
         except Exception as e:
             print(f"[EricDiffusion] from_single_file (auto-detect) failed: {e}")
+
+        # Attempt 2b: if we detected a prefix, try prefix-stripping + auto-detect.
+        # This is the last from_single_file attempt before we fall through to
+        # the AIO and direct-load paths.
+        if detected_prefix is not None:
+            print(
+                f"[EricDiffusion] Retrying from_single_file with prefix "
+                f"{detected_prefix!r} pre-stripped (auto-detect config)..."
+            )
+            temp_dir = None
+            try:
+                temp_dir, stripped_path = _write_prefix_stripped_temp(
+                    weights_path, detected_prefix,
+                )
+                component = component_class.from_single_file(
+                    stripped_path,
+                    torch_dtype=dtype,
+                )
+                print(
+                    f"[EricDiffusion] {subfolder_hint} loaded successfully via "
+                    f"from_single_file (prefix pre-stripped, auto-detect)"
+                )
+                return component
+            except Exception as e:
+                print(
+                    f"[EricDiffusion] from_single_file (prefix pre-stripped "
+                    f"auto-detect) failed: {e}"
+                )
+            finally:
+                if temp_dir is not None:
+                    import shutil
+                    try:
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+                    except Exception:
+                        pass
 
     # ── AIO fallback: pipeline-level from_single_file ──────────────────
     #
