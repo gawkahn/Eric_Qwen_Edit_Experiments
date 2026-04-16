@@ -762,12 +762,80 @@ def _load_single_weights(component_class, weights_path: str, dtype,
             f"Sample model keys: {list(model_keys)[:5]}"
         )
 
-    if pct < 90:
-        print(f"[EricDiffusion] WARNING: Only {len(matched)}/{len(model_keys)} "
-              f"keys matched ({pct:.1f}%) — some weights were NOT loaded")
+    # Report match quality.  Three tiers:
+    #   >= 99%  — healthy, minor drift at most (just log the OK line)
+    #   90-99% — minor mismatch, probably benign (soft note)
+    #   10-89% — major mismatch; load proceeds because strict=False
+    #             but this is LIKELY not what the user wants, so be loud
+    #
+    # The <10% case was already rejected with ValueError above.  Anything
+    # in 10-89% means load_state_dict(strict=False) will apply the matched
+    # weights and SILENTLY retain base-model weights for every unmatched
+    # parameter — which makes the final component a hybrid the user may
+    # not notice unless they A/B against base.  We can't make that call
+    # for the user (some legit fine-tunes are partial), but we can be
+    # extremely clear about what just happened.
+    missing_keys = model_keys - ckpt_keys
+    unused_keys = ckpt_keys - model_keys
+
+    if pct >= 99:
+        print(
+            f"[EricDiffusion] {len(matched)}/{len(model_keys)} keys matched "
+            f"({pct:.1f}%) — healthy full override"
+        )
+    elif pct >= 90:
+        print(
+            f"[EricDiffusion] {len(matched)}/{len(model_keys)} keys matched "
+            f"({pct:.1f}%) — minor mismatch; "
+            f"{len(missing_keys)} param(s) missing from checkpoint will keep "
+            f"base-model values"
+        )
     else:
-        print(f"[EricDiffusion] {len(matched)}/{len(model_keys)} keys matched "
-              f"({pct:.1f}%)")
+        # Loud multi-line warning for major mismatches.  User explicitly
+        # doesn't want this to be a hard fail (some civitai files are
+        # orphaned and have no better alternative), but the output from
+        # this component will be a hybrid of fine-tune + base that may
+        # not behave as intended.
+        print(
+            f"[EricDiffusion] ╔══════════════════════════════════════════════════════════╗"
+        )
+        print(
+            f"[EricDiffusion] ║  WARNING: checkpoint only partially matches model.        ║"
+        )
+        print(
+            f"[EricDiffusion] ║  The effects may not be what you expect.                  ║"
+        )
+        print(
+            f"[EricDiffusion] ╚══════════════════════════════════════════════════════════╝"
+        )
+        print(
+            f"[EricDiffusion]   Matched:  {len(matched)}/{len(model_keys)} "
+            f"model params ({pct:.1f}%)"
+        )
+        print(
+            f"[EricDiffusion]   Missing:  {len(missing_keys)} model params NOT in "
+            f"checkpoint — these will silently retain the BASE MODEL's "
+            f"values (not your fine-tune's)"
+        )
+        if unused_keys:
+            print(
+                f"[EricDiffusion]   Unused:   {len(unused_keys)} checkpoint "
+                f"keys were not consumed by the model (may indicate a "
+                f"different architecture variant or format drift)"
+            )
+        print(
+            f"[EricDiffusion]   Sample missing params: "
+            f"{list(missing_keys)[:3]}"
+        )
+        if unused_keys:
+            print(
+                f"[EricDiffusion]   Sample unused keys:    "
+                f"{list(unused_keys)[:3]}"
+            )
+        print(
+            f"[EricDiffusion]   The component will load anyway (strict=False). "
+            f"If output looks off, this mismatch is likely why."
+        )
 
     component.load_state_dict(state_dict, strict=False)
     return component
