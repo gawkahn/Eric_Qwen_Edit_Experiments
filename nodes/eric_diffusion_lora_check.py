@@ -300,9 +300,14 @@ def check_lora(lora_path, transformer=None, param_dict: Optional[Dict] = None,
                 "projection split into separate to_q/to_k/to_v.  The "
                 "LoRA is NOT incompatible with the underlying model "
                 "weights, just with the diffusers module structure.  "
-                "Conversion (key rename + QKV split) is required.  Until "
-                "a converter tool lands, use ComfyUI's native LoRA loader "
-                "for this file."
+                "load_lora_with_key_fix will attempt automatic in-memory "
+                "conversion via a registered ConversionPlan (see "
+                "nodes/eric_lora_format_convert*.py); this 0% pre-check "
+                "result is expected and will be followed by a converted "
+                "load attempt.  If you also see a 'Converted adapter "
+                "loaded' line, the LoRA is active.  If conversion is "
+                "skipped (no plan available), no plan is registered for "
+                "this (LoRA family, model family) pair yet."
             )
         elif has_double_blocks or has_single_blocks:
             arch_hint = (
