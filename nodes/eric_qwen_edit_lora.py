@@ -727,14 +727,38 @@ def _load_lora_adapter(pipe, state_dict: dict, adapter_name: str,
     """
     # Normalise lora_down/lora_up → lora_A/lora_B
     state_dict = _rename_lora_down_up(state_dict)
+
     # ── Try 1: Pipeline LoRA loading with normalised keys ────────────
-    try:
-        pipe.load_lora_weights(state_dict, adapter_name=adapter_name)
-        print(f"{log_prefix} LoRA loaded via pipeline with normalised keys")
-        return True
-    except (ValueError, RuntimeError) as e:
-        print(f"{log_prefix} Pipeline LoRA load with normalised keys "
-              f"failed: {str(e)[:120]}")
+    # Diffusers expects LoRA keys prefixed with "transformer." when
+    # targeting a transformer component.  After Kohya decode the keys
+    # are bare (e.g. "transformer_blocks.0.attn.to_q.lora_A.weight"),
+    # so we try both bare and prefixed, and verify registration after
+    # each attempt — pipe.load_lora_weights silently no-ops when no
+    # keys match, which caused false-positive "Loaded OK" reports.
+    for attempt_label, sd_to_load in (
+        ("normalised keys", state_dict),
+        ("transformer-prefixed keys",
+         {f"transformer.{k}": v for k, v in state_dict.items()}),
+    ):
+        try:
+            pipe.load_lora_weights(sd_to_load, adapter_name=adapter_name)
+            # Verify the adapter actually registered
+            try:
+                adapter_lists = pipe.get_list_adapters()
+                present = any(
+                    adapter_name in v for v in adapter_lists.values()
+                )
+            except Exception:
+                present = True  # can't verify; assume success
+            if present:
+                print(f"{log_prefix} LoRA loaded via pipeline with "
+                      f"{attempt_label}")
+                return True
+            print(f"{log_prefix} Pipeline load ({attempt_label}) returned "
+                  f"but adapter not registered — trying next path")
+        except (ValueError, RuntimeError) as e:
+            print(f"{log_prefix} Pipeline LoRA load ({attempt_label}) "
+                  f"failed: {str(e)[:120]}")
 
     # ── Try 2: Direct PEFT injection on the transformer ──────────────
     try:
