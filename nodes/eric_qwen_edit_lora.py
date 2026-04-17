@@ -1021,6 +1021,7 @@ def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
     Returns True if the LoRA was loaded, False if it was skipped.
     """
     from .eric_diffusion_lora_check import check_lora
+    from .eric_lora_format_convert import decode_kohya_to_bfl
     from .eric_lora_format_convert_apply import (
         convert_state_dict, find_matching_plan, load_converted_lora,
     )
@@ -1056,6 +1057,10 @@ def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
             and pre_check.matched == 0 and pre_check.total_layers > 0):
         try:
             source_sd = _load_state_dict(lora_path)
+            # Chroma LoRAs often come in Kohya underscore format
+            # (lora_unet_*); decode to BFL dot format so
+            # detect_lora_format recognises them as bfl_original.
+            source_sd = decode_kohya_to_bfl(source_sd)
             model_param_names = [n for n, _ in transformer.named_parameters()]
             plan = find_matching_plan(source_sd, model_param_names)
             if plan is not None:

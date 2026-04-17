@@ -56,10 +56,9 @@ import torch
 from .eric_lora_format_convert import (
     CONVERSION_PLANS,
     ConversionPlan,
+    QKVSplitSpec,
     apply_rename_rules,
     detect_lora_format,
-    split_fused_qkv_lora,
-    split_fused_qkv_via_svd,
     split_state_key,
 )
 
@@ -246,6 +245,40 @@ _OUT_LORA_A = ".lora_A.weight"
 _OUT_LORA_B = ".lora_B.weight"
 
 
+def _resolve_split_dims(
+    spec: QKVSplitSpec,
+    out_total: int,
+    base: str,
+    kind: str,
+) -> Tuple[int, ...]:
+    """Compute per-target output dimensions for a fused split.
+
+    When ``spec.target_dims`` is provided, validates that the sum equals
+    ``out_total``.  When absent, divides equally among targets (validates
+    divisibility).  Returns a tuple of ``len(spec.targets)`` ints.
+    """
+    n = len(spec.targets)
+    if spec.target_dims is not None:
+        if len(spec.target_dims) != n:
+            raise ValueError(
+                f"{kind} split at {base}: target_dims has "
+                f"{len(spec.target_dims)} entries but targets has {n}"
+            )
+        if sum(spec.target_dims) != out_total:
+            raise ValueError(
+                f"{kind} split at {base}: sum(target_dims)="
+                f"{sum(spec.target_dims)} != out_dim={out_total}"
+            )
+        return spec.target_dims
+    if out_total % n != 0:
+        raise ValueError(
+            f"{kind} split at {base}: out_dim={out_total} not "
+            f"divisible by {n} targets"
+        )
+    d = out_total // n
+    return tuple(d for _ in range(n))
+
+
 def _group_by_module(state_dict: Dict[str, "torch.Tensor"]) -> Dict[str, Dict[str, "torch.Tensor"]]:
     """Group {full_key: tensor} by base module path → {suffix: tensor}."""
     modules: Dict[str, Dict[str, "torch.Tensor"]] = {}
@@ -372,17 +405,12 @@ def convert_state_dict(
             )
             if qkv_spec:
                 out_total = delta.shape[0]
-                if out_total % 3 != 0:
-                    raise ValueError(
-                        f"LoKR QKV delta at {base} has out_dim={out_total}, "
-                        f"not divisible by 3"
-                    )
-                slice_dim = out_total // 3
-                for i, tgt in enumerate(qkv_spec.targets):
+                dims = _resolve_split_dims(qkv_spec, out_total, base, "LoKR")
+                offset = 0
+                for tgt, d in zip(qkv_spec.targets, dims):
                     out_base = base.replace(qkv_spec.pattern, tgt)
-                    lo = i * slice_dim
-                    hi = (i + 1) * slice_dim
-                    out[out_base + ".diff"] = delta[lo:hi].contiguous()
+                    out[out_base + ".diff"] = delta[offset:offset + d].contiguous()
+                    offset += d
                 n_lokr_qkv += 1
             else:
                 out[base + ".diff"] = delta.contiguous()
@@ -398,14 +426,15 @@ def convert_state_dict(
             B = parts[b_key]
             alpha = parts.get(".alpha")
             if qkv_spec:
-                splits = split_fused_qkv_lora(A, B, alpha=alpha)
-                for name, tgt in zip(("q", "k", "v"), qkv_spec.targets):
+                dims = _resolve_split_dims(qkv_spec, B.shape[0], base, "LoRA")
+                offset = 0
+                for tgt, d in zip(qkv_spec.targets, dims):
                     out_base = base.replace(qkv_spec.pattern, tgt)
                     _emit_lora_module(
                         out, out_base,
-                        splits[name]["lora_A"], splits[name]["lora_B"],
-                        splits[name].get("alpha"),
+                        A.clone(), B[offset:offset + d].clone(), alpha,
                     )
+                    offset += d
                 n_lora_qkv += 1
             else:
                 _emit_lora_module(out, base, A, B, alpha)
@@ -421,14 +450,15 @@ def convert_state_dict(
             B = parts[u_key]
             alpha = parts.get(".alpha")
             if qkv_spec:
-                splits = split_fused_qkv_lora(A, B, alpha=alpha)
-                for name, tgt in zip(("q", "k", "v"), qkv_spec.targets):
+                dims = _resolve_split_dims(qkv_spec, B.shape[0], base, "LoRA")
+                offset = 0
+                for tgt, d in zip(qkv_spec.targets, dims):
                     out_base = base.replace(qkv_spec.pattern, tgt)
                     _emit_lora_module(
                         out, out_base,
-                        splits[name]["lora_A"], splits[name]["lora_B"],
-                        splits[name].get("alpha"),
+                        A.clone(), B[offset:offset + d].clone(), alpha,
                     )
+                    offset += d
                 n_lora_qkv += 1
             else:
                 _emit_lora_module(out, base, A, B, alpha)

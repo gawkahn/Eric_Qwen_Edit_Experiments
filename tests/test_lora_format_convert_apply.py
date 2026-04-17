@@ -156,16 +156,31 @@ def test_find_plan_klein_lora_with_klein_model_returns_klein_plan():
     assert plan.target_family == "diffusers_klein"
 
 
-def test_find_plan_klein_lora_with_non_klein_model_returns_none():
-    """A bfl_original LoRA + a model lacking `to_qkv_mlp_proj` → no plan."""
+def test_find_plan_bfl_lora_with_chroma_model_returns_chroma_plan():
+    """A bfl_original LoRA + a model with `proj_mlp` → Chroma plan (slice 5)."""
     lora_sd = {
         "diffusion_model.double_blocks.0.img_attn.qkv.lokr_w2": torch.zeros(1, 1),
     }
-    # Standard diffusers Flux.1 layout — no to_qkv_mlp_proj
+    # Chroma / Flux.1-derivative layout — has proj_mlp, no to_qkv_mlp_proj
     model_params = [
         "transformer_blocks.0.attn.to_q.weight",
         "single_transformer_blocks.0.proj_mlp.weight",
         "single_transformer_blocks.0.proj_out.weight",
+    ]
+    plan = find_matching_plan(lora_sd, model_params)
+    assert plan is not None
+    assert plan.target_family == "diffusers_chroma"
+
+
+def test_find_plan_bfl_lora_with_unsupported_model_returns_none():
+    """A bfl_original LoRA + a model matching no plan signature → None."""
+    lora_sd = {
+        "diffusion_model.double_blocks.0.img_attn.qkv.lokr_w2": torch.zeros(1, 1),
+    }
+    # Some hypothetical model with neither proj_mlp nor to_qkv_mlp_proj
+    model_params = [
+        "transformer_blocks.0.attn.to_q.weight",
+        "transformer_blocks.0.ff.net.0.proj.weight",
     ]
     plan = find_matching_plan(lora_sd, model_params)
     assert plan is None

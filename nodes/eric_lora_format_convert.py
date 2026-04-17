@@ -104,23 +104,34 @@ class RenameRule:
 
 @dataclass(frozen=True)
 class QKVSplitSpec:
-    """Identifies a fused-QKV module that must be split into 3 outputs.
+    """Identifies a fused module that must be split into N outputs.
 
     `pattern` is a substring matched against base module paths AFTER
     rename_rules have been applied.  When the substring matches, the
-    framework replaces it with each of `targets` in turn (one for Q,
-    K, V) to produce the three output module paths.
+    framework replaces it with each of `targets` in turn to produce
+    the N output module paths.
 
-    Examples (Klein-9B double_blocks have two distinct QKV groups):
+    `target_dims` is an optional tuple of integers specifying the
+    output-dimension size of each split.  When ``None``, the fused
+    dimension is divided equally among targets (all targets get the
+    same size).  When provided, ``len(target_dims)`` must equal
+    ``len(targets)`` and ``sum(target_dims)`` must equal the fused
+    dimension of the tensor being split.
+
+    Examples:
+        # Klein double-block 3-way equal QKV split:
         QKVSplitSpec(".attn.qkv",
                      targets=(".attn.to_q", ".attn.to_k", ".attn.to_v"))
-        QKVSplitSpec(".attn.qkv_txt",
-                     targets=(".attn.add_q_proj",
-                              ".attn.add_k_proj",
-                              ".attn.add_v_proj"))
+
+        # Chroma single-block 4-way UNEQUAL split (Q+K+V+MLP_gate):
+        QKVSplitSpec(".__LINEAR1__",
+                     targets=(".attn.to_q", ".attn.to_k",
+                              ".attn.to_v", ".proj_mlp"),
+                     target_dims=(3072, 3072, 3072, 12288))
     """
     pattern: str
-    targets: Tuple[str, str, str]
+    targets: Tuple[str, ...]
+    target_dims: Optional[Tuple[int, ...]] = None
 
 
 @dataclass
@@ -337,6 +348,96 @@ def split_fused_qkv_via_svd(
 
 
 # ════════════════════════════════════════════════════════════════════════
+#  Kohya underscore → BFL dot-format decoder
+# ════════════════════════════════════════════════════════════════════════
+
+# BFL-original module paths use underscores within component names
+# (double_blocks, img_attn, etc.) but dots between them.  Kohya
+# trainers encode such paths by replacing dots with underscores and
+# prepending `lora_unet_`.  To reverse this we protect known compound
+# names (whose internal underscores are NOT dots) before converting
+# the remaining underscores back to dots.
+#
+# Sorted longest-first so overlapping patterns don't shadow each other
+# (e.g. "query_norm" before "norm").
+_KOHYA_COMPOUNDS: Tuple[str, ...] = (
+    "single_transformer_blocks",
+    "transformer_blocks",
+    "double_blocks",
+    "single_blocks",
+    "query_norm",
+    "key_norm",
+    "img_attn",
+    "txt_attn",
+    "img_mlp",
+    "txt_mlp",
+    "q_norm",
+    "k_norm",
+)
+
+_SENTINEL = "\x00"
+
+
+def decode_kohya_to_bfl(
+    state_dict: Dict[str, "torch.Tensor"],
+) -> Dict[str, "torch.Tensor"]:
+    """Decode ``lora_unet_*`` Kohya keys to BFL dot-separated format.
+
+    Converts keys like::
+
+        lora_unet_double_blocks_0_img_attn_qkv.lora_down.weight
+
+    to::
+
+        diffusion_model.double_blocks.0.img_attn.qkv.lora_down.weight
+
+    Keys that don't start with ``lora_unet_`` pass through unchanged.
+    Returns a new dict (never mutates the input).
+
+    This is a LIGHTER decode than ``_decode_kohya_keys`` in the loader
+    module, which calls diffusers' full Flux Kohya converter and
+    produces diffusers-format output.  Here we only recover the BFL
+    dot-separated form so that ``detect_lora_format`` / ``find_matching_plan``
+    can recognise the LoRA's source family.
+    """
+    _PREFIX = "lora_unet_"
+    if not any(k.startswith(_PREFIX) for k in state_dict):
+        return state_dict
+
+    out: Dict[str, "torch.Tensor"] = {}
+    for key, val in state_dict.items():
+        if not key.startswith(_PREFIX):
+            out[key] = val
+            continue
+
+        remainder = key[len(_PREFIX):]
+
+        # Adapter suffix boundary: first dot after the encoded module path.
+        # Kohya preserves dots for adapter suffixes (.lora_down.weight, .alpha, etc.)
+        dot_idx = remainder.find(".")
+        if dot_idx < 0:
+            # No suffix — unusual but pass through with prefix stripped
+            out[f"diffusion_model.{remainder}"] = val
+            continue
+
+        encoded_path = remainder[:dot_idx]
+        suffix = remainder[dot_idx:]  # includes leading dot
+
+        # Protect compound names whose internal underscores are NOT dots
+        decoded = encoded_path
+        for compound in _KOHYA_COMPOUNDS:
+            decoded = decoded.replace(compound, compound.replace("_", _SENTINEL))
+
+        # Remaining underscores → dots
+        decoded = decoded.replace("_", ".")
+        decoded = decoded.replace(_SENTINEL, "_")
+
+        out[f"diffusion_model.{decoded}{suffix}"] = val
+
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════════
 #  Auto-register family plans
 # ════════════════════════════════════════════════════════════════════════
 #
@@ -344,5 +445,5 @@ def split_fused_qkv_via_svd(
 # side effect.  This MUST sit at the bottom of the module — the family
 # files import `register_plan` from here, so they need this module to
 # be fully defined before they execute.
-from . import eric_lora_format_convert_flux  # noqa: E402, F401  (registers Klein/Flux2)
-# Slice 5 will add: from . import eric_lora_format_convert_chroma
+from . import eric_lora_format_convert_flux    # noqa: E402, F401  (registers Klein/Flux2)
+from . import eric_lora_format_convert_chroma  # noqa: E402, F401  (registers Chroma)
