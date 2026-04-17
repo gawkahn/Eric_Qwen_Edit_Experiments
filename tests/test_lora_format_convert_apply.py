@@ -59,11 +59,16 @@ from nodes.eric_lora_format_convert_apply import (  # noqa: E402
 #  reconstruct_lokr_delta
 # ════════════════════════════════════════════════════════════════════════
 
-def test_lokr_reconstruct_kron_with_alpha_scaling():
-    # alpha=4, w1.shape=(4,4) → r=4, scale = 4/4 = 1.0
+def test_lokr_reconstruct_directly_stored_ignores_alpha():
+    """When w1 and w2 are stored DIRECTLY (no _a/_b decomposition), the
+    stored alpha must be ignored entirely (scale=1.0).  This matches
+    ComfyUI's LoKR loader convention and is critical for ai-toolkit
+    LoRAs whose stored alpha is a ~1e10 sentinel rather than a
+    meaningful scale factor (e.g. klein_snofs)."""
     w1 = torch.ones(4, 4)
     w2 = torch.eye(8)
-    alpha = torch.tensor(4.0)
+    # Even with a wildly bogus alpha, directly-stored w1+w2 → scale=1.0
+    alpha = torch.tensor(9.999e9)
     delta = reconstruct_lokr_delta(w1, w2, alpha)
     expected = torch.kron(w1.float(), w2.float())  # scale = 1.0
     assert torch.allclose(delta, expected)
@@ -77,13 +82,31 @@ def test_lokr_reconstruct_no_alpha_defaults_to_unscaled():
     assert torch.allclose(delta, expected)
 
 
-def test_lokr_reconstruct_alpha_lt_rank_scales_down():
-    # r = min(4,4) = 4;  alpha=2 → scale = 2/4 = 0.5
+def test_lokr_reconstruct_decomposed_w1_applies_alpha():
+    """When w1 is decomposed (lokr_w1_a/lokr_w1_b present in source),
+    alpha IS applied as alpha/w1_b_dim — matches ComfyUI's path that
+    sets dim = w1_b.shape[0]."""
     w1 = torch.ones(4, 4)
     w2 = torch.eye(2)
     alpha = torch.tensor(2.0)
-    delta = reconstruct_lokr_delta(w1, w2, alpha)
+    delta = reconstruct_lokr_delta(
+        w1, w2, alpha,
+        w1_is_decomposed=True, w1_b_dim=4,  # alpha/dim = 2/4 = 0.5
+    )
     expected = torch.kron(w1.float(), w2.float()) * 0.5
+    assert torch.allclose(delta, expected)
+
+
+def test_lokr_reconstruct_decomposed_w2_applies_alpha():
+    """Same as above but the decomposition is on w2."""
+    w1 = torch.ones(4, 4)
+    w2 = torch.eye(2)
+    alpha = torch.tensor(8.0)
+    delta = reconstruct_lokr_delta(
+        w1, w2, alpha,
+        w2_is_decomposed=True, w2_b_dim=4,  # alpha/dim = 8/4 = 2.0
+    )
+    expected = torch.kron(w1.float(), w2.float()) * 2.0
     assert torch.allclose(delta, expected)
 
 
@@ -206,18 +229,20 @@ def test_convert_klein_lokr_qkv_emits_three_diff_outputs():
 
 
 def test_convert_klein_lokr_qkv_diff_reconstructs_original():
-    """The 3 emitted .diff slices should concatenate to the original delta."""
+    """The 3 emitted .diff slices should concatenate to the original delta.
+
+    Klein LoKRs always have w1 and w2 stored directly (no _a/_b
+    decomposition) — so the stored alpha is intentionally IGNORED at
+    reconstruction time and the expected delta is just kron(w1, w2)."""
     plan = get_plan("bfl_klein", "diffusers_klein")
     sd = _make_synthetic_klein_lokr_module(
         "diffusion_model.double_blocks.0.img_attn.qkv",
         w1_dim=4, out_w2=3072, in_w2=1024,
     )
-    # Original delta = kron(w1, w2) * (alpha/r)
+    # Direct-stored LoKR → alpha ignored → scale=1.0
     w1 = sd["diffusion_model.double_blocks.0.img_attn.qkv.lokr_w1"]
     w2 = sd["diffusion_model.double_blocks.0.img_attn.qkv.lokr_w2"]
-    alpha = sd["diffusion_model.double_blocks.0.img_attn.qkv.alpha"]
-    r = min(w1.shape)
-    expected_delta = torch.kron(w1.float(), w2.float()) * (alpha.item() / r)
+    expected_delta = torch.kron(w1.float(), w2.float())
 
     out = convert_state_dict(sd, plan, target_rank=8)
     reconstructed = torch.cat([
@@ -227,6 +252,27 @@ def test_convert_klein_lokr_qkv_diff_reconstructs_original():
     ], dim=0)
     assert torch.allclose(reconstructed, expected_delta), \
         f"max err {(reconstructed - expected_delta).abs().max()}"
+
+
+def test_convert_klein_lokr_with_bogus_alpha_still_produces_sane_delta():
+    """The pathological ai-toolkit case: stored alpha = ~1e10 must be
+    silently ignored so the resulting delta has reasonable magnitude.
+    Exact reproduction of klein_snofs / Realism_Engine / breast_slider."""
+    plan = get_plan("bfl_klein", "diffusers_klein")
+    # Make a synthetic LoKR with sane w1 / w2 magnitudes but bogus alpha
+    sd = _make_synthetic_klein_lokr_module(
+        "diffusion_model.double_blocks.0.img_attn.proj",
+        w1_dim=4, out_w2=1024, in_w2=1024,
+        alpha=9.999e9,  # ai-toolkit's bogus sentinel
+    )
+    out = convert_state_dict(sd, plan, target_rank=8)
+    delta = out["transformer_blocks.0.attn.to_out.0.diff"]
+    # Without the bogus alpha applied, max magnitude should be O(1) for
+    # randn-initialized factors; with it applied, would be O(1e9).
+    assert delta.abs().max().item() < 100.0, (
+        f"delta max {delta.abs().max().item()} suggests bogus alpha was "
+        f"applied — should have been ignored for direct-stored LoKR"
+    )
 
 
 def test_convert_klein_lokr_qkv_txt_emits_add_proj_diff_outputs():

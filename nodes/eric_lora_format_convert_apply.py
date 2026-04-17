@@ -119,19 +119,50 @@ def reconstruct_lokr_delta(
     w1: "torch.Tensor",
     w2: "torch.Tensor",
     alpha: Optional["torch.Tensor"] = None,
+    *,
+    w1_is_decomposed: bool = False,
+    w2_is_decomposed: bool = False,
+    w1_b_dim: Optional[int] = None,
+    w2_b_dim: Optional[int] = None,
 ) -> "torch.Tensor":
     """Reconstruct the merged delta for a LoKR module.
 
-    delta = kron(w1, w2) * (alpha / r), where r = min(w1.shape).
-    When alpha is absent, scale defaults to 1.0 (LyCORIS convention —
-    weights are assumed pre-scaled).
+    Scaling convention matches ComfyUI's
+    `comfy/weight_adapter/lokr.py::LoKrAdapter.calculate_weight`:
+
+      - When EITHER w1 OR w2 is provided in DECOMPOSED form
+        (lokr_w1_a/lokr_w1_b or lokr_w2_a/lokr_w2_b), the stored alpha
+        IS applied as `scale = alpha / dim` where dim is the inner rank
+        of the corresponding decomposition (w1_b.shape[0] or
+        w2_b.shape[0]).
+      - When BOTH w1 and w2 are stored directly, the stored alpha is
+        IGNORED entirely and `scale = 1.0`.  This matches ComfyUI's
+        behaviour and is critical for LoRAs trained by ai-toolkit
+        whose stored alpha is a ~1e10 sentinel value rather than a
+        meaningful scale (e.g. klein_snofs, Realism_Engine_Klein_V2).
+
+    Why this matters: applying `scale = alpha / min(w1.shape) = 2.5e9`
+    on top of base weights of magnitude ~1 produces a delta that
+    overwhelms the model and yields pure noise.  ComfyUI silently
+    avoids this by never reading the stored alpha for direct LoKRs.
+
+    Caller is responsible for passing the decomposition flags when the
+    source state dict had `_a`/`_b` factor keys present.  For Klein/
+    Flux2 LoRAs in this codebase, w1 and w2 are always directly stored
+    (no `_a`/`_b`), so the default flags produce the right behaviour.
 
     Returns a float32 tensor.  Caller is responsible for casting back
     to the LoRA's working dtype.
     """
-    r = min(w1.shape) if w1.ndim >= 2 else 1
-    if alpha is not None:
-        scale = (alpha.item() / r) if r > 0 else 1.0
+    if w1_is_decomposed and w1_b_dim is not None:
+        dim = w1_b_dim
+    elif w2_is_decomposed and w2_b_dim is not None:
+        dim = w2_b_dim
+    else:
+        dim = None
+
+    if alpha is not None and dim is not None and dim > 0:
+        scale = alpha.item() / dim
     else:
         scale = 1.0
     return torch.kron(w1.float(), w2.float()) * scale
