@@ -282,19 +282,40 @@ def convert_state_dict(
 ) -> Dict[str, "torch.Tensor"]:
     """Apply a ConversionPlan to a state dict.
 
-    Returns a state dict containing ONLY canonical standard-LoRA keys
-    (.lora_A.weight / .lora_B.weight) at the plan's rename-target
-    paths.  Alpha is baked into the factors via sqrt(alpha/rank)
-    distribution — no separate .alpha keys are emitted (diffusers'
-    fast-path loader rejects state dicts with non-"lora" keys).
+    Output format depends on the SOURCE adapter type per module:
 
-    target_rank governs the SVD-truncation rank for LoKR/LoHa modules.
-    Higher rank = better fidelity but larger output.  Default 64 was
-    chosen after rank-16 produced visible noise on Klein-9B LoKRs whose
-    underlying delta has effective rank > 64.  For LoRAs whose trained
-    rank is small, higher target_rank is harmless (extra singular
-    components are zero-magnitude and contribute nothing).  Standard
-    LoRAs are not SVD-touched — they keep their original rank.
+      Standard LoRA (lora_A / lora_B input)
+        → emits canonical standard-LoRA keys at the rename-target paths:
+          `<base>.lora_A.weight` and `<base>.lora_B.weight`.
+          Alpha is baked into the factors via sqrt(alpha/rank) distribution
+          — no separate .alpha keys are emitted (diffusers' fast-path
+          loader rejects state dicts with non-"lora" keys).
+          QKV-split is exact (no information loss).
+
+      LoKR (lokr_w1 / lokr_w2 input)
+        → emits a single `<base>.diff` per module containing the
+          fully-reconstructed delta `kron(w1, w2) * (alpha/r)`.
+          QKV-split slices the delta into 3 (out, in) blocks per
+          module, each emitted as a `.diff` at the corresponding
+          target path.  Lossless — no SVD truncation.  Trade-off: the
+          downstream loader applies these via direct weight merge
+          (no PEFT-managed runtime weight scaling), matching the
+          existing _load_lokr_adapter_direct semantics.
+
+    Why .diff instead of SVD-truncated lora_A/lora_B for LoKRs:
+    Klein-9B LoKRs commonly have w1=(4,4) and large w2 (e.g.
+    (9216, 1024) for single_blocks.linear1).  The merged delta has
+    theoretical rank up to 4 * min(out_w2, in_w2) — typically thousands.
+    SVD-truncating to rank 64 keeps ~1.5% of singular components and
+    produces visibly noisy outputs on real LoRAs (e.g. klein_snofs).
+    Direct .diff merge keeps the full content with no rank tradeoff;
+    memory footprint is `out * in` per module instead of
+    `(out + in) * rank` but stays well within VRAM for diffusion-model
+    LoRAs.  Standard LoRAs continue to use the lora_A/lora_B path —
+    they're already low-rank by construction.
+
+    target_rank parameter is reserved for future SVD-based paths
+    (e.g. LoHa support) and currently unused by LoKR conversion.
     """
     # Phase 1: rename keys (preserves all suffixes)
     renamed = apply_rename_rules(source_state_dict, plan)
@@ -312,23 +333,28 @@ def convert_state_dict(
         )
 
         # ── LoKR module ──────────────────────────────────────────────
+        # Emit .diff (full merged delta) — see convert_state_dict
+        # docstring for the "why direct merge instead of SVD" rationale.
         if ".lokr_w1" in parts and ".lokr_w2" in parts:
             delta = reconstruct_lokr_delta(
                 parts[".lokr_w1"], parts[".lokr_w2"], parts.get(".alpha"),
             )
             if qkv_spec:
-                splits = split_fused_qkv_via_svd(delta, target_rank)
-                for name, tgt in zip(("q", "k", "v"), qkv_spec.targets):
-                    out_base = base.replace(qkv_spec.pattern, tgt)
-                    _emit_lora_module(
-                        out, out_base,
-                        splits[name]["lora_A"], splits[name]["lora_B"],
-                        splits[name]["alpha"],
+                out_total = delta.shape[0]
+                if out_total % 3 != 0:
+                    raise ValueError(
+                        f"LoKR QKV delta at {base} has out_dim={out_total}, "
+                        f"not divisible by 3"
                     )
+                slice_dim = out_total // 3
+                for i, tgt in enumerate(qkv_spec.targets):
+                    out_base = base.replace(qkv_spec.pattern, tgt)
+                    lo = i * slice_dim
+                    hi = (i + 1) * slice_dim
+                    out[out_base + ".diff"] = delta[lo:hi].contiguous()
                 n_lokr_qkv += 1
             else:
-                A, B, alpha = svd_compress_to_lora(delta, target_rank)
-                _emit_lora_module(out, base, A, B, alpha)
+                out[base + ".diff"] = delta.contiguous()
                 n_lokr_single += 1
             continue
 
@@ -411,17 +437,21 @@ def _apply_converted_lora_as_delta(
 ) -> bool:
     """Direct weight merge — bypass PEFT entirely.
 
-    For each module path in `state_dict` with both lora_A and lora_B,
-    compute `delta = (lora_B @ lora_A) * weight` and add it to the
-    corresponding model parameter at `<path>.weight`.  Alpha is already
-    baked into the factors by convert_state_dict, so the runtime scale
-    factor is simply `weight`.
+    Handles both convert_state_dict output formats:
+      `.diff`                     → delta = state_dict[".diff"] * weight
+      `.lora_A.weight` + `.lora_B.weight` → delta = (B @ A) * weight
+
+    For each module, computes delta and adds it to the corresponding
+    model parameter at `<path>.weight`.  Alpha is already baked into
+    standard-LoRA factors and into LoKR .diff at convert time, so the
+    runtime scale factor is simply `weight`.
 
     Used as the reliable fallback when pipe.load_lora_weights and PEFT
-    injection both fail to actually register the adapter.  Trades off
-    per-stage runtime weight changes (you'd have to reload to change
-    weight) for guaranteed correctness — same compromise the existing
-    _load_lokr_adapter_direct path makes.
+    injection don't actually register the adapter, AND as the primary
+    path for any state dict containing .diff entries (since diffusers'
+    LoRA loader doesn't understand .diff).  Trades off per-stage
+    runtime weight changes for guaranteed correctness — same compromise
+    the existing _load_lokr_adapter_direct path makes.
     """
     model_sd = dict(transformer.named_parameters())
     modules: Dict[str, Dict[str, "torch.Tensor"]] = {}
@@ -435,24 +465,33 @@ def _apply_converted_lora_as_delta(
         backup = {}
         setattr(transformer, backup_attr, backup)
 
-    applied = skipped = 0
+    applied_diff = applied_lora = skipped = 0
     for base, parts in modules.items():
-        # Explicit None-test — `tensor or other` triggers tensor's
-        # ambiguous-boolean error on multi-element tensors.
-        A = parts[".lora_A.weight"] if ".lora_A.weight" in parts else parts.get(".lora_A")
-        B = parts[".lora_B.weight"] if ".lora_B.weight" in parts else parts.get(".lora_B")
-        if A is None or B is None:
-            skipped += 1
-            continue
         target_key = base + ".weight"
         if target_key not in model_sd:
             target_key = base  # rare: parameter without .weight suffix
         if target_key not in model_sd:
             skipped += 1
             continue
-
         param = model_sd[target_key]
-        delta = (B.float() @ A.float()) * float(weight)
+
+        # Compute delta — prefer .diff (LoKR direct path) over B@A
+        if ".diff" in parts:
+            delta = parts[".diff"].float() * float(weight)
+            applied_kind = "diff"
+        else:
+            # Standard-LoRA path: explicit None-test (avoid `tensor or other`
+            # which raises ambiguous-boolean for multi-element tensors).
+            A = parts[".lora_A.weight"] if ".lora_A.weight" in parts \
+                else parts.get(".lora_A")
+            B = parts[".lora_B.weight"] if ".lora_B.weight" in parts \
+                else parts.get(".lora_B")
+            if A is None or B is None:
+                skipped += 1
+                continue
+            delta = (B.float() @ A.float()) * float(weight)
+            applied_kind = "lora"
+
         if delta.shape != param.shape:
             try:
                 delta = delta.reshape(param.shape)
@@ -465,7 +504,10 @@ def _apply_converted_lora_as_delta(
             backup[target_key] = param.data.clone()
 
         param.data.add_(delta.to(dtype=param.dtype, device=param.device))
-        applied += 1
+        if applied_kind == "diff":
+            applied_diff += 1
+        else:
+            applied_lora += 1
 
     # Mark the adapter so set_adapters() can find it (matches how
     # _load_lokr_adapter_direct registers its direct-merge adapters).
@@ -473,17 +515,18 @@ def _apply_converted_lora_as_delta(
         transformer.peft_config = {}
     transformer.peft_config[adapter_name] = {
         "_type": "converted_lora_direct",
-        "_applied_modules": applied,
+        "_applied_modules": applied_diff + applied_lora,
         "_weight": weight,
     }
     if not getattr(transformer, "_hf_peft_config_loaded", False):
         transformer._hf_peft_config_loaded = True
 
     print(
-        f"{log_prefix} direct delta merge: applied={applied}, "
-        f"skipped={skipped} (weight={weight})"
+        f"{log_prefix} direct delta merge: "
+        f"diff={applied_diff}, lora={applied_lora}, skipped={skipped} "
+        f"(weight={weight})"
     )
-    return applied > 0
+    return (applied_diff + applied_lora) > 0
 
 
 def load_converted_lora(
@@ -515,6 +558,21 @@ def load_converted_lora(
     if transformer is None:
         print(f"{log_prefix} pipe has no .transformer attribute")
         return False
+
+    # If the converted state dict contains any .diff entries (LoKR
+    # direct path), skip the pipeline-load attempt — diffusers' LoRA
+    # loader doesn't recognize .diff and would either error or silently
+    # drop them.  Direct merge handles both .diff and .lora_A/.lora_B
+    # in one pass.
+    if any(k.endswith(".diff") for k in converted_state_dict):
+        print(
+            f"{log_prefix} converted state dict contains .diff entries "
+            f"(LoKR) — using direct delta merge"
+        )
+        return _apply_converted_lora_as_delta(
+            transformer, converted_state_dict,
+            adapter_name, weight, log_prefix,
+        )
 
     # ── Attempt 1: pipeline path with `transformer.` prefix ───────────
     prefixed = {f"transformer.{k}": v for k, v in converted_state_dict.items()}

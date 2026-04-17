@@ -171,15 +171,16 @@ def _make_synthetic_klein_lokr_module(base_path: str, w1_dim: int = 4,
     }
 
 
-def test_convert_klein_lokr_qkv_emits_three_lora_outputs():
-    """A single fused-QKV LoKR module should produce 3 split outputs after convert.
+def test_convert_klein_lokr_qkv_emits_three_diff_outputs():
+    """A single fused-QKV LoKR module should produce 3 split .diff outputs.
 
-    Note: convert_state_dict deliberately emits NO .alpha keys (alpha is
-    baked into the factors) because diffusers' fast-path loader rejects
-    state dicts whose keys don't all contain 'lora'.
+    LoKRs go through the lossless .diff path (full merged delta direct
+    merge) instead of SVD-truncated lora_A/lora_B.  See convert_state_dict
+    docstring for the rationale (rank-64 SVD throws away ~98% of singular
+    components on Klein's biggest matrices).
     """
     plan = get_plan("bfl_klein", "diffusers_klein")
-    # Klein img_attn.qkv: w2 shape (3*4096/4, 4096/4) = (3072, 1024) given w1=(4,4)
+    # Klein img_attn.qkv: w2 shape (3*4096/4, 4096/4) = (3072, 1024), w1=(4,4)
     sd = _make_synthetic_klein_lokr_module(
         "diffusion_model.double_blocks.0.img_attn.qkv",
         w1_dim=4, out_w2=3072, in_w2=1024,
@@ -192,16 +193,43 @@ def test_convert_klein_lokr_qkv_emits_three_lora_outputs():
         "transformer_blocks.0.attn.to_v",
     )
     for base in expected_bases:
-        assert f"{base}.lora_A.weight" in out, f"missing {base}.lora_A.weight"
-        assert f"{base}.lora_B.weight" in out, f"missing {base}.lora_B.weight"
-        assert f"{base}.alpha"   not in out, f"unexpected {base}.alpha"
+        assert f"{base}.diff" in out, f"missing {base}.diff"
+        # Diff shape: each Q/K/V slice is (out_w2 * w1 / 3, in_w2 * w1)
+        # = (3072*4/3, 1024*4) = (4096, 4096)
+        assert out[f"{base}.diff"].shape == (4096, 4096)
     # No placeholder leakage
     assert not any("__QKV_IMG__" in k for k in out)
-    # And no .alpha keys anywhere
+    # No lora_A/lora_B/alpha for LoKR modules — only .diff
+    assert not any(k.endswith(".lora_A.weight") for k in out)
+    assert not any(k.endswith(".lora_B.weight") for k in out)
     assert not any(k.endswith(".alpha") for k in out)
 
 
-def test_convert_klein_lokr_qkv_txt_emits_add_proj_outputs():
+def test_convert_klein_lokr_qkv_diff_reconstructs_original():
+    """The 3 emitted .diff slices should concatenate to the original delta."""
+    plan = get_plan("bfl_klein", "diffusers_klein")
+    sd = _make_synthetic_klein_lokr_module(
+        "diffusion_model.double_blocks.0.img_attn.qkv",
+        w1_dim=4, out_w2=3072, in_w2=1024,
+    )
+    # Original delta = kron(w1, w2) * (alpha/r)
+    w1 = sd["diffusion_model.double_blocks.0.img_attn.qkv.lokr_w1"]
+    w2 = sd["diffusion_model.double_blocks.0.img_attn.qkv.lokr_w2"]
+    alpha = sd["diffusion_model.double_blocks.0.img_attn.qkv.alpha"]
+    r = min(w1.shape)
+    expected_delta = torch.kron(w1.float(), w2.float()) * (alpha.item() / r)
+
+    out = convert_state_dict(sd, plan, target_rank=8)
+    reconstructed = torch.cat([
+        out["transformer_blocks.0.attn.to_q.diff"],
+        out["transformer_blocks.0.attn.to_k.diff"],
+        out["transformer_blocks.0.attn.to_v.diff"],
+    ], dim=0)
+    assert torch.allclose(reconstructed, expected_delta), \
+        f"max err {(reconstructed - expected_delta).abs().max()}"
+
+
+def test_convert_klein_lokr_qkv_txt_emits_add_proj_diff_outputs():
     plan = get_plan("bfl_klein", "diffusers_klein")
     sd = _make_synthetic_klein_lokr_module(
         "diffusion_model.double_blocks.2.txt_attn.qkv",
@@ -211,13 +239,12 @@ def test_convert_klein_lokr_qkv_txt_emits_add_proj_outputs():
 
     for tgt in ("add_q_proj", "add_k_proj", "add_v_proj"):
         base = f"transformer_blocks.2.attn.{tgt}"
-        assert f"{base}.lora_A.weight" in out
-        assert f"{base}.lora_B.weight" in out
+        assert f"{base}.diff" in out, f"missing {base}.diff"
     assert not any("__QKV_TXT__" in k for k in out)
 
 
-def test_convert_klein_lokr_non_qkv_passes_through_via_svd():
-    """A non-QKV LoKR module (e.g. img_attn.proj) emits a single SVD-compressed LoRA."""
+def test_convert_klein_lokr_non_qkv_emits_single_diff():
+    """A non-QKV LoKR module (e.g. img_attn.proj) emits one .diff (no split)."""
     plan = get_plan("bfl_klein", "diffusers_klein")
     sd = _make_synthetic_klein_lokr_module(
         "diffusion_model.double_blocks.0.img_attn.proj",
@@ -226,15 +253,15 @@ def test_convert_klein_lokr_non_qkv_passes_through_via_svd():
     out = convert_state_dict(sd, plan, target_rank=8)
 
     base = "transformer_blocks.0.attn.to_out.0"
-    assert f"{base}.lora_A.weight" in out
-    assert f"{base}.lora_B.weight" in out
-    assert f"{base}.alpha"   not in out
-    # Single output, two keys (.lora_A.weight + .lora_B.weight)
-    assert sum(1 for k in out if k.startswith(base + ".lora")) == 2
+    assert f"{base}.diff" in out
+    # Single key for the module
+    assert sum(1 for k in out if k.startswith(base + ".")) == 1
+    # Diff shape = (out_w2 * w1_dim, in_w2 * w1_dim) = (4096, 4096)
+    assert out[f"{base}.diff"].shape == (4096, 4096)
 
 
-def test_convert_klein_single_block_lokr_renames_and_compresses():
-    """single_blocks.X.linear1 → single_transformer_blocks.X.attn.to_qkv_mlp_proj."""
+def test_convert_klein_single_block_lokr_renames_to_diff():
+    """single_blocks.X.linear1 → single_transformer_blocks.X.attn.to_qkv_mlp_proj.diff."""
     plan = get_plan("bfl_klein", "diffusers_klein")
     sd = _make_synthetic_klein_lokr_module(
         "diffusion_model.single_blocks.5.linear1",
@@ -242,8 +269,8 @@ def test_convert_klein_single_block_lokr_renames_and_compresses():
     )
     out = convert_state_dict(sd, plan, target_rank=8)
     base = "single_transformer_blocks.5.attn.to_qkv_mlp_proj"
-    assert f"{base}.lora_A.weight" in out
-    assert f"{base}.lora_B.weight" in out
+    assert f"{base}.diff" in out
+    assert out[f"{base}.diff"].shape == (36864, 4096)  # = (9216*4, 1024*4)
 
 
 def test_convert_standard_lora_qkv_split_is_exact():
@@ -309,17 +336,16 @@ def test_convert_standard_lora_pass_through_bakes_alpha():
         f"max err: {(actual - expected).abs().max()}"
 
 
-def test_convert_full_klein_lora_module_count():
-    """Converting a synthetic full Klein LoRA produces the expected key count.
+def test_convert_full_klein_lokr_module_count():
+    """Converting a synthetic full Klein LoKR LoRA produces 144 .diff outputs.
 
     Math:
-      - 8 double_blocks × 6 non-QKV modules (proj×2, mlp.0×2, mlp.2×2) = 48 modules → 48 single LoRA outputs
-      - 8 double_blocks × 2 QKV modules (img, txt)                     = 16 modules → 16 × 3 = 48 outputs
-      - 24 single_blocks × 2 modules (linear1, linear2)                = 48 modules → 48 single outputs
-      Total module-level outputs: 48 + 48 + 48 = 144
-      Each output emits 2 keys (.lora_A.weight + .lora_B.weight; alpha
-      is baked into factors, no .alpha key)
-      → Total state-dict keys = 144 × 2 = 288
+      - 8 double_blocks × 6 non-QKV modules → 48 single .diff outputs
+      - 8 double_blocks × 2 QKV modules     → 16 modules × 3 split → 48 .diff
+      - 24 single_blocks × 2 modules        → 48 single .diff outputs
+      Total LoKR module outputs: 48 + 48 + 48 = 144
+      Each LoKR module emits exactly 1 .diff key (full merged delta)
+      → Total state-dict keys = 144
     """
     plan = get_plan("bfl_klein", "diffusers_klein")
 
@@ -354,18 +380,15 @@ def test_convert_full_klein_lora_module_count():
 
     out = convert_state_dict(sd, plan, target_rank=4)
 
-    # Module-level output counts
-    output_modules = set()
-    for k in out:
-        for sfx in (".lora_A.weight", ".lora_B.weight"):
-            if k.endswith(sfx):
-                output_modules.add(k[: -len(sfx)])
-                break
-    assert len(output_modules) == 144, (
-        f"expected 144 unique output modules, got {len(output_modules)}"
+    # Module-level output counts: every key is .diff (one per module)
+    diff_keys = [k for k in out if k.endswith(".diff")]
+    assert len(diff_keys) == 144, (
+        f"expected 144 .diff keys, got {len(diff_keys)}"
     )
-    # 2 keys per module (no .alpha — baked into factors)
-    assert len(out) == 144 * 2, f"expected 288 keys, got {len(out)}"
+    assert len(out) == 144, f"expected 144 total keys, got {len(out)}"
+    # No standard-LoRA / alpha keys for an all-LoKR source
+    assert not any(k.endswith(".lora_A.weight") for k in out)
+    assert not any(k.endswith(".lora_B.weight") for k in out)
     assert not any(k.endswith(".alpha") for k in out)
 
 
@@ -441,6 +464,61 @@ def test_direct_delta_merge_registers_in_peft_config():
     assert "registered" in transformer.peft_config
     assert transformer.peft_config["registered"]["_type"] == "converted_lora_direct"
     assert transformer.peft_config["registered"]["_applied_modules"] == 1
+
+
+def test_direct_delta_merge_handles_diff_keys():
+    """`.diff` entries (LoKR direct path) bypass B@A and apply the raw delta."""
+    transformer = _FakeTransformer()
+    target_key = "transformer_blocks.0.attn.to_q.weight"
+    raw_delta = torch.randn(8, 8)
+    state_dict = {
+        "transformer_blocks.0.attn.to_q.diff": raw_delta,
+    }
+    success = _apply_converted_lora_as_delta(
+        transformer, state_dict, "diff_test",
+        weight=2.0, log_prefix="[test]",
+    )
+    assert success
+    actual = dict(transformer.named_parameters())[target_key]
+    expected = raw_delta * 2.0  # base was zeros
+    assert torch.allclose(actual, expected, atol=1e-5)
+
+
+def test_direct_delta_merge_handles_mixed_diff_and_lora():
+    """Same state dict can mix .diff (LoKR) and .lora_A/.lora_B (standard) keys."""
+    # Two-target fake transformer for the mixed test
+    transformer = torch.nn.Module()
+    transformer.transformer_blocks = torch.nn.Module()
+    transformer.transformer_blocks._modules["0"] = torch.nn.Module()
+    block = transformer.transformer_blocks._modules["0"]
+    block.attn = torch.nn.Module()
+    block.attn.to_q = torch.nn.Linear(8, 8, bias=False)
+    block.attn.to_k = torch.nn.Linear(8, 8, bias=False)
+    block.attn.to_q.weight.data.zero_()
+    block.attn.to_k.weight.data.zero_()
+
+    diff_q = torch.randn(8, 8)
+    A_k = torch.randn(2, 8)
+    B_k = torch.randn(8, 2)
+    state_dict = {
+        # LoKR-style .diff for to_q
+        "transformer_blocks.0.attn.to_q.diff":          diff_q,
+        # Standard-LoRA for to_k
+        "transformer_blocks.0.attn.to_k.lora_A.weight": A_k,
+        "transformer_blocks.0.attn.to_k.lora_B.weight": B_k,
+    }
+    success = _apply_converted_lora_as_delta(
+        transformer, state_dict, "mixed",
+        weight=1.0, log_prefix="[test]",
+    )
+    assert success
+    params = dict(transformer.named_parameters())
+    assert torch.allclose(
+        params["transformer_blocks.0.attn.to_q.weight"], diff_q, atol=1e-5,
+    )
+    assert torch.allclose(
+        params["transformer_blocks.0.attn.to_k.weight"], B_k @ A_k, atol=1e-5,
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════
