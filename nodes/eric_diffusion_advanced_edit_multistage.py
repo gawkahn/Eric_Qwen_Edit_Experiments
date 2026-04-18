@@ -155,13 +155,12 @@ class EricDiffusionAdvancedEditMultistage:
                         ),
                     },
                 ),
-                "eta": ("FLOAT", {
+                "s1_eta": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": (
-                        "Stochastic sampling coefficient (applied to all "
-                        "stages).  0.0 = deterministic.  For edit tasks "
-                        "usually leave at 0.0 — reference-anchored outputs "
-                        "get jittery with eta > 0."
+                        "Stage 1 stochastic sampling coefficient.\n"
+                        "0.0 = deterministic.  For edit tasks usually 0.0.\n"
+                        "Higher values add diversity but reduce reference fidelity."
                     ),
                 }),
                 "max_sequence_length": ("INT", {
@@ -242,6 +241,13 @@ class EricDiffusionAdvancedEditMultistage:
                 "s2_sigma_schedule": (SIGMA_SCHEDULE_NAMES, {
                     "default": "balanced",
                 }),
+                "s2_eta": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": (
+                        "Stage 2 stochastic sampling coefficient.\n"
+                        "0.0 = deterministic (recommended for refinement)."
+                    ),
+                }),
 
                 # ── Stage 3 ───────────────────────────────────────────
                 "upscale_to_stage3": ("FLOAT", {
@@ -269,6 +275,13 @@ class EricDiffusionAdvancedEditMultistage:
                 "s3_sampler": (sampler_names(), {"default": "flow_multistep2"}),
                 "s3_sigma_schedule": (SIGMA_SCHEDULE_NAMES, {
                     "default": "karras",
+                }),
+                "s3_eta": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": (
+                        "Stage 3 stochastic sampling coefficient.\n"
+                        "0.0 = deterministic (recommended for final polish)."
+                    ),
                 }),
 
                 # ── Upscale VAE bridge ────────────────────────────────
@@ -312,7 +325,7 @@ class EricDiffusionAdvancedEditMultistage:
         image_4=None, image_4_vl: bool = True, image_4_ref: bool = True,
         seed: int = 0,
         seed_mode: str = "offset_per_stage",
-        eta: float = 0.0,
+        s1_eta: float = 0.0,
         max_sequence_length: int = 1024,
         s1_mp: float = 0.5,
         override_s1_width: int = 0,
@@ -327,12 +340,14 @@ class EricDiffusionAdvancedEditMultistage:
         s2_denoise: float = 0.85,
         s2_sampler: str = "flow_heun",
         s2_sigma_schedule: str = "balanced",
+        s2_eta: float = 0.0,
         upscale_to_stage3: float = 2.0,
         s3_steps: int = 15,
         s3_cfg: float = 4.0,
         s3_denoise: float = 0.5,
         s3_sampler: str = "flow_multistep2",
         s3_sigma_schedule: str = "karras",
+        s3_eta: float = 0.0,
         use_upscale_vae: bool = False,
         upscale_vae=None,
     ) -> Tuple[torch.Tensor]:
@@ -592,7 +607,7 @@ class EricDiffusionAdvancedEditMultistage:
         # generate_qwen_edit call re-encodes refs internally (fast
         # baseline — Phase 2 slice 4 adds the encode-once optimization
         # and the per-stage re-encode switch).
-        def _stage_common(width, height, steps, cfg, sampler, schedule, gen_obj, progress_cb):
+        def _stage_common(width, height, steps, cfg, sampler, schedule, gen_obj, progress_cb, eta):
             return dict(
                 pipe=pipe,
                 prompt=prompt,
@@ -623,7 +638,7 @@ class EricDiffusionAdvancedEditMultistage:
             s1_kwargs = _stage_common(
                 s1_w, s1_h, s1_steps, s1_cfg,
                 s1_sampler, s1_sigma_schedule,
-                s1_gen, _stage_progress_cb,
+                s1_gen, _stage_progress_cb, s1_eta,
             )
             s1_latents, s1_out_h, s1_out_w = generate_qwen_edit(**s1_kwargs)
             steps_completed[0] += s1_steps
@@ -676,7 +691,7 @@ class EricDiffusionAdvancedEditMultistage:
             s2_kwargs = _stage_common(
                 s2_w, s2_h, s2_steps, s2_cfg,
                 s2_sampler, s2_sigma_schedule,
-                s2_gen, _stage_progress_cb,
+                s2_gen, _stage_progress_cb, s2_eta,
             )
             s2_kwargs["initial_latents"] = s2_input_latents
             s2_kwargs["denoise"] = s2_denoise
@@ -755,7 +770,7 @@ class EricDiffusionAdvancedEditMultistage:
             s3_kwargs = _stage_common(
                 s3_eff_w, s3_eff_h, s3_steps, s3_cfg,
                 s3_sampler, s3_sigma_schedule,
-                s3_gen, _stage_progress_cb,
+                s3_gen, _stage_progress_cb, s3_eta,
             )
             s3_kwargs["initial_latents"] = s3_input_latents
             s3_kwargs["denoise"] = s3_denoise

@@ -161,18 +161,12 @@ class EricDiffusionAdvancedMultiStage:
                         "random = independent random seed per stage."
                     ),
                 }),
-                "eta": ("FLOAT", {
-                    "default": 0.0,
-                    "min": 0.0,
-                    "max": 1.0,
-                    "step": 0.05,
+                "s1_eta": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": (
-                        "Stochastic sampling coefficient (applies to ALL stages).\n"
-                        "• 0.0 — fully deterministic (default)\n"
-                        "• 0.3-0.5 — moderate stochasticity, improves detail\n"
-                        "• 0.7+ — heavy noise injection (can be erratic)\n"
-                        "Fresh gaussian noise is injected at every step scaled by eta.\n"
-                        "RES4LYF workflows commonly use 0.5 for Chroma refinement."
+                        "Stage 1 stochastic sampling coefficient.\n"
+                        "0.0 = deterministic.  0.3-0.85 adds diversity.\n"
+                        "S1 generates from noise so higher eta is safe."
                     ),
                 }),
                 "max_sequence_length": ("INT", {
@@ -277,6 +271,15 @@ class EricDiffusionAdvancedMultiStage:
                 "s2_sigma_schedule": (SIGMA_SCHEDULE_NAMES, {
                     "default": "balanced",
                 }),
+                "s2_eta": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": (
+                        "Stage 2 stochastic sampling coefficient.\n"
+                        "0.0 = deterministic (recommended for refinement).\n"
+                        "High eta in refinement stages erodes structure\n"
+                        "preserved by the denoise ratio."
+                    ),
+                }),
 
                 # ── Stage 3 ───────────────────────────────────────────
                 "upscale_to_stage3": ("FLOAT", {
@@ -316,6 +319,14 @@ class EricDiffusionAdvancedMultiStage:
                 }),
                 "s3_sigma_schedule": (SIGMA_SCHEDULE_NAMES, {
                     "default": "karras",
+                }),
+                "s3_eta": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": (
+                        "Stage 3 stochastic sampling coefficient.\n"
+                        "0.0 = deterministic (recommended for final polish).\n"
+                        "Even small eta at S3 can cause mottling in smooth areas."
+                    ),
                 }),
 
                 # ── Upscale VAE (Qwen-Image only) ─────────────────────
@@ -394,7 +405,7 @@ class EricDiffusionAdvancedMultiStage:
         aspect_ratio: str = "1:1   Square",
         seed: int = 0,
         seed_mode: str = "offset_per_stage",
-        eta: float = 0.0,
+        s1_eta: float = 0.0,
         max_sequence_length: int = 512,
         s1_mp: float = 0.5,
         override_s1_width: int = 0,
@@ -409,12 +420,14 @@ class EricDiffusionAdvancedMultiStage:
         s2_denoise: float = 0.85,
         s2_sampler: str = "flow_heun",
         s2_sigma_schedule: str = "balanced",
+        s2_eta: float = 0.0,
         upscale_to_stage3: float = 2.0,
         s3_steps: int = 15,
         s3_cfg: float = 3.5,
         s3_denoise: float = 0.5,
         s3_sampler: str = "flow_multistep2",
         s3_sigma_schedule: str = "karras",
+        s3_eta: float = 0.0,
         use_upscale_vae: bool = False,
         upscale_vae=None,
         reference_image=None,
@@ -704,7 +717,7 @@ class EricDiffusionAdvancedMultiStage:
                 progress_cb=_stage_progress_cb,
                 initial_latents=s1_initial_latents,
                 denoise=s1_effective_denoise,
-                eta=eta,
+                eta=s1_eta,
             )
             if is_flux2:
                 s1_latents, s1_ids = generate_flux2(**s1_common)
@@ -755,7 +768,7 @@ class EricDiffusionAdvancedMultiStage:
                 generator=s2_gen, max_sequence_length=max_sequence_length,
                 progress_cb=_stage_progress_cb,
                 denoise=s2_denoise,
-                eta=eta,
+                eta=s2_eta,
             )
             if is_flux2:
                 s2_input_latents = upscale_flux2_latents(
@@ -834,7 +847,7 @@ class EricDiffusionAdvancedMultiStage:
                 generator=s3_gen, max_sequence_length=max_sequence_length,
                 progress_cb=_stage_progress_cb,
                 denoise=s3_denoise,
-                eta=eta,
+                eta=s3_eta,
             )
             if is_flux2:
                 s3_input_latents = upscale_flux2_latents(
