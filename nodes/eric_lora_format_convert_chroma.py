@@ -104,6 +104,12 @@ _CHROMA_PLAN = ConversionPlan(
         RenameRule(".txt_mlp.0",  ".ff_context.net.0.proj"),
         RenameRule(".txt_mlp.2",  ".ff_context.net.2"),
 
+        # ── Double-block: modulation (AdaLayerNormZero) ──────────────
+        # BFL stores modulation as img_mod.lin / txt_mod.lin; diffusers
+        # stores it as norm1.linear / norm1_context.linear.
+        RenameRule(".img_mod.lin",  ".norm1.linear"),
+        RenameRule(".txt_mod.lin",  ".norm1_context.linear"),
+
         # ── Single-block (COMPLETELY different from Klein) ───────────
         # Klein keeps single-block fused: linear1 → to_qkv_mlp_proj,
         # linear2 → to_out.  Chroma splits everything.
@@ -112,6 +118,8 @@ _CHROMA_PLAN = ConversionPlan(
         RenameRule(".linear1", ".__LINEAR1__"),
         # linear2 → 1:1 rename to proj_out (no split)
         RenameRule(".linear2", ".proj_out"),
+        # Single-block modulation (AdaLayerNormZeroSingle)
+        RenameRule(".modulation.lin", ".norm.linear"),
 
         # Single-block norms
         RenameRule(".norm.q_norm",     ".attn.norm_q"),

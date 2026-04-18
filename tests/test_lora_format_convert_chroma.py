@@ -203,6 +203,18 @@ def test_double_block_norm_renames():
     assert "transformer_blocks.0.attn.norm_added_k.scale" in out
 
 
+def test_double_block_modulation_renames():
+    """img_mod.lin → norm1.linear, txt_mod.lin → norm1_context.linear."""
+    plan = get_plan("bfl_chroma", "diffusers_chroma")
+    sd = {
+        "diffusion_model.double_blocks.0.img_mod.lin.lora_down.weight": torch.zeros(1, 1),
+        "diffusion_model.double_blocks.0.txt_mod.lin.lora_down.weight": torch.zeros(1, 1),
+    }
+    out = apply_rename_rules(sd, plan)
+    assert "transformer_blocks.0.norm1.linear.lora_down.weight" in out
+    assert "transformer_blocks.0.norm1_context.linear.lora_down.weight" in out
+
+
 # ════════════════════════════════════════════════════════════════════════
 #  Rename — single_blocks
 # ════════════════════════════════════════════════════════════════════════
@@ -221,6 +233,14 @@ def test_single_block_linear2_renames_to_proj_out():
     sd = {"diffusion_model.single_blocks.20.linear2.lora_down.weight": torch.zeros(1, 1)}
     out = apply_rename_rules(sd, plan)
     assert "single_transformer_blocks.20.proj_out.lora_down.weight" in out
+
+
+def test_single_block_modulation_renames():
+    """modulation.lin → norm.linear."""
+    plan = get_plan("bfl_chroma", "diffusers_chroma")
+    sd = {"diffusion_model.single_blocks.5.modulation.lin.lora_down.weight": torch.zeros(1, 1)}
+    out = apply_rename_rules(sd, plan)
+    assert "single_transformer_blocks.5.norm.linear.lora_down.weight" in out
 
 
 def test_single_block_norm_renames():
@@ -465,6 +485,19 @@ def test_kohya_decode_txt_mlp():
     sd = {"lora_unet_double_blocks_3_txt_mlp_2.lora_up.weight": torch.zeros(1)}
     out = decode_kohya_to_bfl(sd)
     assert "diffusion_model.double_blocks.3.txt_mlp.2.lora_up.weight" in out
+
+
+def test_kohya_decode_img_mod_compound():
+    """img_mod internal underscore must be preserved (not split to img.mod)."""
+    sd = {"lora_unet_double_blocks_0_img_mod_lin.lora_down.weight": torch.zeros(1)}
+    out = decode_kohya_to_bfl(sd)
+    assert "diffusion_model.double_blocks.0.img_mod.lin.lora_down.weight" in out
+
+
+def test_kohya_decode_txt_mod_compound():
+    sd = {"lora_unet_double_blocks_0_txt_mod_lin.lora_down.weight": torch.zeros(1)}
+    out = decode_kohya_to_bfl(sd)
+    assert "diffusion_model.double_blocks.0.txt_mod.lin.lora_down.weight" in out
 
 
 def test_kohya_decoded_detected_as_bfl_original():

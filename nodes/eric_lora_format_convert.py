@@ -371,6 +371,8 @@ _KOHYA_COMPOUNDS: Tuple[str, ...] = (
     "txt_attn",
     "img_mlp",
     "txt_mlp",
+    "img_mod",
+    "txt_mod",
     "q_norm",
     "k_norm",
 )
