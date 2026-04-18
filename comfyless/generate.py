@@ -46,8 +46,12 @@ from nodes.eric_diffusion_utils import (
     detect_pipeline_class,
     read_guidance_embeds,
 )
+from nodes.eric_diffusion_samplers import sampler_choices, swap_sampler
+from nodes.eric_qwen_edit_lora import load_lora_with_key_fix
 
 CONTRACT_VERSION = 1
+SAMPLER_NAMES = sampler_choices()
+SCHEDULE_NAMES = ["linear", "balanced", "karras"]
 _ALIGN = 32  # dimension alignment for all supported models
 
 
@@ -137,11 +141,20 @@ def generate(
     width: int = 1024,
     height: int = 1024,
     max_sequence_length: int = 512,
+    sampler: str = "default",
+    schedule: str = "linear",
+    loras: Optional[List[Dict[str, Any]]] = None,
     precision: str = "bf16",
     device: str = "cuda",
     offload_vae: bool = False,
 ) -> Dict[str, Any]:
     """Generate a single image and save it.
+
+    Args:
+        loras: List of {"path": str, "weight": float} dicts.  Applied
+            in order.  LoRA load failures are non-fatal (warned, skipped).
+        sampler: One of SAMPLER_NAMES ("default", "multistep2", "multistep3").
+        schedule: Sigma schedule — reserved for future manual-loop use.
 
     Returns a metadata dict suitable for the sidecar JSON / bridge output.
     Raises on fatal errors (model not found, inference failure).
@@ -194,6 +207,30 @@ def generate(
     _log(f"[comfyless] Ready — family={model_family}, "
          f"guidance_embeds={guidance_embeds}")
 
+    # ── Load LoRAs ────────────────────────────────────────────────────
+    lora_warnings: List[str] = []
+    loras = loras or []
+    for i, lora_spec in enumerate(loras):
+        lora_path = lora_spec["path"]
+        lora_weight = float(lora_spec.get("weight", 1.0))
+        adapter_name = Path(lora_path).stem.replace(" ", "_").replace(".", "_")
+        _log(f"[comfyless] LoRA {i+1}/{len(loras)}: "
+             f"{Path(lora_path).name} (weight={lora_weight})")
+        try:
+            success = load_lora_with_key_fix(
+                pipe, lora_path, adapter_name,
+                log_prefix="[comfyless-LoRA]",
+                weight=lora_weight,
+            )
+            if not success:
+                msg = f"LoRA skipped (0 modules applied): {lora_path}"
+                _log(f"[comfyless] WARNING: {msg}")
+                lora_warnings.append(msg)
+        except Exception as e:
+            msg = f"LoRA load failed: {lora_path}: {e}"
+            _log(f"[comfyless] WARNING: {msg}")
+            lora_warnings.append(msg)
+
     # ── Build generator ───────────────────────────────────────────────
     exec_device = getattr(pipe, "_execution_device", None) or device
     generator = torch.Generator(device=exec_device).manual_seed(seed)
@@ -207,16 +244,17 @@ def generate(
     )
 
     _log(f"[comfyless] Generating: {width}x{height}, "
-         f"steps={steps}, cfg={cfg_scale}, seed={seed}")
+         f"steps={steps}, cfg={cfg_scale}, seed={seed}, sampler={sampler}")
 
     # ── VAE: move back to GPU for decode ──────────────────────────────
     if offload_vae and hasattr(pipe, "vae"):
         vae_target = next(pipe.transformer.parameters()).device
         pipe.vae = pipe.vae.to(vae_target)
 
-    # ── Inference ─────────────────────────────────────────────────────
+    # ── Inference (with optional sampler swap) ────────────────────────
     t0 = time.monotonic()
-    result = pipe(**call_kwargs)
+    with swap_sampler(pipe, sampler, log_prefix="[comfyless]"):
+        result = pipe(**call_kwargs)
     elapsed = time.monotonic() - t0
     _log(f"[comfyless] Generated in {elapsed:.1f}s")
 
@@ -230,24 +268,27 @@ def generate(
         pipe.vae = pipe.vae.to("cpu")
 
     # ── Build metadata ────────────────────────────────────────────────
-    metadata = {
+    metadata: Dict[str, Any] = {
         "prompt": prompt,
         "negative_prompt": negative_prompt,
         "model": model_path,
         "model_family": model_family,
-        "loras": [],
+        "loras": [{"path": l["path"], "weight": float(l.get("weight", 1.0))}
+                  for l in loras],
         "seed": seed,
         "steps": steps,
         "cfg_scale": cfg_scale,
         "true_cfg_scale": true_cfg_scale,
         "width": width,
         "height": height,
-        "sampler": "default",
-        "schedule": "linear",
+        "sampler": sampler,
+        "schedule": schedule,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "elapsed_seconds": round(elapsed, 2),
         "contract_version": CONTRACT_VERSION,
     }
+    if lora_warnings:
+        metadata["lora_warnings"] = lora_warnings
 
     return metadata
 
@@ -275,6 +316,13 @@ def _parse_args() -> argparse.Namespace:
                    help="True CFG scale override (qwen-image)")
     p.add_argument("--width", type=int, default=1024)
     p.add_argument("--height", type=int, default=1024)
+    p.add_argument("--lora", action="append", default=[],
+                   metavar="PATH:WEIGHT",
+                   help="LoRA to apply (repeatable).  Format: path or path:weight")
+    p.add_argument("--sampler", choices=SAMPLER_NAMES, default="default",
+                   help="Sampler algorithm")
+    p.add_argument("--schedule", choices=SCHEDULE_NAMES, default="linear",
+                   help="Sigma schedule (reserved for future manual-loop use)")
     p.add_argument("--max-seq-len", type=int, default=512,
                    help="Max sequence length for text encoder")
     p.add_argument("--precision", choices=["bf16", "fp16", "fp32"], default="bf16")
@@ -283,6 +331,19 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--output", "-o", type=str, default="output.png",
                    help="Output image path")
     return p.parse_args()
+
+
+def _parse_lora_arg(spec: str) -> Dict[str, Any]:
+    """Parse 'path:weight' or 'path' into {"path": ..., "weight": ...}."""
+    if ":" in spec:
+        # Split on LAST colon (paths may contain colons on Windows, unlikely here)
+        idx = spec.rfind(":")
+        try:
+            weight = float(spec[idx + 1:])
+            return {"path": spec[:idx], "weight": weight}
+        except ValueError:
+            pass
+    return {"path": spec, "weight": 1.0}
 
 
 def _run_json_mode() -> int:
@@ -329,6 +390,9 @@ def _run_json_mode() -> int:
             true_cfg_scale=params.get("true_cfg_scale"),
             width=params.get("width", 1024),
             height=params.get("height", 1024),
+            sampler=params.get("sampler", "default"),
+            schedule=params.get("schedule", "linear"),
+            loras=req.get("loras", []),
             max_sequence_length=params.get("max_sequence_length", 512),
             precision=params.get("precision", "bf16"),
             device=params.get("device", "cuda"),
@@ -377,6 +441,8 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
         print("Error: --prompt is required", file=sys.stderr)
         return 1
 
+    loras = [_parse_lora_arg(s) for s in args.lora] if args.lora else []
+
     try:
         metadata = generate(
             model_path=args.model,
@@ -389,6 +455,9 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
             true_cfg_scale=args.true_cfg,
             width=args.width,
             height=args.height,
+            sampler=args.sampler,
+            schedule=args.schedule,
+            loras=loras,
             max_sequence_length=args.max_seq_len,
             precision=args.precision,
             device=args.device,
