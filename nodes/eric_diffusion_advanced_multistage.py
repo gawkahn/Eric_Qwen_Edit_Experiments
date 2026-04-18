@@ -149,6 +149,8 @@ class EricDiffusionAdvancedMultiStage:
                 "negative_prompt": ("STRING", {
                     "multiline": True, "default": "",
                 }),
+
+                # ── Global settings ──────────────────────────────────
                 "aspect_ratio": (ratio_names, {"default": "1:1   Square"}),
                 "seed": ("INT", {
                     "default": 0, "min": 0, "max": 0xffffffffffffffff,
@@ -161,14 +163,6 @@ class EricDiffusionAdvancedMultiStage:
                         "random = independent random seed per stage."
                     ),
                 }),
-                "s1_eta": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": (
-                        "Stage 1 stochastic sampling coefficient.\n"
-                        "0.0 = deterministic.  0.3-0.85 adds diversity.\n"
-                        "S1 generates from noise so higher eta is safe."
-                    ),
-                }),
                 "max_sequence_length": ("INT", {
                     "default": 512, "min": 64, "max": 2048, "step": 64,
                     "tooltip": (
@@ -179,41 +173,77 @@ class EricDiffusionAdvancedMultiStage:
                         "so longer prompts cost extra VRAM/time per stage."
                     ),
                 }),
-
-                # ── Stage 1 ───────────────────────────────────────────
                 "s1_mp": ("FLOAT", {
                     "default": 0.5, "min": 0.25, "max": 4.0, "step": 0.1,
                     "tooltip": "Stage 1 initial resolution in megapixels.",
                 }),
                 "override_s1_width": ("INT", {
-                    "default": 0,
-                    "min": 0,
-                    "max": 16384,
-                    "step": 16,
+                    "default": 0, "min": 0, "max": 16384, "step": 16,
                     "tooltip": (
                         "Explicit Stage 1 width in pixels.  When this "
                         "AND override_s1_height are both non-zero, they "
-                        "override aspect_ratio + s1_mp for Stage 1 "
-                        "dimensions.  Stage 2 and Stage 3 still scale "
-                        "from here via upscale_to_stage2 / "
-                        "upscale_to_stage3 factors — the override only "
-                        "replaces the S1 starting size.\n\n"
-                        "Must be a multiple of 16.  Non-multiples are "
-                        "floored with a log note.\n\n"
-                        "Common video resolutions:\n"
-                        "• 1920×1088 (1080p, 16-aligned — not 1080)\n"
-                        "• 1280×720 (720p, exact)\n"
-                        "• 3840×2160 (4K, exact)"
+                        "override aspect_ratio + s1_mp.  Must be a "
+                        "multiple of 16."
                     ),
                 }),
                 "override_s1_height": ("INT", {
-                    "default": 0,
-                    "min": 0,
-                    "max": 16384,
-                    "step": 16,
+                    "default": 0, "min": 0, "max": 16384, "step": 16,
                     "tooltip": (
                         "Explicit Stage 1 height in pixels.  Must be "
                         "set non-zero together with override_s1_width."
+                    ),
+                }),
+                "upscale_to_stage2": ("FLOAT", {
+                    "default": 2.0, "min": 0.0, "max": 8.0, "step": 0.5,
+                    "tooltip": "Area upscale factor S1→S2 (0 = output S1).",
+                }),
+                "upscale_to_stage3": ("FLOAT", {
+                    "default": 2.0, "min": 0.0, "max": 8.0, "step": 0.5,
+                    "tooltip": (
+                        "Area upscale factor S2→S3 (0 = disable stage 3).\n"
+                        "IGNORED when use_upscale_vae is ON — Wan2.1 VAE "
+                        "forces fixed 2× linear."
+                    ),
+                }),
+                "use_upscale_vae": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "QWEN-IMAGE ONLY. Wan2.1 2× upscale VAE for "
+                        "inter-stage and final decode (up to 4× total).\n"
+                        "Ignored for Flux/Flux2/Chroma."
+                    ),
+                }),
+                "upscale_vae": ("UPSCALE_VAE", {
+                    "tooltip": (
+                        "Optional. Output of 'Eric Qwen Upscale VAE Loader'. "
+                        "Only honored when 'use_upscale_vae' is ON."
+                    ),
+                }),
+                "reference_image": ("IMAGE", {
+                    "tooltip": (
+                        "Optional. Stage 1 starts from encoded reference "
+                        "latents (i2i).  s1_denoise controls blend ratio."
+                    ),
+                }),
+                "s1_denoise": ("FLOAT", {
+                    "default": 0.85, "min": 0.05, "max": 1.0, "step": 0.05,
+                    "tooltip": (
+                        "Stage 1 denoise (i2i only, ignored without "
+                        "reference_image).  1.0 = full repaint, "
+                        "0.85 = refine, 0.3 = polish."
+                    ),
+                }),
+
+                # ── Stage 1 ──────────────────────────────────────────
+                "_s1_sep": ("STRING", {
+                    "default": "── Stage 1 ──────────────",
+                    "tooltip": "Visual separator (no effect on generation)",
+                }),
+                "s1_eta": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": (
+                        "Stochastic noise injection.  0.0 = deterministic.\n"
+                        "S1 generates from noise so higher eta is safe."
                     ),
                 }),
                 "s1_steps": ("INT", {
@@ -225,23 +255,25 @@ class EricDiffusionAdvancedMultiStage:
                 "s1_sampler": (sampler_names(), {
                     "default": "flow_heun",
                     "tooltip": (
-                        "Sampler for Stage 1 (initial draft).\n"
-                        "• flow_heun — 2nd order, general-purpose (default)\n"
-                        "• flow_multistep2 — same cost as Euler with 2nd-order accuracy\n"
-                        "• flow_rk3 — BEST quality but REQUIRES ≥15 steps. At lower\n"
-                        "  step counts it extrapolates outside the model's training\n"
-                        "  distribution and produces edge artifacts.\n"
-                        "See single-stage node tooltip for full comparison."
+                        "flow_heun = 2nd order, general-purpose.\n"
+                        "flow_rk3 = best quality but requires ≥15 steps."
                     ),
                 }),
                 "s1_sigma_schedule": (SIGMA_SCHEDULE_NAMES, {
                     "default": "linear",
                 }),
 
-                # ── Stage 2 ───────────────────────────────────────────
-                "upscale_to_stage2": ("FLOAT", {
-                    "default": 2.0, "min": 0.0, "max": 8.0, "step": 0.5,
-                    "tooltip": "Area upscale factor S1→S2 (0 = output S1).",
+                # ── Stage 2 ──────────────────────────────────────────
+                "_s2_sep": ("STRING", {
+                    "default": "── Stage 2 ──────────────",
+                    "tooltip": "Visual separator (no effect on generation)",
+                }),
+                "s2_eta": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": (
+                        "Stochastic noise injection.  0.0 = deterministic.\n"
+                        "Lower eta in refinement preserves S1 structure."
+                    ),
                 }),
                 "s2_steps": ("INT", {
                     "default": 20, "min": 1, "max": 200,
@@ -249,52 +281,34 @@ class EricDiffusionAdvancedMultiStage:
                 "s2_cfg": ("FLOAT", {
                     "default": 3.5, "min": 1.0, "max": 20.0, "step": 0.5,
                 }),
-                "s2_denoise": ("FLOAT", {
-                    "default": 0.85, "min": 0.1, "max": 1.0, "step": 0.05,
-                    "tooltip": (
-                        "1.0 = full re-denoise (ignores S1 latents). "
-                        "0.85 = aggressive refinement. "
-                        "Lower values preserve more of S1's structure."
-                    ),
-                }),
                 "s2_sampler": (sampler_names(), {
                     "default": "flow_heun",
                     "tooltip": (
-                        "Sampler for Stage 2 refinement.\n"
-                        "• flow_heun — best general choice for refinement\n"
-                        "• flow_multistep2 — same quality at Euler cost\n"
-                        "• flow_rk3 — ONLY use if effective steps (steps × denoise)\n"
-                        "  is ≥15. With denoise<1.0 the effective step count is "
-                        "  lower than the 'steps' parameter."
+                        "flow_heun = best general choice for refinement.\n"
+                        "flow_rk3 = only if effective steps ≥ 15."
                     ),
                 }),
                 "s2_sigma_schedule": (SIGMA_SCHEDULE_NAMES, {
                     "default": "balanced",
                 }),
-                "s2_eta": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                "s2_denoise": ("FLOAT", {
+                    "default": 0.85, "min": 0.1, "max": 1.0, "step": 0.05,
                     "tooltip": (
-                        "Stage 2 stochastic sampling coefficient.\n"
-                        "0.0 = deterministic (recommended for refinement).\n"
-                        "High eta in refinement stages erodes structure\n"
-                        "preserved by the denoise ratio."
+                        "0.85 = aggressive refinement.  Lower values "
+                        "preserve more of S1's structure."
                     ),
                 }),
 
-                # ── Stage 3 ───────────────────────────────────────────
-                "upscale_to_stage3": ("FLOAT", {
-                    "default": 2.0, "min": 0.0, "max": 8.0, "step": 0.5,
+                # ── Stage 3 ──────────────────────────────────────────
+                "_s3_sep": ("STRING", {
+                    "default": "── Stage 3 ──────────────",
+                    "tooltip": "Visual separator (no effect on generation)",
+                }),
+                "s3_eta": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": (
-                        "Area upscale factor S2→S3 (0 = disable stage 3).\n"
-                        "\n"
-                        "IGNORED when use_upscale_vae is ON — the Wan2.1 "
-                        "upscale VAE forces a fixed 2× linear upscale "
-                        "regardless of this value.  Set this to 0 to "
-                        "disable stage 3 entirely (that still works), or "
-                        "any non-zero value will be coerced to 2× when "
-                        "the switch is on.  A console NOTE line is printed "
-                        "if your value differs from 2.0 and gets ignored, "
-                        "so it's obvious what happened."
+                        "Stochastic noise injection.  0.0 = deterministic.\n"
+                        "Even small eta at S3 can cause mottling."
                     ),
                 }),
                 "s3_steps": ("INT", {
@@ -303,96 +317,19 @@ class EricDiffusionAdvancedMultiStage:
                 "s3_cfg": ("FLOAT", {
                     "default": 3.5, "min": 1.0, "max": 20.0, "step": 0.5,
                 }),
-                "s3_denoise": ("FLOAT", {
-                    "default": 0.5, "min": 0.1, "max": 1.0, "step": 0.05,
-                }),
                 "s3_sampler": (sampler_names(), {
                     "default": "flow_multistep2",
                     "tooltip": (
-                        "Sampler for Stage 3 polish.\n"
-                        "multistep2 is the default because it keeps cost low\n"
-                        "(1 model call per step) while still being 2nd-order\n"
-                        "accurate. Avoid flow_rk3 here — S3's partial-denoise\n"
-                        "cuts effective step count and RK3 extrapolates badly\n"
-                        "at low step counts."
+                        "multistep2 = low cost + 2nd-order accuracy.\n"
+                        "Avoid flow_rk3 — S3 partial-denoise cuts "
+                        "effective steps."
                     ),
                 }),
                 "s3_sigma_schedule": (SIGMA_SCHEDULE_NAMES, {
                     "default": "karras",
                 }),
-                "s3_eta": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": (
-                        "Stage 3 stochastic sampling coefficient.\n"
-                        "0.0 = deterministic (recommended for final polish).\n"
-                        "Even small eta at S3 can cause mottling in smooth areas."
-                    ),
-                }),
-
-                # ── Upscale VAE (Qwen-Image only) ─────────────────────
-                "use_upscale_vae": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": (
-                        "QWEN-IMAGE ONLY. When ON and an upscale_vae is "
-                        "connected, the Wan2.1 2× VAE replaces bislerp for "
-                        "the S2→S3 inter-stage upscale AND replaces the "
-                        "final VAE decode — giving up to 4× the resolution "
-                        "of the stage settings in a 3-stage workflow.\n\n"
-                        "Connect the upscale_vae input and flip this switch "
-                        "to A/B test with-VAE vs without-VAE on the same "
-                        "seed and prompt.\n\n"
-                        "Ignored (with a warning) for Flux/Flux2/Chroma — "
-                        "their VAEs aren't compatible with the Wan2.1 "
-                        "latent space.  If you connect the VAE but forget "
-                        "to turn the switch off when switching to a "
-                        "non-Qwen pipeline, nothing breaks — the switch "
-                        "just falls back silently to bislerp/standard "
-                        "decode and logs a warning."
-                    ),
-                }),
-                "upscale_vae": ("UPSCALE_VAE", {
-                    "tooltip": (
-                        "Optional. Output of 'Eric Qwen Upscale VAE Loader'. "
-                        "Only honored when 'use_upscale_vae' is ON AND the "
-                        "pipeline is Qwen-Image.  Connecting this without "
-                        "flipping the switch prints a soft warning and does "
-                        "nothing."
-                    ),
-                }),
-
-                # ── Image-to-image (reference conditioning) ───────────
-                "reference_image": ("IMAGE", {
-                    "tooltip": (
-                        "Optional. Connect a reference image and Stage 1 "
-                        "will start from its encoded latents instead of "
-                        "pure noise (classical i2i).  The image is bicubic-"
-                        "resized to match your aspect_ratio + s1_mp target "
-                        "and encoded through the pipeline's VAE.\n\n"
-                        "The s1_denoise slider controls how much of the "
-                        "reference is kept vs repainted at Stage 1.  S2 "
-                        "and S3 use their own denoise values on top.\n\n"
-                        "Works for Flux, Chroma, Qwen-Image.  Flux.2 i2i "
-                        "is not yet supported.  Leave unconnected for "
-                        "pure text-to-image — the legacy path is bit-for-"
-                        "bit unchanged."
-                    ),
-                }),
-                "s1_denoise": ("FLOAT", {
-                    "default": 0.85,
-                    "min": 0.05,
-                    "max": 1.0,
-                    "step": 0.05,
-                    "tooltip": (
-                        "Stage 1 denoise strength.  Only used when "
-                        "reference_image is connected — ignored otherwise.\n\n"
-                        "• 1.0  — full re-denoise (reference effectively "
-                        "thrown away, same as no reference)\n"
-                        "• 0.85 — default: meaningful refinement, "
-                        "composition preserved, details rewritten\n"
-                        "• 0.65 — conservative: reference stays very visible\n"
-                        "• 0.30 — polish: minimal change, mostly VAE round-trip\n"
-                        "• 0.05 — near-pass-through: reference barely touched"
-                    ),
+                "s3_denoise": ("FLOAT", {
+                    "default": 0.5, "min": 0.1, "max": 1.0, "step": 0.05,
                 }),
             },
         }
@@ -405,29 +342,35 @@ class EricDiffusionAdvancedMultiStage:
         aspect_ratio: str = "1:1   Square",
         seed: int = 0,
         seed_mode: str = "offset_per_stage",
-        s1_eta: float = 0.0,
         max_sequence_length: int = 512,
         s1_mp: float = 0.5,
         override_s1_width: int = 0,
         override_s1_height: int = 0,
+        upscale_to_stage2: float = 2.0,
+        upscale_to_stage3: float = 2.0,
+        # Stage 1
+        _s1_sep: str = "",
+        s1_eta: float = 0.0,
         s1_steps: int = 15,
         s1_cfg: float = 3.5,
         s1_sampler: str = "flow_heun",
         s1_sigma_schedule: str = "linear",
-        upscale_to_stage2: float = 2.0,
+        # Stage 2
+        _s2_sep: str = "",
+        s2_eta: float = 0.0,
         s2_steps: int = 20,
         s2_cfg: float = 3.5,
-        s2_denoise: float = 0.85,
         s2_sampler: str = "flow_heun",
         s2_sigma_schedule: str = "balanced",
-        s2_eta: float = 0.0,
-        upscale_to_stage3: float = 2.0,
+        s2_denoise: float = 0.85,
+        # Stage 3
+        _s3_sep: str = "",
+        s3_eta: float = 0.0,
         s3_steps: int = 15,
         s3_cfg: float = 3.5,
-        s3_denoise: float = 0.5,
         s3_sampler: str = "flow_multistep2",
         s3_sigma_schedule: str = "karras",
-        s3_eta: float = 0.0,
+        s3_denoise: float = 0.5,
         use_upscale_vae: bool = False,
         upscale_vae=None,
         reference_image=None,

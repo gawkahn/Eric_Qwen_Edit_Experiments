@@ -138,7 +138,7 @@ class EricDiffusionAdvancedEditMultistage:
                 "image_4_vl": ("BOOLEAN", {"default": True}),
                 "image_4_ref": ("BOOLEAN", {"default": True}),
 
-                # ── Shared stage controls ─────────────────────────────
+                # ── Global settings ───────────────────────────────────
                 "seed": ("INT", {
                     "default": 0, "min": 0, "max": 0xffffffffffffffff,
                     "tooltip": "Random seed (0 = non-deterministic).",
@@ -148,159 +148,51 @@ class EricDiffusionAdvancedEditMultistage:
                     {
                         "default": "offset_per_stage",
                         "tooltip": (
-                            "How the seed propagates across stages.\n"
-                            "• offset_per_stage — s1=seed, s2=seed+1, s3=seed+2\n"
-                            "• same_all_stages — all stages share the same seed\n"
-                            "• random_per_stage — each stage gets a fresh random seed"
+                            "offset = s1=seed, s2=seed+1, s3=seed+2.\n"
+                            "same = all stages share one seed.\n"
+                            "random = independent random seed per stage."
                         ),
                     },
                 ),
-                "s1_eta": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": (
-                        "Stage 1 stochastic sampling coefficient.\n"
-                        "0.0 = deterministic.  For edit tasks usually 0.0.\n"
-                        "Higher values add diversity but reduce reference fidelity."
-                    ),
-                }),
                 "max_sequence_length": ("INT", {
                     "default": 1024, "min": 64, "max": 2048, "step": 64,
                     "tooltip": "Max prompt token length (Qwen Edit default 1024).",
                 }),
-
-                # ── Stage 1 ───────────────────────────────────────────
                 "s1_mp": ("FLOAT", {
                     "default": 0.5, "min": 0.1, "max": 4.0, "step": 0.1,
                     "tooltip": (
                         "Stage 1 target area in megapixels.  Aspect ratio "
-                        "is derived from the last connected reference image "
-                        "unless override_s1_width/height are set."
+                        "derived from last reference image unless overridden."
                     ),
                 }),
                 "override_s1_width": ("INT", {
-                    "default": 0,
-                    "min": 0,
-                    "max": 16384,
-                    "step": 16,
+                    "default": 0, "min": 0, "max": 16384, "step": 16,
                     "tooltip": (
-                        "Explicit Stage 1 width in pixels.  When this "
-                        "AND override_s1_height are both non-zero, they "
-                        "override the default 'derive from last "
-                        "reference at s1_mp' behavior for Stage 1.  "
-                        "Stage 2 and Stage 3 still scale from here via "
-                        "upscale_to_stage2 / upscale_to_stage3 factors, "
-                        "preserving the override's aspect ratio.\n\n"
-                        "Must be a multiple of 16.  1080p requires "
-                        "1088 not 1080.\n\n"
-                        "Leave at 0 to use the default last-reference-"
-                        "aspect behavior."
+                        "Explicit Stage 1 width (0 = auto from reference). "
+                        "Must be multiple of 16."
                     ),
                 }),
                 "override_s1_height": ("INT", {
-                    "default": 0,
-                    "min": 0,
-                    "max": 16384,
-                    "step": 16,
-                    "tooltip": (
-                        "Explicit Stage 1 height in pixels.  Must be "
-                        "set non-zero together with override_s1_width."
-                    ),
+                    "default": 0, "min": 0, "max": 16384, "step": 16,
+                    "tooltip": "Explicit Stage 1 height (set with override_s1_width).",
                 }),
-                "s1_steps": ("INT", {"default": 20, "min": 1, "max": 200}),
-                "s1_cfg": ("FLOAT", {
-                    "default": 4.0, "min": 1.0, "max": 20.0, "step": 0.5,
-                }),
-                "s1_sampler": (sampler_names(), {
-                    "default": "flow_heun",
-                    "tooltip": (
-                        "Stage 1 sampler.  flow_heun is the safe default "
-                        "for edit drafting at low MP."
-                    ),
-                }),
-                "s1_sigma_schedule": (SIGMA_SCHEDULE_NAMES, {
-                    "default": "linear",
-                }),
-
-                # ── Stage 2 ───────────────────────────────────────────
                 "upscale_to_stage2": ("FLOAT", {
                     "default": 2.0, "min": 0.0, "max": 8.0, "step": 0.5,
                     "tooltip": "Area upscale factor S1→S2 (0 = output S1).",
                 }),
-                "s2_steps": ("INT", {"default": 20, "min": 1, "max": 200}),
-                "s2_cfg": ("FLOAT", {
-                    "default": 4.0, "min": 1.0, "max": 20.0, "step": 0.5,
-                }),
-                "s2_denoise": ("FLOAT", {
-                    "default": 0.85, "min": 0.1, "max": 1.0, "step": 0.05,
-                    "tooltip": (
-                        "Partial denoise strength at S2.  0.85 = meaningful "
-                        "refinement while keeping S1's composition."
-                    ),
-                }),
-                "s2_sampler": (sampler_names(), {"default": "flow_heun"}),
-                "s2_sigma_schedule": (SIGMA_SCHEDULE_NAMES, {
-                    "default": "balanced",
-                }),
-                "s2_eta": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": (
-                        "Stage 2 stochastic sampling coefficient.\n"
-                        "0.0 = deterministic (recommended for refinement)."
-                    ),
-                }),
-
-                # ── Stage 3 ───────────────────────────────────────────
                 "upscale_to_stage3": ("FLOAT", {
                     "default": 2.0, "min": 0.0, "max": 8.0, "step": 0.5,
                     "tooltip": (
-                        "Area upscale factor S2→S3 (0 = output S2, stage 3 "
-                        "disabled).\n"
-                        "\n"
-                        "In Phase 2 slice 3 (not yet): when use_upscale_vae "
-                        "is ON, this value is IGNORED and the Wan2.1 VAE "
-                        "forces a fixed 2× linear upscale."
+                        "Area upscale factor S2→S3 (0 = disable stage 3).\n"
+                        "IGNORED when use_upscale_vae is ON — Wan2.1 VAE "
+                        "forces fixed 2× linear."
                     ),
                 }),
-                "s3_steps": ("INT", {"default": 15, "min": 1, "max": 200}),
-                "s3_cfg": ("FLOAT", {
-                    "default": 4.0, "min": 1.0, "max": 20.0, "step": 0.5,
-                }),
-                "s3_denoise": ("FLOAT", {
-                    "default": 0.5, "min": 0.1, "max": 1.0, "step": 0.05,
-                    "tooltip": (
-                        "Partial denoise strength at S3.  0.5 = polish pass, "
-                        "minimal structural changes from S2."
-                    ),
-                }),
-                "s3_sampler": (sampler_names(), {"default": "flow_multistep2"}),
-                "s3_sigma_schedule": (SIGMA_SCHEDULE_NAMES, {
-                    "default": "karras",
-                }),
-                "s3_eta": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": (
-                        "Stage 3 stochastic sampling coefficient.\n"
-                        "0.0 = deterministic (recommended for final polish)."
-                    ),
-                }),
-
-                # ── Upscale VAE bridge ────────────────────────────────
                 "use_upscale_vae": ("BOOLEAN", {
                     "default": False,
                     "tooltip": (
-                        "When ON with an upscale_vae connected, the "
-                        "Wan2.1 2× VAE replaces bislerp for the S2→S3 "
-                        "inter-stage upscale AND replaces the final VAE "
-                        "decode.  In a 3-stage edit you get ~4× the "
-                        "resolution of the stage settings — e.g. S1 at "
-                        "0.5 MP, S2 at 1 MP (bislerp), S3 at 4 MP (VAE), "
-                        "final image at 16 MP (VAE final decode).\n\n"
-                        "References don't go through the upscale VAE — "
-                        "they stay at their original encoding and are "
-                        "attended to at every stage.\n\n"
-                        "Soft-fails if the switch is on but the VAE isn't "
-                        "connected — prints a warning and falls back to "
-                        "bislerp inter-stage + standard decode, no crash."
+                        "Wan2.1 2× upscale VAE for inter-stage and final "
+                        "decode (up to 4× total resolution)."
                     ),
                 }),
                 "upscale_vae": ("UPSCALE_VAE", {
@@ -310,6 +202,81 @@ class EricDiffusionAdvancedEditMultistage:
                         "ON. Connecting this without flipping the switch "
                         "prints a soft note and does nothing."
                     ),
+                }),
+
+                # ── Stage 1 ──────────────────────────────────────────
+                "_s1_sep": ("STRING", {
+                    "default": "── Stage 1 ──────────────",
+                    "tooltip": "Visual separator (no effect on generation)",
+                }),
+                "s1_eta": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": (
+                        "Stochastic noise injection.  0.0 = deterministic.\n"
+                        "For edit tasks usually 0.0 — higher values reduce "
+                        "reference fidelity."
+                    ),
+                }),
+                "s1_steps": ("INT", {"default": 20, "min": 1, "max": 200}),
+                "s1_cfg": ("FLOAT", {
+                    "default": 4.0, "min": 1.0, "max": 20.0, "step": 0.5,
+                }),
+                "s1_sampler": (sampler_names(), {
+                    "default": "flow_heun",
+                    "tooltip": "flow_heun = safe default for edit drafting.",
+                }),
+                "s1_sigma_schedule": (SIGMA_SCHEDULE_NAMES, {
+                    "default": "linear",
+                }),
+
+                # ── Stage 2 ──────────────────────────────────────────
+                "_s2_sep": ("STRING", {
+                    "default": "── Stage 2 ──────────────",
+                    "tooltip": "Visual separator (no effect on generation)",
+                }),
+                "s2_eta": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": (
+                        "Stochastic noise injection.  0.0 = deterministic.\n"
+                        "Lower eta in refinement preserves S1 structure."
+                    ),
+                }),
+                "s2_steps": ("INT", {"default": 20, "min": 1, "max": 200}),
+                "s2_cfg": ("FLOAT", {
+                    "default": 4.0, "min": 1.0, "max": 20.0, "step": 0.5,
+                }),
+                "s2_sampler": (sampler_names(), {"default": "flow_heun"}),
+                "s2_sigma_schedule": (SIGMA_SCHEDULE_NAMES, {
+                    "default": "balanced",
+                }),
+                "s2_denoise": ("FLOAT", {
+                    "default": 0.85, "min": 0.1, "max": 1.0, "step": 0.05,
+                    "tooltip": "0.85 = refine while keeping S1 composition.",
+                }),
+
+                # ── Stage 3 ──────────────────────────────────────────
+                "_s3_sep": ("STRING", {
+                    "default": "── Stage 3 ──────────────",
+                    "tooltip": "Visual separator (no effect on generation)",
+                }),
+                "s3_eta": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": (
+                        "Stochastic noise injection.  0.0 = deterministic.\n"
+                        "Even small eta at S3 can cause mottling."
+                    ),
+                }),
+                "s3_steps": ("INT", {"default": 15, "min": 1, "max": 200}),
+                "s3_cfg": ("FLOAT", {
+                    "default": 4.0, "min": 1.0, "max": 20.0, "step": 0.5,
+                }),
+                "s3_sampler": (sampler_names(), {"default": "flow_multistep2"}),
+                "s3_sigma_schedule": (SIGMA_SCHEDULE_NAMES, {
+                    "default": "karras",
+                }),
+                "s3_denoise": ("FLOAT", {
+                    "default": 0.5, "min": 0.1, "max": 1.0, "step": 0.05,
+                    "tooltip": "0.5 = polish pass, minimal structural change.",
                 }),
             },
         }
@@ -325,29 +292,35 @@ class EricDiffusionAdvancedEditMultistage:
         image_4=None, image_4_vl: bool = True, image_4_ref: bool = True,
         seed: int = 0,
         seed_mode: str = "offset_per_stage",
-        s1_eta: float = 0.0,
         max_sequence_length: int = 1024,
         s1_mp: float = 0.5,
         override_s1_width: int = 0,
         override_s1_height: int = 0,
+        upscale_to_stage2: float = 2.0,
+        upscale_to_stage3: float = 2.0,
+        # Stage 1
+        _s1_sep: str = "",
+        s1_eta: float = 0.0,
         s1_steps: int = 20,
         s1_cfg: float = 4.0,
         s1_sampler: str = "flow_heun",
         s1_sigma_schedule: str = "linear",
-        upscale_to_stage2: float = 2.0,
+        # Stage 2
+        _s2_sep: str = "",
+        s2_eta: float = 0.0,
         s2_steps: int = 20,
         s2_cfg: float = 4.0,
-        s2_denoise: float = 0.85,
         s2_sampler: str = "flow_heun",
         s2_sigma_schedule: str = "balanced",
-        s2_eta: float = 0.0,
-        upscale_to_stage3: float = 2.0,
+        s2_denoise: float = 0.85,
+        # Stage 3
+        _s3_sep: str = "",
+        s3_eta: float = 0.0,
         s3_steps: int = 15,
         s3_cfg: float = 4.0,
-        s3_denoise: float = 0.5,
         s3_sampler: str = "flow_multistep2",
         s3_sigma_schedule: str = "karras",
-        s3_eta: float = 0.0,
+        s3_denoise: float = 0.5,
         use_upscale_vae: bool = False,
         upscale_vae=None,
     ) -> Tuple[torch.Tensor]:
