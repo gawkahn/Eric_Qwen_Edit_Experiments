@@ -19,6 +19,7 @@ from .eric_diffusion_lora_stacker import (
     EricDiffusionLoRAStacker,
     EricQwenEditLoRAStacker,
 )
+from .eric_diffusion_save import EricDiffusionSave
 
 # ── Edit nodes ──────────────────────────────────────────────────────────
 from .eric_qwen_edit_loader import EricQwenEditLoader, EricQwenEditUnload
@@ -61,6 +62,7 @@ NODE_CLASS_MAPPINGS = {
     "Eric Diffusion Advanced Edit":     EricDiffusionAdvancedEdit,
     "Eric Diffusion Advanced Edit Multi-Stage": EricDiffusionAdvancedEditMultistage,
     "Eric Diffusion LoRA Stacker":      EricDiffusionLoRAStacker,
+    "Eric Diffusion Save":              EricDiffusionSave,
     # Edit
     "Eric Qwen-Edit Loader": EricQwenEditLoader,
     "Eric Qwen-Edit Unload": EricQwenEditUnload,
@@ -110,6 +112,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Eric Diffusion Advanced Edit":     "Eric Diffusion Advanced Edit (Qwen Edit)",
     "Eric Diffusion Advanced Edit Multi-Stage": "Eric Diffusion Advanced Edit Multi-Stage (Qwen Edit)",
     "Eric Diffusion LoRA Stacker":      "Eric Diffusion LoRA Stacker",
+    "Eric Diffusion Save":              "Eric Diffusion Save Image",
     # Edit
     "Eric Qwen-Edit Loader": "Eric Qwen-Edit Load Model",
     "Eric Qwen-Edit Unload": "Eric Qwen-Edit Unload",

@@ -15,8 +15,10 @@ Author: Eric Hiss (GitHub: EricRollei)
 
 import inspect
 import math
+import os
 import torch
 import numpy as np
+from datetime import datetime
 from typing import Tuple
 
 from .eric_qwen_edit_utils import pil_to_tensor
@@ -248,8 +250,8 @@ class EricDiffusionGenerate:
 
     CATEGORY = "Eric Diffusion"
     FUNCTION = "generate"
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    RETURN_TYPES = ("IMAGE", "GEN_METADATA")
+    RETURN_NAMES = ("image", "metadata")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -402,4 +404,26 @@ class EricDiffusionGenerate:
         # ── Convert to ComfyUI tensor [B, H, W, C] ─────────────────────────
         pil_image = result.images[0]
         tensor = pil_to_tensor(pil_image).unsqueeze(0)
-        return (tensor,)
+
+        # ── Build GEN_METADATA ─────────────────────────────────────────────
+        model_name = (
+            pipeline.get("transformer_override_name")
+            or os.path.basename(pipeline.get("model_path", ""))
+        )
+        metadata = {
+            "model_name":    model_name,
+            "model_path":    pipeline.get("model_path", ""),
+            "model_family":  model_family,
+            "node_type":     "basic-gen",
+            "seed":          seed,
+            "steps":         steps,
+            "cfg_scale":     cfg_scale,
+            "sampler":       sampler,
+            "prompt":        prompt,
+            "negative_prompt": negative_prompt,
+            "width":         width,
+            "height":        height,
+            "timestamp":     datetime.now().isoformat(),
+        }
+
+        return (tensor, metadata)

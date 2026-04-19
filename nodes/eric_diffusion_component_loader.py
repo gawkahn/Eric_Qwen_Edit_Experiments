@@ -565,6 +565,7 @@ class EricDiffusionComponentLoader:
         pipeline_dict = {
             "pipeline":        pipeline,
             "model_path":      base_pipeline_path,
+            "transformer_override_name": os.path.splitext(os.path.basename(transformer_path))[0] if transformer_path else None,
             "model_family":    model_family,
             "offload_vae":     offload_vae,
             "guidance_embeds": guidance_embeds,
