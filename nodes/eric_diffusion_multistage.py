@@ -30,6 +30,8 @@ from .eric_diffusion_generate import ASPECT_RATIOS, compute_dimensions
 from .eric_qwen_edit_lora import _set_adapters_safe
 from .eric_diffusion_samplers import sampler_choices, swap_sampler
 from .eric_diffusion_manual_loop import _maybe_enable_vae_tiling
+from .eric_diffusion_utils import build_model_metadata
+from datetime import datetime
 
 # Reuse the latent helpers and sigma math from the Qwen multistage node —
 # they are purely mathematical and model-agnostic.
@@ -155,8 +157,8 @@ class EricDiffusionMultiStage:
 
     CATEGORY = "Eric Diffusion"
     FUNCTION = "generate"
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    RETURN_TYPES = ("IMAGE", "GEN_METADATA")
+    RETURN_NAMES = ("image", "metadata")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -318,6 +320,23 @@ class EricDiffusionMultiStage:
         stage_count  = 3 if do_s3 else (2 if do_s2 else 1)
         total_steps  = s1_steps + (s2_steps if do_s2 else 0) + (s3_steps if do_s3 else 0)
 
+        _base_meta = {
+            **build_model_metadata(pipeline),
+            "node_type":   "multi-gen",
+            "seed":        seed,
+            "seed_mode":   seed_mode,
+            "sampler":     sampler,
+            "sampler_s2":  sampler,
+            "sampler_s3":  sampler,
+            "prompt":      prompt,
+            "negative_prompt": negative_prompt,
+            "stage_1": {"steps": s1_steps, "cfg": s1_cfg, "mp": s1_mp},
+            "stage_2": {"steps": s2_steps, "cfg": s2_cfg, "denoise": s2_denoise,
+                        "sigma_schedule": s2_sigma_schedule, "upscale": upscale_to_stage2},
+            "stage_3": {"steps": s3_steps, "cfg": s3_cfg, "denoise": s3_denoise,
+                        "sigma_schedule": s3_sigma_schedule, "upscale": upscale_to_stage3},
+        }
+
         print(f"[EricDiffusion-MS] {model_family} — {stage_count} stage(s), "
               f"{total_steps} total steps, seed_mode={seed_mode}, sampler={sampler}")
         print(f"  S1: {s1_w}×{s1_h} ({s1_mp_act:.2f} MP), {s1_steps} steps, cfg={s1_cfg}")
@@ -411,7 +430,8 @@ class EricDiffusionMultiStage:
 
             if not do_s2:
                 pil = s1_result.images[0]
-                return (pil_to_tensor(pil).unsqueeze(0),)
+                meta = {**_base_meta, "width": s1_w, "height": s1_h, "timestamp": datetime.now().isoformat()}
+                return (pil_to_tensor(pil).unsqueeze(0), meta)
 
             s1_latents = s1_result.images
             # Detect packing format from tensor shape — don't rely on model_family.
@@ -456,7 +476,8 @@ class EricDiffusionMultiStage:
 
             if not do_s3:
                 pil = s2_result.images[0]
-                return (pil_to_tensor(pil).unsqueeze(0),)
+                meta = {**_base_meta, "width": s2_w, "height": s2_h, "timestamp": datetime.now().isoformat()}
+                return (pil_to_tensor(pil).unsqueeze(0), meta)
 
             s2_latents_final = s2_result.images
             print(f"[EricDiffusion-MS]   S2 latents: {s2_latents_final.shape}")
@@ -493,7 +514,8 @@ class EricDiffusionMultiStage:
 
             pil = s3_result.images[0]
             print(f"[EricDiffusion-MS] Output: {pil.size[0]}×{pil.size[1]}")
-            return (pil_to_tensor(pil).unsqueeze(0),)
+            meta = {**_base_meta, "width": s3_w, "height": s3_h, "timestamp": datetime.now().isoformat()}
+            return (pil_to_tensor(pil).unsqueeze(0), meta)
 
         finally:
             sampler_ctx.__exit__(None, None, None)

@@ -36,9 +36,11 @@ Author: Eric Hiss (GitHub: EricRollei)
 import inspect
 import torch
 import numpy as np
+from datetime import datetime
 from typing import Tuple
 
 from .eric_qwen_edit_utils import pil_to_tensor
+from .eric_diffusion_utils import build_model_metadata
 from .eric_diffusion_generate import ASPECT_RATIOS, compute_dimensions
 from .eric_qwen_edit_lora import _set_adapters_safe
 from .eric_diffusion_samplers import sampler_choices, swap_sampler
@@ -158,8 +160,8 @@ class EricDiffusionUltraGen:
 
     CATEGORY = "Eric Diffusion"
     FUNCTION = "generate"
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    RETURN_TYPES = ("IMAGE", "GEN_METADATA")
+    RETURN_NAMES = ("image", "metadata")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -388,6 +390,24 @@ class EricDiffusionUltraGen:
         stage_count = 3 if do_s3 else (2 if do_s2 else 1)
         total_steps = s1_steps + (s2_steps if do_s2 else 0) + (s3_steps if do_s3 else 0)
 
+        _base_meta = {
+            **build_model_metadata(pipeline),
+            "node_type":       "ultragen",
+            "seed":            seed,
+            "seed_mode":       seed_mode,
+            "sampler":         sampler,
+            "sampler_s2":      sampler,
+            "sampler_s3":      sampler,
+            "prompt":          prompt,
+            "negative_prompt": negative_prompt,
+            "upscale_vae_mode": upscale_vae_mode,
+            "stage_1": {"steps": s1_steps, "cfg": s1_cfg, "mp": s1_mp},
+            "stage_2": {"steps": s2_steps, "cfg": s2_cfg, "denoise": s2_denoise,
+                        "sigma_schedule": s2_sigma_schedule, "upscale": upscale_to_stage2},
+            "stage_3": {"steps": s3_steps, "cfg": s3_cfg, "denoise": s3_denoise,
+                        "sigma_schedule": s3_sigma_schedule, "upscale": upscale_to_stage3},
+        }
+
         # ── Upscale VAE compatibility check ────────────────────────────────
         use_inter_stage = False
         use_final_decode = False
@@ -506,13 +526,12 @@ class EricDiffusionUltraGen:
             )
 
             if not do_s2:
+                _meta = {**_base_meta, "width": s1_w, "height": s1_h, "timestamp": datetime.now().isoformat()}
                 if use_final_decode:
-                    return self._final_decode(
-                        s1_result.images, upscale_vae, pipe,
-                        s1_h, s1_w, vae_scale,
-                    )
+                    (t,) = self._final_decode(s1_result.images, upscale_vae, pipe, s1_h, s1_w, vae_scale)
+                    return (t, _meta)
                 pil = s1_result.images[0]
-                return (pil_to_tensor(pil).unsqueeze(0),)
+                return (pil_to_tensor(pil).unsqueeze(0), _meta)
 
             s1_latents = s1_result.images
             print(f"[EricDiffusion-UG]   S1 latents: {s1_latents.shape}")
@@ -546,13 +565,12 @@ class EricDiffusionUltraGen:
             )
 
             if not do_s3:
+                _meta = {**_base_meta, "width": s2_w, "height": s2_h, "timestamp": datetime.now().isoformat()}
                 if use_final_decode:
-                    return self._final_decode(
-                        s2_result.images, upscale_vae, pipe,
-                        s2_h, s2_w, vae_scale,
-                    )
+                    (t,) = self._final_decode(s2_result.images, upscale_vae, pipe, s2_h, s2_w, vae_scale)
+                    return (t, _meta)
                 pil = s2_result.images[0]
-                return (pil_to_tensor(pil).unsqueeze(0),)
+                return (pil_to_tensor(pil).unsqueeze(0), _meta)
 
             s2_latents_final = s2_result.images
             print(f"[EricDiffusion-UG]   S2 latents: {s2_latents_final.shape}")
@@ -597,15 +615,14 @@ class EricDiffusionUltraGen:
                 **s3_cfg_kw,
             )
 
+            _meta = {**_base_meta, "width": s3_w, "height": s3_h, "timestamp": datetime.now().isoformat()}
             if use_final_decode:
-                return self._final_decode(
-                    s3_result.images, upscale_vae, pipe,
-                    s3_h, s3_w, vae_scale,
-                )
+                (t,) = self._final_decode(s3_result.images, upscale_vae, pipe, s3_h, s3_w, vae_scale)
+                return (t, _meta)
 
             pil = s3_result.images[0]
             print(f"[EricDiffusion-UG] Output: {pil.size[0]}×{pil.size[1]}")
-            return (pil_to_tensor(pil).unsqueeze(0),)
+            return (pil_to_tensor(pil).unsqueeze(0), _meta)
 
         finally:
             sampler_ctx.__exit__(None, None, None)

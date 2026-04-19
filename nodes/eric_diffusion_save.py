@@ -87,6 +87,12 @@ def _resolve_token(token: str, metadata: dict, now: datetime) -> str | None:
     if name_lower == "sampler":
         return metadata.get("sampler", "")
 
+    if name_lower == "sampler_s2":
+        return metadata.get("sampler_s2", "")
+
+    if name_lower == "sampler_s3":
+        return metadata.get("sampler_s3", "")
+
     if name_lower == "node":
         return _truncate(metadata.get("node_type", ""), param)
 

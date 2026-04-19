@@ -53,11 +53,13 @@ prompt to use the remapped numbers.
 Author: Eric Hiss (GitHub: EricRollei)
 """
 
+from datetime import datetime
 from typing import Tuple
 
 import torch
 
 from .eric_diffusion_advanced_multistage import _vae_supports_upscale
+from .eric_diffusion_utils import build_model_metadata
 from .eric_diffusion_generate import resolve_override_dimensions
 from .eric_diffusion_manual_loop import (
     sampler_names,
@@ -85,8 +87,8 @@ class EricDiffusionAdvancedEdit:
 
     CATEGORY = "Eric Diffusion"
     FUNCTION = "generate"
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    RETURN_TYPES = ("IMAGE", "GEN_METADATA")
+    RETURN_NAMES = ("image", "metadata")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -592,4 +594,28 @@ class EricDiffusionAdvancedEdit:
                 pipe.vae = pipe.vae.to("cpu")
                 torch.cuda.empty_cache()
 
-        return (image_tensor,)
+        # input_image_dimensions: record H×W for each connected slot (tensors carry no path)
+        _img_dims = []
+        for img in [image_1, image_2, image_3, image_4]:
+            if img is not None:
+                _img_dims.append(f"{img.shape[2]}x{img.shape[1]}")
+        metadata = {
+            **build_model_metadata(pipeline),
+            "node_type":        "adv-edit",
+            "seed":             seed,
+            "steps":            steps,
+            "cfg_scale":        cfg_scale,
+            "sampler":          sampler,
+            "sampler_s2":       "",
+            "sampler_s3":       "",
+            "sigma_schedule":   sigma_schedule,
+            "eta":              eta,
+            "use_upscale_vae":  use_upscale_vae,
+            "prompt":           prompt,
+            "negative_prompt":  negative_prompt,
+            "input_image_dimensions": _img_dims,
+            "width":            out_w,
+            "height":           out_h,
+            "timestamp":        datetime.now().isoformat(),
+        }
+        return (image_tensor, metadata)

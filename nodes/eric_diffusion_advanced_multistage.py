@@ -41,9 +41,11 @@ Author: Eric Hiss (GitHub: EricRollei)
 """
 
 import torch
+from datetime import datetime
 from typing import Tuple
 
 from .eric_qwen_edit_utils import pil_to_tensor
+from .eric_diffusion_utils import build_model_metadata
 from .eric_diffusion_generate import (
     ASPECT_RATIOS,
     compute_dimensions,
@@ -128,8 +130,8 @@ class EricDiffusionAdvancedMultiStage:
 
     CATEGORY = "Eric Diffusion"
     FUNCTION = "generate"
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    RETURN_TYPES = ("IMAGE", "GEN_METADATA")
+    RETURN_NAMES = ("image", "metadata")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -441,6 +443,28 @@ class EricDiffusionAdvancedMultiStage:
 
         stage_count = 3 if do_s3 else (2 if do_s2 else 1)
 
+        _base_meta = {
+            **build_model_metadata(pipeline),
+            "node_type":   "adv-multi-gen",
+            "seed":        seed,
+            "seed_mode":   seed_mode,
+            "sampler":     s1_sampler,
+            "sampler_s2":  s2_sampler,
+            "sampler_s3":  s3_sampler,
+            "prompt":      prompt,
+            "negative_prompt": negative_prompt,
+            "use_upscale_vae": use_upscale_vae,
+            "stage_1": {"steps": s1_steps, "cfg": s1_cfg, "eta": s1_eta,
+                        "denoise": s1_denoise, "sigma_schedule": s1_sigma_schedule,
+                        "sampler": s1_sampler, "mp": s1_mp},
+            "stage_2": {"steps": s2_steps, "cfg": s2_cfg, "eta": s2_eta,
+                        "denoise": s2_denoise, "sigma_schedule": s2_sigma_schedule,
+                        "sampler": s2_sampler, "upscale": upscale_to_stage2},
+            "stage_3": {"steps": s3_steps, "cfg": s3_cfg, "eta": s3_eta,
+                        "denoise": s3_denoise, "sigma_schedule": s3_sigma_schedule,
+                        "sampler": s3_sampler, "upscale": upscale_to_stage3},
+        }
+
         # Total cost in transformer evaluations (steps × sampler cost × cfg multiplier)
         cfg_mult = 2 if (s1_cfg > 1.0 or s2_cfg > 1.0 or s3_cfg > 1.0) and negative_prompt else 1
         total_evals = (
@@ -675,7 +699,7 @@ class EricDiffusionAdvancedMultiStage:
                 s1_ids = None
             steps_completed[0] += s1_steps
 
-            if not do_s2:
+            if not do_s2:  # noqa: SIM102
                 if is_flux2:
                     image_tensor = decode_flux2_latents(pipe, s1_latents, s1_ids)
                 elif is_qwen and effective_use_vae:
@@ -694,7 +718,8 @@ class EricDiffusionAdvancedMultiStage:
                     image_tensor = decode_qwen_latents(pipe, s1_latents, s1_h, s1_w)
                 else:
                     image_tensor = decode_flux_latents(pipe, s1_latents, s1_h, s1_w)
-                return (image_tensor,)
+                meta = {**_base_meta, "width": s1_w, "height": s1_h, "timestamp": datetime.now().isoformat()}
+                return (image_tensor, meta)
 
             print(f"[EricDiffusion-Adv-MS]   S1 latents: {tuple(s1_latents.shape)}")
 
@@ -773,7 +798,8 @@ class EricDiffusionAdvancedMultiStage:
                     image_tensor = decode_qwen_latents(pipe, s2_latents, s2_h, s2_w)
                 else:
                     image_tensor = decode_flux_latents(pipe, s2_latents, s2_h, s2_w)
-                return (image_tensor,)
+                meta = {**_base_meta, "width": s2_w, "height": s2_h, "timestamp": datetime.now().isoformat()}
+                return (image_tensor, meta)
 
             print(f"[EricDiffusion-Adv-MS]   S2 latents: {tuple(s2_latents.shape)}")
 
@@ -883,7 +909,8 @@ class EricDiffusionAdvancedMultiStage:
                 steps_completed[0] += s3_steps
                 image_tensor = decode_flux_latents(pipe, s3_latents, s3_h, s3_w)
 
-            return (image_tensor,)
+            meta = {**_base_meta, "width": s3_w, "height": s3_h, "timestamp": datetime.now().isoformat()}
+            return (image_tensor, meta)
 
         finally:
             # CRITICAL: restore transformer to its original GPU device.

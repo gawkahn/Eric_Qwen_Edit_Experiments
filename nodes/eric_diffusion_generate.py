@@ -15,7 +15,6 @@ Author: Eric Hiss (GitHub: EricRollei)
 
 import inspect
 import math
-import os
 import torch
 import numpy as np
 from datetime import datetime
@@ -23,6 +22,7 @@ from typing import Tuple
 
 from .eric_qwen_edit_utils import pil_to_tensor
 from .eric_diffusion_samplers import sampler_choices, swap_sampler
+from .eric_diffusion_utils import build_model_metadata
 
 
 # ── Resolution helpers ───────────────────────────────────────────────────────
@@ -406,24 +406,20 @@ class EricDiffusionGenerate:
         tensor = pil_to_tensor(pil_image).unsqueeze(0)
 
         # ── Build GEN_METADATA ─────────────────────────────────────────────
-        model_name = (
-            pipeline.get("transformer_override_name")
-            or os.path.basename(pipeline.get("model_path", ""))
-        )
         metadata = {
-            "model_name":    model_name,
-            "model_path":    pipeline.get("model_path", ""),
-            "model_family":  model_family,
-            "node_type":     "basic-gen",
-            "seed":          seed,
-            "steps":         steps,
-            "cfg_scale":     cfg_scale,
-            "sampler":       sampler,
-            "prompt":        prompt,
+            **build_model_metadata(pipeline),
+            "node_type":       "basic-gen",
+            "seed":            seed,
+            "steps":           steps,
+            "cfg_scale":       cfg_scale,
+            "sampler":         sampler,
+            "sampler_s2":      "",
+            "sampler_s3":      "",
+            "prompt":          prompt,
             "negative_prompt": negative_prompt,
-            "width":         width,
-            "height":        height,
-            "timestamp":     datetime.now().isoformat(),
+            "width":           width,
+            "height":          height,
+            "timestamp":       datetime.now().isoformat(),
         }
 
         return (tensor, metadata)

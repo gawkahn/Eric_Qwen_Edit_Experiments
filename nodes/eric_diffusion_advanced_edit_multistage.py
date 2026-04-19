@@ -40,6 +40,7 @@ Author: Eric Hiss (GitHub: EricRollei)
 """
 
 import torch
+from datetime import datetime
 from typing import Tuple
 
 from .eric_diffusion_advanced_multistage import (
@@ -47,6 +48,7 @@ from .eric_diffusion_advanced_multistage import (
     _vae_supports_upscale,
 )
 from .eric_diffusion_generate import resolve_override_dimensions
+from .eric_diffusion_utils import build_model_metadata
 from .eric_diffusion_manual_loop import (
     sampler_names,
     sampler_cost,
@@ -84,8 +86,8 @@ class EricDiffusionAdvancedEditMultistage:
 
     CATEGORY = "Eric Diffusion"
     FUNCTION = "generate"
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    RETURN_TYPES = ("IMAGE", "GEN_METADATA")
+    RETURN_NAMES = ("image", "metadata")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -390,6 +392,34 @@ class EricDiffusionAdvancedEditMultistage:
         do_s3 = do_s2 and upscale_to_stage3 > 0
         stage_count = 3 if do_s3 else (2 if do_s2 else 1)
 
+        _img_dims = [
+            f"{img.shape[2]}x{img.shape[1]}"
+            for img in [image_1, image_2, image_3, image_4]
+            if img is not None
+        ]
+        _base_meta = {
+            **build_model_metadata(pipeline),
+            "node_type":   "adv-edit-multi",
+            "seed":        seed,
+            "seed_mode":   seed_mode,
+            "sampler":     s1_sampler,
+            "sampler_s2":  s2_sampler,
+            "sampler_s3":  s3_sampler,
+            "prompt":      prompt,
+            "negative_prompt": negative_prompt,
+            "use_upscale_vae": use_upscale_vae,
+            "input_image_dimensions": _img_dims,
+            "stage_1": {"steps": s1_steps, "cfg": s1_cfg, "eta": s1_eta,
+                        "sigma_schedule": s1_sigma_schedule, "sampler": s1_sampler,
+                        "mp": s1_mp},
+            "stage_2": {"steps": s2_steps, "cfg": s2_cfg, "eta": s2_eta,
+                        "denoise": s2_denoise, "sigma_schedule": s2_sigma_schedule,
+                        "sampler": s2_sampler, "upscale": upscale_to_stage2},
+            "stage_3": {"steps": s3_steps, "cfg": s3_cfg, "eta": s3_eta,
+                        "denoise": s3_denoise, "sigma_schedule": s3_sigma_schedule,
+                        "sampler": s3_sampler, "upscale": upscale_to_stage3},
+        }
+
         # Stage 1 dimensions: default from last-reference aspect + s1_mp,
         # or from explicit override_s1_width/height.  When override is
         # active, the S1 aspect ratio is taken from the override so
@@ -634,7 +664,8 @@ class EricDiffusionAdvancedEditMultistage:
                     image_tensor = decode_qwen_latents(
                         pipe, s1_latents, s1_out_h, s1_out_w,
                     )
-                return (image_tensor,)
+                meta = {**_base_meta, "width": s1_out_w, "height": s1_out_h, "timestamp": datetime.now().isoformat()}
+                return (image_tensor, meta)
 
             print(
                 f"[EricDiffusion-AdvEditMS]   S1 noise latents: "
@@ -689,7 +720,8 @@ class EricDiffusionAdvancedEditMultistage:
                     image_tensor = decode_qwen_latents(
                         pipe, s2_latents, s2_out_h, s2_out_w,
                     )
-                return (image_tensor,)
+                meta = {**_base_meta, "width": s2_out_w, "height": s2_out_h, "timestamp": datetime.now().isoformat()}
+                return (image_tensor, meta)
 
             print(
                 f"[EricDiffusion-AdvEditMS]   S2 noise latents: "
@@ -767,7 +799,8 @@ class EricDiffusionAdvancedEditMultistage:
                 image_tensor = decode_qwen_latents(
                     pipe, s3_latents, s3_out_h, s3_out_w,
                 )
-            return (image_tensor,)
+            meta = {**_base_meta, "width": s3_out_w, "height": s3_out_h, "timestamp": datetime.now().isoformat()}
+            return (image_tensor, meta)
 
         finally:
             # CRITICAL: restore transformer to its original GPU device.

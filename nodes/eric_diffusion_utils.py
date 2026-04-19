@@ -9,6 +9,7 @@ Shared helpers for the generic multi-model diffusion loader/generate nodes.
 import gc
 import json
 import os
+from datetime import datetime
 import torch
 
 
@@ -1045,3 +1046,36 @@ def clear_gen_pipeline_cache() -> bool:
 
     print("[EricDiffusion] Pipeline cache cleared, VRAM freed")
     return True
+
+
+# ── Metadata helpers ─────────────────────────────────────────────────────────
+
+def build_model_metadata(pipeline_dict: dict) -> dict:
+    """Extract model identity and LoRA fields from a GEN_PIPELINE dict.
+
+    Returns a partial metadata dict suitable for merging into any node's
+    full metadata before returning GEN_METADATA.  Centralises the
+    transformer_override_name → model_name derivation and LoRA extraction
+    so every node uses the same logic.
+    """
+    model_name = (
+        pipeline_dict.get("transformer_override_name")
+        or os.path.basename(pipeline_dict.get("model_path", ""))
+    )
+
+    raw_loras = pipeline_dict.get("applied_loras") or {}
+    loras = {}
+    for name, info in raw_loras.items():
+        w1 = info.get("weight_s1", 1.0)
+        loras[name] = {
+            "weight_s1": w1,
+            "weight_s2": info.get("weight_s2", w1),
+            "weight_s3": info.get("weight_s3", w1),
+        }
+
+    return {
+        "model_name":   model_name,
+        "model_path":   pipeline_dict.get("model_path", ""),
+        "model_family": pipeline_dict.get("model_family", ""),
+        "loras":        loras,
+    }

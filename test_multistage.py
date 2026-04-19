@@ -332,7 +332,7 @@ UltraGen = ultragen_mod.EricDiffusionUltraGen
 # Class attributes
 check("ultragen_category", UltraGen.CATEGORY == "Eric Diffusion")
 check("ultragen_function", UltraGen.FUNCTION == "generate")
-check("ultragen_return_image", UltraGen.RETURN_TYPES == ("IMAGE",))
+check("ultragen_return_image", UltraGen.RETURN_TYPES == ("IMAGE", "GEN_METADATA"))
 
 # INPUT_TYPES has both required pipeline and prompt
 input_types = UltraGen.INPUT_TYPES()

@@ -49,11 +49,13 @@ Author: Eric Hiss (GitHub: EricRollei)
 """
 
 import math
+from datetime import datetime
 from typing import Tuple
 
 import torch
 
 from .eric_qwen_edit_utils import pil_to_tensor
+from .eric_diffusion_utils import build_model_metadata
 from .eric_diffusion_generate import (
     ASPECT_RATIOS,
     compute_dimensions,
@@ -89,8 +91,8 @@ class EricDiffusionAdvancedGenerate:
 
     CATEGORY = "Eric Diffusion"
     FUNCTION = "generate"
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    RETURN_TYPES = ("IMAGE", "GEN_METADATA")
+    RETURN_NAMES = ("image", "metadata")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -478,4 +480,22 @@ class EricDiffusionAdvancedGenerate:
                 pipe.vae = pipe.vae.to("cpu")
                 torch.cuda.empty_cache()
 
-        return (image_tensor,)
+        metadata = {
+            **build_model_metadata(pipeline),
+            "node_type":       "adv-gen",
+            "seed":            seed,
+            "steps":           steps,
+            "cfg_scale":       cfg_scale,
+            "sampler":         sampler,
+            "sampler_s2":      "",
+            "sampler_s3":      "",
+            "sigma_schedule":  sigma_schedule,
+            "eta":             eta,
+            "denoise":         denoise,
+            "prompt":          prompt,
+            "negative_prompt": negative_prompt,
+            "width":           width,
+            "height":          height,
+            "timestamp":       datetime.now().isoformat(),
+        }
+        return (image_tensor, metadata)
