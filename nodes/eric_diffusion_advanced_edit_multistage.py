@@ -205,8 +205,8 @@ class EricDiffusionAdvancedEditMultistage:
                 }),
 
                 # ── Stage 1 ──────────────────────────────────────────
-                "_s1_sep": ("STRING", {
-                    "default": "── Stage 1 ──────────────",
+                "STAGE_1": ("STRING", {
+                    "default": "STAGE 1",
                     "tooltip": "Visual separator (no effect on generation)",
                 }),
                 "s1_eta": ("FLOAT", {
@@ -230,8 +230,8 @@ class EricDiffusionAdvancedEditMultistage:
                 }),
 
                 # ── Stage 2 ──────────────────────────────────────────
-                "_s2_sep": ("STRING", {
-                    "default": "── Stage 2 ──────────────",
+                "STAGE_2": ("STRING", {
+                    "default": "STAGE 2",
                     "tooltip": "Visual separator (no effect on generation)",
                 }),
                 "s2_eta": ("FLOAT", {
@@ -255,8 +255,8 @@ class EricDiffusionAdvancedEditMultistage:
                 }),
 
                 # ── Stage 3 ──────────────────────────────────────────
-                "_s3_sep": ("STRING", {
-                    "default": "── Stage 3 ──────────────",
+                "STAGE_3": ("STRING", {
+                    "default": "STAGE 3",
                     "tooltip": "Visual separator (no effect on generation)",
                 }),
                 "s3_eta": ("FLOAT", {
@@ -299,14 +299,14 @@ class EricDiffusionAdvancedEditMultistage:
         upscale_to_stage2: float = 2.0,
         upscale_to_stage3: float = 2.0,
         # Stage 1
-        _s1_sep: str = "",
+        STAGE_1: str = "",
         s1_eta: float = 0.0,
         s1_steps: int = 20,
         s1_cfg: float = 4.0,
         s1_sampler: str = "flow_heun",
         s1_sigma_schedule: str = "linear",
         # Stage 2
-        _s2_sep: str = "",
+        STAGE_2: str = "",
         s2_eta: float = 0.0,
         s2_steps: int = 20,
         s2_cfg: float = 4.0,
@@ -314,7 +314,7 @@ class EricDiffusionAdvancedEditMultistage:
         s2_sigma_schedule: str = "balanced",
         s2_denoise: float = 0.85,
         # Stage 3
-        _s3_sep: str = "",
+        STAGE_3: str = "",
         s3_eta: float = 0.0,
         s3_steps: int = 15,
         s3_cfg: float = 4.0,
