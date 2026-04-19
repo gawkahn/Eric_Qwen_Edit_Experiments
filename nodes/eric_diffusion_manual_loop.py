@@ -1529,6 +1529,37 @@ def generate_qwen(
     return final_latents
 
 
+# ── VAE tiling helper ────────────────────────────────────────────────────────
+#
+# Standard diffusers VAE decoders OOM above ~4 MP without tiling.  The
+# upscale VAE path already handles this for Qwen when connected; this helper
+# covers every other decode site (Flux, Flux.2, Qwen without upscale VAE).
+#
+# Threshold matches the empirical breakpoint noted in the project backlog.
+
+_TILING_THRESHOLD_PIXELS = 4_000_000  # 4 MP
+
+
+def _maybe_enable_vae_tiling(vae, height: int, width: int) -> bool:
+    """Enable VAE tiling when output exceeds 4 MP. Returns True if tiling was enabled."""
+    if height * width <= _TILING_THRESHOLD_PIXELS:
+        return False
+    try:
+        vae.enable_tiling(
+            tile_sample_min_height=256,
+            tile_sample_min_width=256,
+            tile_sample_stride_height=192,
+            tile_sample_stride_width=192,
+        )
+        print(
+            f"[EricDiffusion] VAE tiling enabled for decode "
+            f"({width}×{height} = {width * height / 1e6:.1f} MP > 4 MP threshold)"
+        )
+        return True
+    except Exception:
+        return False
+
+
 def decode_qwen_latents(
     pipe, latents: torch.Tensor, height: int, width: int,
 ) -> torch.Tensor:
@@ -1542,26 +1573,31 @@ def decode_qwen_latents(
 
     Returns a ComfyUI-format image tensor [1, H, W, 3].
     """
-    with torch.no_grad():
-        latents = pipe._unpack_latents(latents, height, width, pipe.vae_scale_factor)
-        latents = latents.to(pipe.vae.dtype)
+    tiling_enabled = _maybe_enable_vae_tiling(pipe.vae, height, width)
+    try:
+        with torch.no_grad():
+            latents = pipe._unpack_latents(latents, height, width, pipe.vae_scale_factor)
+            latents = latents.to(pipe.vae.dtype)
 
-        # Qwen's VAE config stores per-channel mean/std (length = z_dim)
-        # as 1D lists. Reshape to (1, z_dim, 1, 1, 1) so broadcast hits
-        # the channel axis of the 5D latent tensor.
-        z_dim = pipe.vae.config.z_dim
-        latents_mean = torch.tensor(pipe.vae.config.latents_mean).view(
-            1, z_dim, 1, 1, 1
-        ).to(latents.device, latents.dtype)
-        latents_std = 1.0 / torch.tensor(pipe.vae.config.latents_std).view(
-            1, z_dim, 1, 1, 1
-        ).to(latents.device, latents.dtype)
-        latents = latents / latents_std + latents_mean
+            # Qwen's VAE config stores per-channel mean/std (length = z_dim)
+            # as 1D lists. Reshape to (1, z_dim, 1, 1, 1) so broadcast hits
+            # the channel axis of the 5D latent tensor.
+            z_dim = pipe.vae.config.z_dim
+            latents_mean = torch.tensor(pipe.vae.config.latents_mean).view(
+                1, z_dim, 1, 1, 1
+            ).to(latents.device, latents.dtype)
+            latents_std = 1.0 / torch.tensor(pipe.vae.config.latents_std).view(
+                1, z_dim, 1, 1, 1
+            ).to(latents.device, latents.dtype)
+            latents = latents / latents_std + latents_mean
 
-        # VAE decode returns 5D; [:, :, 0] drops the trivial temporal dim
-        # to get (B, 3, H, W).
-        image = pipe.vae.decode(latents, return_dict=False)[0][:, :, 0]
-        image = pipe.image_processor.postprocess(image, output_type="pt")
+            # VAE decode returns 5D; [:, :, 0] drops the trivial temporal dim
+            # to get (B, 3, H, W).
+            image = pipe.vae.decode(latents, return_dict=False)[0][:, :, 0]
+            image = pipe.image_processor.postprocess(image, output_type="pt")
+    finally:
+        if tiling_enabled:
+            pipe.vae.disable_tiling()
     # image is [1, 3, H, W] in [0, 1]; convert to ComfyUI format [1, H, W, 3]
     return image.permute(0, 2, 3, 1).contiguous().float().cpu()
 
@@ -1826,9 +1862,20 @@ def decode_flux2_latents(
         # Unpatchify: (B, C*4, H_patched, W_patched) → (B, C, H_lat, W_lat)
         latents_unpatched = pipe._unpatchify_latents(latents_spatial)
 
-        # VAE decode → pixel image
-        image = vae.decode(latents_unpatched, return_dict=False)[0]
-        image = pipe.image_processor.postprocess(image, output_type="pt")
+        # Derive pixel dimensions from latent spatial shape for tiling check.
+        # vae_scale_factor is 8 for Flux.2; latents_unpatched is (B, C, H_lat, W_lat).
+        vae_scale = getattr(pipe, "vae_scale_factor", 8)
+        _, _, h_lat, w_lat = latents_unpatched.shape
+        pix_h, pix_w = h_lat * vae_scale, w_lat * vae_scale
+
+        tiling_enabled = _maybe_enable_vae_tiling(vae, pix_h, pix_w)
+        try:
+            # VAE decode → pixel image
+            image = vae.decode(latents_unpatched, return_dict=False)[0]
+            image = pipe.image_processor.postprocess(image, output_type="pt")
+        finally:
+            if tiling_enabled:
+                vae.disable_tiling()
 
     # (1, 3, H, W) → (1, H, W, 3)
     return image.permute(0, 2, 3, 1).contiguous().float().cpu()
@@ -1910,11 +1957,16 @@ def decode_flux_latents(pipe, latents: torch.Tensor, height: int, width: int) ->
 
     Returns a ComfyUI-format image tensor [1, H, W, 3].
     """
-    with torch.no_grad():
-        latents = pipe._unpack_latents(latents, height, width, pipe.vae_scale_factor)
-        latents = (latents / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor
-        image = pipe.vae.decode(latents, return_dict=False)[0]
-        image = pipe.image_processor.postprocess(image, output_type="pt")
+    tiling_enabled = _maybe_enable_vae_tiling(pipe.vae, height, width)
+    try:
+        with torch.no_grad():
+            latents = pipe._unpack_latents(latents, height, width, pipe.vae_scale_factor)
+            latents = (latents / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor
+            image = pipe.vae.decode(latents, return_dict=False)[0]
+            image = pipe.image_processor.postprocess(image, output_type="pt")
+    finally:
+        if tiling_enabled:
+            pipe.vae.disable_tiling()
     # image is [1, 3, H, W] in [0, 1]; convert to ComfyUI format [1, H, W, 3]
     return image.permute(0, 2, 3, 1).contiguous().float().cpu()
 

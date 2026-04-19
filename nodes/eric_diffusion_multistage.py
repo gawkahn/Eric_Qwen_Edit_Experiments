@@ -29,6 +29,7 @@ from .eric_qwen_edit_utils import pil_to_tensor
 from .eric_diffusion_generate import ASPECT_RATIOS, compute_dimensions
 from .eric_qwen_edit_lora import _set_adapters_safe
 from .eric_diffusion_samplers import sampler_choices, swap_sampler
+from .eric_diffusion_manual_loop import _maybe_enable_vae_tiling
 
 # Reuse the latent helpers and sigma math from the Qwen multistage node —
 # they are purely mathematical and model-agnostic.
@@ -393,6 +394,8 @@ class EricDiffusionMultiStage:
             _apply_lora_stage_weights(pipe, pipeline, 1)
             s1_cfg_kw = _cfg_kwargs(pipe, model_family, guidance_embeds, s1_cfg, neg,
                                     max_sequence_length)
+            if not do_s2:
+                _maybe_enable_vae_tiling(pipe.vae, s1_h, s1_w)
             s1_result = pipe(
                 prompt=prompt,
                 height=s1_h,
@@ -403,6 +406,8 @@ class EricDiffusionMultiStage:
                 output_type="latent" if do_s2 else "pil",
                 **s1_cfg_kw,
             )
+            if not do_s2 and hasattr(pipe, "vae"):
+                pipe.vae.disable_tiling()
 
             if not do_s2:
                 pil = s1_result.images[0]
@@ -432,6 +437,8 @@ class EricDiffusionMultiStage:
             _apply_lora_stage_weights(pipe, pipeline, 2)
             s2_cfg_kw = _cfg_kwargs(pipe, model_family, guidance_embeds, s2_cfg, neg,
                                     max_sequence_length)
+            if not do_s3:
+                _maybe_enable_vae_tiling(pipe.vae, s2_h, s2_w)
             s2_result = pipe(
                 prompt=prompt,
                 height=s2_h,
@@ -444,6 +451,8 @@ class EricDiffusionMultiStage:
                 output_type="latent" if do_s3 else "pil",
                 **s2_cfg_kw,
             )
+            if not do_s3 and hasattr(pipe, "vae"):
+                pipe.vae.disable_tiling()
 
             if not do_s3:
                 pil = s2_result.images[0]
@@ -466,6 +475,7 @@ class EricDiffusionMultiStage:
             _apply_lora_stage_weights(pipe, pipeline, 3)
             s3_cfg_kw = _cfg_kwargs(pipe, model_family, guidance_embeds, s3_cfg, neg,
                                     max_sequence_length)
+            _maybe_enable_vae_tiling(pipe.vae, s3_h, s3_w)
             s3_result = pipe(
                 prompt=prompt,
                 height=s3_h,
@@ -478,6 +488,8 @@ class EricDiffusionMultiStage:
                 output_type="pil",
                 **s3_cfg_kw,
             )
+            if hasattr(pipe, "vae"):
+                pipe.vae.disable_tiling()
 
             pil = s3_result.images[0]
             print(f"[EricDiffusion-MS] Output: {pil.size[0]}×{pil.size[1]}")
