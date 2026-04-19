@@ -29,6 +29,7 @@ DTYPE_MAP = {
 _FAMILY_PATTERNS = [
     ("qwenimageeditplus",   "qwen-edit"),
     ("qwenimage",           "qwen-image"),
+    ("flux2klein",          "flux2klein"),
     ("flux2",               "flux2"),
     ("chroma",              "chroma"),
     ("flux",                "flux"),

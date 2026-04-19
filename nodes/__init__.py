@@ -15,6 +15,7 @@ from .eric_diffusion_advanced_generate import EricDiffusionAdvancedGenerate
 from .eric_diffusion_advanced_multistage import EricDiffusionAdvancedMultiStage
 from .eric_diffusion_advanced_edit import EricDiffusionAdvancedEdit
 from .eric_diffusion_advanced_edit_multistage import EricDiffusionAdvancedEditMultistage
+from .eric_diffusion_flux2_edit import EricDiffusionEdit
 from .eric_diffusion_lora_stacker import (
     EricDiffusionLoRAStacker,
     EricQwenEditLoRAStacker,
@@ -61,6 +62,7 @@ NODE_CLASS_MAPPINGS = {
     "Eric Diffusion Advanced Multi-Stage": EricDiffusionAdvancedMultiStage,
     "Eric Diffusion Advanced Edit":     EricDiffusionAdvancedEdit,
     "Eric Diffusion Advanced Edit Multi-Stage": EricDiffusionAdvancedEditMultistage,
+    "Eric Diffusion Edit":              EricDiffusionEdit,
     "Eric Diffusion LoRA Stacker":      EricDiffusionLoRAStacker,
     "Eric Diffusion Save":              EricDiffusionSave,
     # Edit
@@ -111,6 +113,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Eric Diffusion Advanced Multi-Stage": "Eric Diffusion Advanced Multi-Stage (Flux/Chroma)",
     "Eric Diffusion Advanced Edit":     "Eric Diffusion Advanced Edit (Qwen Edit)",
     "Eric Diffusion Advanced Edit Multi-Stage": "Eric Diffusion Advanced Edit Multi-Stage (Qwen Edit)",
+    "Eric Diffusion Edit":              "Eric Diffusion Edit (Flux.2 Klein/Dev)",
     "Eric Diffusion LoRA Stacker":      "Eric Diffusion LoRA Stacker",
     "Eric Diffusion Save":              "Eric Diffusion Save Image",
     # Edit
