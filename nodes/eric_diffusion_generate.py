@@ -413,8 +413,16 @@ class EricDiffusionGenerate:
         )
 
         # ── Inference (with optional custom sampler) ───────────────────────
+        # SDXL/SD1 use DDPM-style schedulers (EulerDiscrete, PNDM) that call
+        # init_noise_sigma in prepare_latents.  FlowMultistep* schedulers don't
+        # have that attribute — fall back to the model's native scheduler.
+        effective_sampler = sampler
+        if model_family in ("sdxl", "sd1") and sampler != "default":
+            print(f"[EricDiffusion] Custom samplers require flow-match schedulers — "
+                  f"ignoring sampler={sampler!r} for {model_family}")
+            effective_sampler = "default"
         try:
-            with swap_sampler(pipe, sampler):
+            with swap_sampler(pipe, effective_sampler):
                 result = pipe(**call_kwargs)
         finally:
             if offload_vae and not using_device_map and hasattr(pipe, "vae"):

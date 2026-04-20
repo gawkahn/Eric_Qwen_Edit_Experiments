@@ -416,7 +416,14 @@ class EricDiffusionMultiStage:
         # Sampler swap wraps ALL three stages.  Mu is precomputed from
         # original_scheduler above, so sigma math remains correct even if
         # the swap installs a custom scheduler.
-        sampler_ctx = swap_sampler(pipe, sampler, log_prefix="[EricDiffusion-MS]")
+        # SDXL/SD1 use DDPM-style schedulers that require init_noise_sigma;
+        # FlowMultistep* don't have it — use the model's native scheduler.
+        effective_sampler = sampler
+        if model_family in ("sdxl", "sd1") and sampler != "default":
+            print(f"[EricDiffusion-MS] Custom samplers require flow-match schedulers — "
+                  f"ignoring sampler={sampler!r} for {model_family}")
+            effective_sampler = "default"
+        sampler_ctx = swap_sampler(pipe, effective_sampler, log_prefix="[EricDiffusion-MS]")
         sampler_ctx.__enter__()
         try:
             # ── Stage 1 — draft (txt2img from noise) ──────────────────────
