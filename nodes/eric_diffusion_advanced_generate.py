@@ -346,6 +346,15 @@ class EricDiffusionAdvancedGenerate:
         )
         supported = flux_families + qwen_families
         if model_family not in supported:
+            unet_families = ("sdxl", "sd3", "sd1")
+            if model_family in unet_families:
+                raise ValueError(
+                    f"Eric Diffusion Advanced Generate uses a transformer "
+                    f"manual loop and does not support UNet-based models "
+                    f"(SDXL/SD3/SD1).  Got model_family={model_family!r}.\n"
+                    f"Use 'Eric Diffusion Generate' or 'Eric Diffusion "
+                    f"Multi-Stage' for SDXL/SD3/SD1."
+                )
             raise ValueError(
                 f"Eric Diffusion Advanced Generate supports Flux-family "
                 f"(Flux/Flux2/Chroma) and Qwen-Image pipelines.  Got "

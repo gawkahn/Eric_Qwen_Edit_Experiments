@@ -123,6 +123,11 @@ def _cfg_kwargs(pipe, model_family: str, guidance_embeds: bool,
         if "max_sequence_length" in sig.parameters:
             kw["max_sequence_length"] = max_sequence_length
         return kw
+    if model_family in ("sdxl", "sd3", "sd1"):
+        kw = {"guidance_scale": cfg_scale}
+        if negative_prompt:
+            kw["negative_prompt"] = negative_prompt
+        return kw
     # Unknown: introspect
     sig = inspect.signature(pipe.__call__)
     accepted = set(sig.parameters.keys())
