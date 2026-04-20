@@ -198,7 +198,7 @@ def _build_call_kwargs(
             kwargs["negative_prompt"] = negative_prompt
         return kwargs
 
-    if model_family in ("flux", "flux2"):
+    if model_family in ("flux", "flux2", "flux2klein"):
         # Flux: guidance-distilled — one forward pass, no negative prompts.
         # guidance_scale typical range 3.5–7.0.
         kwargs = {

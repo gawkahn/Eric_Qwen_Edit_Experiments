@@ -338,8 +338,8 @@ class EricDiffusionAdvancedGenerate:
 
         # ── Family check ───────────────────────────────────────────────
         flux_families = (
-            "flux", "flux2", "chroma",
-            "fluxpipeline", "flux2pipeline", "chromapipeline",
+            "flux", "flux2", "flux2klein", "chroma",
+            "fluxpipeline", "flux2pipeline", "flux2kleinpipeline", "chromapipeline",
         )
         qwen_families = (
             "qwen-image", "qwenimage", "qwenimagepipeline",
@@ -374,7 +374,7 @@ class EricDiffusionAdvancedGenerate:
         effective_denoise = 1.0
         is_i2i = reference_image is not None
         if is_i2i:
-            is_flux2_preflight = model_family in ("flux2", "flux2pipeline")
+            is_flux2_preflight = model_family in ("flux2", "flux2klein", "flux2pipeline", "flux2kleinpipeline")
             if is_flux2_preflight:
                 raise ValueError(
                     "Flux.2 i2i is not yet supported — stock diffusers has "
@@ -439,7 +439,7 @@ class EricDiffusionAdvancedGenerate:
             pipe.vae = pipe.vae.to(vae_target)
 
         # ── Run the manual loop ────────────────────────────────────────
-        is_flux2 = model_family in ("flux2", "flux2pipeline")
+        is_flux2 = model_family in ("flux2", "flux2klein", "flux2pipeline", "flux2kleinpipeline")
         is_chroma = model_family in ("chroma", "chromapipeline")
         is_qwen = model_family in qwen_families
 

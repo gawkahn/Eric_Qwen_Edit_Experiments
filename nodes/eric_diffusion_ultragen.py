@@ -101,7 +101,7 @@ def _cfg_kwargs(pipe, model_family: str, guidance_embeds: bool,
         if negative_prompt:
             kw["negative_prompt"] = negative_prompt
         return kw
-    if model_family in ("flux", "flux2"):
+    if model_family in ("flux", "flux2", "flux2klein"):
         kw = {"guidance_scale": cfg_scale}
         sig = inspect.signature(pipe.__call__)
         if "max_sequence_length" in sig.parameters:

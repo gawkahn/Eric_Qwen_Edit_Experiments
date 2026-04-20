@@ -385,8 +385,8 @@ class EricDiffusionAdvancedMultiStage:
 
         # ── Family check ───────────────────────────────────────────────
         flux_families = (
-            "flux", "flux2", "chroma",
-            "fluxpipeline", "flux2pipeline", "chromapipeline",
+            "flux", "flux2", "flux2klein", "chroma",
+            "fluxpipeline", "flux2pipeline", "flux2kleinpipeline", "chromapipeline",
         )
         qwen_families = (
             "qwen-image", "qwenimage", "qwenimagepipeline",
@@ -571,7 +571,7 @@ class EricDiffusionAdvancedMultiStage:
         # upscale_flux_latents.  Only Flux.2 needs a separate upscale
         # because it packs differently.  Qwen has its own decode path
         # because its VAE is 5D and uses per-channel mean/std denorm.
-        is_flux2 = model_family in ("flux2", "flux2pipeline")
+        is_flux2 = model_family in ("flux2", "flux2klein", "flux2pipeline", "flux2kleinpipeline")
         is_chroma = model_family in ("chroma", "chromapipeline")
         is_qwen = model_family in qwen_families
         vae_scale = getattr(pipe, "vae_scale_factor", 8)
