@@ -33,6 +33,7 @@ _FAMILY_PATTERNS = [
     ("flux2",               "flux2"),
     ("chroma",              "chroma"),
     ("flux",                "flux"),
+    ("auraflow",            "auraflow"),
     ("stablediffusion3",    "sd3"),
     ("stablediffusionxl",   "sdxl"),
     ("stablediffusion",     "sd1"),

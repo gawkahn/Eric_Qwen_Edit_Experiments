@@ -220,6 +220,17 @@ def _build_call_kwargs(
             kwargs["negative_prompt"] = negative_prompt
         return kwargs
 
+    if model_family == "auraflow":
+        # AuraFlow / Pony v7: classical CFG with UMT5 encoder.
+        # max_sequence_length defaults to 256 on UMT5 (vs 512 for T5-XXL on Flux).
+        kwargs = {**base, "guidance_scale": cfg_scale}
+        if negative_prompt:
+            kwargs["negative_prompt"] = negative_prompt
+        sig = inspect.signature(pipe.__call__)
+        if "max_sequence_length" in sig.parameters:
+            kwargs["max_sequence_length"] = max_sequence_length
+        return kwargs
+
     # ── Unknown family: introspect __call__ signature and pass what fits ──
     print(
         f"[EricDiffusion] Unknown model_family={model_family!r} — "
