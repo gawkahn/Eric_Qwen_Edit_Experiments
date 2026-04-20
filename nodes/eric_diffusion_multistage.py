@@ -411,7 +411,9 @@ class EricDiffusionMultiStage:
 
         # Move VAE to GPU if offloaded (skip when device_map manages placement)
         if offload_vae and not using_device_map and hasattr(pipe, "vae"):
-            pipe.vae = pipe.vae.to(next(pipe.transformer.parameters()).device)
+            _denoiser = getattr(pipe, "transformer", None) or getattr(pipe, "unet", None)
+            if _denoiser is not None:
+                pipe.vae = pipe.vae.to(next(_denoiser.parameters()).device)
 
         # Sampler swap wraps ALL three stages.  Mu is precomputed from
         # original_scheduler above, so sigma math remains correct even if

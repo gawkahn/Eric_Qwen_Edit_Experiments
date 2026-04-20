@@ -190,12 +190,10 @@ class EricDiffusionLoader:
             cache["model_path"]    = model_path
             cache["cache_key"]     = cache_key
 
-        params_b = (
-            sum(p.numel() for p in pipeline.transformer.parameters()) / 1e9
-            if hasattr(pipeline, "transformer") else 0.0
-        )
+        denoiser = getattr(pipeline, "transformer", None) or getattr(pipeline, "unet", None)
+        params_b = sum(p.numel() for p in denoiser.parameters()) / 1e9 if denoiser else 0.0
         print(
-            f"[EricDiffusion] Loaded — {params_b:.2f}B transformer params, "
+            f"[EricDiffusion] Loaded — {params_b:.2f}B denoiser params, "
             f"guidance_embeds={guidance_embeds}"
         )
 

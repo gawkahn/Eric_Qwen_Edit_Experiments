@@ -424,17 +424,22 @@ class EricDiffusionComponentLoader:
             fmt = detect_component_format(transformer_path)
             print(f"[EricDiffusion] Transformer override: {transformer_path!r} (fmt: {fmt})")
             cls_, cname = resolve_component_class(model_index, "transformer")
+            # SDXL/SD1 use a "unet" slot, not "transformer" — fall back transparently.
+            transformer_slot = "transformer"
+            if cls_ is None and model_index.get("unet"):
+                cls_, cname = resolve_component_class(model_index, "unet")
+                transformer_slot = "unet"
             if cls_ is None:
                 raise ValueError(
-                    f"Transformer class '{cname}' not found in installed diffusers. "
+                    f"Transformer/UNet class '{cname}' not found in installed diffusers. "
                     "Try: pip install -U diffusers"
                 )
-            kwargs["transformer"] = load_component(
+            kwargs[transformer_slot] = load_component(
                 cls_, transformer_path, dtype,
-                base_path=base_pipeline_path, subfolder_hint="transformer",
+                base_path=base_pipeline_path, subfolder_hint=transformer_slot,
                 pipeline_class=pipeline_class,
             )
-            print(f"[EricDiffusion] Custom transformer loaded ({cname})")
+            print(f"[EricDiffusion] Custom {transformer_slot} loaded ({cname})")
 
         if vae_path:
             fmt = detect_component_format(vae_path)
@@ -577,12 +582,10 @@ class EricDiffusionComponentLoader:
             cache["model_path"]    = base_pipeline_path
             cache["cache_key"]     = cache_key
 
-        params_b = (
-            sum(p.numel() for p in pipeline.transformer.parameters()) / 1e9
-            if hasattr(pipeline, "transformer") else 0.0
-        )
+        denoiser = getattr(pipeline, "transformer", None) or getattr(pipeline, "unet", None)
+        params_b = sum(p.numel() for p in denoiser.parameters()) / 1e9 if denoiser else 0.0
         print(
-            f"[EricDiffusion] Component pipeline ready — {params_b:.2f}B transformer params, "
+            f"[EricDiffusion] Component pipeline ready — {params_b:.2f}B denoiser params, "
             f"overrides: {overrides}"
         )
 

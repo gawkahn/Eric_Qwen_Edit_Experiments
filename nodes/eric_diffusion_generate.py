@@ -402,8 +402,9 @@ class EricDiffusionGenerate:
         # Skip when device_map is in use — accelerate manages device placement.
         using_device_map = hasattr(pipe, "hf_device_map")
         if offload_vae and not using_device_map and hasattr(pipe, "vae"):
-            vae_target = next(pipe.transformer.parameters()).device
-            pipe.vae = pipe.vae.to(vae_target)
+            _denoiser = getattr(pipe, "transformer", None) or getattr(pipe, "unet", None)
+            if _denoiser is not None:
+                pipe.vae = pipe.vae.to(next(_denoiser.parameters()).device)
 
         # ── Build call kwargs for this model family ────────────────────────
         call_kwargs = _build_call_kwargs(
