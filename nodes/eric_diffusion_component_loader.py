@@ -24,6 +24,7 @@ from typing import Tuple
 from .eric_diffusion_utils import (
     DTYPE_MAP,
     detect_pipeline_class,
+    detect_load_variant,
     read_model_index,
     resolve_component_class,
     detect_component_format,
@@ -516,6 +517,9 @@ class EricDiffusionComponentLoader:
         load_kwargs = dict(torch_dtype=dtype, local_files_only=True, **kwargs)
         if use_device_map:
             load_kwargs["device_map"] = "balanced"
+        variant = detect_load_variant(base_pipeline_path)
+        if variant:
+            load_kwargs["variant"] = variant
 
         pipeline = pipeline_class.from_pretrained(base_pipeline_path, **load_kwargs)
 

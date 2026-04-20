@@ -154,6 +154,25 @@ def resolve_component_path(path: str) -> str:
     return path  # return original; caller will get a clear "not found" error
 
 
+def detect_load_variant(model_path: str) -> str | None:
+    """Return 'fp16' or 'fp32' if the model directory uses variant-named weight
+    files (e.g. diffusion_pytorch_model.fp16.safetensors), else None.
+
+    Scans the first component subfolder found; all subdirs in a given model
+    release use the same variant naming convention.
+    """
+    for subdir in ("unet", "transformer", "vae", "text_encoder", "text_encoder_2"):
+        subdir_path = os.path.join(model_path, subdir)
+        if not os.path.isdir(subdir_path):
+            continue
+        for fname in os.listdir(subdir_path):
+            if ".fp16." in fname:
+                return "fp16"
+            if ".fp32." in fname:
+                return "fp32"
+    return None
+
+
 def detect_component_format(path: str) -> str:
     """Detect the layout of a component override path.
 
