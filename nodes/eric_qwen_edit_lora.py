@@ -259,7 +259,7 @@ def _load_lokr_adapter_peft(pipe, state_dict: dict, adapter_name: str,
     """Inject LoKR adapter via PEFT's ``inject_adapter_in_model``."""
     from peft import LoKrConfig, inject_adapter_in_model, set_peft_model_state_dict
 
-    transformer = pipe.transformer
+    transformer = getattr(pipe, "transformer", None) or getattr(pipe, "unet", None)
 
     # Use a very large r so that PEFT creates full (non-decomposed) w1/w2
     # matrices.  alpha = r gives unit scaling (1.0).
@@ -316,7 +316,7 @@ def _load_lokr_adapter_direct(pipe, state_dict: dict, adapter_name: str,
     """
     import math, re
 
-    transformer = pipe.transformer
+    transformer = getattr(pipe, "transformer", None) or getattr(pipe, "unet", None)
     model_sd = dict(transformer.named_parameters())
 
     # Group state dict keys by module path
@@ -436,7 +436,7 @@ def _load_loha_adapter_peft(pipe, state_dict: dict, adapter_name: str,
     """Inject LoHa adapter via PEFT's ``inject_adapter_in_model``."""
     from peft import LoHaConfig, inject_adapter_in_model, set_peft_model_state_dict
 
-    transformer = pipe.transformer
+    transformer = getattr(pipe, "transformer", None) or getattr(pipe, "unet", None)
 
     # Determine rank from the first w1_a tensor shape
     r_val = None
@@ -491,7 +491,7 @@ def _load_loha_adapter_direct(pipe, state_dict: dict, adapter_name: str,
     LoHa delta = ``(w1_a @ w1_b) * (w2_a @ w2_b) * (alpha / r) * weight``.
     When *alpha* is absent, scale defaults to ``1.0``.
     """
-    transformer = pipe.transformer
+    transformer = getattr(pipe, "transformer", None) or getattr(pipe, "unet", None)
     model_sd = dict(transformer.named_parameters())
 
     # Group state dict keys by module path
@@ -780,7 +780,7 @@ def _load_lora_adapter_peft(pipe, state_dict: dict, adapter_name: str,
     """Inject standard LoRA adapter directly via PEFT on the transformer."""
     from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
 
-    transformer = pipe.transformer
+    transformer = getattr(pipe, "transformer", None) or getattr(pipe, "unet", None)
 
     # Normalise lora_down/lora_up → lora_A/lora_B before PEFT sees them
     state_dict = _rename_lora_down_up(state_dict)
@@ -837,7 +837,7 @@ def _load_lora_adapter_direct(pipe, state_dict: dict, adapter_name: str,
     The user *weight* is baked in at merge time.  ``set_adapters()`` will
     not be able to change it afterwards (a limitation of direct merge).
     """
-    transformer = pipe.transformer
+    transformer = getattr(pipe, "transformer", None) or getattr(pipe, "unet", None)
     model_sd = dict(transformer.named_parameters())
 
     modules: dict[str, dict] = {}
