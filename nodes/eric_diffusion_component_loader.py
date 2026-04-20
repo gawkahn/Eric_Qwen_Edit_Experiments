@@ -372,6 +372,15 @@ class EricDiffusionComponentLoader:
                     "default": False,
                     "tooltip": "Extreme VRAM savings via sequential CPU offload — very slow.",
                 }),
+                "vae_from_transformer": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "Extract VAE from the transformer_path AIO checkpoint instead of "
+                        "using the base pipeline's VAE. Useful when the checkpoint bundles "
+                        "a custom or stabilized VAE (e.g. Illustrious, NoobAI, AllInOne). "
+                        "Ignored if vae_path is also set."
+                    ),
+                }),
             },
         }
 
@@ -388,6 +397,7 @@ class EricDiffusionComponentLoader:
         offload_vae: bool = False,
         attention_slicing: bool = False,
         sequential_offload: bool = False,
+        vae_from_transformer: bool = False,
     ) -> Tuple:
         base_pipeline_path   = base_pipeline_path.strip()
         transformer_path     = transformer_path.strip()
@@ -398,7 +408,7 @@ class EricDiffusionComponentLoader:
         cache_key = (
             f"comp_{base_pipeline_path}_{transformer_path}_{vae_path}_"
             f"{text_encoder_path}_{text_encoder_2_path}_{precision}_{device}_{offload_vae}"
-            f"_{attention_slicing}_{sequential_offload}"
+            f"_{attention_slicing}_{sequential_offload}_{vae_from_transformer}"
         )
         cache = get_gen_pipeline_cache()
 
@@ -440,6 +450,17 @@ class EricDiffusionComponentLoader:
                 pipeline_class=pipeline_class,
             )
             print(f"[EricDiffusion] Custom {transformer_slot} loaded ({cname})")
+
+        if vae_from_transformer and transformer_path and not vae_path:
+            cls_, cname = resolve_component_class(model_index, "vae")
+            if cls_ is None:
+                raise ValueError(f"VAE class '{cname}' not found in installed diffusers.")
+            kwargs["vae"] = load_component(
+                cls_, transformer_path, dtype,
+                base_path=base_pipeline_path, subfolder_hint="vae",
+                pipeline_class=pipeline_class,
+            )
+            print(f"[EricDiffusion] VAE extracted from transformer checkpoint ({cname})")
 
         if vae_path:
             fmt = detect_component_format(vae_path)
