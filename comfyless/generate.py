@@ -103,8 +103,23 @@ def _build_call_kwargs(
             kwargs["negative_prompt"] = negative_prompt
         return kwargs
 
-    if model_family in ("flux", "flux2", "chroma"):
+    if model_family in ("flux", "flux2", "flux2klein", "chroma"):
         kwargs = {**base, "guidance_scale": cfg_scale}
+        sig = inspect.signature(pipe.__call__)
+        if "max_sequence_length" in sig.parameters:
+            kwargs["max_sequence_length"] = max_sequence_length
+        return kwargs
+
+    if model_family in ("sdxl", "sd3", "sd1"):
+        kwargs = {**base, "guidance_scale": cfg_scale}
+        if negative_prompt:
+            kwargs["negative_prompt"] = negative_prompt
+        return kwargs
+
+    if model_family == "auraflow":
+        kwargs = {**base, "guidance_scale": cfg_scale}
+        if negative_prompt:
+            kwargs["negative_prompt"] = negative_prompt
         sig = inspect.signature(pipe.__call__)
         if "max_sequence_length" in sig.parameters:
             kwargs["max_sequence_length"] = max_sequence_length
@@ -248,8 +263,9 @@ def generate(
 
     # ── VAE: move back to GPU for decode ──────────────────────────────
     if offload_vae and hasattr(pipe, "vae"):
-        vae_target = next(pipe.transformer.parameters()).device
-        pipe.vae = pipe.vae.to(vae_target)
+        _denoiser = getattr(pipe, "transformer", None) or getattr(pipe, "unet", None)
+        if _denoiser is not None:
+            pipe.vae = pipe.vae.to(next(_denoiser.parameters()).device)
 
     # ── Inference (with optional sampler swap) ────────────────────────
     t0 = time.monotonic()
