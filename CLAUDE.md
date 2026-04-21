@@ -66,13 +66,14 @@ See the general `Git Commit Discipline` rule in `~/.claude/CLAUDE.md` for the ca
 - The manual loop module `eric_diffusion_manual_loop.py` is large (>2600 lines) — when committing changes to it, write the commit message based on the _semantic_ change (which function/path you touched), not the line count
 - The test files import from `nodes/eric_diffusion_manual_loop.py` via `importlib.util.spec_from_file_location` — they DON'T fail if the module file is missing at import time, but they fail silently with confusing errors. When committing a test-only change, verify the tested module is already in git, or bundle test+module changes in the same commit
 
-**Remote sync for this repo (overrides the global default):**
+**Remote sync cadence:**
 
-The global `Git Commit Discipline` rule says "Never push to remote without explicit user approval." In this repo that default is overridden: **push `origin main` immediately after every user-approved commit**, same cadence as the commit itself. No separate approval per push.
+The global `Git Commit Discipline` rule "Never push to remote without explicit user approval" still holds. The repo-specific addition is about *when* to seek that approval: **after every user-approved slice commit, proactively ask whether to push.** Do not silently defer pushes to end-of-session — that caused local to drift 47 commits ahead of remote before being noticed on 2026-04-21.
 
-- Standing authorization granted 2026-04-21 after discovering local was 47 commits ahead of remote. This is a personal solo repo (`github.com/gawkahn/...`); keeping remote in sync avoids that drift.
-- If the user says "don't push yet" or "hold off" for a specific commit, respect that for that commit only — default still holds for the next one.
-- Force push, skipping hooks (`--no-verify`), and signing bypass are NOT covered by this authorization — those still require explicit per-invocation approval.
+- Default flow: commit → ask the user "push `origin main` now?" → push on yes, hold on no.
+- If the user's slice-approval message already said to push (e.g. "commit and push this"), that's the push approval — no second ask for that one.
+- "Hold" on one commit does not extend to the next — ask again after the next slice.
+- Force push, skipping hooks (`--no-verify`), and signing bypass remain separate per-invocation approvals regardless.
 
 ## Architecture
 
