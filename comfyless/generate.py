@@ -228,6 +228,8 @@ def generate(
     text_encoder_path: str = "",
     text_encoder_2_path: str = "",
     vae_from_transformer: bool = False,
+    attention_slicing: bool = False,
+    sequential_offload: bool = False,
 ) -> Dict[str, Any]:
     """Generate a single image and save it.
 
@@ -352,16 +354,28 @@ def generate(
         load_kwargs["variant"] = variant
         _log(f"[comfyless] Detected weight variant: {variant}")
 
-    pipe = pipeline_class.from_pretrained(model_path, **load_kwargs).to(device)
+    pipe = pipeline_class.from_pretrained(model_path, **load_kwargs)
+
+    # Device placement — sequential_offload precludes .to(device) (accelerate manages it)
+    if sequential_offload:
+        _log("[comfyless] Enabling sequential CPU offload")
+        pipe.enable_sequential_cpu_offload()
+    else:
+        pipe = pipe.to(device)
+        if offload_vae and hasattr(pipe, "vae"):
+            pipe.vae = pipe.vae.to("cpu")
+            _log("[comfyless] VAE offloaded to CPU")
 
     # VAE tiling — required for >2MP decode
     if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
         pipe.vae.enable_tiling()
 
-    # VAE offload
-    if offload_vae and hasattr(pipe, "vae"):
-        pipe.vae = pipe.vae.to("cpu")
-        _log("[comfyless] VAE offloaded to CPU")
+    if attention_slicing:
+        try:
+            pipe.enable_attention_slicing(slice_size="auto")
+            _log("[comfyless] Attention slicing enabled")
+        except Exception as e:
+            _log(f"[comfyless] Attention slicing not available: {e}")
 
     guidance_embeds = read_guidance_embeds(pipe)
     _log(f"[comfyless] Ready — family={model_family}, "
@@ -528,6 +542,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--precision", choices=["bf16", "fp16", "fp32"], default="bf16")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--offload-vae", action="store_true")
+    p.add_argument("--attention-slicing", action="store_true",
+                   help="Trade speed for lower peak VRAM")
+    p.add_argument("--sequential-offload", action="store_true",
+                   help="Extreme VRAM savings via sequential CPU offload — very slow")
     p.add_argument("--output", "-o", type=str, default="output.png",
                    help="Output image path")
     return p.parse_args()
@@ -597,6 +615,8 @@ def _run_json_mode() -> int:
             precision=params.get("precision", "bf16"),
             device=params.get("device", "cuda"),
             offload_vae=params.get("offload_vae", False),
+            attention_slicing=params.get("attention_slicing", False),
+            sequential_offload=params.get("sequential_offload", False),
             transformer_path=params.get("transformer_path", ""),
             vae_path=params.get("vae_path", ""),
             text_encoder_path=params.get("text_encoder_path", ""),
@@ -730,6 +750,8 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
             precision=args.precision,
             device=args.device,
             offload_vae=args.offload_vae,
+            attention_slicing=args.attention_slicing,
+            sequential_offload=args.sequential_offload,
             transformer_path=p.get("transformer_path", ""),
             vae_path=p.get("vae_path", ""),
             text_encoder_path=p.get("text_encoder_path", ""),
