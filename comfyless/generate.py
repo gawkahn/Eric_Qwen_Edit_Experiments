@@ -44,7 +44,12 @@ import torch
 
 from nodes.eric_diffusion_utils import (
     detect_pipeline_class,
+    detect_load_variant,
     read_guidance_embeds,
+    read_model_index,
+    resolve_component_class,
+    detect_component_format,
+    load_component,
 )
 from nodes.eric_diffusion_samplers import sampler_choices, swap_sampler
 from nodes.eric_qwen_edit_lora import load_lora_with_key_fix
@@ -85,6 +90,11 @@ _CLI_DEFAULTS = {
     "sampler": "default",
     "schedule": "linear",
     "max_seq_len": 512,
+    "transformer_path": "",
+    "vae_path": "",
+    "text_encoder_path": "",
+    "text_encoder_2_path": "",
+    "vae_from_transformer": False,
 }
 
 
@@ -213,6 +223,11 @@ def generate(
     precision: str = "bf16",
     device: str = "cuda",
     offload_vae: bool = False,
+    transformer_path: str = "",
+    vae_path: str = "",
+    text_encoder_path: str = "",
+    text_encoder_2_path: str = "",
+    vae_from_transformer: bool = False,
 ) -> Dict[str, Any]:
     """Generate a single image and save it.
 
@@ -254,11 +269,90 @@ def generate(
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     dtype = dtype_map.get(precision, torch.bfloat16)
 
-    pipe = pipeline_class.from_pretrained(
-        model_path,
-        torch_dtype=dtype,
-        local_files_only=True,
-    ).to(device)
+    # ── Load component overrides (mirrors EricDiffusionComponentLoader) ──
+    transformer_path    = transformer_path.strip()
+    vae_path            = vae_path.strip()
+    text_encoder_path   = text_encoder_path.strip()
+    text_encoder_2_path = text_encoder_2_path.strip()
+
+    _has_components = any([transformer_path, vae_path, text_encoder_path,
+                           text_encoder_2_path, vae_from_transformer])
+    model_index = read_model_index(model_path) if _has_components else {}
+
+    comp_kwargs: dict = {}
+    if transformer_path:
+        _log(f"[comfyless] Transformer override: {transformer_path!r}")
+        cls_, cname = resolve_component_class(model_index, "transformer")
+        transformer_slot = "transformer"
+        if cls_ is None and model_index.get("unet"):
+            cls_, cname = resolve_component_class(model_index, "unet")
+            transformer_slot = "unet"
+        if cls_ is None:
+            raise ValueError(
+                f"Transformer/UNet class '{cname}' not found in installed diffusers."
+            )
+        comp_kwargs[transformer_slot] = load_component(
+            cls_, transformer_path, dtype,
+            base_path=model_path, subfolder_hint=transformer_slot,
+            pipeline_class=pipeline_class,
+        )
+        _log(f"[comfyless] Custom {transformer_slot} loaded ({cname})")
+
+    if vae_from_transformer and transformer_path and not vae_path:
+        cls_, cname = resolve_component_class(model_index, "vae")
+        if cls_ is None:
+            raise ValueError(f"VAE class '{cname}' not found in diffusers.")
+        comp_kwargs["vae"] = load_component(
+            cls_, transformer_path, dtype,
+            base_path=model_path, subfolder_hint="vae",
+            pipeline_class=pipeline_class,
+        )
+        _log(f"[comfyless] VAE extracted from transformer checkpoint ({cname})")
+
+    if vae_path:
+        _log(f"[comfyless] VAE override: {vae_path!r}")
+        cls_, cname = resolve_component_class(model_index, "vae")
+        if cls_ is None:
+            raise ValueError(f"VAE class '{cname}' not found in diffusers.")
+        comp_kwargs["vae"] = load_component(
+            cls_, vae_path, dtype,
+            base_path=model_path, subfolder_hint="vae",
+            pipeline_class=pipeline_class,
+        )
+        _log(f"[comfyless] Custom VAE loaded ({cname})")
+
+    if text_encoder_path:
+        _log(f"[comfyless] Text encoder (slot 1) override: {text_encoder_path!r}")
+        cls_, cname = resolve_component_class(model_index, "text_encoder")
+        if cls_ is None:
+            raise ValueError(f"Text encoder class '{cname}' not found.")
+        comp_kwargs["text_encoder"] = load_component(
+            cls_, text_encoder_path, dtype,
+            base_path=model_path, subfolder_hint="text_encoder",
+            pipeline_class=pipeline_class,
+        )
+        _log(f"[comfyless] Custom text encoder (slot 1) loaded ({cname})")
+
+    if text_encoder_2_path:
+        _log(f"[comfyless] Text encoder (slot 2) override: {text_encoder_2_path!r}")
+        cls_, cname = resolve_component_class(model_index, "text_encoder_2")
+        if cls_ is None:
+            raise ValueError(f"Text encoder 2 class '{cname}' not found or pipeline "
+                             f"has no second text encoder.")
+        comp_kwargs["text_encoder_2"] = load_component(
+            cls_, text_encoder_2_path, dtype,
+            base_path=model_path, subfolder_hint="text_encoder_2",
+            pipeline_class=pipeline_class,
+        )
+        _log(f"[comfyless] Custom text encoder (slot 2) loaded ({cname})")
+
+    load_kwargs: dict = dict(torch_dtype=dtype, local_files_only=True, **comp_kwargs)
+    variant = detect_load_variant(model_path)
+    if variant:
+        load_kwargs["variant"] = variant
+        _log(f"[comfyless] Detected weight variant: {variant}")
+
+    pipe = pipeline_class.from_pretrained(model_path, **load_kwargs).to(device)
 
     # VAE tiling — required for >2MP decode
     if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
@@ -354,6 +448,11 @@ def generate(
         "negative_prompt": negative_prompt,
         "model": model_path,
         "model_family": model_family,
+        "transformer_path":    transformer_path,
+        "vae_path":            vae_path,
+        "text_encoder_path":   text_encoder_path,
+        "text_encoder_2_path": text_encoder_2_path,
+        "vae_from_transformer": vae_from_transformer,
         "loras": [{"path": l["path"], "weight": float(l.get("weight", 1.0))}
                   for l in loras],
         "seed": seed,
@@ -416,6 +515,16 @@ def _parse_args() -> argparse.Namespace:
                    help="Sigma schedule (reserved for future manual-loop use)")
     p.add_argument("--max-seq-len", type=int, default=None,
                    help="Max sequence length for text encoder")
+    p.add_argument("--transformer", type=str, default=None, metavar="PATH",
+                   help="Custom transformer/UNet weights (dir, subdir, or .safetensors)")
+    p.add_argument("--vae", type=str, default=None, metavar="PATH",
+                   help="Custom VAE weights")
+    p.add_argument("--te1", type=str, default=None, metavar="PATH",
+                   help="Custom text encoder slot 1 (CLIP-L for Flux; Qwen2.5-VL for Qwen)")
+    p.add_argument("--te2", type=str, default=None, metavar="PATH",
+                   help="Custom text encoder slot 2 (T5-XXL for Flux/Chroma)")
+    p.add_argument("--vae-from-transformer", action="store_true", default=None,
+                   help="Extract VAE from the --transformer AIO checkpoint")
     p.add_argument("--precision", choices=["bf16", "fp16", "fp32"], default="bf16")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--offload-vae", action="store_true")
@@ -488,6 +597,11 @@ def _run_json_mode() -> int:
             precision=params.get("precision", "bf16"),
             device=params.get("device", "cuda"),
             offload_vae=params.get("offload_vae", False),
+            transformer_path=params.get("transformer_path", ""),
+            vae_path=params.get("vae_path", ""),
+            text_encoder_path=params.get("text_encoder_path", ""),
+            text_encoder_2_path=params.get("text_encoder_2_path", ""),
+            vae_from_transformer=params.get("vae_from_transformer", False),
         )
 
         sidecar_path = os.path.join(output_dir, f"{output_stem}.json")
@@ -556,6 +670,11 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
             ("sampler",            args.sampler),
             ("schedule",           args.schedule),
             ("max_sequence_length", args.max_seq_len),
+            ("transformer_path",    args.transformer),
+            ("vae_path",            args.vae),
+            ("text_encoder_path",   args.te1),
+            ("text_encoder_2_path", args.te2),
+            ("vae_from_transformer", args.vae_from_transformer),
         ]:
             if cli_val is not None:
                 p[sidecar_key] = cli_val
@@ -574,6 +693,11 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
             "sampler":             args.sampler           if args.sampler           is not None else d["sampler"],
             "schedule":            args.schedule          if args.schedule          is not None else d["schedule"],
             "max_sequence_length": args.max_seq_len       if args.max_seq_len       is not None else d["max_seq_len"],
+            "transformer_path":    args.transformer       if args.transformer       is not None else d["transformer_path"],
+            "vae_path":            args.vae               if args.vae               is not None else d["vae_path"],
+            "text_encoder_path":   args.te1               if args.te1               is not None else d["text_encoder_path"],
+            "text_encoder_2_path": args.te2               if args.te2               is not None else d["text_encoder_2_path"],
+            "vae_from_transformer": args.vae_from_transformer if args.vae_from_transformer is not None else d["vae_from_transformer"],
         }
 
     if not p.get("model"):
@@ -606,6 +730,11 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
             precision=args.precision,
             device=args.device,
             offload_vae=args.offload_vae,
+            transformer_path=p.get("transformer_path", ""),
+            vae_path=p.get("vae_path", ""),
+            text_encoder_path=p.get("text_encoder_path", ""),
+            text_encoder_2_path=p.get("text_encoder_2_path", ""),
+            vae_from_transformer=p.get("vae_from_transformer", False),
         )
 
         # Write sidecar alongside the image
