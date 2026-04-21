@@ -34,6 +34,7 @@ import argparse
 import inspect
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -118,6 +119,75 @@ def _coerce(value: str):
     except ValueError:
         pass
     return value
+
+
+# ── Savepath helpers ─────────────────────────────────────────────────────
+
+def _format_date_token(fmt: str) -> str:
+    """Convert ComfyUI-style date format string (MM-dd-YY) to a strftime result."""
+    s = fmt
+    s = s.replace("YYYY", "%Y")
+    s = s.replace("YY",   "%y")
+    s = s.replace("MM",   "%m")
+    s = s.replace("dd",   "%d")
+    s = s.replace("HH",   "%H")
+    s = s.replace("mm",   "%M")
+    s = s.replace("ss",   "%S")
+    return datetime.now().strftime(s)
+
+
+def _expand_savepath_template(
+    template: str,
+    model_path: str,
+    seed: int,
+    steps: int,
+    cfg_scale: float,
+    sampler: str,
+) -> str:
+    """Expand %var% and %var:spec% tokens in a savepath template string."""
+    model_name = Path(model_path).name
+
+    def _replace(m: re.Match) -> str:
+        token = m.group(1)
+        name, _, spec = token.partition(":")
+        name = name.lower()
+        if name == "date":
+            return _format_date_token(spec) if spec else datetime.now().strftime("%Y-%m-%d")
+        if name == "model":
+            n = int(spec) if spec.isdigit() else None
+            return model_name[:n] if n else model_name
+        if name == "seed":
+            return str(seed)
+        if name == "steps":
+            return str(steps)
+        if name == "cfg":
+            return str(cfg_scale)
+        if name == "sampler":
+            return sampler
+        return m.group(0)  # unknown token: leave as-is
+
+    return re.sub(r"%([^%]+)%", _replace, template)
+
+
+def _resolve_savepath(
+    template: str,
+    model_path: str,
+    seed: int,
+    steps: int,
+    cfg_scale: float,
+    sampler: str,
+) -> str:
+    """Expand template, create parent dirs, return first available counter slot."""
+    expanded = _expand_savepath_template(template, model_path, seed, steps, cfg_scale, sampler)
+    parent = Path(expanded).parent
+    parent.mkdir(parents=True, exist_ok=True)
+    stem = Path(expanded).name
+    counter = 1
+    while True:
+        candidate = parent / f"{stem}{counter:04d}.png"
+        if not candidate.exists():
+            return str(candidate)
+        counter += 1
 
 
 def _apply_overrides(params: dict, overrides: list) -> dict:
@@ -546,8 +616,13 @@ def _parse_args() -> argparse.Namespace:
                    help="Trade speed for lower peak VRAM")
     p.add_argument("--sequential-offload", action="store_true",
                    help="Extreme VRAM savings via sequential CPU offload — very slow")
-    p.add_argument("--output", "-o", type=str, default="output.png",
-                   help="Output image path")
+    p.add_argument("--output", "-o", type=str, default="/tmp/comfyless.png",
+                   help="Output image path (exact; overwrites)")
+    p.add_argument("--savepath", type=str, default=None,
+                   metavar="TEMPLATE",
+                   help="Output path template with %%date:MM-dd-YY%%, %%model:12%%, "
+                        "%%seed%%, %%steps%%, %%cfg%%, %%sampler%%. "
+                        "Auto-creates dirs; always writes comfyless0001.png, 0002, ...")
     return p.parse_args()
 
 
@@ -731,11 +806,30 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
 
     loras = [_parse_lora_arg(s) for s in args.lora] if args.lora else p.get("loras", [])
 
+    # Resolve output path — savepath template takes precedence over --output
+    if args.savepath:
+        seed_for_path = p.get("seed", -1)
+        if seed_for_path < 0:
+            seed_for_path = torch.randint(0, 2**32 - 1, (1,)).item()
+            _log(f"[comfyless] Random seed: {seed_for_path}")
+            p["seed"] = seed_for_path
+        output_path = _resolve_savepath(
+            args.savepath,
+            p["model"],
+            seed_for_path,
+            p.get("steps", _CLI_DEFAULTS["steps"]),
+            p.get("cfg_scale", _CLI_DEFAULTS["cfg"]),
+            p.get("sampler", _CLI_DEFAULTS["sampler"]),
+        )
+        _log(f"[comfyless] Output: {output_path}")
+    else:
+        output_path = args.output
+
     try:
         metadata = generate(
             model_path=p["model"],
             prompt=p["prompt"],
-            output_path=args.output,
+            output_path=output_path,
             negative_prompt=p.get("negative_prompt", ""),
             seed=p.get("seed", -1),
             steps=p.get("steps", 28),
@@ -760,7 +854,7 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
         )
 
         # Write sidecar alongside the image
-        stem = os.path.splitext(args.output)[0]
+        stem = os.path.splitext(output_path)[0]
         sidecar_path = f"{stem}.json"
         with open(sidecar_path, "w") as f:
             json.dump(metadata, f, indent=2)
