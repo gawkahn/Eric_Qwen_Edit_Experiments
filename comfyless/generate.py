@@ -69,6 +69,57 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+# ── Sidecar / override helpers ───────────────────────────────────────────
+
+_SKIP_SIDECAR_KEYS = {"timestamp", "elapsed_seconds", "contract_version",
+                      "lora_warnings", "model_family"}
+
+_CLI_DEFAULTS = {
+    "negative_prompt": "",
+    "seed": -1,
+    "steps": 28,
+    "cfg": 3.5,
+    "true_cfg": None,
+    "width": 1024,
+    "height": 1024,
+    "sampler": "default",
+    "schedule": "linear",
+    "max_seq_len": 512,
+}
+
+
+def _load_sidecar(path: str) -> dict:
+    with open(path) as f:
+        data = json.load(f)
+    return {k: v for k, v in data.items() if k not in _SKIP_SIDECAR_KEYS}
+
+
+def _coerce(value: str):
+    if value.lower() == "true":
+        return True
+    if value.lower() == "false":
+        return False
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    return value
+
+
+def _apply_overrides(params: dict, overrides: list) -> dict:
+    result = dict(params)
+    for spec in overrides:
+        if "=" not in spec:
+            raise ValueError(f"--override {spec!r}: expected key=value format")
+        key, _, raw = spec.partition("=")
+        result[key.strip()] = _coerce(raw.strip())
+    return result
+
+
 def _build_call_kwargs(
     pipe,
     model_family: str,
@@ -334,26 +385,36 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--json", action="store_true",
                    help="Agent bridge mode: JSON stdin/stdout")
-    p.add_argument("--model", type=str, help="Path to diffusers model directory")
-    p.add_argument("--prompt", type=str, help="Generation prompt")
-    p.add_argument("--negative-prompt", type=str, default="",
+    p.add_argument("--params", type=str, default=None,
+                   metavar="SIDECAR_JSON",
+                   help="Load base params from a comfyless sidecar JSON. "
+                        "Use --override key=value to patch individual fields.")
+    p.add_argument("--override", action="append", default=[],
+                   metavar="KEY=VALUE",
+                   help="Override a param from --params (repeatable). "
+                        "E.g. --override model=/path/sdxl --override cfg_scale=8")
+    p.add_argument("--model", type=str, default=None,
+                   help="Path to diffusers model directory")
+    p.add_argument("--prompt", type=str, default=None,
+                   help="Generation prompt")
+    p.add_argument("--negative-prompt", type=str, default=None,
                    help="Negative prompt (qwen-image only)")
-    p.add_argument("--seed", type=int, default=-1,
+    p.add_argument("--seed", type=int, default=None,
                    help="Random seed (-1 for random)")
-    p.add_argument("--steps", type=int, default=28)
-    p.add_argument("--cfg", type=float, default=3.5, help="CFG scale")
+    p.add_argument("--steps", type=int, default=None)
+    p.add_argument("--cfg", type=float, default=None, help="CFG scale")
     p.add_argument("--true-cfg", type=float, default=None,
                    help="True CFG scale override (qwen-image)")
-    p.add_argument("--width", type=int, default=1024)
-    p.add_argument("--height", type=int, default=1024)
+    p.add_argument("--width", type=int, default=None)
+    p.add_argument("--height", type=int, default=None)
     p.add_argument("--lora", action="append", default=[],
                    metavar="PATH:WEIGHT",
                    help="LoRA to apply (repeatable).  Format: path or path:weight")
-    p.add_argument("--sampler", choices=SAMPLER_NAMES, default="default",
+    p.add_argument("--sampler", choices=SAMPLER_NAMES, default=None,
                    help="Sampler algorithm")
-    p.add_argument("--schedule", choices=SCHEDULE_NAMES, default="linear",
+    p.add_argument("--schedule", choices=SCHEDULE_NAMES, default=None,
                    help="Sigma schedule (reserved for future manual-loop use)")
-    p.add_argument("--max-seq-len", type=int, default=512,
+    p.add_argument("--max-seq-len", type=int, default=None,
                    help="Max sequence length for text encoder")
     p.add_argument("--precision", choices=["bf16", "fp16", "fp32"], default="bf16")
     p.add_argument("--device", type=str, default="cuda")
@@ -463,32 +524,85 @@ def _run_json_mode() -> int:
 
 
 def _run_cli_mode(args: argparse.Namespace) -> int:
-    """Human CLI mode: argparse flags, human-readable output."""
-    if not args.model:
-        print("Error: --model is required", file=sys.stderr)
+    """Human CLI mode: argparse flags, human-readable output.
+
+    When --params is given, sidecar JSON provides base params.
+    --override key=value patches apply next, then any explicit CLI
+    flags (non-None) win over the sidecar.
+    """
+    # ── Build effective params ────────────────────────────────────────
+    if args.params:
+        try:
+            p = _load_sidecar(args.params)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Error loading --params {args.params!r}: {e}", file=sys.stderr)
+            return 1
+        try:
+            p = _apply_overrides(p, args.override)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+        # Explicit CLI flags (sentinel = None means "not set") win over sidecar
+        for sidecar_key, cli_val in [
+            ("model",              args.model),
+            ("prompt",             args.prompt),
+            ("negative_prompt",    args.negative_prompt),
+            ("seed",               args.seed),
+            ("steps",              args.steps),
+            ("cfg_scale",          args.cfg),
+            ("true_cfg_scale",     args.true_cfg),
+            ("width",              args.width),
+            ("height",             args.height),
+            ("sampler",            args.sampler),
+            ("schedule",           args.schedule),
+            ("max_sequence_length", args.max_seq_len),
+        ]:
+            if cli_val is not None:
+                p[sidecar_key] = cli_val
+    else:
+        d = _CLI_DEFAULTS
+        p = {
+            "model":               args.model,
+            "prompt":              args.prompt,
+            "negative_prompt":     args.negative_prompt   if args.negative_prompt is not None else d["negative_prompt"],
+            "seed":                args.seed              if args.seed              is not None else d["seed"],
+            "steps":               args.steps             if args.steps             is not None else d["steps"],
+            "cfg_scale":           args.cfg               if args.cfg               is not None else d["cfg"],
+            "true_cfg_scale":      args.true_cfg          if args.true_cfg          is not None else d["true_cfg"],
+            "width":               args.width             if args.width             is not None else d["width"],
+            "height":              args.height            if args.height            is not None else d["height"],
+            "sampler":             args.sampler           if args.sampler           is not None else d["sampler"],
+            "schedule":            args.schedule          if args.schedule          is not None else d["schedule"],
+            "max_sequence_length": args.max_seq_len       if args.max_seq_len       is not None else d["max_seq_len"],
+        }
+
+    if not p.get("model"):
+        print("Error: --model is required (or provide via --params / --override model=...)",
+              file=sys.stderr)
         return 1
-    if not args.prompt:
-        print("Error: --prompt is required", file=sys.stderr)
+    if not p.get("prompt"):
+        print("Error: --prompt is required (or provide via --params / --override prompt=...)",
+              file=sys.stderr)
         return 1
 
-    loras = [_parse_lora_arg(s) for s in args.lora] if args.lora else []
+    loras = [_parse_lora_arg(s) for s in args.lora] if args.lora else p.get("loras", [])
 
     try:
         metadata = generate(
-            model_path=args.model,
-            prompt=args.prompt,
+            model_path=p["model"],
+            prompt=p["prompt"],
             output_path=args.output,
-            negative_prompt=args.negative_prompt,
-            seed=args.seed,
-            steps=args.steps,
-            cfg_scale=args.cfg,
-            true_cfg_scale=args.true_cfg,
-            width=args.width,
-            height=args.height,
-            sampler=args.sampler,
-            schedule=args.schedule,
+            negative_prompt=p.get("negative_prompt", ""),
+            seed=p.get("seed", -1),
+            steps=p.get("steps", 28),
+            cfg_scale=p.get("cfg_scale", 3.5),
+            true_cfg_scale=p.get("true_cfg_scale"),
+            width=p.get("width", 1024),
+            height=p.get("height", 1024),
+            sampler=p.get("sampler", "default"),
+            schedule=p.get("schedule", "linear"),
             loras=loras,
-            max_sequence_length=args.max_seq_len,
+            max_sequence_length=p.get("max_sequence_length", 512),
             precision=args.precision,
             device=args.device,
             offload_vae=args.offload_vae,
