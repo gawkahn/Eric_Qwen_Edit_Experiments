@@ -12,13 +12,14 @@ maintainers = [
     { name = "Eric Hiss", email = "eric@historic.camera" }
 ]
 dependencies = [
-    "torch>=2.0.0",
-    "diffusers>=0.30.0",
-    "transformers>=4.40.0",
-    "accelerate",
-    "safetensors",
-    "pillow",
-    "numpy",
+    "torch==2.11.0",
+    "diffusers==0.37.1",
+    "transformers==5.5.3",
+    "accelerate==1.13.0",
+    "peft==0.18.1",
+    "safetensors==0.7.0",
+    "pillow==12.2.0",
+    "numpy==2.4.4",
 ]
 
 [project.urls]
