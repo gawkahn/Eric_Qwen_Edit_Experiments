@@ -267,9 +267,23 @@ def generate(
         if _denoiser is not None:
             pipe.vae = pipe.vae.to(next(_denoiser.parameters()).device)
 
+    # ── Sampler guard: flow-match samplers require FlowMatch schedulers ──
+    # SDXL/SD1 use DDPM-style schedulers that lack init_noise_sigma.
+    # Config-driven runs may specify a sampler chosen for a different
+    # model family — fall back to "default" rather than crash silently.
+    effective_sampler = sampler
+    if model_family in ("sdxl", "sd1") and sampler != "default":
+        print(
+            f"[comfyless] WARNING: sampler={sampler!r} requires a flow-match "
+            f"scheduler but {model_family} uses a DDPM-style scheduler "
+            f"(init_noise_sigma). Falling back to default (Euler). "
+            f"Set sampler=default in your config for {model_family} runs."
+        )
+        effective_sampler = "default"
+
     # ── Inference (with optional sampler swap) ────────────────────────
     t0 = time.monotonic()
-    with swap_sampler(pipe, sampler, log_prefix="[comfyless]"):
+    with swap_sampler(pipe, effective_sampler, log_prefix="[comfyless]"):
         result = pipe(**call_kwargs)
     elapsed = time.monotonic() - t0
     _log(f"[comfyless] Generated in {elapsed:.1f}s")
