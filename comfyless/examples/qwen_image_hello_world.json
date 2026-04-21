@@ -1,0 +1,20 @@
+{
+  "model": "/home/gawkahn/projects/ai-lab/ai-base/models/hf-local/Qwen-Image-2512",
+  "prompt": "A close-up photograph of a golden retriever puppy sitting on a bed of autumn leaves, soft diffused morning light, warm color palette, ultra-detailed fur, shallow depth of field",
+  "negative_prompt": "blurry, low quality, watermark, text, signature",
+  "seed": 42,
+  "steps": 50,
+  "cfg_scale": 4.0,
+  "true_cfg_scale": 4.0,
+  "width": 1024,
+  "height": 1024,
+  "sampler": "default",
+  "schedule": "linear",
+  "max_sequence_length": 512,
+  "loras": [],
+  "transformer_path": "",
+  "vae_path": "",
+  "text_encoder_path": "",
+  "text_encoder_2_path": "",
+  "vae_from_transformer": false
+}
