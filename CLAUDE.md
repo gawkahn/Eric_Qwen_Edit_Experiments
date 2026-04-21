@@ -66,6 +66,14 @@ See the general `Git Commit Discipline` rule in `~/.claude/CLAUDE.md` for the ca
 - The manual loop module `eric_diffusion_manual_loop.py` is large (>2600 lines) — when committing changes to it, write the commit message based on the _semantic_ change (which function/path you touched), not the line count
 - The test files import from `nodes/eric_diffusion_manual_loop.py` via `importlib.util.spec_from_file_location` — they DON'T fail if the module file is missing at import time, but they fail silently with confusing errors. When committing a test-only change, verify the tested module is already in git, or bundle test+module changes in the same commit
 
+**Remote sync for this repo (overrides the global default):**
+
+The global `Git Commit Discipline` rule says "Never push to remote without explicit user approval." In this repo that default is overridden: **push `origin main` immediately after every user-approved commit**, same cadence as the commit itself. No separate approval per push.
+
+- Standing authorization granted 2026-04-21 after discovering local was 47 commits ahead of remote. This is a personal solo repo (`github.com/gawkahn/...`); keeping remote in sync avoids that drift.
+- If the user says "don't push yet" or "hold off" for a specific commit, respect that for that commit only — default still holds for the next one.
+- Force push, skipping hooks (`--no-verify`), and signing bypass are NOT covered by this authorization — those still require explicit per-invocation approval.
+
 ## Architecture
 
 ### ComfyUI Registration
