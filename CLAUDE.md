@@ -7,37 +7,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project documentation artifacts
 
-Three persistent artifact types live in `docs/` and are mirrored to Obsidian under
-`~/obsidian/vaults/vault1/10_Projects/Image_gen/`. **Always write both copies.**
+Rules for ADRs, security reviews, and the tech debt register are in §12 of
+`~/.claude/CLAUDE.md`. Local paths for this project:
 
-### Architecture Decision Records (ADRs) — `docs/decisions/`
+- **Repo:** `docs/decisions/`, `docs/security/`, `TECH_DEBT.md` at project root
+- **Obsidian:** `~/obsidian/vaults/vault1/10_Projects/Image_gen/Decisions/`,
+  `Security/`, `Tech_Debt.md`
 
-Write an ADR before implementing any non-trivial design. Required when:
-- A security-sensitive system is being designed (IPC, networking, auth, file I/O from untrusted input)
-- Multiple architecturally distinct options exist and the choice has lasting consequences
-- A design constraint is non-obvious and would otherwise be re-litigated in future sessions
-
-Format: `ADR-NNN-short-title.md`. Contents: **Context → Decision → Alternatives Rejected → Deferred / Out of Scope → Security Review Reference** (if applicable). Number sequentially.
-
-Obsidian mirror: `Decisions/ADR-NNN-Short-Title.md`
-
-### Security reviews — `docs/security/`
-
-Spawn the `security-auditor` subagent for any design that involves:
-- IPC (sockets, pipes, shared memory)
-- File writes driven by external input
-- Model/weight loading from paths supplied by untrusted callers
-- Auth, crypto, PII, or audit-trail logic
-
-Save the full reviewer output as `docs/security/review-YYYY-MM-DD-topic.md`. Reference it from the relevant ADR. Security-motivated code changes must note the finding they close in the commit body.
-
-Obsidian mirror: `Security/Review-YYYY-MM-DD-Topic.md`
-
-### Tech debt register — `TECH_DEBT.md` (project root)
-
-Every conscious deferral gets an entry: what it is, why it's deferred now, and what event triggers revisiting. Use the `/note-debt` skill to append entries. Never delete entries — mark them resolved with a date instead.
-
-Obsidian mirror: `Tech_Debt.md`
+This is a solo personal project — `docs/` in the repo is the canonical store.
+Obsidian copies are a personal reference mirror.
 
 ---
 

@@ -52,7 +52,7 @@ model calls directly (Phase C / RES4LYF territory). The current Adams-Bashforth
 multistep samplers (multistep2, multistep3) cover the available quality improvement
 space within the scheduler API.
 Trigger: Phase C manual denoising loop is implemented.
-See `nodes/eric_diffusion_samplers.py` docstring.
+See `docs/decisions/ADR-005-sampler-multistep-only.md`.
 
 ---
 

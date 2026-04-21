@@ -1,7 +1,7 @@
 # ADR-001: Comfyless Daemon — Socket Location and Path Trust Model
 
 **Date:** 2026-04-21
-**Status:** Accepted
+**Status:** accepted
 **Context:** comfyless daemon (not yet implemented as of this writing)
 
 ---
@@ -114,6 +114,12 @@ swaps would help. Deferred. Tracked in `TECH_DEBT.md`.
 
 ---
 
-## Security Review Reference
+## Changelog
 
-Full review: `docs/security/review-2026-04-21-daemon-socket.md`
+- 2026-04-21: Initial ADR; security review conducted before any code written.
+  See `docs/security/review-daemon-socket-2026-04-21.md`.
+
+## AI-Disclosure
+
+ADR authored by Claude Sonnet 4.6, 2026-04-21. Design decisions made collaboratively
+with Grant Kahn during security review. Reviewed by Grant Kahn.
