@@ -20,7 +20,18 @@ This is a ComfyUI extension; there is no standalone executable, test suite, or b
 pip install -r requirements.txt
 ```
 
-**Reload nodes in ComfyUI:** Restart ComfyUI or use the ComfyUI Manager "Reload" button after editing node files.
+**Package-manager split (pip for the node pack, uv for comfyless dev):**
+
+This repo uses two tools deliberately:
+
+- **ComfyUI node pack path** — `pip` is the convention. ComfyUI Manager installs custom node packs by running `pip install -r requirements.txt` inside ComfyUI's venv. `requirements.txt` is the canonical manifest for downstream users and must remain pip-compatible.
+- **Comfyless dev path** — `uv` is the preferred tool for local development, testing, and reproducibility work. `pyproject.toml` is the human-edited source of truth for dep declarations; `uv.lock` is the machine-generated full transitive lock (kept in version control so `uv sync` is reproducible across machines). `.python-version` pins the interpreter.
+
+Rules:
+- **`pyproject.toml` and `requirements.txt` must agree on direct deps at all times** — both list the same 8 top-level pins in the same order (`torch`, `diffusers`, `transformers`, `accelerate`, `peft`, `safetensors`, `pillow`, `numpy`). Any dep bump edits both.
+- **`uv.lock` is regenerated whenever `pyproject.toml` changes** — `uv lock` after the edit, then commit pyproject + requirements + lock together in one slice.
+- **Do NOT edit `uv.lock` by hand.** It's machine output.
+- Fresh dev setup: `uv sync` (creates `.venv` matching the lock). ComfyUI install still uses pip as before — no change for downstream users.
 
 **Lint (no CI configured — run manually):**
 ```bash
