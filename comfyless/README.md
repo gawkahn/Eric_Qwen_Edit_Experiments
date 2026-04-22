@@ -14,20 +14,20 @@ Every feature reachable from the ComfyUI loader/generate node chain is reachable
 
 ## Contents
 
-1. [Prerequisites](#Prerequisites)
-2. [Quick start](#Quick start)
-3. [Invocation modes](#Invocation modes)
-4. [CLI flag reference](#CLI flag reference)
-5. [Sidecar JSON and `--params` replay](#Sidecar JSON and `--params` replay)
-6. [Example walkthrough (Qwen-Image)](#Example walkthrough (Qwen-Image))
-7. [Model families and what they accept](#Model families and what they accept)
-8. [Component overrides](#Component overrides)
-9. [LoRA](#LoRA)
-10. [VRAM knobs](#VRAM knobs)
-11. [Python function API](#Python function API)
-12. [JSON bridge mode](#JSON bridge mode)
-13. [Server mode](#Server mode)
-14. [Troubleshooting](#Troubleshooting)
+1. [Prerequisites](<#Prerequisites>)
+2. [Quick start](<#Quick start>)
+3. [Invocation modes](<#Invocation modes>)
+4. [CLI flag reference](<#CLI flag reference>)
+5. [Sidecar JSON and `--params` replay](<#Sidecar JSON and `--params` replay>)
+6. [Example walkthrough (Qwen-Image)](<#Example walkthrough (Qwen-Image)>)
+7. [Model families and what they accept](<#Model families and what they accept>)
+8. [Component overrides](<#Component overrides>)
+9. [LoRA](<#LoRA>)
+10. [VRAM knobs](<#VRAM knobs>)
+11. [Python function API](<#Python function API>)
+12. [JSON bridge mode](<#JSON bridge mode>)
+13. [Server mode](<#Server mode>)
+14. [Troubleshooting](<#Troubleshooting>)
 
 ---
 
@@ -131,7 +131,7 @@ All flags are optional except `--model` and `--prompt` (which can alternatively 
 | `--negative-prompt STR` | `""` | Negative prompt. **Used by:** qwen-image, sdxl, sd3, sd1, auraflow. **Silently ignored by:** flux, flux2, flux2klein, chroma (guidance-embedded models) |
 | `--seed INT` | `-1` | Seed. `-1` = random, logged to stderr |
 | `--steps INT` | `28` | Denoising steps |
-| `--cfg FLOAT` | `3.5` | CFG / guidance scale. Routes to `guidance_scale` or `true_cfg_scale` depending on model family — see [Model families](#Model families and what they accept) |
+| `--cfg FLOAT` | `3.5` | CFG / guidance scale. Routes to `guidance_scale` or `true_cfg_scale` depending on model family — see [Model families](<#Model families and what they accept>) |
 | `--true-cfg FLOAT` | `None` | Explicit override for `true_cfg_scale` (qwen-image only). When omitted, `--cfg` is used |
 | `--width INT` | `1024` | Width in px. Rounded down to nearest multiple of 32 |
 | `--height INT` | `1024` | Height in px. Rounded down to nearest multiple of 32 |
@@ -175,7 +175,7 @@ All flags are optional except `--model` and `--prompt` (which can alternatively 
 
 | Flag | What it does |
 |---|---|
-| `--savepath TEMPLATE` | Output path template. Auto-creates parent dirs; appends a 4-digit counter (`0001`, `0002`, …) so files never overwrite. Wins over `--output` when set. In server mode the template is applied within `--output-dir`. See [Savepath tokens](#Savepath tokens) |
+| `--savepath TEMPLATE` | Output path template. Auto-creates parent dirs; appends a 4-digit counter (`0001`, `0002`, …) so files never overwrite. Wins over `--output` when set. In server mode the template is applied within `--output-dir`. See [Savepath tokens](<#Savepath tokens>) |
 
 ### Savepath tokens
 
