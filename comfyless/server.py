@@ -500,8 +500,7 @@ def run_server(
     output_dir = os.path.realpath(output_dir)
     model_base = os.path.realpath(model_base)
 
-    if not os.path.isdir(output_dir):
-        raise FileNotFoundError(f"--output-dir not found: {output_dir}")
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
     if not os.path.isdir(model_base):
         raise FileNotFoundError(f"--model-base not found: {model_base}")
 
