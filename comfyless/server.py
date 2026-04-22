@@ -256,15 +256,227 @@ def _handle_generate(
     precision: str,
     server_state: dict,
 ) -> dict:
+    """Execute a validated generate request with model caching and incremental LoRA diff.
+
+    server_state keys (mutated here):
+        pipeline, model_family, guidance_embeds, cache_key, loaded_loras
     """
-    Execute a validated generate request.  Stub until Step 3.
-    server_state carries the cached pipeline and loaded LoRA set between calls.
-    """
-    return {
-        "status": "error",
-        "error_type": "NotImplemented",
-        "error": "Generation handler not yet wired — Step 3 pending",
+    # Local imports — avoids circular dependency at module level (generate.py
+    # will import server.socket_path; server imports generate.* only inside here).
+    from .generate import _load_pipeline, _expand_savepath_template, _resolve_savepath, generate
+    from nodes.eric_qwen_edit_lora import load_lora_with_key_fix
+
+    req_precision = req.get("precision") or precision
+    req_device    = req.get("device")    or device
+
+    # Cache key covers everything that affects pipeline shape; LoRAs are tracked
+    # separately so they can be diffed incrementally.
+    cache_key = (
+        req["model"],
+        req_precision,
+        req_device,
+        req.get("transformer_path",    "") or "",
+        req.get("vae_path",            "") or "",
+        req.get("text_encoder_path",   "") or "",
+        req.get("text_encoder_2_path", "") or "",
+        bool(req.get("vae_from_transformer")),
+        bool(req.get("offload_vae")),
+        bool(req.get("attention_slicing")),
+        bool(req.get("sequential_offload")),
+    )
+
+    # ── Evict on config change ────────────────────────────────────────
+    if server_state.get("cache_key") != cache_key and "pipeline" in server_state:
+        _log("Model config changed — evicting cached pipeline")
+        del server_state["pipeline"]
+        import torch; torch.cuda.empty_cache()
+        server_state.clear()
+
+    # ── Load if not cached ────────────────────────────────────────────
+    if "pipeline" not in server_state:
+        try:
+            pipe, model_family, guidance_embeds = _load_pipeline(
+                req["model"],
+                precision=req_precision,
+                device=req_device,
+                offload_vae=bool(req.get("offload_vae")),
+                transformer_path=req.get("transformer_path",    "") or "",
+                vae_path=req.get("vae_path",            "") or "",
+                text_encoder_path=req.get("text_encoder_path",   "") or "",
+                text_encoder_2_path=req.get("text_encoder_2_path", "") or "",
+                vae_from_transformer=bool(req.get("vae_from_transformer")),
+                attention_slicing=bool(req.get("attention_slicing")),
+                sequential_offload=bool(req.get("sequential_offload")),
+            )
+        except Exception as e:
+            return {"status": "error", "error_type": "LoadError", "error": str(e)}
+        server_state.update({
+            "pipeline":        pipe,
+            "model_family":    model_family,
+            "guidance_embeds": guidance_embeds,
+            "cache_key":       cache_key,
+            "loaded_loras":    [],  # list of {"path", "weight", "adapter_name"}
+        })
+
+    pipe         = server_state["pipeline"]
+    loaded_loras = server_state["loaded_loras"]
+
+    # ── LoRA diff ─────────────────────────────────────────────────────
+    requested_loras = req.get("loras") or []
+    requested_paths = {l["path"] for l in requested_loras}
+    loaded_paths    = {l["path"] for l in loaded_loras}
+
+    # Remove dropped LoRAs; on failure evict and reload pipeline from scratch.
+    to_remove = [l for l in loaded_loras if l["path"] not in requested_paths]
+    for lora_rec in to_remove:
+        try:
+            pipe.delete_adapters([lora_rec["adapter_name"]])
+            loaded_loras.remove(lora_rec)
+            loaded_paths.discard(lora_rec["path"])
+            _log(f"[server] LoRA removed: {lora_rec['path']}")
+        except Exception as e:
+            _log(f"[server] LoRA removal failed ({e}) — evicting pipeline and reloading")
+            del server_state["pipeline"]
+            import torch; torch.cuda.empty_cache()
+            server_state.clear()
+            try:
+                pipe, model_family, guidance_embeds = _load_pipeline(
+                    req["model"],
+                    precision=req_precision,
+                    device=req_device,
+                    offload_vae=bool(req.get("offload_vae")),
+                    transformer_path=req.get("transformer_path",    "") or "",
+                    vae_path=req.get("vae_path",            "") or "",
+                    text_encoder_path=req.get("text_encoder_path",   "") or "",
+                    text_encoder_2_path=req.get("text_encoder_2_path", "") or "",
+                    vae_from_transformer=bool(req.get("vae_from_transformer")),
+                    attention_slicing=bool(req.get("attention_slicing")),
+                    sequential_offload=bool(req.get("sequential_offload")),
+                )
+            except Exception as e2:
+                return {"status": "error", "error_type": "LoadError", "error": str(e2)}
+            server_state.update({
+                "pipeline":        pipe,
+                "model_family":    model_family,
+                "guidance_embeds": guidance_embeds,
+                "cache_key":       cache_key,
+                "loaded_loras":    [],
+            })
+            loaded_loras = server_state["loaded_loras"]
+            loaded_paths = set()
+            break  # all prior LoRAs are gone; add everything fresh below
+
+    # Add LoRAs not yet applied
+    lora_warnings: list = []
+    for lora_spec in requested_loras:
+        if lora_spec["path"] in loaded_paths:
+            continue
+        lora_path    = lora_spec["path"]
+        lora_weight  = float(lora_spec.get("weight", 1.0))
+        adapter_name = sanitize_adapter_name(Path(lora_path).stem)
+        try:
+            success = load_lora_with_key_fix(
+                pipe, lora_path, adapter_name,
+                log_prefix="[comfyless-server]",
+                weight=lora_weight,
+            )
+            if success:
+                loaded_loras.append({"path": lora_path, "weight": lora_weight,
+                                     "adapter_name": adapter_name})
+                _log(f"[server] LoRA loaded: {lora_path}")
+            else:
+                msg = f"LoRA skipped (0 modules): {lora_path}"
+                _log(f"[server] WARNING: {msg}")
+                lora_warnings.append(msg)
+        except Exception as e:
+            msg = f"LoRA load failed: {lora_path}: {e}"
+            _log(f"[server] WARNING: {msg}")
+            lora_warnings.append(msg)
+
+    # ── Resolve output path (server owns this; client template is just a hint) ──
+    savepath = req.get("savepath")
+    if savepath:
+        # Strip leading slashes so template can't escape output_dir.
+        # Subdirectory components are allowed (e.g. %date:YYYY-MM-dd%/image).
+        safe_template = savepath.lstrip("/").lstrip("\\")
+        full_template = str(Path(output_dir) / safe_template)
+        # Validate template expands within output_dir before creating any dirs.
+        expanded = _expand_savepath_template(
+            full_template, req["model"],
+            req.get("seed", -1), req.get("steps", 28),
+            req.get("cfg_scale", 3.5), req.get("sampler", "default"),
+        )
+        if not _within(str(Path(expanded).parent), output_dir):
+            return {"status": "error", "error_type": "PathError",
+                    "error": "savepath template expands outside --output-dir"}
+        try:
+            output_path = _resolve_savepath(
+                full_template, req["model"],
+                req.get("seed", -1), req.get("steps", 28),
+                req.get("cfg_scale", 3.5), req.get("sampler", "default"),
+            )
+        except Exception as e:
+            return {"status": "error", "error_type": "PathError", "error": str(e)}
+    else:
+        counter = 1
+        while True:
+            candidate = str(Path(output_dir) / f"comfyless{counter:04d}.png")
+            if not os.path.exists(candidate):
+                output_path = candidate
+                break
+            counter += 1
+
+    # Belt-and-suspenders: re-verify the final resolved path.
+    if not _within(output_path, output_dir):
+        return {"status": "error", "error_type": "PathError",
+                "error": f"Resolved output path escaped output_dir: {output_path!r}"}
+
+    # ── Generate ──────────────────────────────────────────────────────
+    cached = {
+        "pipeline":        pipe,
+        "model_family":    server_state["model_family"],
+        "guidance_embeds": server_state["guidance_embeds"],
     }
+    try:
+        metadata = generate(
+            model_path=req["model"],
+            prompt=req["prompt"],
+            output_path=output_path,
+            negative_prompt=req.get("negative_prompt", ""),
+            seed=req.get("seed", -1),
+            steps=req.get("steps", 28),
+            cfg_scale=req.get("cfg_scale", 3.5),
+            true_cfg_scale=req.get("true_cfg_scale"),
+            width=req.get("width", 1024),
+            height=req.get("height", 1024),
+            sampler=req.get("sampler", "default"),
+            schedule=req.get("schedule", "linear"),
+            loras=requested_loras,
+            max_sequence_length=req.get("max_sequence_length", 512),
+            precision=req_precision,
+            device=req_device,
+            offload_vae=bool(req.get("offload_vae")),
+            attention_slicing=bool(req.get("attention_slicing")),
+            sequential_offload=bool(req.get("sequential_offload")),
+            transformer_path=req.get("transformer_path",    "") or "",
+            vae_path=req.get("vae_path",            "") or "",
+            text_encoder_path=req.get("text_encoder_path",   "") or "",
+            text_encoder_2_path=req.get("text_encoder_2_path", "") or "",
+            vae_from_transformer=bool(req.get("vae_from_transformer")),
+            _cached_pipeline=cached,
+        )
+    except Exception as e:
+        import traceback
+        return {
+            "status":     "error",
+            "error_type": "InferenceError",
+            "error":      str(e),
+            "traceback":  traceback.format_exc(),
+        }
+
+    if lora_warnings:
+        metadata.setdefault("lora_warnings", []).extend(lora_warnings)
+    return {"status": "ok", "output_path": output_path, "metadata": metadata}
 
 
 # ════════════════════════════════════════════════════════════════════════

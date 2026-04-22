@@ -271,25 +271,12 @@ def _build_call_kwargs(
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  Core generate function
+#  Pipeline loader (extracted so the server can cache the result)
 # ════════════════════════════════════════════════════════════════════════
 
-def generate(
+def _load_pipeline(
     model_path: str,
-    prompt: str,
-    output_path: str,
     *,
-    negative_prompt: str = "",
-    seed: int = -1,
-    steps: int = 28,
-    cfg_scale: float = 3.5,
-    true_cfg_scale: Optional[float] = None,
-    width: int = 1024,
-    height: int = 1024,
-    max_sequence_length: int = 512,
-    sampler: str = "default",
-    schedule: str = "linear",
-    loras: Optional[List[Dict[str, Any]]] = None,
     precision: str = "bf16",
     device: str = "cuda",
     offload_vae: bool = False,
@@ -300,40 +287,12 @@ def generate(
     vae_from_transformer: bool = False,
     attention_slicing: bool = False,
     sequential_offload: bool = False,
-) -> Dict[str, Any]:
-    """Generate a single image and save it.
+):
+    """Load, place, and configure a diffusers pipeline.
 
-    Args:
-        loras: List of {"path": str, "weight": float} dicts.  Applied
-            in order.  LoRA load failures are non-fatal (warned, skipped).
-        sampler: One of SAMPLER_NAMES ("default", "multistep2", "multistep3").
-        schedule: Sigma schedule — reserved for future manual-loop use.
-
-    Returns a metadata dict suitable for the sidecar JSON / bridge output.
-    Raises on fatal errors (model not found, inference failure).
+    Returns (pipe, model_family, guidance_embeds).
+    Called by generate() for one-shot use and by the server to populate its cache.
     """
-    # ── Validate inputs ───────────────────────────────────────────────
-    if not os.path.isdir(model_path):
-        raise FileNotFoundError(f"Model not found: {model_path}")
-
-    output_dir = os.path.dirname(output_path) or "."
-    if not os.path.isdir(output_dir):
-        raise FileNotFoundError(f"Output directory not found: {output_dir}")
-
-    # ── Align dimensions ──────────────────────────────────────────────
-    aligned_w = _align_dim(width)
-    aligned_h = _align_dim(height)
-    if aligned_w != width or aligned_h != height:
-        _log(f"[comfyless] Dimensions aligned to {_ALIGN}px: "
-             f"{width}x{height} -> {aligned_w}x{aligned_h}")
-        width, height = aligned_w, aligned_h
-
-    # ── Resolve seed ──────────────────────────────────────────────────
-    if seed < 0:
-        seed = torch.randint(0, 2**32 - 1, (1,)).item()
-        _log(f"[comfyless] Random seed: {seed}")
-
-    # ── Detect model family and load pipeline ─────────────────────────
     _log(f"[comfyless] Loading model: {model_path}")
     pipeline_class, class_name, model_family = detect_pipeline_class(model_path)
     _log(f"[comfyless] Detected: {class_name} (family: {model_family})")
@@ -341,7 +300,6 @@ def generate(
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     dtype = dtype_map.get(precision, torch.bfloat16)
 
-    # ── Load component overrides (mirrors EricDiffusionComponentLoader) ──
     transformer_path    = transformer_path.strip()
     vae_path            = vae_path.strip()
     text_encoder_path   = text_encoder_path.strip()
@@ -426,7 +384,6 @@ def generate(
 
     pipe = pipeline_class.from_pretrained(model_path, **load_kwargs)
 
-    # Device placement — sequential_offload precludes .to(device) (accelerate manages it)
     if sequential_offload:
         _log("[comfyless] Enabling sequential CPU offload")
         pipe.enable_sequential_cpu_offload()
@@ -436,7 +393,6 @@ def generate(
             pipe.vae = pipe.vae.to("cpu")
             _log("[comfyless] VAE offloaded to CPU")
 
-    # VAE tiling — required for >2MP decode
     if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
         pipe.vae.enable_tiling()
 
@@ -448,32 +404,115 @@ def generate(
             _log(f"[comfyless] Attention slicing not available: {e}")
 
     guidance_embeds = read_guidance_embeds(pipe)
-    _log(f"[comfyless] Ready — family={model_family}, "
-         f"guidance_embeds={guidance_embeds}")
+    _log(f"[comfyless] Ready — family={model_family}, guidance_embeds={guidance_embeds}")
+    return pipe, model_family, guidance_embeds
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  Core generate function
+# ════════════════════════════════════════════════════════════════════════
+
+def generate(
+    model_path: str,
+    prompt: str,
+    output_path: str,
+    *,
+    negative_prompt: str = "",
+    seed: int = -1,
+    steps: int = 28,
+    cfg_scale: float = 3.5,
+    true_cfg_scale: Optional[float] = None,
+    width: int = 1024,
+    height: int = 1024,
+    max_sequence_length: int = 512,
+    sampler: str = "default",
+    schedule: str = "linear",
+    loras: Optional[List[Dict[str, Any]]] = None,
+    precision: str = "bf16",
+    device: str = "cuda",
+    offload_vae: bool = False,
+    transformer_path: str = "",
+    vae_path: str = "",
+    text_encoder_path: str = "",
+    text_encoder_2_path: str = "",
+    vae_from_transformer: bool = False,
+    attention_slicing: bool = False,
+    sequential_offload: bool = False,
+    _cached_pipeline: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Generate a single image and save it.
+
+    Args:
+        loras: List of {"path": str, "weight": float} dicts.  Applied
+            in order.  LoRA load failures are non-fatal (warned, skipped).
+        sampler: One of SAMPLER_NAMES ("default", "multistep2", "multistep3").
+        schedule: Sigma schedule — reserved for future manual-loop use.
+
+    Returns a metadata dict suitable for the sidecar JSON / bridge output.
+    Raises on fatal errors (model not found, inference failure).
+    """
+    # ── Validate inputs ───────────────────────────────────────────────
+    if not os.path.isdir(model_path):
+        raise FileNotFoundError(f"Model not found: {model_path}")
+
+    output_dir = os.path.dirname(output_path) or "."
+    if not os.path.isdir(output_dir):
+        raise FileNotFoundError(f"Output directory not found: {output_dir}")
+
+    # ── Align dimensions ──────────────────────────────────────────────
+    aligned_w = _align_dim(width)
+    aligned_h = _align_dim(height)
+    if aligned_w != width or aligned_h != height:
+        _log(f"[comfyless] Dimensions aligned to {_ALIGN}px: "
+             f"{width}x{height} -> {aligned_w}x{aligned_h}")
+        width, height = aligned_w, aligned_h
+
+    # ── Resolve seed ──────────────────────────────────────────────────
+    if seed < 0:
+        seed = torch.randint(0, 2**32 - 1, (1,)).item()
+        _log(f"[comfyless] Random seed: {seed}")
+
+    # ── Load pipeline (or reuse server-cached pipeline) ──────────────
+    if _cached_pipeline is not None:
+        pipe           = _cached_pipeline["pipeline"]
+        model_family   = _cached_pipeline["model_family"]
+        guidance_embeds = _cached_pipeline["guidance_embeds"]
+        _log(f"[comfyless] Reusing cached pipeline (family: {model_family})")
+    else:
+        pipe, model_family, guidance_embeds = _load_pipeline(
+            model_path, precision=precision, device=device, offload_vae=offload_vae,
+            transformer_path=transformer_path, vae_path=vae_path,
+            text_encoder_path=text_encoder_path, text_encoder_2_path=text_encoder_2_path,
+            vae_from_transformer=vae_from_transformer, attention_slicing=attention_slicing,
+            sequential_offload=sequential_offload,
+        )
 
     # ── Load LoRAs ────────────────────────────────────────────────────
     lora_warnings: List[str] = []
     loras = loras or []
-    for i, lora_spec in enumerate(loras):
-        lora_path = lora_spec["path"]
-        lora_weight = float(lora_spec.get("weight", 1.0))
-        adapter_name = Path(lora_path).stem.replace(" ", "_").replace(".", "_")
-        _log(f"[comfyless] LoRA {i+1}/{len(loras)}: "
-             f"{Path(lora_path).name} (weight={lora_weight})")
-        try:
-            success = load_lora_with_key_fix(
-                pipe, lora_path, adapter_name,
-                log_prefix="[comfyless-LoRA]",
-                weight=lora_weight,
-            )
-            if not success:
-                msg = f"LoRA skipped (0 modules applied): {lora_path}"
+    # When a cached pipeline is provided the server has already managed LoRAs;
+    # skip loading but keep the list so it appears correctly in metadata.
+    if _cached_pipeline is None:
+        for i, lora_spec in enumerate(loras):
+            lora_path = lora_spec["path"]
+            lora_weight = float(lora_spec.get("weight", 1.0))
+            adapter_name = Path(lora_path).stem.replace(" ", "_").replace(".", "_")
+            _log(f"[comfyless] LoRA {i+1}/{len(loras)}: "
+                 f"{Path(lora_path).name} (weight={lora_weight})")
+            try:
+                success = load_lora_with_key_fix(
+                    pipe, lora_path, adapter_name,
+                    log_prefix="[comfyless-LoRA]",
+                    weight=lora_weight,
+                )
+                if not success:
+                    msg = f"LoRA skipped (0 modules applied): {lora_path}"
+                    _log(f"[comfyless] WARNING: {msg}")
+                    lora_warnings.append(msg)
+            except Exception as e:
+                msg = f"LoRA load failed: {lora_path}: {e}"
                 _log(f"[comfyless] WARNING: {msg}")
                 lora_warnings.append(msg)
-        except Exception as e:
-            msg = f"LoRA load failed: {lora_path}: {e}"
-            _log(f"[comfyless] WARNING: {msg}")
-            lora_warnings.append(msg)
 
     # ── Build generator ───────────────────────────────────────────────
     exec_device = getattr(pipe, "_execution_device", None) or device
