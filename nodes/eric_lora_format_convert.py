@@ -365,6 +365,7 @@ _KOHYA_COMPOUNDS: Tuple[str, ...] = (
     "transformer_blocks",
     "double_blocks",
     "single_blocks",
+    "distilled_guidance_layer",  # Chroma-HD; not in base Chroma or Flux
     "query_norm",
     "key_norm",
     "img_attn",

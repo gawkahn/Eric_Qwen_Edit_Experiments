@@ -19,6 +19,20 @@ import folder_paths
 import torch
 from typing import Tuple, List
 
+# Adapter key suffixes that mark the boundary between module path and param name.
+_SUFFIX_MARKERS = (
+    ".lora_down.", ".lora_up.", ".lora_A.", ".lora_B.",
+    ".alpha", ".lokr_", ".hada_", ".diff",
+)
+
+# Kohya-format text encoder LoRA key prefixes and the pipeline attribute they target.
+# Order matters: lora_te_ (single-TE) must come after lora_te1_ / lora_te2_.
+_TE_PREFIX_MAP = (
+    ("lora_te1_", "text_encoder"),
+    ("lora_te2_", "text_encoder_2"),
+    ("lora_te_",  "text_encoder"),
+)
+
 
 def get_lora_list() -> List[str]:
     """Get list of available LoRA files from ComfyUI's loras folder."""
@@ -127,10 +141,13 @@ def _normalize_keys(state_dict: dict, model=None) -> dict:
     ``named_modules()``.  This makes it robust regardless of training
     tool or checkpoint convention.
     """
-    # Filter out text-encoder keys first
+    # Filter out text-encoder keys (dot format and Kohya prefix format).
+    # TE keys are handled separately by _apply_te_lora before this is called.
+    _TE_PREFIXES = ("text_encoder.", "text_encoder_2.",
+                    "lora_te1_", "lora_te2_", "lora_te_")
     filtered = {}
     for k, v in state_dict.items():
-        if k.startswith(("text_encoder.", "text_encoder_2.")):
+        if k.startswith(_TE_PREFIXES):
             continue
         filtered[k] = v
 
@@ -574,6 +591,96 @@ def _load_loha_adapter_direct(pipe, state_dict: dict, adapter_name: str,
     return applied > 0
 
 
+def _apply_te_lora(pipe, state_dict: dict, adapter_name: str,
+                   log_prefix: str = "[LoRA]",
+                   weight: float = 1.0) -> bool:
+    """Decode and apply Kohya-format text encoder LoRA keys (lora_te1_*, lora_te2_*, lora_te_*).
+
+    Called from the fallback path of load_lora_with_key_fix, before the
+    transformer key normalisation that would otherwise silently discard TE keys.
+
+    Decoding: uses the text encoder's named_modules() tree, exactly as
+    _decode_kohya_keys uses the transformer's tree for lora_transformer_* keys.
+
+    Application: tries pipe.load_lora_weights() with decoded+prefixed keys
+    (diffusers routes 'text_encoder.*' / 'text_encoder_2.*' keys correctly).
+    Falls back to a warning if that also fails — does not attempt direct merge
+    on the TE (TE direct merge is complex and TEs are usually small enough that
+    the pipeline path succeeds).
+
+    Returns True if any TE keys were found (regardless of application success).
+    """
+    has_te_keys = any(
+        k.startswith(pfx)
+        for pfx, _ in _TE_PREFIX_MAP
+        for k in state_dict
+    )
+    if not has_te_keys:
+        return False
+
+    te_dict: dict = {}  # combined {component.path: tensor} for pipe.load_lora_weights
+
+    for prefix, component_attr in _TE_PREFIX_MAP:
+        te_module = getattr(pipe, component_attr, None)
+        if te_module is None:
+            continue
+
+        keys_for_prefix = {k: v for k, v in state_dict.items() if k.startswith(prefix)}
+        if not keys_for_prefix:
+            continue
+
+        # Build underscore→dot lookup from the TE module tree
+        underscore_to_dot = {
+            name.replace(".", "_"): name
+            for name, _ in te_module.named_modules()
+            if name
+        }
+
+        decoded = 0
+        skipped_keys = []
+        for key, value in keys_for_prefix.items():
+            remainder = key[len(prefix):]
+
+            # Find adapter suffix boundary
+            split_idx = -1
+            for marker in _SUFFIX_MARKERS:
+                idx = remainder.find(marker)
+                if idx >= 0 and (split_idx < 0 or idx < split_idx):
+                    split_idx = idx
+
+            if split_idx < 0:
+                skipped_keys.append(key)
+                continue
+
+            module_encoded = remainder[:split_idx]
+            adapter_suffix = remainder[split_idx:]
+
+            if module_encoded in underscore_to_dot:
+                out_key = f"{component_attr}.{underscore_to_dot[module_encoded]}{adapter_suffix}"
+                te_dict[out_key] = value
+                decoded += 1
+            else:
+                skipped_keys.append(key)
+
+        if decoded:
+            print(f"{log_prefix} TE LoRA ({component_attr}): {decoded} keys decoded")
+        if skipped_keys:
+            print(f"{log_prefix} TE LoRA ({component_attr}): "
+                  f"{len(skipped_keys)} keys could not be decoded (module not in TE)")
+
+    if not te_dict:
+        print(f"{log_prefix} TE LoRA keys found but none could be decoded — skipping TE application")
+        return True  # keys were present even if not applied
+
+    try:
+        pipe.load_lora_weights(te_dict, adapter_name=f"{adapter_name}_te")
+        print(f"{log_prefix} Text encoder LoRA applied ({len(te_dict)} params)")
+    except Exception as e:
+        print(f"{log_prefix} Text encoder LoRA load failed (non-fatal): {e}")
+
+    return True
+
+
 def _decode_kohya_keys(state_dict: dict, model) -> dict:
     """Convert Kohya underscore-encoded LoRA keys to dot-separated format.
 
@@ -629,13 +736,6 @@ def _decode_kohya_keys(state_dict: dict, model) -> dict:
     underscore_to_dot = {}
     for name in model_modules:
         underscore_to_dot[name.replace(".", "_")] = name
-
-    # Suffixes that mark the boundary between module path and adapter param.
-    # The module path is underscore-encoded; the suffix uses dots.
-    _SUFFIX_MARKERS = (
-        ".lora_down.", ".lora_up.", ".lora_A.", ".lora_B.",
-        ".alpha", ".lokr_", ".hada_", ".diff",
-    )
 
     decoded = {}
     converted = 0
@@ -1165,6 +1265,12 @@ def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
     # ── Fallback: manual load + Kohya decode + key normalisation ─────
     state_dict = _load_state_dict(lora_path)
     transformer = getattr(pipe, "transformer", None)
+
+    # Extract and apply text encoder LoRA keys before transformer processing.
+    # _normalize_keys filters these out anyway; doing it explicitly here
+    # ensures they are applied to the correct TE component rather than dropped.
+    _apply_te_lora(pipe, state_dict, adapter_name, log_prefix, weight)
+
     state_dict = _decode_kohya_keys(state_dict, transformer)
     state_dict = _normalize_keys(state_dict, model=transformer)
 
