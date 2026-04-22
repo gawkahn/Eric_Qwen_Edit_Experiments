@@ -461,6 +461,32 @@ def _load_single_weights(component_class, weights_path: str, dtype,
 
     detected_prefix = _peek_dominant_prefix(weights_path)
 
+    def _load_stripped_in_memory(src_path: str, prefix: str, target_dtype, cfg_path: str):
+        """Load weights into RAM, strip the dominant prefix, and instantiate the
+        component via from_config + load_state_dict(assign=True).
+
+        Avoids the write-to-/tmp / re-read cycle of the old temp-file approach —
+        for 20B+ models that saves 60-120 s of disk I/O.  Requires PyTorch ≥ 2.0
+        for assign=True.  Falls back naturally when the caller catches any exception.
+        """
+        from safetensors.torch import load_file as st_load
+        sd = st_load(src_path) if src_path.lower().endswith(".safetensors") \
+            else torch.load(src_path, map_location="cpu", weights_only=True)
+        stripped = {
+            (k[len(prefix):] if k.startswith(prefix) else k): v.to(target_dtype)
+            for k, v in sd.items()
+        }
+        del sd
+        config = component_class.load_config(cfg_path, local_files_only=True)
+        model  = component_class.from_config(config)
+        incompat = model.load_state_dict(stripped, strict=False, assign=True)
+        del stripped
+        if incompat.missing_keys:
+            print(f"[EricDiffusion] in-memory strip: "
+                  f"{len(incompat.missing_keys)} missing / "
+                  f"{len(incompat.unexpected_keys)} unexpected keys")
+        return model
+
     def _write_prefix_stripped_temp(src_path: str, prefix: str) -> str:
         """Load src_path, strip prefix from all matching keys, save to a
         temp .safetensors file, and return the temp path.  Caller owns
@@ -511,17 +537,28 @@ def _load_single_weights(component_class, weights_path: str, dtype,
             except Exception as e:
                 print(f"[EricDiffusion] from_single_file with base config failed: {e}")
 
-        # Attempt 1b: if we detected an SGM prefix and the base config
-        # is available, pre-strip the prefix to a temp file and retry.
-        # Handles the diffusers Flux2 converter bug where position-based
-        # parsing breaks on prefixed keys.  Uses a temp directory that
-        # gets cleaned up in a finally block regardless of outcome.
+        # Attempt 1b: SGM prefix detected + base config available.
+        # Primary: strip prefix in RAM and use from_config + load_state_dict —
+        # no temp file, no disk write.  Falls back to the old temp-file path
+        # if the in-memory approach raises (e.g. non-diffusers key format).
         if detected_prefix is not None and has_config:
             print(
                 f"[EricDiffusion] Retrying from_single_file with prefix "
                 f"{detected_prefix!r} pre-stripped (workaround for "
                 f"upstream converter parsing bug)..."
             )
+            try:
+                component = _load_stripped_in_memory(
+                    weights_path, detected_prefix, dtype, config_path,
+                )
+                print(
+                    f"[EricDiffusion] {subfolder_hint} loaded successfully via "
+                    f"in-memory prefix strip (base config)"
+                )
+                return component
+            except Exception as e:
+                print(f"[EricDiffusion] in-memory strip failed ({e}); "
+                      f"retrying via temp file...")
             temp_dir = None
             try:
                 temp_dir, stripped_path = _write_prefix_stripped_temp(
