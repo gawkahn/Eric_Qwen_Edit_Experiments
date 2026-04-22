@@ -468,15 +468,22 @@ def _load_single_weights(component_class, weights_path: str, dtype,
         Avoids the write-to-/tmp / re-read cycle of the old temp-file approach —
         for 20B+ models that saves 60-120 s of disk I/O.  Requires PyTorch ≥ 2.0
         for assign=True.  Falls back naturally when the caller catches any exception.
+
+        Memory discipline: pop from sd one key at a time so sd and stripped never
+        coexist at full size.  Peak ≈ 2× model size (stripped + fresh model),
+        down from 3× (sd + stripped + model) in the dict-comprehension version.
         """
         from safetensors.torch import load_file as st_load
         sd = st_load(src_path) if src_path.lower().endswith(".safetensors") \
             else torch.load(src_path, map_location="cpu", weights_only=True)
-        stripped = {
-            (k[len(prefix):] if k.startswith(prefix) else k): v.to(target_dtype)
-            for k, v in sd.items()
-        }
-        del sd
+        # Pop one key at a time: sd shrinks as stripped grows, never 2× in RAM.
+        keys = list(sd.keys())
+        stripped = {}
+        for k in keys:
+            v = sd.pop(k)
+            new_k = k[len(prefix):] if k.startswith(prefix) else k
+            stripped[new_k] = v.to(target_dtype)
+        del sd, keys
         config = component_class.load_config(cfg_path, local_files_only=True)
         model  = component_class.from_config(config)
         incompat = model.load_state_dict(stripped, strict=False, assign=True)
