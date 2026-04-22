@@ -26,7 +26,8 @@ Every feature reachable from the ComfyUI loader/generate node chain is reachable
 10. [VRAM knobs](#vram-knobs)
 11. [Python function API](#python-function-api)
 12. [JSON bridge mode](#json-bridge-mode)
-13. [Troubleshooting](#troubleshooting)
+13. [Server mode](#server-mode)
+14. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -135,7 +136,7 @@ All flags are optional except `--model` and `--prompt` (which can alternatively 
 | `--width INT` | `1024` | Width in px. Rounded down to nearest multiple of 32 |
 | `--height INT` | `1024` | Height in px. Rounded down to nearest multiple of 32 |
 | `--max-seq-len INT` | `512` | Text-encoder max sequence length. Relevant to flux/flux2/chroma/auraflow |
-| `--output PATH`, `-o` | `output.png` | Output image path. Sidecar JSON is written alongside with the same stem |
+| `--output PATH`, `-o` | `output.png` | Output image path. Sidecar JSON is written alongside with the same stem. **Ignored when a server is running** (server owns the output path) — use `--savepath` instead |
 
 ### Sampler / schedule
 
@@ -170,12 +171,44 @@ All flags are optional except `--model` and `--prompt` (which can alternatively 
 | `--attention-slicing` | off | `enable_attention_slicing("auto")`. Lower peak VRAM, slower |
 | `--sequential-offload` | off | `enable_sequential_cpu_offload()` via accelerate. Extreme VRAM savings, very slow. Incompatible with `--offload-vae` (sequential mode manages placement itself) |
 
+### Output naming
+
+| Flag | What it does |
+|---|---|
+| `--savepath TEMPLATE` | Output path template. Auto-creates parent dirs; appends a 4-digit counter (`0001`, `0002`, …) so files never overwrite. Wins over `--output` when set. In server mode the template is applied within `--output-dir`. See [savepath tokens](#savepath-tokens) |
+
+**Savepath tokens** — all case-insensitive, `%name%` or `%name:spec%`:
+
+| Token | Expands to |
+|---|---|
+| `%model%` | Transformer filename if `--transformer` is set, otherwise base model directory name. Mirrors ComfyUI "show what was actually used" convention |
+| `%transformer%` | Always the transformer filename (or base model if none) |
+| `%base_model%` | Always the base model directory name |
+| `%date%` | `YYYY-MM-DD` |
+| `%date:FORMAT%` | `strftime`-formatted date, e.g. `%date:MM-dd-YY%` → `04-22-26` |
+| `%seed%` | Resolved seed integer |
+| `%steps%` | Step count |
+| `%cfg%` | CFG scale |
+| `%sampler%` | Sampler name |
+| `%model:N%` | First N characters of the model name (e.g. `%model:12%`) |
+
+Example: `--savepath ~/gen/%date%/%model%_s%seed%` → `~/gen/2026-04-22/Qwen-Image-25120001.png`
+
 ### Replay mode
 
 | Flag | What it does |
 |---|---|
 | `--params SIDECAR_JSON` | Load base params from a comfyless sidecar JSON. Any explicit CLI flag wins over the sidecar |
 | `--override KEY=VALUE` | Patch a sidecar key. Repeatable. Value is coerced to `int`, `float`, `bool`, or `str` |
+
+### Server mode flags
+
+| Flag | What it does |
+|---|---|
+| `--serve` | Start the persistent model server. Blocks until `--unload` is received. Requires `--model-base` and `--output-dir` |
+| `--unload` | Send a shutdown command to the running server |
+| `--output-dir DIR` | `[--serve]` Directory where the server saves generated images. Created if absent |
+| `--model-base DIR` | `[--serve]` Security boundary: all model and LoRA paths in incoming requests must resolve within this directory |
 
 ### Agent bridge
 
@@ -516,6 +549,78 @@ For agent / tool-calling integrations. Input is a JSON object on stdin, output i
 ```
 
 Non-zero exit code on failure, zero on success.
+
+---
+
+## Server mode
+
+The server keeps a diffusers pipeline loaded in VRAM between invocations, eliminating the 30–90 second model-load overhead on every run. Once the server is up, any normal `comfyless.generate` invocation auto-detects the socket and delegates to it — no flag changes needed on the client side.
+
+### Start the server
+
+```bash
+PY=/home/gawkahn/projects/ai-lab/ai-stack-data/comfy-dev/run/venv/bin/python3
+cd /home/gawkahn/projects/ai-lab/code/Eric_Qwen_Edit_Experiments
+
+$PY -m comfyless.generate --serve \
+    --model-base /home/gawkahn/projects/ai-lab/ai-base/models \
+    --output-dir /home/gawkahn/gen-output \
+    --device cuda:1 \
+    --precision bf16 &
+```
+
+The server prints its socket path and config to stderr, then blocks waiting for requests. Run it in a background shell or a tmux pane — it logs to stderr.
+
+**Socket location:** `$XDG_RUNTIME_DIR/comfyless.sock` when systemd has set `XDG_RUNTIME_DIR` (typical on Linux desktop); otherwise `/tmp/comfyless-$UID/comfyless.sock`. The directory is created at mode `0700`; the socket at `0600` — inaccessible to other users.
+
+### Using the server (auto-detect)
+
+After the server starts, run generation normally:
+
+```bash
+$PY -m comfyless.generate \
+    --model /home/gawkahn/projects/ai-lab/ai-base/models/hf-local/Qwen-Image-2512 \
+    --prompt "..." \
+    --savepath /home/gawkahn/gen-output/%date%/%model%_s%seed% \
+    --device cuda:1
+```
+
+Auto-detect fires when the socket exists **and** you are using `--savepath` or the default `--output` path. If you pass an explicit `--output` path, comfyless assumes you want to control the destination yourself and runs in-process instead.
+
+The server handles:
+- **Model caching** — first request loads the model; subsequent requests with the same config (`model`, `device`, `precision`, all component override paths) reuse the cached pipeline with no load time.
+- **Config eviction** — if the model, precision, device, or any component override changes, the server evicts the old pipeline, frees GPU memory, and loads the new one.
+- **Incremental LoRA diff** — the server tracks which LoRAs are applied. When a request adds or removes a LoRA, only the delta is applied (`delete_adapters` / `load_lora_weights`). A fresh load for every run is not needed.
+
+### Output naming in server mode
+
+The server owns the output path — `--output` on the client is ignored. Use `--savepath` to control naming within the server's `--output-dir`:
+
+```bash
+$PY -m comfyless.generate \
+    --model /home/.../Qwen-Image-2512 \
+    --prompt "..." \
+    --savepath "%date:YYYY-MM-dd%/%model:12%_s%seed%"
+```
+
+The savepath template is relative (leading `/` stripped); the server resolves it within `--output-dir` and validates it doesn't escape that directory.
+
+When no `--savepath` is given, the server auto-names files `comfyless0001.png`, `comfyless0002.png`, … in `--output-dir`.
+
+### Stop the server
+
+```bash
+$PY -m comfyless.generate --unload
+```
+
+This sends a shutdown command over the socket. The server unloads the pipeline from VRAM, frees the socket file, and exits cleanly. Prints `No server found` if no socket is present.
+
+### Security model
+
+- All model and LoRA paths in requests are validated against `--model-base` before any load. Requests with paths outside that root are rejected.
+- Output paths are validated against `--output-dir` after template expansion; templates that would escape the directory are rejected.
+- LoRA adapter names are sanitized to `[a-zA-Z0-9_-]` before being passed to diffusers.
+- Full design rationale: `docs/decisions/ADR-001-daemon-socket-security.md`.
 
 ---
 
