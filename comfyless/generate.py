@@ -124,15 +124,20 @@ def _coerce(value: str):
 # ── Savepath helpers ─────────────────────────────────────────────────────
 
 def _format_date_token(fmt: str) -> str:
-    """Convert ComfyUI-style date format string (MM-dd-YY) to a strftime result."""
+    """Convert a ComfyUI-style date format string to a strftime result.
+
+    Matching is case-insensitive for all tokens except MM (month) vs mm (minutes),
+    which preserves the ComfyUI convention and avoids ambiguity.
+    """
     s = fmt
-    s = s.replace("YYYY", "%Y")
-    s = s.replace("YY",   "%y")
-    s = s.replace("MM",   "%m")
-    s = s.replace("dd",   "%d")
-    s = s.replace("HH",   "%H")
-    s = s.replace("mm",   "%M")
-    s = s.replace("ss",   "%S")
+    # Longer tokens first to avoid partial matches (YYYY before YY, etc.)
+    s = re.sub(r"(?i)YYYY", "%Y", s)
+    s = re.sub(r"(?i)YY",   "%y", s)
+    s = re.sub(r"MM",       "%m", s)  # month — uppercase only (ComfyUI convention)
+    s = re.sub(r"(?i)DD",   "%d", s)
+    s = re.sub(r"(?i)HH",   "%H", s)
+    s = re.sub(r"mm",       "%M", s)  # minutes — lowercase only (ComfyUI convention)
+    s = re.sub(r"(?i)SS",   "%S", s)
     return datetime.now().strftime(s)
 
 
@@ -143,9 +148,18 @@ def _expand_savepath_template(
     steps: int,
     cfg_scale: float,
     sampler: str,
+    transformer_path: str = "",
 ) -> str:
-    """Expand %var% and %var:spec% tokens in a savepath template string."""
-    model_name = Path(model_path).name
+    """Expand %var% and %var:spec% tokens in a savepath template string.
+
+    %model%      — transformer filename if --transformer is set, otherwise base model.
+                   Matches ComfyUI behavior: shows the weights that were actually used.
+    %transformer% — always the transformer filename (or base model if none).
+    %base_model% — always the base model directory name.
+    All token names are case-insensitive.
+    """
+    base_model_name = Path(model_path).name
+    model_name = Path(transformer_path).name if transformer_path else base_model_name
 
     def _replace(m: re.Match) -> str:
         token = m.group(1)
@@ -153,9 +167,12 @@ def _expand_savepath_template(
         name = name.lower()
         if name == "date":
             return _format_date_token(spec) if spec else datetime.now().strftime("%Y-%m-%d")
-        if name == "model":
+        if name in ("model", "transformer"):
             n = int(spec) if spec.isdigit() else None
             return model_name[:n] if n else model_name
+        if name == "base_model":
+            n = int(spec) if spec.isdigit() else None
+            return base_model_name[:n] if n else base_model_name
         if name == "seed":
             return str(seed)
         if name == "steps":
@@ -176,9 +193,12 @@ def _resolve_savepath(
     steps: int,
     cfg_scale: float,
     sampler: str,
+    transformer_path: str = "",
 ) -> str:
     """Expand template, create parent dirs, return first available counter slot."""
-    expanded = _expand_savepath_template(template, model_path, seed, steps, cfg_scale, sampler)
+    expanded = _expand_savepath_template(
+        template, model_path, seed, steps, cfg_scale, sampler, transformer_path,
+    )
     parent = Path(expanded).parent
     parent.mkdir(parents=True, exist_ok=True)
     stem = Path(expanded).name
@@ -859,6 +879,7 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
             p.get("steps", _CLI_DEFAULTS["steps"]),
             p.get("cfg_scale", _CLI_DEFAULTS["cfg"]),
             p.get("sampler", _CLI_DEFAULTS["sampler"]),
+            transformer_path=p.get("transformer_path", ""),
         )
         _log(f"[comfyless] Output: {output_path}")
     else:

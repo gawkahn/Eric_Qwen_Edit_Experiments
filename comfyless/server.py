@@ -401,10 +401,12 @@ def _handle_generate(
         safe_template = savepath.lstrip("/").lstrip("\\")
         full_template = str(Path(output_dir) / safe_template)
         # Validate template expands within output_dir before creating any dirs.
+        _txp = req.get("transformer_path", "") or ""
         expanded = _expand_savepath_template(
             full_template, req["model"],
             req.get("seed", -1), req.get("steps", 28),
             req.get("cfg_scale", 3.5), req.get("sampler", "default"),
+            transformer_path=_txp,
         )
         if not _within(str(Path(expanded).parent), output_dir):
             return {"status": "error", "error_type": "PathError",
@@ -414,6 +416,7 @@ def _handle_generate(
                 full_template, req["model"],
                 req.get("seed", -1), req.get("steps", 28),
                 req.get("cfg_scale", 3.5), req.get("sampler", "default"),
+                transformer_path=_txp,
             )
         except Exception as e:
             return {"status": "error", "error_type": "PathError", "error": str(e)}
