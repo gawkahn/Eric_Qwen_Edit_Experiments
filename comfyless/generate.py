@@ -881,9 +881,15 @@ def _delegate_to_server(
     if not socket_path().exists():
         return None
 
+    # Resolve all path fields to absolute before sending. The server runs
+    # in its own CWD and calls os.path.realpath() for validation — relative
+    # paths sent from the client would resolve differently there.
+    def _abspath(v: str) -> str:
+        return os.path.abspath(v) if v else v
+
     req: Dict[str, Any] = {
         "type":                "generate",
-        "model":               p["model"],
+        "model":               _abspath(p["model"]),
         "prompt":              p["prompt"],
         "negative_prompt":     p.get("negative_prompt", ""),
         "seed":                p.get("seed", -1),
@@ -894,17 +900,18 @@ def _delegate_to_server(
         "height":              p.get("height", 1024),
         "sampler":             p.get("sampler", "default"),
         "schedule":            p.get("schedule", "linear"),
-        "loras":               loras,
+        "loras":               [{"path": _abspath(l["path"]), "weight": l.get("weight", 1.0)}
+                                for l in loras],
         "max_sequence_length": p.get("max_sequence_length", 512),
         "precision":           args.precision,
         "device":              args.device,
         "offload_vae":         args.offload_vae,
         "attention_slicing":   args.attention_slicing,
         "sequential_offload":  args.sequential_offload,
-        "transformer_path":    p.get("transformer_path", ""),
-        "vae_path":            p.get("vae_path", ""),
-        "text_encoder_path":   p.get("text_encoder_path", ""),
-        "text_encoder_2_path": p.get("text_encoder_2_path", ""),
+        "transformer_path":    _abspath(p.get("transformer_path", "")),
+        "vae_path":            _abspath(p.get("vae_path", "")),
+        "text_encoder_path":   _abspath(p.get("text_encoder_path", "")),
+        "text_encoder_2_path": _abspath(p.get("text_encoder_2_path", "")),
         "vae_from_transformer": p.get("vae_from_transformer", False),
     }
     if args.savepath:
