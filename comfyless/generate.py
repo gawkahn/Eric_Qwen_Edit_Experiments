@@ -676,12 +676,22 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sequential-offload", action="store_true",
                    help="Extreme VRAM savings via sequential CPU offload — very slow")
     p.add_argument("--output", "-o", type=str, default="/tmp/comfyless.png",
-                   help="Output image path (exact; overwrites)")
+                   help="Output image path (exact; overwrites). "
+                        "Ignored when a server is running — use --savepath instead.")
     p.add_argument("--savepath", type=str, default=None,
                    metavar="TEMPLATE",
                    help="Output path template with %%date:MM-dd-YY%%, %%model:12%%, "
                         "%%seed%%, %%steps%%, %%cfg%%, %%sampler%%. "
                         "Auto-creates dirs; always writes comfyless0001.png, 0002, ...")
+    # ── Server mode ──────────────────────────────────────────────────────
+    p.add_argument("--serve", action="store_true",
+                   help="Start the persistent model server (keeps pipeline in VRAM)")
+    p.add_argument("--unload", action="store_true",
+                   help="Shut down the running model server cleanly")
+    p.add_argument("--output-dir", type=str, default=None, metavar="DIR",
+                   help="[--serve] Directory where the server saves generated images")
+    p.add_argument("--model-base", type=str, default=None, metavar="DIR",
+                   help="[--serve] Root that all model and LoRA paths must be within")
     return p.parse_args()
 
 
@@ -791,6 +801,139 @@ def _run_json_mode() -> int:
         return 1
 
 
+# ════════════════════════════════════════════════════════════════════════
+#  Server mode / socket delegation
+# ════════════════════════════════════════════════════════════════════════
+
+def _run_serve_mode(args: argparse.Namespace) -> int:
+    """Start the persistent model server and block until --unload is received."""
+    from .server import run_server
+    if not args.model_base:
+        print("Error: --model-base is required with --serve", file=sys.stderr)
+        return 1
+    if not args.output_dir:
+        print("Error: --output-dir is required with --serve", file=sys.stderr)
+        return 1
+    try:
+        run_server(
+            output_dir=args.output_dir,
+            model_base=args.model_base,
+            device=args.device,
+            precision=args.precision,
+        )
+        return 0
+    except (FileNotFoundError, PermissionError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+
+def _send_server_command(req: dict) -> Optional[dict]:
+    """Connect to the running server, send one request, return the response.
+
+    Returns None if the socket doesn't exist or the connection is refused.
+    Local import keeps server.py off the critical import path.
+    """
+    import socket as _socket
+    from .server import socket_path, _send, _recv
+    sock_p = socket_path()
+    if not sock_p.exists():
+        return None
+    conn = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    try:
+        conn.connect(str(sock_p))
+        _send(conn, req)
+        return _recv(conn)
+    except (OSError, ConnectionRefusedError):
+        return None
+    finally:
+        conn.close()
+
+
+def _send_unload() -> int:
+    """Send an unload command to the running server."""
+    resp = _send_server_command({"type": "unload"})
+    if resp is None:
+        print("No server found (socket missing or connection refused).", file=sys.stderr)
+        return 1
+    if resp.get("status") == "ok":
+        print("Server unloaded.")
+        return 0
+    print(f"Server error: {resp.get('error', 'unknown')}", file=sys.stderr)
+    return 1
+
+
+def _delegate_to_server(
+    args: argparse.Namespace,
+    p: dict,
+    loras: list,
+) -> Optional[int]:
+    """Try to send this generation request to the running server.
+
+    Returns an int exit code when the server handled it (success or error).
+    Returns None when the server is unreachable — caller falls through to
+    in-process generation.
+
+    Delegation is skipped when --output is set explicitly: the server owns
+    path resolution and cannot write to an arbitrary caller-supplied path.
+    Use --savepath for naming control when a server is running.
+    """
+    from .server import socket_path
+    if not socket_path().exists():
+        return None
+
+    req: Dict[str, Any] = {
+        "type":                "generate",
+        "model":               p["model"],
+        "prompt":              p["prompt"],
+        "negative_prompt":     p.get("negative_prompt", ""),
+        "seed":                p.get("seed", -1),
+        "steps":               p.get("steps", 28),
+        "cfg_scale":           p.get("cfg_scale", 3.5),
+        "true_cfg_scale":      p.get("true_cfg_scale"),
+        "width":               p.get("width", 1024),
+        "height":              p.get("height", 1024),
+        "sampler":             p.get("sampler", "default"),
+        "schedule":            p.get("schedule", "linear"),
+        "loras":               loras,
+        "max_sequence_length": p.get("max_sequence_length", 512),
+        "precision":           args.precision,
+        "device":              args.device,
+        "offload_vae":         args.offload_vae,
+        "attention_slicing":   args.attention_slicing,
+        "sequential_offload":  args.sequential_offload,
+        "transformer_path":    p.get("transformer_path", ""),
+        "vae_path":            p.get("vae_path", ""),
+        "text_encoder_path":   p.get("text_encoder_path", ""),
+        "text_encoder_2_path": p.get("text_encoder_2_path", ""),
+        "vae_from_transformer": p.get("vae_from_transformer", False),
+    }
+    if args.savepath:
+        req["savepath"] = args.savepath
+
+    resp = _send_server_command(req)
+    if resp is None:
+        _log("[comfyless] Server socket found but connection failed — running in-process")
+        return None
+
+    if resp.get("status") == "ok":
+        metadata    = resp.get("metadata", {})
+        output_path = resp.get("output_path", "")
+        _log(f"[comfyless] Saved: {output_path}")
+        if output_path:
+            stem = os.path.splitext(output_path)[0]
+            sidecar_path = f"{stem}.json"
+            with open(sidecar_path, "w") as f:
+                json.dump(metadata, f, indent=2)
+            print(f"[comfyless] Metadata: {sidecar_path}")
+        print(f"\nDone. seed={metadata.get('seed', '?')}, "
+              f"time={metadata.get('elapsed_seconds', '?')}s")
+        return 0
+
+    err = resp.get("error", "unknown error")
+    print(f"Error (server): {err}", file=sys.stderr)
+    return 1
+
+
 def _run_cli_mode(args: argparse.Namespace) -> int:
     """Human CLI mode: argparse flags, human-readable output.
 
@@ -865,6 +1008,16 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
 
     loras = [_parse_lora_arg(s) for s in args.lora] if args.lora else p.get("loras", [])
 
+    # ── Delegate to server if one is running ──────────────────────────
+    # Only delegate when using default --output or explicit --savepath.
+    # Explicit --output paths can't be honoured by the server (it owns
+    # path resolution), so we fall through to in-process in that case.
+    using_default_output = args.output == "/tmp/comfyless.png"
+    if args.savepath or using_default_output:
+        result = _delegate_to_server(args, p, loras)
+        if result is not None:
+            return result
+
     # Resolve output path — savepath template takes precedence over --output
     if args.savepath:
         seed_for_path = p.get("seed", -1)
@@ -938,6 +1091,10 @@ def main() -> int:
     args = _parse_args()
     if args.json:
         return _run_json_mode()
+    if args.serve:
+        return _run_serve_mode(args)
+    if args.unload:
+        return _send_unload()
     return _run_cli_mode(args)
 
 
