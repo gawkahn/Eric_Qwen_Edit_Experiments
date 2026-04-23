@@ -134,11 +134,27 @@ def _extract_eric_save_params(params_json: str, path: str) -> dict:
     if "model_path" in data:
         out["model"] = data["model_path"]
 
-    _log(
-        f"[comfyless] Eric Diffusion Save parameters chunk — "
-        f"extracted {sorted(out.keys())}. "
-        "LoRA weights not replayed; use --lora to re-apply."
-    )
+    _log(f"[comfyless] Eric Diffusion Save parameters chunk — extracted {sorted(out.keys())}")
+
+    # Warn when the baked-in model path doesn't exist on this host.
+    # ComfyUI often runs in a container with different mount points.
+    model_val = out.get("model", "")
+    if model_val and not os.path.exists(model_val):
+        print(
+            f"WARNING: model path from image metadata does not exist on this host:\n"
+            f"  {model_val}\n"
+            f"  Use --override model=<host-path> to supply the correct path.",
+            file=sys.stderr,
+        )
+
+    if data.get("loras"):
+        print(
+            "WARNING: LoRAs were active when this image was saved but will NOT be "
+            "replayed.\n"
+            "  Use --lora path:weight to re-apply them.",
+            file=sys.stderr,
+        )
+
     return out
 
 
