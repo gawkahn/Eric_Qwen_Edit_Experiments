@@ -34,10 +34,13 @@ examples/not public/
 # Archives
 *.zip
 
-# Claude session artifacts (not committed — ephemeral per-session state)
+# Claude session artifacts — per-session ephemeral state, never committed
 memory/
 session-handoff-*.md
-.claude/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/memory/
+# .claude/settings.json and .claude/hooks/ ARE committed (discipline travels with repo)
 
 # Test harness — local config and generated outputs (the example IS tracked)
 tests/lora_test_config.toml

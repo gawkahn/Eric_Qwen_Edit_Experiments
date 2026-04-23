@@ -69,7 +69,12 @@ See the general `Git Commit Discipline` rule in `~/.claude/CLAUDE.md` for the ca
 - Prefix: `feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `update:`, `tool:` for standalone CLI tools, `workflows:` for workflow JSON artifacts
 - Imperative mood, lowercase after the prefix
 - Short first line (≤72 chars), optional body explaining the _why_ not the _what_
-- When a change was AI-produced, append a Co-Authored-By trailer referencing Claude. Match the existing repo pattern — check `git log --format="%an|%cn" -20` before starting if unsure.
+- **Every AI-produced commit must include both trailers** (global §0 rule 6 + §7):
+  ```
+  AI-disclosure: Claude (Sonnet 4.6) authored; Grant reviewed.
+  Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+  ```
+  Use the tier that actually wrote the code. The `AI-disclosure:` line is enforced by the pre-commit hook in `.claude/hooks/check-ai-disclosure.sh`.
 
 **Files that belong in commits:**
 
@@ -99,6 +104,23 @@ The global `Git Commit Discipline` rule "Never push to remote without explicit u
 - If the user's slice-approval message already said to push (e.g. "commit and push this"), that's the push approval — no second ask for that one.
 - "Hold" on one commit does not extend to the next — ask again after the next slice.
 - Force push, skipping hooks (`--no-verify`), and signing bypass remain separate per-invocation approvals regardless.
+
+## Review bar (this project)
+
+No Red Zone surfaces (no auth, PII, billing, or audit trail — single-user desktop ML tool). Global §5A default applies:
+
+- **Every non-trivial code slice runs `code-reviewer` (Opus) before commit.** "Trivial" = single-line fix, pure doc edit, mechanical rename with no behavior change. When in doubt, run it.
+- The `code-reviewer` subagent is pinned to `claude-opus-4-7` in `~/.claude/agents/code-reviewer.md`. Do not override to a weaker model.
+- `security-auditor` is not required for this project's normal work surface, but run it if a change ever introduces: file writes from external input, loading executable code from caller-supplied paths, or network-facing surfaces.
+- Trivial skips: ask `"Trivial — skip review? Change: <one-line summary>. Reply 'review' to run it anyway."` Do not self-decide.
+
+## Commit-time hooks
+
+`.claude/settings.json` installs a `PreToolUse` hook on `Bash` that rejects `git commit -m "..."` calls whose message lacks an `AI-disclosure:` trailer. Required per global §7 and §0 rule 6.
+
+- Bypassable by editor commit (no `-m` flag).
+- For human-only commits: `AI-disclosure: none`.
+- Hook script: `.claude/hooks/check-ai-disclosure.sh` (committed; travels with repo).
 
 ## Architecture
 
