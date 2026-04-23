@@ -4,7 +4,8 @@
 
 Use it when you want to:
 - Script a parameter sweep (e.g. iterate over every transformer in a directory with the same prompt + seed)
-- Replay a generation from a sidecar JSON with one or two overrides
+- Replay a generation from any saved PNG (params are embedded in the image) or a sidecar JSON, with optional overrides
+- Load a ComfyUI-saved PNG and re-run its workflow params through comfyless
 - Drive image gen from an LLM agent via a JSON stdin/stdout contract
 - Run unattended overnight batches
 
@@ -200,7 +201,7 @@ Example: `--savepath ~/gen/%date%/%model%_s%seed%` → `~/gen/2026-04-22/Qwen-Im
 
 | Flag | What it does |
 |---|---|
-| `--params SIDECAR_JSON` | Load base params from a comfyless sidecar JSON. Any explicit CLI flag wins over the sidecar |
+| `--params FILE` | Load base params from a comfyless sidecar JSON **or a PNG**. Any explicit CLI flag wins over the loaded params. See [Sidecar JSON and `--params` replay](<#Sidecar JSON and `--params` replay>) |
 | `--override KEY=VALUE` | Patch a sidecar key. Repeatable. Value is coerced to `int`, `float`, `bool`, or `str` |
 
 ### Server mode flags
@@ -222,7 +223,12 @@ Example: `--savepath ~/gen/%date%/%model%_s%seed%` → `~/gen/2026-04-22/Qwen-Im
 
 ## Sidecar JSON and `--params` replay
 
-Every successful run writes a JSON sidecar alongside the output image. For `--output /tmp/dog.png`, the sidecar is `/tmp/dog.json`. Contents:
+Every successful run does two things:
+
+1. **Embeds the full params as a `comfyless` PNG text chunk** inside the output image itself. The image is self-contained — no separate file needed to replay it.
+2. **Writes a JSON sidecar** alongside the image (same stem, `.json` extension) as a human-readable copy of the same data.
+
+For `--output /tmp/dog.png`, the sidecar is `/tmp/dog.json`. Contents:
 
 ```json
 {
@@ -252,13 +258,21 @@ Every successful run writes a JSON sidecar alongside the output image. For `--ou
 
 ### Replay
 
-Same image, guaranteed (same seed + same model + same params + same torch/CUDA build = same pixels):
+`--params` accepts either the PNG directly or the sidecar JSON — both carry the same data:
 
 ```bash
+# From the PNG (params embedded in the image)
+$PY -m comfyless.generate \
+    --params /tmp/dog.png \
+    --output /tmp/dog_again.png
+
+# From the sidecar JSON (human-readable copy)
 $PY -m comfyless.generate \
     --params /tmp/dog.json \
     --output /tmp/dog_again.png
 ```
+
+Same image, guaranteed (same seed + same model + same params + same torch/CUDA build = same pixels).
 
 ### Replay with tweaks
 
@@ -286,12 +300,35 @@ for t in /home/gawkahn/projects/ai-lab/ai-base/models/hf-local/qwen-finetunes/*/
 done
 ```
 
-Resolution of conflicting settings is:
-1. `--params` loads the sidecar (if given)
-2. `--override` patches apply
+### ComfyUI PNG as `--params`
+
+If you pass a PNG that was saved by ComfyUI (no `comfyless` chunk), comfyless reads the embedded ComfyUI `prompt` graph instead and extracts what it can:
+
+| Extracted | Source node |
+|---|---|
+| `steps`, `cfg_scale`, `seed`, `schedule` | `KSampler` / `KSamplerAdvanced` |
+| `prompt`, `negative_prompt` | `CLIPTextEncode` nodes connected to the sampler |
+| `width`, `height` | `Empty*Latent*` node |
+| Model filename (as a warning only) | `CheckpointLoaderSimple` / `DiffusionModelLoader` |
+
+Model path is **never** extractable from a ComfyUI PNG — ComfyUI stores filenames, not full paths. Supply it with `--override`:
+
+```bash
+$PY -m comfyless.generate \
+    --params /tmp/comfyui_output.png \
+    --override model=/path/to/model \
+    --output /tmp/rerun.png
+```
+
+Fields that couldn't be extracted are logged as warnings and must be filled in via `--model`, `--prompt`, or `--override`.
+
+### Resolution order
+
+1. `--params` loads the base params (PNG or JSON)
+2. `--override KEY=VALUE` patches apply in order
 3. Any explicit `--flag VALUE` on the command line wins over both
 
-Meaning: the sidecar is the "recipe," `--override` is inline edits, and explicit flags are per-invocation trumps.
+The params file is the "recipe," `--override` is inline edits, and explicit flags are per-invocation trumps.
 
 ---
 
