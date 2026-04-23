@@ -81,6 +81,12 @@ def _log(msg: str) -> None:
 _SKIP_SIDECAR_KEYS = {"timestamp", "elapsed_seconds", "contract_version",
                       "lora_warnings", "model_family"}
 
+# Keys written by Eric Diffusion Save that are not comfyless CLI params.
+# model_path is handled separately (renamed → model).
+_ERIC_SAVE_DROP = _SKIP_SIDECAR_KEYS | {
+    "node_type", "model_name", "sampler_s2", "sampler_s3", "loras", "model_path",
+}
+
 _CLI_DEFAULTS = {
     "negative_prompt": "",
     "seed": -1,
@@ -113,12 +119,36 @@ def _load_params(path: str) -> dict:
     return _load_sidecar(path)
 
 
+def _extract_eric_save_params(params_json: str, path: str) -> dict:
+    """Extract gen params from an Eric Diffusion Save 'parameters' tEXt chunk.
+
+    Renames model_path → model; drops node-internal fields not used by comfyless.
+    LoRA weights stored in the chunk are not replayed (format mismatch); use --lora.
+    """
+    try:
+        data = json.loads(params_json)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"parameters chunk in {path!r} is not valid JSON: {e}")
+
+    out = {k: v for k, v in data.items() if k not in _ERIC_SAVE_DROP}
+    if "model_path" in data:
+        out["model"] = data["model_path"]
+
+    _log(
+        f"[comfyless] Eric Diffusion Save parameters chunk — "
+        f"extracted {sorted(out.keys())}. "
+        "LoRA weights not replayed; use --lora to re-apply."
+    )
+    return out
+
+
 def _load_params_from_png(path: str) -> dict:
     """Extract comfyless or ComfyUI params from a PNG file's tEXt chunks.
 
     Priority:
       1. comfyless chunk — full params from a prior comfyless run.
-      2. ComfyUI prompt chunk — partial extraction; warns about missing fields.
+      2. parameters chunk — Eric Diffusion Save node format.
+      3. ComfyUI prompt chunk — partial extraction; warns about missing fields.
     """
     from PIL import Image as _Image
     try:
@@ -133,6 +163,11 @@ def _load_params_from_png(path: str) -> dict:
         except json.JSONDecodeError as e:
             raise ValueError(f"comfyless chunk in {path!r} is not valid JSON: {e}")
         return {k: v for k, v in data.items() if k not in _SKIP_SIDECAR_KEYS}
+
+    raw = info.get("parameters")
+    if raw:
+        _log(f"[comfyless] No comfyless chunk in {path!r} — trying Eric Diffusion Save parameters chunk")
+        return _extract_eric_save_params(raw, path)
 
     raw = info.get("prompt")
     if raw:
