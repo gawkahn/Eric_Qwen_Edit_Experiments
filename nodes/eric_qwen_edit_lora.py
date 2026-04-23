@@ -1181,6 +1181,15 @@ def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
             and pre_check.matched == 0 and pre_check.total_layers > 0):
         try:
             source_sd = _load_state_dict(lora_path)
+            # Apply text encoder LoRA keys before conversion (they pass
+            # through convert_state_dict unchanged and cause diffusers
+            # to warn about unexpected keys in load_converted_lora).
+            _apply_te_lora(pipe, source_sd, adapter_name, log_prefix, weight)
+            _TE_STRIP = tuple(pfx for pfx, _ in _TE_PREFIX_MAP) + (
+                "text_encoder.", "text_encoder_2.",
+            )
+            source_sd = {k: v for k, v in source_sd.items()
+                         if not k.startswith(_TE_STRIP)}
             # Chroma LoRAs often come in Kohya underscore format
             # (lora_unet_*); decode to BFL dot format so
             # detect_lora_format recognises them as bfl_original.
