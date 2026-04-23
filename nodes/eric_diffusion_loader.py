@@ -23,6 +23,7 @@ from .eric_diffusion_utils import (
     read_guidance_embeds,
     get_gen_pipeline_cache,
     clear_gen_pipeline_cache,
+    resolve_hf_path,
 )
 from .eric_diffusion_component_loader import (
     available_device_options,
@@ -104,6 +105,14 @@ class EricDiffusionLoader:
                     "default": False,
                     "tooltip": "Extreme VRAM savings via sequential CPU offload — very slow.",
                 }),
+                "allow_hf_download": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "Accept HuggingFace repo IDs (e.g. 'black-forest-labs/FLUX.1-dev') "
+                        "in addition to local paths. Checks the local HF cache first. "
+                        "Enable to download if not cached; disable to fail-closed (no network)."
+                    ),
+                }),
             },
         }
 
@@ -116,8 +125,9 @@ class EricDiffusionLoader:
         offload_vae: bool = False,
         attention_slicing: bool = False,
         sequential_offload: bool = False,
+        allow_hf_download: bool = False,
     ) -> Tuple:
-        model_path = model_path.strip()
+        model_path = resolve_hf_path(model_path.strip(), allow_download=allow_hf_download)
         cache_key = (
             f"{model_path}_{precision}_{device}_{offload_vae}"
             f"_{attention_slicing}_{sequential_offload}"
