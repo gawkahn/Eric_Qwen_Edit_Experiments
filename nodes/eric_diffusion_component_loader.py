@@ -32,6 +32,7 @@ from .eric_diffusion_utils import (
     read_guidance_embeds,
     get_gen_pipeline_cache,
     clear_gen_pipeline_cache,
+    resolve_hf_path,
 )
 
 
@@ -382,6 +383,14 @@ class EricDiffusionComponentLoader:
                         "Ignored if vae_path is also set."
                     ),
                 }),
+                "allow_hf_download": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "Accept HuggingFace repo IDs (e.g. 'Tongyi-MAI/Z-Image') "
+                        "for any path input. Checks the local HF cache first. "
+                        "Enable to download if not cached; disable to fail-closed."
+                    ),
+                }),
             },
         }
 
@@ -399,12 +408,13 @@ class EricDiffusionComponentLoader:
         attention_slicing: bool = False,
         sequential_offload: bool = False,
         vae_from_transformer: bool = False,
+        allow_hf_download: bool = False,
     ) -> Tuple:
-        base_pipeline_path   = base_pipeline_path.strip()
-        transformer_path     = transformer_path.strip()
-        vae_path             = vae_path.strip()
-        text_encoder_path    = text_encoder_path.strip()
-        text_encoder_2_path  = text_encoder_2_path.strip()
+        base_pipeline_path   = resolve_hf_path(base_pipeline_path.strip(),  allow_download=allow_hf_download)
+        transformer_path     = resolve_hf_path(transformer_path.strip(),     allow_download=allow_hf_download) if transformer_path.strip()    else ""
+        vae_path             = resolve_hf_path(vae_path.strip(),             allow_download=allow_hf_download) if vae_path.strip()            else ""
+        text_encoder_path    = resolve_hf_path(text_encoder_path.strip(),    allow_download=allow_hf_download) if text_encoder_path.strip()   else ""
+        text_encoder_2_path  = resolve_hf_path(text_encoder_2_path.strip(),  allow_download=allow_hf_download) if text_encoder_2_path.strip() else ""
 
         cache_key = (
             f"comp_{base_pipeline_path}_{transformer_path}_{vae_path}_"
