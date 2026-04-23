@@ -81,6 +81,22 @@ Queued in Backlog.
 - **Suggested fix:** Pass `max_sequence_length` in the sdxl/sd3/sd1/zimage block (after checking `sig.parameters` like auraflow does).
 - **Priority:** Low
 
+### [Security] Missing §12 security review for comfyless Unix socket IPC server
+- **Location:** `comfyless/server.py` — full IPC server using Unix sockets
+- **Observed:** 2026-04-23 governance review (§12 trigger: IPC)
+- **Why not now:** Server is working and single-user; no immediate threat model. Review should have happened before it shipped.
+- **Suggested fix:** Write `docs/security/review-comfyless-server-<date>.md` and ADR before the next non-trivial change to `server.py`.
+- **Trigger:** Any code change to `comfyless/server.py`.
+- **Priority:** Medium
+
+### [Security] Missing §12 security review for `resolve_hf_path` (caller-supplied model weight loading)
+- **Location:** `nodes/eric_diffusion_utils.py` `resolve_hf_path()`, called from all 5 loader nodes
+- **Observed:** 2026-04-23 governance review (§12 trigger: loading model weights from caller-supplied paths)
+- **Why not now:** Shipped without a review; function is straightforward (HF cache lookup + optional download). No known exploit path in current single-user context.
+- **Suggested fix:** Write `docs/security/review-resolve-hf-path-<date>.md` before the next change that touches path resolution or download behaviour.
+- **Trigger:** Any change to `resolve_hf_path` or the `allow_hf_download` flow.
+- **Priority:** Medium
+
 ### [Code] `--override key=value` syntax inconsistent with `--param <value>` CLI convention
 - **Location:** `comfyless/generate.py` `_apply_overrides()`, argparse setup
 - **Observed:** 2026-04-23 during `--params` image path work

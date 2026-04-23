@@ -107,12 +107,33 @@ The global `Git Commit Discipline` rule "Never push to remote without explicit u
 
 ## Review bar (this project)
 
-No Red Zone surfaces (no auth, PII, billing, or audit trail — single-user desktop ML tool). Global §5A default applies:
+**§5 Red Zone (auth / PII / billing / audit):** Currently absent — no auth, no PII, no billing, no audit trail. Solo desktop tool.
 
-- **Every non-trivial code slice runs `code-reviewer` (Opus) before commit.** "Trivial" = single-line fix, pure doc edit, mechanical rename with no behavior change. When in doubt, run it.
-- The `code-reviewer` subagent is pinned to `claude-opus-4-7` in `~/.claude/agents/code-reviewer.md`. Do not override to a weaker model.
-- `security-auditor` is not required for this project's normal work surface, but run it if a change ever introduces: file writes from external input, loading executable code from caller-supplied paths, or network-facing surfaces.
-- Trivial skips: ask `"Trivial — skip review? Change: <one-line summary>. Reply 'review' to run it anyway."` Do not self-decide.
+**§12 security review triggers — already present:**
+
+§12 is broader than §5 and this project already trips it on three surfaces:
+
+| Surface | File | Trigger |
+|---------|------|---------|
+| Unix socket IPC server | `comfyless/server.py` | IPC (Unix sockets) |
+| HF repo ID resolution + download | `nodes/eric_diffusion_utils.py` `resolve_hf_path` | Loading model weights from caller-supplied paths |
+| `--json` stdin/stdout bridge | `comfyless/generate.py` `_run_json_mode` | Machine-facing interface; future LLM agent tool surface |
+
+**Debt:** No ADR or security review exists for `comfyless/server.py` (IPC) or `resolve_hf_path` (caller-supplied model loading). These should have had §12 reviews before the code landed. Backlogged — when either surface is next modified, write the missing review before touching the code.
+
+**Surfaces that become Red Zone on scope change:**
+
+- **`--json` bridge + LLM agent wiring** (Backlog) — once model output drives paths or parameters into `generate()`, this becomes a Red Zone surface: prompt injection, path traversal, actor identity. Treat any commit that wires this as Red Zone from day one, not after.
+- **HTTP transport** — if `--serve` ever grows a network interface, that commit is Red Zone regardless of other scope.
+- **Batch generation from external input** — file writes at scale from caller-supplied lists is a §12 trigger.
+
+**Review rules:**
+
+- **Every non-trivial code slice runs `code-reviewer` (Opus) before commit.** "Trivial" = single-line fix, pure doc edit, mechanical rename with no behavior change.
+- **Any change to `comfyless/server.py`, `resolve_hf_path`, or `_run_json_mode` also runs `security-auditor` (Opus).** Output saved to `docs/security/review-<slug>-<YYYY-MM-DD>.md` and referenced in the commit body.
+- **When the `--json` / LLM agent wiring lands:** write spec + ADR before code, run `security-auditor`, treat as Red Zone from the first commit.
+- Trivial skip ask: `"Trivial — skip review? Change: <one-line summary>. Reply 'review' to run it anyway."` Do not self-decide.
+- `code-reviewer` and `security-auditor` are pinned to `claude-opus-4-7` in `~/.claude/agents/`. Do not override.
 
 ## Commit-time hooks
 
