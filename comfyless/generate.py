@@ -51,6 +51,7 @@ from nodes.eric_diffusion_utils import (
     resolve_component_class,
     detect_component_format,
     load_component,
+    resolve_hf_path,
 )
 from nodes.eric_diffusion_samplers import sampler_choices, swap_sampler
 from nodes.eric_qwen_edit_lora import load_lora_with_key_fix
@@ -432,12 +433,14 @@ def _load_pipeline(
     vae_from_transformer: bool = False,
     attention_slicing: bool = False,
     sequential_offload: bool = False,
+    allow_hf_download: bool = False,
 ):
     """Load, place, and configure a diffusers pipeline.
 
     Returns (pipe, model_family, guidance_embeds).
     Called by generate() for one-shot use and by the server to populate its cache.
     """
+    model_path = resolve_hf_path(model_path, allow_download=allow_hf_download)
     _log(f"[comfyless] Loading model: {model_path}")
     pipeline_class, class_name, model_family = detect_pipeline_class(model_path)
     _log(f"[comfyless] Detected: {class_name} (family: {model_family})")
@@ -449,6 +452,14 @@ def _load_pipeline(
     vae_path            = vae_path.strip()
     text_encoder_path   = text_encoder_path.strip()
     text_encoder_2_path = text_encoder_2_path.strip()
+    if transformer_path:
+        transformer_path    = resolve_hf_path(transformer_path,    allow_download=allow_hf_download)
+    if vae_path:
+        vae_path            = resolve_hf_path(vae_path,            allow_download=allow_hf_download)
+    if text_encoder_path:
+        text_encoder_path   = resolve_hf_path(text_encoder_path,   allow_download=allow_hf_download)
+    if text_encoder_2_path:
+        text_encoder_2_path = resolve_hf_path(text_encoder_2_path, allow_download=allow_hf_download)
 
     _has_components = any([transformer_path, vae_path, text_encoder_path,
                            text_encoder_2_path, vae_from_transformer])
@@ -583,6 +594,7 @@ def generate(
     vae_from_transformer: bool = False,
     attention_slicing: bool = False,
     sequential_offload: bool = False,
+    allow_hf_download: bool = False,
     _cached_pipeline: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Generate a single image and save it.
@@ -597,6 +609,7 @@ def generate(
     Raises on fatal errors (model not found, inference failure).
     """
     # ── Validate inputs ───────────────────────────────────────────────
+    model_path = resolve_hf_path(model_path, allow_download=allow_hf_download)
     if not os.path.isdir(model_path):
         raise FileNotFoundError(f"Model not found: {model_path}")
 
@@ -629,7 +642,7 @@ def generate(
             transformer_path=transformer_path, vae_path=vae_path,
             text_encoder_path=text_encoder_path, text_encoder_2_path=text_encoder_2_path,
             vae_from_transformer=vae_from_transformer, attention_slicing=attention_slicing,
-            sequential_offload=sequential_offload,
+            sequential_offload=sequential_offload, allow_hf_download=allow_hf_download,
         )
 
     # ── Load LoRAs ────────────────────────────────────────────────────
@@ -801,6 +814,9 @@ def _parse_args() -> argparse.Namespace:
                    help="Trade speed for lower peak VRAM")
     p.add_argument("--sequential-offload", action="store_true",
                    help="Extreme VRAM savings via sequential CPU offload — very slow")
+    p.add_argument("--allow-hf-download", action="store_true", default=False,
+                   help="Allow downloading models from HuggingFace if not in local cache. "
+                        "By default only the local cache is used (no network access)")
     p.add_argument("--output", "-o", type=str, default="/tmp/comfyless.png",
                    help="Output image path (exact; overwrites). "
                         "Ignored when a server is running — use --savepath instead.")
@@ -1141,6 +1157,18 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
 
     loras = [_parse_lora_arg(s) for s in args.lora] if args.lora else p.get("loras", [])
 
+    # ── Resolve HF repo IDs to local paths before server delegation ───
+    # The server's path validation expects real filesystem paths; HF IDs
+    # must be resolved client-side so the server never sees a repo ID.
+    allow_hf_download = args.allow_hf_download
+    for _key in ("model", "transformer_path", "vae_path", "text_encoder_path", "text_encoder_2_path"):
+        if p.get(_key):
+            try:
+                p[_key] = resolve_hf_path(p[_key], allow_download=allow_hf_download)
+            except (ValueError, RuntimeError) as e:
+                print(f"Error resolving {_key}: {e}", file=sys.stderr)
+                return 1
+
     # ── Delegate to server if one is running ──────────────────────────
     # Only delegate when using default --output or explicit --savepath.
     # Explicit --output paths can't be honoured by the server (it owns
@@ -1192,6 +1220,7 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
             offload_vae=args.offload_vae,
             attention_slicing=args.attention_slicing,
             sequential_offload=args.sequential_offload,
+            allow_hf_download=allow_hf_download,
             transformer_path=p.get("transformer_path", ""),
             vae_path=p.get("vae_path", ""),
             text_encoder_path=p.get("text_encoder_path", ""),
