@@ -105,6 +105,123 @@ def _load_sidecar(path: str) -> dict:
     return {k: v for k, v in data.items() if k not in _SKIP_SIDECAR_KEYS}
 
 
+def _load_params(path: str) -> dict:
+    """Load base params from a comfyless sidecar JSON or a PNG with embedded metadata."""
+    if path.lower().endswith(".png"):
+        return _load_params_from_png(path)
+    return _load_sidecar(path)
+
+
+def _load_params_from_png(path: str) -> dict:
+    """Extract comfyless or ComfyUI params from a PNG file's tEXt chunks.
+
+    Priority:
+      1. comfyless chunk — full params from a prior comfyless run.
+      2. ComfyUI prompt chunk — partial extraction; warns about missing fields.
+    """
+    from PIL import Image as _Image
+    try:
+        info = _Image.open(path).info
+    except Exception as e:
+        raise OSError(f"Cannot open PNG {path!r}: {e}")
+
+    raw = info.get("comfyless")
+    if raw:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"comfyless chunk in {path!r} is not valid JSON: {e}")
+        return {k: v for k, v in data.items() if k not in _SKIP_SIDECAR_KEYS}
+
+    raw = info.get("prompt")
+    if raw:
+        _log(f"[comfyless] No comfyless chunk in {path!r} — trying ComfyUI prompt chunk")
+        return _extract_comfyui_params(raw)
+
+    raise ValueError(
+        f"No comfyless or ComfyUI metadata found in {path!r}. "
+        "Only PNGs saved by comfyless (or ComfyUI) contain embedded params."
+    )
+
+
+def _extract_comfyui_params(prompt_json: str) -> dict:
+    """Extract generation params from a ComfyUI prompt JSON string.
+
+    Returns a partial params dict. Absent fields must be supplied via --override.
+    Model path is never extracted (ComfyUI stores filenames, not full paths).
+    """
+    try:
+        graph = json.loads(prompt_json)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"ComfyUI prompt chunk is not valid JSON: {e}")
+
+    params: dict = {}
+    by_class: dict = {}
+    for node_id, node in graph.items():
+        by_class.setdefault(node.get("class_type", ""), []).append((node_id, node))
+
+    def _follow(val):
+        if isinstance(val, list) and len(val) == 2:
+            return graph.get(str(val[0]))
+        return None
+
+    # ── Sampler node ─────────────────────────────────────────────────
+    sampler_node = None
+    for ct in ("KSampler", "KSamplerAdvanced"):
+        if ct in by_class:
+            sampler_node = by_class[ct][0][1]
+            break
+
+    if sampler_node:
+        inp = sampler_node.get("inputs", {})
+        if "steps" in inp:
+            params["steps"] = int(inp["steps"])
+        if "cfg" in inp:
+            params["cfg_scale"] = float(inp["cfg"])
+        seed = inp.get("seed") if inp.get("seed") is not None else inp.get("noise_seed")
+        if seed is not None:
+            params["seed"] = int(seed)
+        if "scheduler" in inp:
+            params["schedule"] = {"karras": "karras"}.get(inp["scheduler"], "linear")
+        for slot, key in (("positive", "prompt"), ("negative", "negative_prompt")):
+            ref = _follow(inp.get(slot))
+            if ref and ref.get("class_type") == "CLIPTextEncode":
+                text = ref["inputs"].get("text", "")
+                if isinstance(text, str):
+                    params[key] = text
+                else:
+                    _log(f"[comfyless] ComfyUI: {slot} text is a graph connection — skipped")
+            elif ref:
+                _log(f"[comfyless] ComfyUI: {slot} node is {ref.get('class_type')!r} — skipped")
+    else:
+        _log("[comfyless] ComfyUI: no KSampler found — steps/cfg/seed not extracted")
+
+    # ── Dimensions ────────────────────────────────────────────────────
+    latent_ct = next(
+        (ct for ct in by_class if ct.startswith("Empty") and "Latent" in ct), None
+    )
+    if latent_ct:
+        inp = by_class[latent_ct][0][1].get("inputs", {})
+        for dim in ("width", "height"):
+            if dim in inp:
+                params[dim] = int(inp[dim])
+
+    # ── Model name (filename only — full path must be supplied by caller) ──
+    for ct in ("CheckpointLoaderSimple", "CheckpointLoader", "DiffusionModelLoader", "UNETLoader"):
+        if ct in by_class:
+            inp = by_class[ct][0][1].get("inputs", {})
+            ckpt = inp.get("ckpt_name") or inp.get("unet_name") or inp.get("model_name")
+            if ckpt:
+                _log(f"[comfyless] ComfyUI: model filename is {ckpt!r} — "
+                     "use --override model=<full/path> to set the model directory")
+            break
+
+    if "model" not in params:
+        _log("[comfyless] ComfyUI: model path not set — use --override model=<path>")
+
+    return params
+
+
 def _coerce(value: str):
     if value.lower() == "true":
         return True
@@ -208,6 +325,14 @@ def _resolve_savepath(
         if not candidate.exists():
             return str(candidate)
         counter += 1
+
+
+def _save_with_metadata(pil_image, path: str, metadata: dict) -> None:
+    """Save a PIL image as PNG with comfyless metadata embedded as a tEXt chunk."""
+    from PIL.PngImagePlugin import PngInfo
+    pnginfo = PngInfo()
+    pnginfo.add_text("comfyless", json.dumps(metadata, default=str))
+    pil_image.save(path, pnginfo=pnginfo)
 
 
 def _apply_overrides(params: dict, overrides: list) -> dict:
@@ -576,16 +701,7 @@ def generate(
     elapsed = time.monotonic() - t0
     _log(f"[comfyless] Generated in {elapsed:.1f}s")
 
-    # ── Save PNG ──────────────────────────────────────────────────────
-    pil_image = result.images[0]
-    pil_image.save(output_path)
-    _log(f"[comfyless] Saved: {output_path}")
-
-    # ── Clean up VAE ──────────────────────────────────────────────────
-    if offload_vae and hasattr(pipe, "vae"):
-        pipe.vae = pipe.vae.to("cpu")
-
-    # ── Build metadata ────────────────────────────────────────────────
+    # ── Build metadata (before save so it can be embedded in the PNG) ──
     metadata: Dict[str, Any] = {
         "prompt": prompt,
         "negative_prompt": negative_prompt,
@@ -613,6 +729,15 @@ def generate(
     if lora_warnings:
         metadata["lora_warnings"] = lora_warnings
 
+    # ── Save PNG with embedded metadata ──────────────────────────────
+    pil_image = result.images[0]
+    _save_with_metadata(pil_image, output_path, metadata)
+    _log(f"[comfyless] Saved: {output_path}")
+
+    # ── Clean up VAE ──────────────────────────────────────────────────
+    if offload_vae and hasattr(pipe, "vae"):
+        pipe.vae = pipe.vae.to("cpu")
+
     return metadata
 
 
@@ -628,8 +753,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--json", action="store_true",
                    help="Agent bridge mode: JSON stdin/stdout")
     p.add_argument("--params", type=str, default=None,
-                   metavar="SIDECAR_JSON",
-                   help="Load base params from a comfyless sidecar JSON. "
+                   metavar="FILE",
+                   help="Load base params from a comfyless sidecar JSON or a PNG "
+                        "with embedded comfyless/ComfyUI metadata. "
                         "Use --override key=value to patch individual fields.")
     p.add_argument("--override", action="append", default=[],
                    metavar="KEY=VALUE",
@@ -951,8 +1077,8 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
     # ── Build effective params ────────────────────────────────────────
     if args.params:
         try:
-            p = _load_sidecar(args.params)
-        except (OSError, json.JSONDecodeError) as e:
+            p = _load_params(args.params)
+        except (OSError, json.JSONDecodeError, ValueError) as e:
             print(f"Error loading --params {args.params!r}: {e}", file=sys.stderr)
             return 1
         try:
