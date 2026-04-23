@@ -62,8 +62,21 @@ See `docs/decisions/ADR-005-sampler-multistep-only.md`.
 Keys prefixed `lora_te1_*` are currently silently dropped during LoRA loading.
 They need to be loaded onto the text encoder (T5 / CLIP). Affects Flux.1 LoRAs most
 visibly. Queued in Backlog.
+*Resolved: 2026-04-22 — `_apply_te_lora()` added to fallback + conversion paths in `eric_qwen_edit_lora.py`.*
 
 **Skip unresolvable Kohya keys in `decode_kohya_to_bfl()`** *(2026-04-21)*
 Keys like `distilled_guidance_layer` cannot be mapped and currently cause errors or
 leave garbage in the converted dict. Should gracefully skip with a warning.
 Queued in Backlog.
+*Resolved: 2026-04-22 — filter against `named_parameters()` in `load_converted_lora` before `pipe.load_lora_weights`.*
+
+---
+
+## CFG Routing
+
+### [Code] SD3 `max_sequence_length` not forwarded in CFG routing
+- **Location:** `nodes/eric_diffusion_generate.py:214`, `comfyless/generate.py` sdxl/sd3/sd1/zimage block
+- **Observed:** 2026-04-23 during zimage family support slice
+- **Why not now:** SD3 default (256) works; only matters if longer prompts are needed; separate slice.
+- **Suggested fix:** Pass `max_sequence_length` in the sdxl/sd3/sd1/zimage block (after checking `sig.parameters` like auraflow does).
+- **Priority:** Low
