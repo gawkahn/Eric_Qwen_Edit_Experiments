@@ -635,8 +635,38 @@ def load_converted_lora(
             adapter_name, weight, log_prefix,
         )
 
+    # ── Drop keys whose base module has no .weight parameter ─────────
+    # Kohya LoRAs sometimes include keys for modules that exist in the BFL
+    # source layout but have no counterpart in the diffusers target (e.g.
+    # distilled_guidance_layer in Klein-9B).  These pass through
+    # convert_state_dict unchanged and would produce "unexpected keys"
+    # warnings from pipe.load_lora_weights.  Filter them here where we
+    # have the transformer and can check directly.
+    param_names = {n for n, _ in transformer.named_parameters()}
+    valid_converted: Dict[str, "torch.Tensor"] = {}
+    dropped_bases: set = set()
+    for k, v in converted_state_dict.items():
+        base, _ = split_state_key(k)
+        if base + ".weight" in param_names or base + ".bias" in param_names:
+            valid_converted[k] = v
+        else:
+            dropped_bases.add(base)
+    if dropped_bases:
+        sample = ", ".join(sorted(dropped_bases)[:5])
+        tail = "..." if len(dropped_bases) > 5 else ""
+        print(
+            f"{log_prefix} skipping {len(dropped_bases)} unresolvable "
+            f"module path(s): {sample}{tail}"
+        )
+    if not valid_converted:
+        print(
+            f"{log_prefix} no valid LoRA keys after filtering — "
+            "LoRA may target a different model family"
+        )
+        return False
+
     # ── Attempt 1: pipeline path with `transformer.` prefix ───────────
-    prefixed = {f"transformer.{k}": v for k, v in converted_state_dict.items()}
+    prefixed = {f"transformer.{k}": v for k, v in valid_converted.items()}
     try:
         pipe.load_lora_weights(prefixed, adapter_name=adapter_name)
         # Verify registration — diffusers can silently no-op when no
@@ -666,5 +696,5 @@ def load_converted_lora(
 
     # ── Attempt 2: direct weight merge ────────────────────────────────
     return _apply_converted_lora_as_delta(
-        transformer, converted_state_dict, adapter_name, weight, log_prefix,
+        transformer, valid_converted, adapter_name, weight, log_prefix,
     )
