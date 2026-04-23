@@ -37,6 +37,7 @@ _FAMILY_PATTERNS = [
     ("stablediffusion3",    "sd3"),
     ("stablediffusionxl",   "sdxl"),
     ("stablediffusion",     "sd1"),
+    ("zimage",              "zimage"),
 ]
 
 

@@ -211,7 +211,7 @@ def _build_call_kwargs(
             kwargs["max_sequence_length"] = max_sequence_length
         return kwargs
 
-    if model_family in ("sdxl", "sd3", "sd1"):
+    if model_family in ("sdxl", "sd3", "sd1", "zimage"):
         # Classical CFG — two forward passes, negative prompt supported.
         # guidance_scale is the true CFG scale (not a distillation embedding).
         # No T5 encoder; max_sequence_length is not a standard parameter.

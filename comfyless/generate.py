@@ -386,7 +386,7 @@ def _build_call_kwargs(
             kwargs["max_sequence_length"] = max_sequence_length
         return kwargs
 
-    if model_family in ("sdxl", "sd3", "sd1"):
+    if model_family in ("sdxl", "sd3", "sd1", "zimage"):
         kwargs = {**base, "guidance_scale": cfg_scale}
         if negative_prompt:
             kwargs["negative_prompt"] = negative_prompt
