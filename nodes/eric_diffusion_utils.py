@@ -83,6 +83,68 @@ def detect_pipeline_class(model_path: str):
     return pipeline_class, class_name, family
 
 
+# ── HuggingFace path resolution ─────────────────────────────────────────────
+
+def _is_hf_repo_id(path: str) -> bool:
+    """Return True if path looks like an HF repo ID ("owner/repo").
+
+    Anything that starts with /, ./, ../, or has a Windows drive letter is a
+    local path.  HF repo IDs have exactly one slash with non-empty parts on
+    each side.
+    """
+    if not path:
+        return False
+    if path.startswith("/") or path.startswith("./") or path.startswith("../"):
+        return False
+    if len(path) >= 2 and path[1] == ":":  # Windows drive letter
+        return False
+    parts = path.split("/")
+    return len(parts) == 2 and all(parts)
+
+
+def resolve_hf_path(path: str, *, allow_download: bool = False) -> str:
+    """Resolve an HF repo ID to a local cache directory; return local paths unchanged.
+
+    Resolution order:
+      1. If path is not an HF repo ID, return it as-is.
+      2. Try the local HF cache (local_files_only=True) — no network.
+      3. If cache miss and allow_download=False, raise ValueError (fail-closed).
+      4. If cache miss and allow_download=True, download and return the snapshot dir.
+
+    Raises:
+      ValueError  — cache miss with allow_download=False, or invalid repo ID format.
+      RuntimeError — download failed (network error, repo not found, etc.).
+    """
+    if not _is_hf_repo_id(path):
+        return path
+
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    try:
+        local_dir = snapshot_download(path, local_files_only=True)
+        if not os.path.isdir(local_dir):
+            raise ValueError(f"HF snapshot resolved to non-directory: {local_dir!r}")
+        return local_dir
+    except LocalEntryNotFoundError:
+        pass
+
+    if not allow_download:
+        raise ValueError(
+            f"{path!r} is not in the local HF cache. "
+            "Set allow_hf_download=True to download it, or run "
+            "'huggingface-cli download <repo>' to cache it manually."
+        )
+
+    try:
+        local_dir = snapshot_download(path)
+        if not os.path.isdir(local_dir):
+            raise ValueError(f"HF download resolved to non-directory: {local_dir!r}")
+        return local_dir
+    except Exception as e:
+        raise RuntimeError(f"Failed to download {path!r} from HuggingFace: {e}") from e
+
+
 def read_guidance_embeds(pipeline) -> bool:
     """Return True if the pipeline's transformer uses guidance embeddings."""
     transformer = getattr(pipeline, "transformer", None)
