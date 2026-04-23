@@ -80,3 +80,10 @@ Queued in Backlog.
 - **Why not now:** SD3 default (256) works; only matters if longer prompts are needed; separate slice.
 - **Suggested fix:** Pass `max_sequence_length` in the sdxl/sd3/sd1/zimage block (after checking `sig.parameters` like auraflow does).
 - **Priority:** Low
+
+### [Code] `--override key=value` syntax inconsistent with `--param <value>` CLI convention
+- **Location:** `comfyless/generate.py` `_apply_overrides()`, argparse setup
+- **Observed:** 2026-04-23 during `--params` image path work
+- **Why not now:** Breaking change to the `--override` interface; needs a deprecation period or a single coordinated rename. The `--json` bridge mode also uses `--override` so both surfaces must change together.
+- **Suggested fix:** Decide on one convention (`param=value` or `--param value`) and apply consistently. User preference is `param=value`; `--override` is the odd one out. Alternatively, accept both syntaxes in `_apply_overrides()` as a transition path.
+- **Priority:** Low

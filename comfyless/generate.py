@@ -136,17 +136,6 @@ def _extract_eric_save_params(params_json: str, path: str) -> dict:
 
     _log(f"[comfyless] Eric Diffusion Save parameters chunk — extracted {sorted(out.keys())}")
 
-    # Warn when the baked-in model path doesn't exist on this host.
-    # ComfyUI often runs in a container with different mount points.
-    model_val = out.get("model", "")
-    if model_val and not os.path.exists(model_val):
-        print(
-            f"WARNING: model path from image metadata does not exist on this host:\n"
-            f"  {model_val}\n"
-            f"  Use --override model=<host-path> to supply the correct path.",
-            file=sys.stderr,
-        )
-
     if data.get("loras"):
         print(
             "WARNING: LoRAs were active when this image was saved but will NOT be "
@@ -1205,6 +1194,22 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
         print("Error: --prompt is required (or provide via --params / --override prompt=...)",
               file=sys.stderr)
         return 1
+
+    # After all overrides are applied, warn if the model path looks like a
+    # local path but doesn't exist. HF repo IDs (owner/repo, no leading /)
+    # are skipped — they'll be resolved in the next step.
+    _model_val = p.get("model", "")
+    _is_local = _model_val.startswith("/") or _model_val.startswith("./") or (
+        len(_model_val) > 1 and _model_val[1] == ":"
+    )
+    if _is_local and not os.path.exists(_model_val):
+        print(
+            f"WARNING: model path does not exist on this host:\n"
+            f"  {_model_val}\n"
+            f"  If this came from a container-saved image, use --model <host-path> "
+            f"or --override model=<host-path>.",
+            file=sys.stderr,
+        )
 
     loras = [_parse_lora_arg(s) for s in args.lora] if args.lora else p.get("loras", [])
 
