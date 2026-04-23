@@ -25,6 +25,7 @@ from .eric_diffusion_component_loader import (
     available_device_options,
     resolve_device_with_fallback,
 )
+from .eric_diffusion_utils import resolve_hf_path
 
 
 # ── Separate cache for the generation pipeline ──────────────────────────
@@ -176,6 +177,14 @@ class EricQwenImageLoader:
                     "default": False,
                     "tooltip": "Extreme VRAM savings via sequential CPU offload"
                 }),
+                "allow_hf_download": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "Accept HuggingFace repo IDs (e.g. 'Qwen/Qwen-Image-2512') "
+                        "in addition to local paths. Checks the local HF cache first. "
+                        "Enable to download if not cached; disable to fail-closed (no network)."
+                    ),
+                }),
             }
         }
 
@@ -188,8 +197,11 @@ class EricQwenImageLoader:
         offload_vae: bool = False,
         attention_slicing: bool = False,
         sequential_offload: bool = False,
+        allow_hf_download: bool = False,
     ) -> Tuple:
         from diffusers import QwenImagePipeline
+
+        model_path = resolve_hf_path(model_path.strip(), allow_download=allow_hf_download)
 
         # Runtime device fallback: handles stale workflow JSON.
         device, use_device_map = resolve_device_with_fallback(

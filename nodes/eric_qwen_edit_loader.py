@@ -26,6 +26,7 @@ from .eric_diffusion_component_loader import (
     available_device_options,
     resolve_device_with_fallback,
 )
+from .eric_diffusion_utils import resolve_hf_path
 
 
 class EricQwenEditLoader:
@@ -105,6 +106,14 @@ class EricQwenEditLoader:
                     "default": False,
                     "tooltip": "Aggressive CPU offloading - very slow but handles huge images"
                 }),
+                "allow_hf_download": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "Accept HuggingFace repo IDs (e.g. 'Qwen/Qwen-Image-Edit-2511') "
+                        "in addition to local paths. Checks the local HF cache first. "
+                        "Enable to download if not cached; disable to fail-closed (no network)."
+                    ),
+                }),
             }
         }
     
@@ -117,10 +126,11 @@ class EricQwenEditLoader:
         offload_vae: bool = False,
         attention_slicing: bool = False,
         sequential_offload: bool = False,
+        allow_hf_download: bool = False,
     ) -> Tuple:
         """
         Load the Qwen-Edit pipeline.
-        
+
         Args:
             model_path: Path to Qwen-Image-Edit model
             precision: Model precision
@@ -129,12 +139,14 @@ class EricQwenEditLoader:
             offload_vae: Move VAE to CPU during inference
             attention_slicing: Enable attention slicing
             sequential_offload: Aggressive CPU offloading
-            
+            allow_hf_download: Resolve HF repo IDs; download if not cached
+
         Returns:
             Tuple containing the pipeline wrapper
         """
         from ..pipelines import QwenEditPipeline
 
+        model_path = resolve_hf_path(model_path.strip(), allow_download=allow_hf_download)
         print(f"[EricQwenEdit] Loading model from: {model_path}")
 
         # Runtime device fallback: handles stale workflow JSON (e.g.
