@@ -20,15 +20,16 @@ Every feature reachable from the ComfyUI loader/generate node chain is reachable
 3. [Invocation modes](<#Invocation modes>)
 4. [CLI flag reference](<#CLI flag reference>)
 5. [Sidecar JSON and `--params` replay](<#Sidecar JSON and `--params` replay>)
-6. [Example walkthrough (Qwen-Image)](<#Example walkthrough (Qwen-Image)>)
-7. [Model families and what they accept](<#Model families and what they accept>)
-8. [Component overrides](<#Component overrides>)
-9. [LoRA](<#LoRA>)
-10. [VRAM knobs](<#VRAM knobs>)
-11. [Python function API](<#Python function API>)
-12. [JSON bridge mode](<#JSON bridge mode>)
-13. [Server mode](<#Server mode>)
-14. [Troubleshooting](<#Troubleshooting>)
+6. [Iteration mode (`--iterate`)](<#Iteration mode (--iterate)>)
+7. [Example walkthrough (Qwen-Image)](<#Example walkthrough (Qwen-Image)>)
+8. [Model families and what they accept](<#Model families and what they accept>)
+9. [Component overrides](<#Component overrides>)
+10. [LoRA](<#LoRA>)
+11. [VRAM knobs](<#VRAM knobs>)
+12. [Python function API](<#Python function API>)
+13. [JSON bridge mode](<#JSON bridge mode>)
+14. [Server mode](<#Server mode>)
+15. [Troubleshooting](<#Troubleshooting>)
 
 ---
 
@@ -194,6 +195,8 @@ All case-insensitive, `%name%` or `%name:spec%`:
 | `%cfg%` | CFG scale |
 | `%sampler%` | Sampler name |
 | `%model:N%` | First N characters of the model name (e.g. `%model:12%`) |
+| `%input%` | Stem of the first `--iterate` source file, e.g. `prompts.json` → `prompts`. Empty when no iteration is active. Useful for grouping a sweep's output: `--savepath %date%/%input%/gen` |
+| `%input_<param>%` | Per-axis stem when multiple `--iterate` flags are in play. Example: `--iterate prompt P.json --iterate seed S.json` → `%input_prompt%` = `P`, `%input_seed%` = `S` |
 
 Example: `--savepath ~/gen/%date%/%model%_s%seed%` → `~/gen/2026-04-22/Qwen-Image-25120001.png`
 
@@ -203,6 +206,14 @@ Example: `--savepath ~/gen/%date%/%model%_s%seed%` → `~/gen/2026-04-22/Qwen-Im
 |---|---|
 | `--params FILE` | Load base params from a comfyless sidecar JSON **or a PNG**. Any explicit CLI flag wins over the loaded params. See [Sidecar JSON and `--params` replay](<#Sidecar JSON and `--params` replay>) |
 | `--override KEY=VALUE` | Patch a sidecar key. Repeatable. Value is coerced to `int`, `float`, `bool`, or `str` |
+
+### Iteration
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--iterate PARAM FILE` | — | Sweep `PARAM` over the flat JSON list in `FILE`. Repeatable: multiple `--iterate` flags produce the Cartesian product. Supported params: `prompt`, `negative_prompt`, `model`, `transformer_path`, `vae_path`, `text_encoder_path`, `text_encoder_2_path`, `seed`, `cfg_scale`, `steps`, `sampler`, `width`, `height`, `lora`. Satisfies the required-field check for `--prompt` / `--model` when iterating that axis. See [Iteration mode](<#Iteration mode (--iterate)>) |
+| `--max-iterations N` | `500` | Hard cap on total generations per `--iterate` invocation (computed up front from the Cartesian product). Exceeding the cap is a hard error with no generation |
+| `--yes`, `-y` | off | Skip the interactive "Proceed with N generations?" prompt that fires when the total is ≥ 5. For scripts / cron / agent use |
 
 ### Server mode flags
 
@@ -285,9 +296,9 @@ $PY -m comfyless.generate \
     --output /tmp/dog_cfg6.png
 ```
 
-### Sweep example (bash)
+### Sweeps (bash — fallback only)
 
-Iterate over a directory of custom transformer checkpoints, same everything else:
+Only reach for a bash loop for axes that `--iterate` doesn't yet support. For anything on the `--iterate` list (`prompt`, `negative_prompt`, `model`, `transformer_path`, `vae_path`, text encoders, `seed`, `cfg_scale`, `steps`, `sampler`, `width`, `height`, `lora`), prefer `--iterate` — see [Iteration mode](<#Iteration mode (--iterate)>). Bash-loop example kept for reference:
 
 ```bash
 for t in /home/gawkahn/projects/ai-lab/ai-base/models/hf-local/qwen-finetunes/*/; do
@@ -329,6 +340,116 @@ Fields that couldn't be extracted are logged as warnings and must be filled in v
 3. Any explicit `--flag VALUE` on the command line wins over both
 
 The params file is the "recipe," `--override` is inline edits, and explicit flags are per-invocation trumps.
+
+---
+
+## Iteration mode (`--iterate`)
+
+Sweep one or more params over a list of values without shell loops. Each invocation becomes N generations, tagged with a shared `iterate_batch_id` UUID so they can be grouped downstream. The daemon's warm pipeline is reused between iterations whenever the varied axis doesn't touch loadable weights.
+
+Full design: [`docs/decisions/ADR-008-comfyless-iterate.md`](../docs/decisions/ADR-008-comfyless-iterate.md).
+
+### Quick start
+
+Two prompts, same model and seed:
+
+```bash
+# prompts.json
+# ["a lighthouse at dusk", "a forest at dawn"]
+
+$PY -m comfyless.generate \
+    --model /home/gawkahn/projects/ai-lab/ai-base/models/hf-local/Qwen-Image-2512 \
+    --iterate prompt prompts.json \
+    --seed 42 --cfg 4.0 --steps 50
+```
+
+Two files, three prompts × four seeds = 12 generations:
+
+```bash
+$PY -m comfyless.generate \
+    --model /path/to/model \
+    --iterate prompt prompts.json \
+    --iterate seed seeds.json
+# stderr: Iteration inputs will result in 12 generations. Proceed? [y/N]
+```
+
+### File format
+
+Each `--iterate PARAM FILE` expects a flat JSON list. Element shape must match the param's type.
+
+| Param | Element shape | Example |
+|---|---|---|
+| `prompt`, `negative_prompt`, `sampler` | string | `["a lighthouse", "a forest"]` |
+| `seed`, `steps`, `width`, `height` | int | `[42, 1337, 9999]` |
+| `cfg_scale` | number (int or float) | `[3.5, 4.0, 4.5]` |
+| `model`, `transformer_path`, `vae_path`, `text_encoder_path`, `text_encoder_2_path` | string (absolute path OR HuggingFace repo ID) | `["/hf-local/Qwen-Image-2512", "black-forest-labs/FLUX.1-dev"]` |
+| `lora` | list of `{path, weight}` dicts — each iteration replaces the entire LoRA stack | see below |
+
+LoRA stack iteration replaces the full `--lora` stack per run; if `--lora` is also supplied on the command line, `--iterate lora` wins and `--lora` is ignored (with a stderr warning). Empty list `[]` means "no LoRA this iteration."
+
+```json
+[
+  [],
+  [{"path": "/loras/style_a.safetensors", "weight": 0.8}],
+  [{"path": "/loras/style_a.safetensors", "weight": 0.8},
+   {"path": "/loras/detail_boost.safetensors", "weight": 0.5}]
+]
+```
+
+### Multiple axes = Cartesian product
+
+Repeat `--iterate` to sweep multiple axes at once. Total generations = product of list lengths.
+
+```bash
+$PY -m comfyless.generate \
+    --model /path/to/model \
+    --iterate prompt prompts.json \
+    --iterate cfg_scale cfgs.json \
+    --iterate seed seeds.json
+# 3 prompts × 4 cfgs × 5 seeds = 60 generations
+```
+
+Zip semantics (matched tuples instead of Cartesian) are not in v1 — see ADR-008 Deferred.
+
+### Safety gates
+
+Two independent gates protect against "I didn't realize that was 1,200 generations":
+
+1. **Interactive confirmation** — when the total is ≥ 5, stderr prints `Iteration inputs will result in N generations. Proceed? [y/N]` and waits on stdin. Any answer other than `y` / `Y` aborts before any work starts.
+2. **Hard cap** — `--max-iterations N` (default `500`) is a fail-closed ceiling. Exceeding it is a hard error, no generation, regardless of TTY.
+
+Use `--yes` to skip the interactive prompt in scripts / cron / agent pipelines; the hard cap still applies.
+
+### Output naming
+
+Each generation gets its own output path. Comfyless's existing collision-auto-increment (`foo.png`, `foo_0001.png`, `foo_0002.png`, …) already separates iterations on a literal `--output` path. For grouped output, use the new `%input%` / `%input_<param>%` savepath tokens:
+
+```bash
+$PY -m comfyless.generate \
+    --model /path/to/model \
+    --iterate prompt prompts.json \
+    --savepath "%date%/%input%/gen_s%seed%"
+# → 2026-04-24/prompts/gen_s42_0001.png
+#   2026-04-24/prompts/gen_s42_0002.png
+```
+
+For multi-axis runs, `%input%` resolves to the stem of the first `--iterate` flag's file; per-axis stems are available as `%input_<param>%`. Use the existing `%seed%` / `%cfg%` / `%steps%` / `%sampler%` / `%model%` tokens to distinguish iterations by their varied axis value.
+
+### Metadata
+
+Each image gets the normal per-image sidecar JSON and PNG `comfyless` tEXt chunk, recording the **fully resolved params for that iteration** (not the iteration list). Replay via `--params <iter-output.png>` is identical to replaying any other generation.
+
+One field is added: `"iterate_batch_id"` — a UUID shared across every image in the sweep. Group downstream by this key to recover "which images came from the same `--iterate` invocation." The iteration axes themselves are not recorded per-image; grouping by `iterate_batch_id` is the correlation primitive.
+
+### Interaction with other modes
+
+- **Server mode:** fully supported. The client fans out the loop locally and sends one `generate` request per iteration. When the varied axes only touch prompt / seed / cfg / steps / sampler / width / height, the server reuses its warm pipeline — this is the warm-cache win that motivates the feature. When an iteration axis touches `model` / a component / a LoRA, the server evicts and reloads per-iteration (matching non-iterated behavior).
+- **`--json` bridge:** rejected in v1. `--json --iterate` exits 1 with a contract-shaped error `IterationNotSupported`. Iteration semantics in the JSON bridge are part of the future LLM-agent tool-call design.
+- **`--params` / `--override`:** precedence is `sidecar < --override < explicit CLI flag < current iteration value`. Each generation is equivalent to a single-gen run with the iteration values patched in on top.
+
+### Progress and summary
+
+Before each iteration, stderr prints `[comfyless] iter i/N`. On completion: `[comfyless] iterate: N/N completed in T.Ts (batch_id=<uuid>)`. On failure during iteration i, v1 stops at that point and prints the failure — resume / continue-on-error are both future slices.
 
 ---
 
