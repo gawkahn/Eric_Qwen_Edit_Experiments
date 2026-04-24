@@ -88,6 +88,7 @@ Queued in Backlog.
 - **Suggested fix:** Write `docs/security/review-comfyless-server-<date>.md` and ADR before the next non-trivial change to `server.py`.
 - **Trigger:** Any code change to `comfyless/server.py`.
 - **Priority:** Medium
+- **Resolved: 2026-04-23** — review written to `docs/security/review-comfyless-server-2026-04-23.md` (mirror: Obsidian `Security/Review-2026-04-23-Comfyless-Server.md`). Conclusion: acceptable for single-user threat model; 3 MEDIUM findings queued as follow-up hardening slice (see entry below). Network transport and `--json` bridge remain Red Zone triggers for a fresh ADR + review when they land.
 
 ### [Security] Missing §12 security review for `resolve_hf_path` (caller-supplied model weight loading)
 - **Location:** `nodes/eric_diffusion_utils.py` `resolve_hf_path()`, called from all 5 loader nodes
@@ -96,6 +97,31 @@ Queued in Backlog.
 - **Suggested fix:** Write `docs/security/review-resolve-hf-path-<date>.md` before the next change that touches path resolution or download behaviour.
 - **Trigger:** Any change to `resolve_hf_path` or the `allow_hf_download` flow.
 - **Priority:** Medium
+- **Resolved: 2026-04-23** — review written to `docs/security/review-resolve-hf-path-2026-04-23.md` (mirror: Obsidian `Security/Review-2026-04-23-Resolve-HF-Path.md`). Conclusion: sound fail-closed resolver; `trust_remote_code` absent codebase-wide (verified). 3 MEDIUM findings queued as follow-up hardening slice (see entry below). LLM-agent bridge promotes these to HIGH when it lands.
+
+### [Security] comfyless server hardening — follow-up from §12 review (2026-04-23)
+- **Location:** `comfyless/server.py`
+- **Observed:** 2026-04-23 security review (`docs/security/review-comfyless-server-2026-04-23.md`)
+- **Why not now:** Acceptable for single-user desktop threat model; review recommends fixes ride with the next server-touching commit, not as a standalone change.
+- **Suggested fix:** (Finding #1) add `MAX_FRAME = 1 MiB` cap and `conn.settimeout(5.0)` in `_recv`; (Finding #2) verify/enforce 0700 mode + uid on `/tmp/comfyless-$UID/` after `mkdir`; (Finding #8) reject non-absolute model/component/LoRA paths in `_check_paths` to remove reliance on `realpath`'s relative-path behaviour.
+- **Trigger:** Next non-trivial commit that touches `comfyless/server.py`.
+- **Priority:** Medium
+
+### [Security] resolve_hf_path hardening — follow-up from §12 review (2026-04-23)
+- **Location:** `nodes/eric_diffusion_utils.py` (`resolve_hf_path`, `_is_hf_repo_id`) + `comfyless/generate.py` `_run_cli_mode`
+- **Observed:** 2026-04-23 security review (`docs/security/review-resolve-hf-path-2026-04-23.md`)
+- **Why not now:** Not exploitable-as-is; `allow_hf_download` defaults to False and `trust_remote_code` is absent. Hardening blocks the PNG-sidecar social-engineering path before the LLM-agent bridge lands.
+- **Suggested fix:** (Finding #1) reject `foo/..` and `foo/.` in `_is_hf_repo_id`; (Finding #2) emit loud stderr warning naming the exact repo when `allow_hf_download=True` hits the network; (Finding #3) symmetric warning in `_run_cli_mode` when a `--params`-derived model value is an HF repo ID under `--allow-hf-download`.
+- **Trigger:** Before wiring the `--json` LLM-agent bridge, or on next change to `resolve_hf_path`.
+- **Priority:** Medium
+
+### [Security] Symmetric `resolve_hf_path` on Qwen component loaders
+- **Location:** `nodes/eric_qwen_edit_component_loader.py`, `nodes/eric_qwen_image_component_loader.py`
+- **Observed:** 2026-04-23 security review of `resolve_hf_path` (Out-of-scope section)
+- **Why not now:** These loaders predate the HF-resolution work and currently fail-closed on repo IDs via `local_files_only=True`. Behaviour-change to add resolution; inconsistency not exploitable.
+- **Suggested fix:** Thread `allow_hf_download` BOOLEAN + `resolve_hf_path` calls into both loaders to match the generic component loader pattern.
+- **Trigger:** Next meaningful edit to either Qwen component loader.
+- **Priority:** Low
 
 ### [Code] `--override key=value` syntax inconsistent with `--param <value>` CLI convention
 - **Location:** `comfyless/generate.py` `_apply_overrides()`, argparse setup
