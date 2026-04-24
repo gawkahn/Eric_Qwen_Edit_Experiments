@@ -40,7 +40,13 @@ session-handoff-*.md
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 .claude/memory/
+.claude/worktrees/
 # .claude/settings.json and .claude/hooks/ ARE committed (discipline travels with repo)
+
+# Local-only reference workflows used to audit live nodes — see 2026-04-24 cull
+workflows/component edit node dev.json
+workflows/Component flux edit.json
+workflows/component loader dev testing.json
 
 # Test harness — local config and generated outputs (the example IS tracked)
 tests/lora_test_config.toml
