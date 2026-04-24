@@ -1384,54 +1384,60 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
             "vae_from_transformer": args.vae_from_transformer if args.vae_from_transformer is not None else d["vae_from_transformer"],
         }
 
-    if not p.get("model"):
-        print("Error: --model is required (or provide via --params / --override model=...)",
-              file=sys.stderr)
-        return 1
-    if not p.get("prompt"):
-        print("Error: --prompt is required (or provide via --params / --override prompt=...)",
-              file=sys.stderr)
-        return 1
-
-    # After all overrides are applied, warn if the model path looks like a
-    # local path but doesn't exist. HF repo IDs (owner/repo, no leading /)
-    # are skipped — they'll be resolved in the next step.
-    _model_val = p.get("model", "")
-    _is_local = _model_val.startswith("/") or _model_val.startswith("./") or (
-        len(_model_val) > 1 and _model_val[1] == ":"
-    )
-    if _is_local and not os.path.exists(_model_val):
-        print(
-            f"WARNING: model path does not exist on this host:\n"
-            f"  {_model_val}\n"
-            f"  If this came from a container-saved image, use --model <host-path> "
-            f"or --override model=<host-path>.",
-            file=sys.stderr,
-        )
-
-    # Symmetric to the local-path warning: if the model came from a PNG --params
-    # sidecar and is an HF repo ID under --allow-hf-download, surface what the
-    # PNG will pull BEFORE resolution — a malicious sidecar could otherwise
-    # trigger an arbitrary HF fetch with only the resolve_hf_path one-liner as
-    # notice. Only fires when --params was used; direct --model entries are the
-    # user's own choice.
-    if args.params and args.allow_hf_download and _is_hf_repo_id(_model_val):
-        print(
-            f"WARNING: --params supplied an HF repo ID under --allow-hf-download:\n"
-            f"  {_model_val}\n"
-            f"  This will be fetched from HuggingFace on cache miss. "
-            f"Verify the repo is what you expect before proceeding.",
-            file=sys.stderr,
-        )
-
-    base_loras = [_parse_lora_arg(s) for s in args.lora] if args.lora else p.get("loras", [])
-
     # ── Plan iterations (no-op when --iterate is absent) ──────────────────
+    # Run BEFORE the required-field check so that --iterate prompt/--iterate model
+    # can satisfy those requirements without a separate CLI flag.
     try:
         plan = _plan_iterations(args)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
+    iterated_axes = {axis[0] for axis in plan["axes"]} if plan else set()
+
+    if not p.get("model") and "model" not in iterated_axes:
+        print("Error: --model is required (or provide via --params / --override model=... "
+              "/ --iterate model <file>)", file=sys.stderr)
+        return 1
+    if not p.get("prompt") and "prompt" not in iterated_axes:
+        print("Error: --prompt is required (or provide via --params / --override prompt=... "
+              "/ --iterate prompt <file>)", file=sys.stderr)
+        return 1
+
+    # After all overrides are applied, warn if the BASE model path looks like a
+    # local path but doesn't exist. HF repo IDs (owner/repo, no leading /) are
+    # skipped — they'll be resolved in the next step. Skipped entirely when
+    # --iterate model is active: each iteration's model is checked per-run
+    # inside _run_one's resolve_hf_path call.
+    _model_val = p.get("model") or ""
+    if "model" not in iterated_axes:
+        _is_local = _model_val.startswith("/") or _model_val.startswith("./") or (
+            len(_model_val) > 1 and _model_val[1] == ":"
+        )
+        if _is_local and not os.path.exists(_model_val):
+            print(
+                f"WARNING: model path does not exist on this host:\n"
+                f"  {_model_val}\n"
+                f"  If this came from a container-saved image, use --model <host-path> "
+                f"or --override model=<host-path>.",
+                file=sys.stderr,
+            )
+
+        # Symmetric to the local-path warning: if the model came from a PNG
+        # --params sidecar and is an HF repo ID under --allow-hf-download,
+        # surface what the PNG will pull BEFORE resolution — a malicious
+        # sidecar could otherwise trigger an arbitrary HF fetch with only the
+        # resolve_hf_path one-liner as notice. Only fires when --params was
+        # used; direct --model entries are the user's own choice.
+        if args.params and args.allow_hf_download and _is_hf_repo_id(_model_val):
+            print(
+                f"WARNING: --params supplied an HF repo ID under --allow-hf-download:\n"
+                f"  {_model_val}\n"
+                f"  This will be fetched from HuggingFace on cache miss. "
+                f"Verify the repo is what you expect before proceeding.",
+                file=sys.stderr,
+            )
+
+    base_loras = [_parse_lora_arg(s) for s in args.lora] if args.lora else p.get("loras", [])
 
     if plan is not None:
         if _iteration_replaces_loras(plan, base_loras):

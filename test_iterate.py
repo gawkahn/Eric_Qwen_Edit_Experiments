@@ -16,6 +16,7 @@ module imports cleanly.
 import argparse
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -318,9 +319,70 @@ check("replaces: plan is None → no warn",
 
 
 # ──────────────────────────────────────────────────────────────────────
-print("\n── --json + --iterate rejection (subprocess) ──────────────────")
+print("\n── --iterate satisfies required fields (subprocess) ──────────")
 
-import subprocess
+# Regression: `--iterate prompt` with no --prompt used to fail the
+# "-- prompt is required" gate because the planning step ran too late.
+# Likewise "--iterate model" should satisfy --model on its own.
+with tempfile.TemporaryDirectory() as tmp:
+    prompts = os.path.join(tmp, "prompts.json")
+    write_json(["hello", "world"], prompts)
+
+    # Without --prompt on CLI but with --iterate prompt: the gate must NOT
+    # fail with "--prompt is required". Use a nonexistent model so the run
+    # exits before any real generation; the required-field check fires
+    # before the path-resolve step, so its absence in stderr proves the
+    # gate accepts iterated prompts.
+    proc = subprocess.run(
+        [sys.executable, "-m", "comfyless.generate",
+         "--model", "/nonexistent/model/path",
+         "--iterate", "prompt", prompts,
+         "--yes"],
+        input="",
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).parent),
+    )
+    check("--iterate prompt: does NOT fail with '--prompt is required'",
+          "--prompt is required" not in proc.stderr,
+          f"stderr={proc.stderr[:300]!r}")
+
+    # Symmetrically, --iterate model should satisfy --model.
+    models = os.path.join(tmp, "models.json")
+    write_json(["/a", "/b"], models)
+    proc = subprocess.run(
+        [sys.executable, "-m", "comfyless.generate",
+         "--prompt", "hello",
+         "--iterate", "model", models,
+         "--yes"],
+        input="",
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).parent),
+    )
+    check("--iterate model: does NOT fail with '--model is required'",
+          "--model is required" not in proc.stderr,
+          f"stderr={proc.stderr[:300]!r}")
+
+    # Negative: iterating an unrelated axis (seed) still requires --prompt/--model.
+    seeds = os.path.join(tmp, "seeds.json")
+    write_json([1, 2, 3], seeds)
+    proc = subprocess.run(
+        [sys.executable, "-m", "comfyless.generate",
+         "--iterate", "seed", seeds,
+         "--yes"],
+        input="",
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).parent),
+    )
+    check("--iterate seed (no --model/--prompt): still fails with required-field error",
+          "--model is required" in proc.stderr,
+          f"stderr={proc.stderr[:300]!r}")
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n── --json + --iterate rejection (subprocess) ──────────────────")
 
 with tempfile.TemporaryDirectory() as tmp:
     prompts = os.path.join(tmp, "prompts.json")
