@@ -1,7 +1,7 @@
 # ADR-008: Comfyless Iteration Mode (`--iterate`)
 
 **Date:** 2026-04-23
-**Status:** proposed
+**Status:** accepted (implemented 2026-04-24)
 
 ---
 
@@ -174,6 +174,7 @@ Tests: add a negative-case test for the validator (invalid file format, unknown 
 
 - **2026-04-23** — proposed. Initial spec after design discussion: Cartesian default, flat JSON list input, `%input%` token (source file stem), 500 hard cap + interactive confirm over 5 + `--yes` escape, rejected under `--json` mode in v1, per-image `iterate_batch_id` UUID for correlation.
 - **2026-04-24** — amended. Added File-format section with worked examples for each element-shape (strings, ints, floats, paths, LoRA stacks). Added `lora` to the supported param list with stack-replacement semantics (iterated stack overrides `--lora`; warn if both are supplied). Added self-describing file format to Alternatives Rejected.
+- **2026-04-24** — accepted and implemented. `comfyless/generate.py` gained `--iterate`, `--max-iterations`, `--yes` flags; 14 iteratable axes; Cartesian fan-out; `%input%`/`%input_<param>%` tokens with client-side pre-expansion before server delegation; `iterate_batch_id` UUID stamped into each sidecar JSON (PNG tEXt embedding deferred — would require server.py change behind §12 gate). New `test_iterate.py` with 52 tests covering validator edge cases, planning errors, Cartesian expansion, template tokens, lora-stack replacement, and `--json` + `--iterate` rejection. Reviewed by code-reviewer (Opus); two promise-drift blockers (missing `--json` guard, test gaps) caught and closed in the same slice before merge.
 
 ## AI-Disclosure
 
