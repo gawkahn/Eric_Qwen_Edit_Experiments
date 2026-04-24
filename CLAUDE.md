@@ -54,11 +54,13 @@ python -m py_compile nodes/<file>.py   # syntax check a single file
 
 **Test suites (no CI, run manually):**
 ```bash
-python3 test_manual_loop.py   # 186 tests: samplers, manual loop, encode helper, Qwen edit
-python3 test_multistage.py    # 141 tests: multistage infrastructure
-python3 test_samplers.py      # 41 tests: custom schedulers / sampler swap
+python3 test_manual_loop.py        # 186 tests: samplers, manual loop, encode helper, Qwen edit
+python3 test_multistage.py         # 141 tests: multistage infrastructure
+python3 test_samplers.py           #  41 tests: custom schedulers / sampler swap
+python3 test_iterate.py            #  55 tests: comfyless --iterate (ADR-008)
+python3 test_server_robustness.py  #   8 tests: comfyless IPC timeouts + BrokenPipe survival
 ```
-All three suites use the ComfyUI venv's Python; run them via `/home/gawkahn/projects/ai-lab/ai-stack-data/comfy-dev/run/venv/bin/python3` when working outside of ComfyUI. Total 368 tests; expect 0 failures.
+All five suites use the ComfyUI venv's Python; run them via `/home/gawkahn/projects/ai-lab/ai-stack-data/comfy-dev/run/venv/bin/python3` when working outside of ComfyUI. Total 431 tests; expect 0 failures.
 
 ## Git commit conventions for this repo
 

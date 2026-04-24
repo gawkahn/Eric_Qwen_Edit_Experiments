@@ -41,7 +41,11 @@ from typing import Any, Dict, Optional
 
 # Wire-protocol guardrails (see docs/security/review-comfyless-server-2026-04-23.md)
 _MAX_FRAME_BYTES = 1 << 20   # 1 MiB; real requests are < 10 KiB
-_RECV_TIMEOUT_SEC = 5.0       # wall-clock deadline for a full request frame
+_RECV_TIMEOUT_SEC = 5.0       # server-side request-read deadline (DoS guard)
+_CLIENT_RECV_TIMEOUT_SEC = 600.0  # client-side response-read deadline: large
+                                  # enough for a real generation (30–120s is
+                                  # common), small enough to eventually surface
+                                  # a wedged server instead of hanging forever.
 
 # Path-shaped request fields — rejected if they contain a NUL byte, because
 # os.path.realpath raises on NUL and that exception would escape _check_paths
@@ -210,9 +214,30 @@ def _send(conn: socket.socket, payload: dict) -> None:
     conn.sendall(json.dumps(payload).encode() + b"\n")
 
 
-def _recv(conn: socket.socket) -> Optional[dict]:
-    """Read one newline-terminated JSON message from the connection."""
-    deadline = time.monotonic() + _RECV_TIMEOUT_SEC
+def _send_safe(conn: socket.socket, payload: dict) -> bool:
+    """_send wrapper that swallows peer-gone errors.
+
+    A client that disconnects mid-request (crash, recv timeout, SIGKILL) must
+    never kill the daemon. Used for every server-to-client send inside
+    _handle_connection. Returns True if delivered, False if the peer was gone.
+    """
+    try:
+        _send(conn, payload)
+        return True
+    except (BrokenPipeError, ConnectionResetError) as e:
+        _log(f"Client disconnected before response delivery: {e}")
+        return False
+
+
+def _recv(conn: socket.socket, timeout: float = _RECV_TIMEOUT_SEC) -> Optional[dict]:
+    """Read one newline-terminated JSON message from the connection.
+
+    Default timeout is the server's DoS-guard value (5s). The client passes a
+    much larger timeout when reading the server's response, since generation
+    can take 30–120s on 20B-parameter models — the 5s server-side bound would
+    always trip on the response path.
+    """
+    deadline = time.monotonic() + timeout
     buf = b""
     while True:
         remaining = deadline - time.monotonic()
@@ -255,8 +280,8 @@ def _handle_connection(
     try:
         req = _recv(conn)
     except (json.JSONDecodeError, ValueError) as e:
-        _send(conn, {"status": "error", "error_type": "ParseError",
-                     "error": f"Invalid JSON: {e}"})
+        _send_safe(conn, {"status": "error", "error_type": "ParseError",
+                          "error": f"Invalid JSON: {e}"})
         return True
 
     if req is None:
@@ -265,13 +290,13 @@ def _handle_connection(
     # ── Schema validation ────────────────────────────────────────────────
     err = _validate_request(req)
     if err:
-        _send(conn, {"status": "error", "error_type": "ValidationError", "error": err})
+        _send_safe(conn, {"status": "error", "error_type": "ValidationError", "error": err})
         return True
 
     req_type = req["type"]
 
     if req_type == "ping":
-        _send(conn, {"status": "ok", "message": "pong"})
+        _send_safe(conn, {"status": "ok", "message": "pong"})
         return True
 
     if req_type == "unload":
@@ -282,19 +307,24 @@ def _handle_connection(
             del pipeline
             import torch; torch.cuda.empty_cache()
             server_state.clear()
-        _send(conn, {"status": "ok", "message": "unloaded"})
+        _send_safe(conn, {"status": "ok", "message": "unloaded"})
         return False  # signal server loop to stop
 
     # req_type == "generate"
     # ── Path enforcement ─────────────────────────────────────────────────
     err = _check_paths(req, model_base)
     if err:
-        _send(conn, {"status": "error", "error_type": "PathError", "error": err})
+        # Server-side audit log for path-validation rejections. Must happen
+        # BEFORE _send_safe so the record exists even if the client has
+        # disconnected (now a graceful no-op). Prompt kept out deliberately.
+        redacted = {k: v for k, v in req.items() if k != "prompt"}
+        _log(f"PathError: {err} req={redacted!r}")
+        _send_safe(conn, {"status": "error", "error_type": "PathError", "error": err})
         return True
 
     # ── Generation (wired in Step 3) ─────────────────────────────────────
     result = _handle_generate(req, output_dir, model_base, device, precision, server_state)
-    _send(conn, result)
+    _send_safe(conn, result)
     return True
 
 

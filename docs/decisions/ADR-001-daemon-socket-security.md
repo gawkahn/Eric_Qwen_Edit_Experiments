@@ -118,6 +118,18 @@ swaps would help. Deferred. Tracked in `TECH_DEBT.md`.
 
 - 2026-04-21: Initial ADR; security review conducted before any code written.
   See `docs/security/review-daemon-socket-2026-04-21.md`.
+- 2026-04-24: Timeout / BrokenPipe fix — `_recv` timeout parametrized into
+  server-default (5s, unchanged DoS guard) vs client-override
+  (`_CLIENT_RECV_TIMEOUT_SEC = 600s`) because generation legitimately takes
+  30–120s and the shared 5s deadline always tripped on the client response
+  path. Added `_send_safe` wrapper so a client that disconnects mid-request
+  never kills the daemon. Added server-side audit log for PathError
+  rejections. Quantitative DoS window from a same-uid misbehaving client
+  grew from "immediate daemon death" to "up to 600s per connection × listen
+  backlog of 4" — strictly less bad than daemon death, but more silent.
+  Per-request inference timeout (Deferred #2 above) and rate-limiting
+  (Deferred #3) remain open. See
+  `docs/security/review-server-timeout-brokenpipe-2026-04-24.md`.
 
 ## AI-Disclosure
 

@@ -1063,7 +1063,7 @@ def _send_server_command(req: dict) -> Optional[dict]:
     Local import keeps server.py off the critical import path.
     """
     import socket as _socket
-    from .server import socket_path, _send, _recv
+    from .server import socket_path, _send, _recv, _CLIENT_RECV_TIMEOUT_SEC
     sock_p = socket_path()
     if not sock_p.exists():
         return None
@@ -1071,7 +1071,9 @@ def _send_server_command(req: dict) -> Optional[dict]:
     try:
         conn.connect(str(sock_p))
         _send(conn, req)
-        return _recv(conn)
+        # Pass the client-side timeout: the server's 5s default is a DoS guard
+        # on its request-read path, not a ceiling on how long generation takes.
+        return _recv(conn, timeout=_CLIENT_RECV_TIMEOUT_SEC)
     except (OSError, ConnectionRefusedError):
         return None
     finally:

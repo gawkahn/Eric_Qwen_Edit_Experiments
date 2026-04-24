@@ -28,6 +28,16 @@ steps, max dimensions, and minimum time between model swaps would mitigate this.
 Low urgency on a single-user machine. Trigger: shared-machine deployment.
 See ADR-001.
 
+**Client-side recv timeout is a flat 600s ceiling** *(2026-04-24)*
+`_CLIENT_RECV_TIMEOUT_SEC = 600.0` in `comfyless/server.py` is a compile-time
+constant. Realistic tail: a 50-MP Qwen-Image-2512 run at 50 steps with tile-VAE
+decode can approach 600s. If it trips, the user sees `request timed out before
+newline` on the client even though the image is being saved on the server side.
+Fix shape: either raise to 1800s or expose via env var `COMFYLESS_CLIENT_RECV_TIMEOUT`.
+Trigger: first report of the ceiling tripping, OR first commit that adds a model
+family with known-longer generation times. See
+`docs/security/review-server-timeout-brokenpipe-2026-04-24.md` (LOW finding).
+
 ---
 
 ## Dependencies
