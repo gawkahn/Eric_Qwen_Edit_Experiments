@@ -2,10 +2,32 @@
 # Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
 # https://github.com/EricRollei/Eric_Qwen_Edit_Experiments
 """
-Eric Qwen-Edit LoRA Node
-Apply LoRA weights to Qwen-Image-Edit pipeline.
+LoRA adapter library (retained after node cull on 2026-04-24).
+
+The EricQwenEditApplyLoRA and EricQwenEditUnloadLoRA node classes that
+previously lived here were removed when Eric Diffusion LoRA Stacker
+superseded single-apply UX (see nodes/REMOVED.md). This file is retained
+because its LoRA-handling library is the backbone of LoRA support across
+the ENTIRE pack:
+
+  - load_lora_with_key_fix  → comfyless/generate.py, comfyless/server.py,
+                               tests/lora_test_harness.py
+  - _set_adapters_safe      → eric_diffusion_lora_stacker.py,
+                               eric_diffusion_ultragen.py,
+                               eric_diffusion_multistage.py,
+                               eric_diffusion_advanced_multistage.py
+  - get_lora_list, get_lora_full_path, _adapter_module_path,
+    _normalize_keys, _detect_adapter_type, adapter-format loaders
+    (_load_{lora,lokr,loha}_adapter, PEFT + direct variants),
+    _decode_kohya_keys, _apply_te_lora, unload_adapters, etc.
+                             → called internally by load_lora_with_key_fix;
+                                exposed for the LoRA stacker + tests.
+
+Despite the file name, this is now a pack-wide library, not a Qwen-Edit node.
 
 Supports standard LoRA, LoKR (Kronecker), and LoHa (Hadamard) adapter formats.
+
+Resurrect the node classes: git show HEAD~1:nodes/eric_qwen_edit_lora.py
 
 Model Credits:
 - Qwen-Image-Edit developed by Qwen Team (Alibaba)
@@ -1316,163 +1338,3 @@ def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
         return False
     return True
 
-
-class EricQwenEditApplyLoRA:
-    """
-    Apply a LoRA to the Qwen-Edit pipeline.
-    
-    This node loads LoRA weights onto the transformer. Multiple LoRA
-    nodes can be chained to apply multiple LoRAs with different weights.
-    
-    Workflow example:
-    [Load Model] -> [Apply LoRA (style)] -> [Apply LoRA (character)] -> [Edit Image]
-    
-    LoRA weight:
-    - 1.0 = full strength
-    - 0.5 = half strength
-    - 0.0 = no effect (disabled)
-    - >1.0 = amplified (may cause artifacts)
-    
-    LoRAs are loaded from ComfyUI's standard loras folder:
-    ComfyUI/models/loras/
-    """
-    
-    CATEGORY = "Eric Qwen-Edit"
-    FUNCTION = "apply_lora"
-    RETURN_TYPES = ("QWEN_EDIT_PIPELINE",)
-    RETURN_NAMES = ("pipeline",)
-    
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "pipeline": ("QWEN_EDIT_PIPELINE",),
-                "lora_name": (get_lora_list(), {
-                    "tooltip": "Select LoRA from ComfyUI/models/loras/"
-                }),
-                "weight": ("FLOAT", {
-                    "default": 1.0,
-                    "min": -2.0,
-                    "max": 2.0,
-                    "step": 0.05,
-                    "tooltip": "LoRA weight strength (1.0 = full, 0.5 = half)"
-                }),
-            },
-            "optional": {
-                "lora_path_override": ("STRING", {
-                    "default": "",
-                    "tooltip": "Optional: Override with custom path (leave empty to use dropdown)"
-                }),
-            }
-        }
-    
-    @classmethod
-    def IS_CHANGED(cls, **kwargs):
-        # Refresh LoRA list on each check
-        return float("nan")
-    
-    def apply_lora(
-        self,
-        pipeline: dict,
-        lora_name: str,
-        weight: float = 1.0,
-        lora_path_override: str = "",
-    ) -> Tuple[dict]:
-        """Apply LoRA to the pipeline."""
-        pipe = pipeline["pipeline"]
-        
-        # Determine which path to use
-        if lora_path_override and lora_path_override.strip():
-            lora_path = lora_path_override.strip()
-            if not os.path.exists(lora_path):
-                raise ValueError(f"LoRA file not found: {lora_path}")
-        else:
-            if lora_name == "none" or not lora_name:
-                print("[EricQwenEdit] LoRA: none selected, skipping")
-                return (pipeline,)
-            lora_path = get_lora_full_path(lora_name)
-            if lora_path is None:
-                raise ValueError(f"LoRA file not found: {lora_name}")
-        
-        lora_filename = os.path.basename(lora_path)
-        adapter_name = _make_adapter_name(lora_filename)
-        
-        print(f"[EricQwenEdit] Applying LoRA: {lora_filename}")
-        print(f"[EricQwenEdit] Path: {lora_path}")
-        print(f"[EricQwenEdit] Weight: {weight}")
-        
-        # Check if this adapter is already loaded
-        loaded_adapters = set()
-        try:
-            adapter_list = pipe.get_list_adapters()
-            for component_adapters in adapter_list.values():
-                loaded_adapters.update(component_adapters)
-        except Exception:
-            pass
-        
-        try:
-            if adapter_name in loaded_adapters:
-                # Already loaded — just update the weight
-                _set_adapters_safe(pipe, adapter_name, weight,
-                                   log_prefix="[EricQwenEdit]")
-                print(f"[EricQwenEdit] LoRA already loaded, updated weight: {adapter_name} -> {weight}")
-            else:
-                # Load fresh (with automatic key normalization fallback)
-                load_lora_with_key_fix(pipe, lora_path, adapter_name,
-                                      log_prefix="[EricQwenEdit]",
-                                      weight=weight)
-                # For PEFT-injected adapters, apply weight via set_adapters.
-                # For direct-merge adapters, weight is already baked in.
-                _set_adapters_safe(pipe, adapter_name, weight,
-                                   log_prefix="[EricQwenEdit]")
-                print(f"[EricQwenEdit] LoRA applied successfully: {adapter_name}")
-            
-        except Exception as e:
-            print(f"[EricQwenEdit] Error loading LoRA: {e}")
-            raise
-        
-        # Track applied adapters in the pipeline dict
-        if "applied_loras" not in pipeline:
-            pipeline["applied_loras"] = {}
-        pipeline["applied_loras"][adapter_name] = {
-            "path": lora_path,
-            "weight": weight,
-            "filename": lora_filename,
-        }
-        
-        # Return the same pipeline dict (modified in place)
-        return (pipeline,)
-
-
-class EricQwenEditUnloadLoRA:
-    """
-    Unload all LoRAs from the Qwen-Edit pipeline.
-    
-    Use this to reset the model to its base state before applying
-    different LoRAs, or to free memory.
-    """
-    
-    CATEGORY = "Eric Qwen-Edit"
-    FUNCTION = "unload_lora"
-    RETURN_TYPES = ("QWEN_EDIT_PIPELINE",)
-    RETURN_NAMES = ("pipeline",)
-    
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "pipeline": ("QWEN_EDIT_PIPELINE",),
-            },
-        }
-    
-    def unload_lora(self, pipeline: dict) -> Tuple[dict]:
-        """Unload all LoRAs from the pipeline."""
-        pipe = pipeline["pipeline"]
-        
-        try:
-            pipe.unload_lora_weights()
-            print("[EricQwenEdit] All LoRAs unloaded")
-        except Exception as e:
-            print(f"[EricQwenEdit] Note: {e}")
-        
-        return (pipeline,)

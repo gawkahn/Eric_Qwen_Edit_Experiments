@@ -3,7 +3,7 @@
 ## 🖼️ Up to 17 MP image editing · 50 MP+ text-to-image generation
 
 ComfyUI custom nodes for **Qwen-Image-Edit-2511** (image editing) and **Qwen-Image-2512** (text-to-image generation) — 20-billion-parameter MMDiT models by Qwen (Alibaba).  
-30 nodes covering loading, single-image editing, multi-image fusion, style transfer, inpainting, inpaint-with-transfer, LoRA, Spectrum acceleration, delta overlay, mask utilities, **text-to-image generation**, multi-stage generation, prompt rewriting, **2× VAE super-resolution upscaling**, **ControlNet-guided generation**, and **ControlNet inpainting** *(experimental)*.
+32 nodes covering loading, image editing (single + multi-reference), style transfer, inpainting, inpaint-with-transfer, LoRA stacking, Spectrum acceleration, delta overlay, mask utilities, **text-to-image generation** (Qwen-Image, Flux, Chroma, SDXL, SD3.5, Pony, Illustrious — auto-detected via `model_index.json`), multi-stage generation, prompt rewriting, **2× VAE super-resolution upscaling**, **ControlNet-guided generation**, and **ControlNet inpainting** *(experimental)*.
 
 ![8 MP image editing in just a few nodes](examples/FireRed11-8mp.png)
 *Edit images at up to 16 MP resolution — just a loader, LoRA, and edit node.*

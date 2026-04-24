@@ -232,9 +232,8 @@ class EricDiffusionLoRAStacker:
 # Same underlying machinery as EricDiffusionLoRAStacker — the entire
 # apply_loras method is inherited unchanged.  The only difference is
 # the ComfyUI socket type on the pipeline input and output, so users
-# can wire this stacker between EricQwenEditLoader and the edit nodes
-# (EricQwenEditImage / EricQwenEditMultiImage / EricDiffusionAdvancedEdit)
-# instead of chaining multiple one-LoRA-per-node Apply LoRA nodes.
+# can wire this stacker between EricQwenEditLoader and EricDiffusionAdvancedEdit
+# (or EricDiffusionAdvancedEditMultistage) instead of using per-LoRA Apply nodes.
 #
 # Why this works unchanged: the stacker's apply_loras logic operates on
 # pipeline["pipeline"] and pipeline["applied_loras"] — both of which are
@@ -278,8 +277,8 @@ class EricQwenEditLoRAStacker(EricDiffusionLoRAStacker):
         types["required"]["pipeline"] = ("QWEN_EDIT_PIPELINE", {
             "tooltip": (
                 "From Eric Qwen-Edit Loader or Component Loader. "
-                "Wire through this stacker then to any edit node "
-                "(Eric Qwen-Edit Image, Multi-Image, or Advanced Edit)."
+                "Wire through this stacker then to Eric Diffusion Advanced Edit "
+                "or Eric Diffusion Advanced Edit Multi-Stage."
             ),
         })
         return types

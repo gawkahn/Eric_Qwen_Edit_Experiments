@@ -23,8 +23,9 @@ input is backlogged (tracked with the same request for Advanced Generate).
 
 Relationship to other edit nodes
 --------------------------------
-- **Eric Qwen-Edit Multi-Image**: legacy pipe()-based multi-reference
-  edit, single-stage.  Still supported, still the safe fallback.
+- Previously delegated some multi-reference flows to ``Eric Qwen-Edit
+  Multi-Image``; that legacy ``pipe()``-based node was removed 2026-04-24
+  — see ``nodes/REMOVED.md``.
 - **Eric Diffusion Advanced Edit** (single-stage): manual-loop edit with
   per-stage sampler/sigma/eta.  Good for quick edits.
 - **Eric Diffusion Advanced Edit Multi-Stage** (this file): three-stage

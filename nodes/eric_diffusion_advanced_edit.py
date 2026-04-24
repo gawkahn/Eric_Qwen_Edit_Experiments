@@ -10,9 +10,9 @@ flags for VL (semantic) and Ref (pixel latent) conditioning paths.
 
 Relationship to other edit nodes
 --------------------------------
-- **Eric Qwen-Edit Image** / **Eric Qwen-Edit Multi-Image**: stock
-  ``pipe()``-based edit nodes.  These stay fully supported and remain
-  the safe fallback if the manual loop ever regresses.
+- Previously delegated some flows to legacy ``pipe()``-based nodes
+  (``Eric Qwen-Edit Image``, ``Eric Qwen-Edit Multi-Image``); both were
+  removed 2026-04-24 — see ``nodes/REMOVED.md``.
 - **Eric Diffusion Advanced Edit** (this file): bypasses ``pipe()`` and
   runs the denoising loop manually, giving access to higher-order
   samplers (flow_heun, flow_rk3, multistep variants), eta stochastic
