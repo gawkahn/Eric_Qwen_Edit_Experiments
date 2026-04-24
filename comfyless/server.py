@@ -32,9 +32,28 @@ import json
 import os
 import re
 import socket
+import stat
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+
+# Wire-protocol guardrails (see docs/security/review-comfyless-server-2026-04-23.md)
+_MAX_FRAME_BYTES = 1 << 20   # 1 MiB; real requests are < 10 KiB
+_RECV_TIMEOUT_SEC = 5.0       # wall-clock deadline for a full request frame
+
+# Path-shaped request fields — rejected if they contain a NUL byte, because
+# os.path.realpath raises on NUL and that exception would escape _check_paths
+# and kill the accept loop.
+_PATH_FIELDS = frozenset({
+    "model",
+    "transformer_path",
+    "vae_path",
+    "text_encoder_path",
+    "text_encoder_2_path",
+    "savepath",
+})
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -49,6 +68,12 @@ def _socket_dir() -> Path:
         return Path(xdg)
     d = Path(f"/tmp/comfyless-{os.getuid()}")
     d.mkdir(mode=0o700, exist_ok=True)
+    # mkdir(exist_ok=True) does not re-apply mode on existing dirs; enforce it.
+    st = d.stat()
+    if st.st_uid != os.getuid():
+        raise RuntimeError(f"socket dir {d} not owned by current uid")
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        os.chmod(d, 0o700)
     return d
 
 
@@ -123,6 +148,13 @@ def _validate_request(req: dict) -> Optional[str]:
             return f"loras[{i}]: expected {{\"path\": str, \"weight\": float}}"
         if not isinstance(lora["path"], str):
             return f"loras[{i}].path: expected str"
+        if "\x00" in lora["path"]:
+            return f"loras[{i}].path: null byte not allowed"
+
+    for field in _PATH_FIELDS:
+        val = req.get(field)
+        if isinstance(val, str) and "\x00" in val:
+            return f"Field {field!r}: null byte not allowed"
 
     return None
 
@@ -141,18 +173,26 @@ def _within(path: str, base: str) -> bool:
 def _check_paths(req: dict, model_base: str) -> Optional[str]:
     """Return an error string if any path in the request is outside model_base."""
     model = req.get("model", "")
+    if not model.startswith("/"):
+        return f"model path must be absolute: {model!r}"
     if not _within(model, model_base):
         return f"model path outside --model-base: {model!r}"
 
     for field in ("transformer_path", "vae_path", "text_encoder_path", "text_encoder_2_path"):
         p = req.get(field, "") or ""
-        if p and not _within(p, model_base):
-            return f"{field} outside --model-base: {p!r}"
+        if p:
+            if not p.startswith("/"):
+                return f"{field} must be absolute: {p!r}"
+            if not _within(p, model_base):
+                return f"{field} outside --model-base: {p!r}"
 
     for i, lora in enumerate(req.get("loras") or []):
         p = lora.get("path", "")
-        if p and not _within(p, model_base):
-            return f"loras[{i}].path outside --model-base: {p!r}"
+        if p:
+            if not p.startswith("/"):
+                return f"loras[{i}].path must be absolute: {p!r}"
+            if not _within(p, model_base):
+                return f"loras[{i}].path outside --model-base: {p!r}"
 
     return None
 
@@ -172,12 +212,22 @@ def _send(conn: socket.socket, payload: dict) -> None:
 
 def _recv(conn: socket.socket) -> Optional[dict]:
     """Read one newline-terminated JSON message from the connection."""
+    deadline = time.monotonic() + _RECV_TIMEOUT_SEC
     buf = b""
     while True:
-        chunk = conn.recv(65536)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ValueError("request timed out before newline")
+        conn.settimeout(remaining)
+        try:
+            chunk = conn.recv(65536)
+        except socket.timeout:
+            raise ValueError("request timed out before newline")
         if not chunk:
             return None
         buf += chunk
+        if len(buf) > _MAX_FRAME_BYTES:
+            raise ValueError(f"request frame exceeds {_MAX_FRAME_BYTES} bytes")
         if b"\n" in buf:
             line, _ = buf.split(b"\n", 1)
             return json.loads(line.decode())
