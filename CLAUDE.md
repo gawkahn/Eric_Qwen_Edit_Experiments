@@ -133,7 +133,7 @@ The global `Git Commit Discipline` rule "Never push to remote without explicit u
 - **Any change to `comfyless/server.py`, `resolve_hf_path`, or `_run_json_mode` also runs `security-auditor` (Opus).** Output saved to `docs/security/review-<slug>-<YYYY-MM-DD>.md` and referenced in the commit body.
 - **When the `--json` / LLM agent wiring lands:** write spec + ADR before code, run `security-auditor`, treat as Red Zone from the first commit.
 - Trivial skip ask: `"Trivial — skip review? Change: <one-line summary>. Reply 'review' to run it anyway."` Do not self-decide.
-- `code-reviewer` and `security-auditor` are pinned to `claude-opus-4-7` in `~/.claude/agents/`. Do not override.
+- Pass `model: "opus"` explicitly at every Agent-tool invocation for reviewer agents (`code-reviewer`, `security-auditor`). The frontmatter pin is known-broken in Claude Code 2.1.117 — structural enforcement requires the invocation-time override.
 
 ## Commit-time hooks
 
