@@ -646,6 +646,19 @@ The savepath template is relative (leading `/` stripped); the server resolves it
 
 When no `--savepath` is given, the server auto-names files `comfyless0001.png`, `comfyless0002.png`, … in `--output-dir`.
 
+### Timeouts and resilience
+
+The two directions of the socket have different recv deadlines because they have different characteristics:
+
+- **Client → server (request read):** 5s hard deadline. DoS protection — the server won't hang forever on a slow or half-dead client sending a request.
+- **Server → client (response read):** 600s on the client side. Generation legitimately takes 30–120s on 20B-parameter models; 50 MP VAE tile decode can stretch it further. The client waits up to 10 minutes before giving up.
+
+**If the client times out after the server has started work**, the server finishes the generation and writes the image anyway — the output file lands in `--output-dir` as configured. Only the response acknowledgment is lost. Server stderr logs `Client disconnected before response delivery` and stays up for the next request.
+
+**If the client crashes or is killed mid-request**, the server does not die. All response-send failures (`BrokenPipeError`, `ConnectionResetError`) are caught and logged.
+
+The 600s client ceiling is a compile-time constant (`_CLIENT_RECV_TIMEOUT_SEC` in `comfyless/server.py`). Raise it if a legitimate generation trips the ceiling on your setup; tracked as an env-var override in `TECH_DEBT.md`.
+
 ### Stop the server
 
 ```bash
@@ -656,7 +669,7 @@ This sends a shutdown command over the socket. The server unloads the pipeline f
 
 ### Security model
 
-- All model and LoRA paths in requests are validated against `--model-base` before any load. Requests with paths outside that root are rejected.
+- All model and LoRA paths in requests are validated against `--model-base` before any load. Requests with paths outside that root are rejected, and the rejection is audit-logged to server stderr (`PathError: ... req=...`, with `prompt` redacted).
 - Output paths are validated against `--output-dir` after template expansion; templates that would escape the directory are rejected.
 - LoRA adapter names are sanitized to `[a-zA-Z0-9_-]` before being passed to diffusers.
 - Full design rationale: `docs/decisions/ADR-001-daemon-socket-security.md`.
@@ -694,6 +707,20 @@ EOF
 
 ### Output file exists but image looks wrong / blotchy
 A handful of model merges produce garbage output regardless of params (see the `AllInOne-XL-V12.5` case in the project Backlog). Verify with a known-good model first (the Qwen-Image example in this manual is a good baseline) before troubleshooting the merge itself.
+
+### `request timed out before newline` (client side)
+The client waited 600s for a server response and got none. Two typical causes:
+- **The generation was very long** — check `--output-dir`; the image usually landed anyway and only the response acknowledgment was lost. If your pipeline routinely needs more than 10 minutes, raise `_CLIENT_RECV_TIMEOUT_SEC` in `comfyless/server.py` (see `TECH_DEBT.md` for the planned env-var override).
+- **The server is wedged.** Check the server's stderr. If it's stuck in a generation that never returns, `--unload` will reset it.
+
+### `request timed out before newline` (server stderr)
+The server waited 5s for a client to finish sending a request and gave up. Usually a flaky client connection; safe to ignore unless it repeats. The limit exists as DoS protection on the request-read path.
+
+### `Client disconnected before response delivery` (server stderr)
+A client closed the socket before receiving the response. The server already did the work — the image is in `--output-dir`. Only the response message was lost. The server stays up for the next request; nothing to fix.
+
+### `PathError: ...` in server stderr
+A client submitted a `--model`, component override, or LoRA path outside `--model-base`. The rejection is logged with the request dict (prompt redacted). Expected behavior when the allowlist does its job — check whether the client was yours and misconfigured, or something you didn't launch.
 
 ---
 
