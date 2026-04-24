@@ -9,6 +9,7 @@ Shared helpers for the generic multi-model diffusion loader/generate nodes.
 import gc
 import json
 import os
+import sys
 from datetime import datetime
 import torch
 
@@ -99,7 +100,11 @@ def _is_hf_repo_id(path: str) -> bool:
     if len(path) >= 2 and path[1] == ":":  # Windows drive letter
         return False
     parts = path.split("/")
-    return len(parts) == 2 and all(parts)
+    if len(parts) != 2 or not all(parts):
+        return False
+    # Reject shapes like "foo/.." or "a/." — validate_repo_id in huggingface_hub
+    # currently blocks them, but our heuristic shouldn't depend on that.
+    return parts[0] not in (".", "..") and parts[1] not in (".", "..")
 
 
 def resolve_hf_path(path: str, *, allow_download: bool = False) -> str:
@@ -136,6 +141,10 @@ def resolve_hf_path(path: str, *, allow_download: bool = False) -> str:
             "'huggingface-cli download <repo>' to cache it manually."
         )
 
+    # Name the repo before we hit the network — a malicious --params sidecar
+    # could steer this toward an attacker-controlled repo; the user opted into
+    # downloads with --allow-hf-download but should see exactly what's fetched.
+    print(f"[EricDiffusion] DOWNLOADING from HuggingFace: {path}", file=sys.stderr)
     try:
         local_dir = snapshot_download(path)
         if not os.path.isdir(local_dir):

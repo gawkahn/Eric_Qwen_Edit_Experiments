@@ -52,6 +52,7 @@ from nodes.eric_diffusion_utils import (
     detect_component_format,
     load_component,
     resolve_hf_path,
+    _is_hf_repo_id,
 )
 from nodes.eric_diffusion_samplers import sampler_choices, swap_sampler
 from nodes.eric_qwen_edit_lora import load_lora_with_key_fix
@@ -1208,6 +1209,21 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
             f"  {_model_val}\n"
             f"  If this came from a container-saved image, use --model <host-path> "
             f"or --override model=<host-path>.",
+            file=sys.stderr,
+        )
+
+    # Symmetric to the local-path warning: if the model came from a PNG --params
+    # sidecar and is an HF repo ID under --allow-hf-download, surface what the
+    # PNG will pull BEFORE resolution — a malicious sidecar could otherwise
+    # trigger an arbitrary HF fetch with only the resolve_hf_path one-liner as
+    # notice. Only fires when --params was used; direct --model entries are the
+    # user's own choice.
+    if args.params and args.allow_hf_download and _is_hf_repo_id(_model_val):
+        print(
+            f"WARNING: --params supplied an HF repo ID under --allow-hf-download:\n"
+            f"  {_model_val}\n"
+            f"  This will be fetched from HuggingFace on cache miss. "
+            f"Verify the repo is what you expect before proceeding.",
             file=sys.stderr,
         )
 
