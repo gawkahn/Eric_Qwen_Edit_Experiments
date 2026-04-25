@@ -212,7 +212,9 @@ Example: `--savepath ~/gen/%date%/%model%_s%seed%` → `~/gen/2026-04-22/Qwen-Im
 | Flag | Default | What it does |
 |---|---|---|
 | `--iterate PARAM FILE` | — | Sweep `PARAM` over the flat JSON list in `FILE`. Repeatable: multiple `--iterate` flags produce the Cartesian product. Supported params: `prompt`, `negative_prompt`, `model`, `transformer_path`, `vae_path`, `text_encoder_path`, `text_encoder_2_path`, `seed`, `cfg_scale`, `steps`, `sampler`, `width`, `height`, `lora`. Satisfies the required-field check for `--prompt` / `--model` when iterating that axis. See [Iteration mode](<#Iteration mode (--iterate)>) |
-| `--max-iterations N` | `500` | Hard cap on total generations per `--iterate` invocation (computed up front from the Cartesian product). Exceeding the cap is a hard error with no generation |
+| `--limit N` | — | After Cartesian expansion, take only the first N combinations. Ceiling, not requirement: if Cartesian total < N, run them all (no error). Distinct from `--max-iterations` — `--limit` is silent truncation by design. Positive integer required |
+| `--batch N` | `1` | Repeat each planned generation N times. Alone (no `--iterate`), runs the base config N times — pair with `--seed -1` for fresh random seeds per repeat. With `--iterate`, runs N shots at each combination. Total = effective_combos × batch. Positive integer required |
+| `--max-iterations N` | `500` | Hard cap on total generations (post-`--limit`, post-`--batch`). Exceeding the cap is a hard error with no generation |
 | `--yes`, `-y` | off | Skip the interactive "Proceed with N generations?" prompt that fires when the total is ≥ 5. For scripts / cron / agent use |
 
 ### Server mode flags
@@ -419,6 +421,50 @@ Two independent gates protect against "I didn't realize that was 1,200 generatio
 2. **Hard cap** — `--max-iterations N` (default `500`) is a fail-closed ceiling. Exceeding it is a hard error, no generation, regardless of TTY.
 
 Use `--yes` to skip the interactive prompt in scripts / cron / agent pipelines; the hard cap still applies.
+
+### Truncation and repetition: `--limit` and `--batch`
+
+Two additional flags that modify run count without changing the safety semantics above. Both layer on top of `--max-iterations`.
+
+**`--limit N`** — after Cartesian expansion, take the first N combinations and discard the rest. A *ceiling*, not a requirement: if Cartesian total < N, run them all (no error). Use case: outer bash loop varying model/cfg/steps where the inner iterate file holds 100 prompts but each invocation should only run the first 25:
+
+```bash
+for cfg in 3.5 4.0 4.5 5.0; do
+  $PY -m comfyless.generate \
+      --model /path/to/model \
+      --iterate prompt prompts1-100.json \
+      --cfg $cfg \
+      --limit 25 --yes
+done
+```
+
+**`--batch N`** — repeat each planned generation N times. The simplest possible iterate mode. Alone, it runs the base config N times — paired with `--seed -1` (random) you get N shots at the same generation, which is the headline use case for hit-and-miss models:
+
+```bash
+$PY -m comfyless.generate \
+    --model /path/to/model \
+    --prompt "a lighthouse at dusk" \
+    --seed -1 \
+    --batch 10 --yes
+# 10 generations, fresh random seed each.
+```
+
+Combined with `--iterate prompt prompts.json` you get N shots at each prompt:
+
+```bash
+$PY -m comfyless.generate \
+    --model /path/to/model \
+    --iterate prompt prompts1-100.json \
+    --batch 5 --seed -1 \
+    --limit 20 --yes
+# 20 prompts × 5 shots each = 100 generations.
+```
+
+**Order of operations:** Cartesian → `--limit` truncation → `--batch` multiplication → `--max-iterations` check → confirmation → execute.
+
+**Footgun guard:** `--batch N` with `--seed` set to a fixed value (not `-1`) AND no `--iterate seed` axis means every repeat will produce an identical image. Comfyless prints a stderr warning in that case but proceeds — you may genuinely want N identical images for some reason.
+
+`--max-iterations` always wins on the total: `--batch 10 --max-iterations 5` errors with "10 iterations exceeds --max-iterations=5".
 
 ### Output naming
 

@@ -1012,6 +1012,18 @@ def _parse_args() -> argparse.Namespace:
                    metavar="N",
                    help="Hard cap on total generations per --iterate invocation "
                         "(default 500). Exceeds this and the run fails fast.")
+    p.add_argument("--limit", type=_positive_int, default=None,
+                   metavar="N",
+                   help="After --iterate Cartesian expansion, take only the first N "
+                        "combinations. Ceiling, not requirement: if Cartesian total < N, "
+                        "run them all (no error). Distinct from --max-iterations: --limit "
+                        "is silent truncation by design.")
+    p.add_argument("--batch", type=_positive_int, default=1,
+                   metavar="N",
+                   help="Repeat each planned generation N times. Alone (no --iterate), "
+                        "runs the base config N times — pair with --seed -1 for fresh "
+                        "random seeds per repeat. Paired with --iterate, runs N shots "
+                        "at each combination. Default 1.")
     p.add_argument("--yes", "-y", action="store_true", default=False,
                    help="Skip the interactive iteration-count confirmation prompt. "
                         "Useful for scripted/cron use. --max-iterations still applies.")
@@ -1312,6 +1324,17 @@ _ITERATE_SHAPES: Dict[str, Any] = {
 _ITERATE_CONFIRM_THRESHOLD = 5   # prompt for confirmation at or above this count
 
 
+def _positive_int(s: str) -> int:
+    """argparse type for flags that require a positive integer (--limit, --batch)."""
+    try:
+        n = int(s)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"expected positive integer, got {s!r}")
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"expected positive integer (>= 1), got {n}")
+    return n
+
+
 def _validate_iterate_value(value: Any, expected: Any) -> bool:
     """True if `value` matches the expected iteration-element shape."""
     if expected == "number":
@@ -1337,16 +1360,25 @@ def _validate_iterate_value(value: Any, expected: Any) -> bool:
 
 
 def _plan_iterations(args: argparse.Namespace) -> Optional[dict]:
-    """Return an iteration plan dict, or None when no --iterate flags were given.
+    """Return an iteration plan dict, or None when no --iterate / --batch is active.
 
     Plan keys:
-      axes:  list of (param_name, file_stem, values_list) tuples, in CLI order.
-      total: Cartesian product size across all axes.
-      input_tokens: dict mapping axis_name → file_stem, plus '_primary' → first axis.
+      axes:               list of (param_name, file_stem, values_list) tuples, in CLI order.
+                          Empty when only --batch is active (pure repetition, no axes).
+      cartesian:          Cartesian product size across all axes (1 when axes is empty).
+      effective_combos:   cartesian after --limit truncation (= cartesian if no limit).
+      batch:              repetitions per combination (= args.batch, default 1).
+      total:              effective_combos * batch — the total number of generations.
+      input_tokens:       dict mapping axis_name → file_stem, plus '_primary' → first axis.
+                          Empty when no --iterate axes are present.
 
+    Plan is None when there's nothing to plan (no --iterate, --batch == 1).
     Raises ValueError with a user-facing message on any validation failure.
     """
-    if not args.iterate:
+    batch = getattr(args, "batch", 1) or 1
+    limit = getattr(args, "limit", None)
+
+    if not args.iterate and batch == 1:
         return None
 
     axes = []
@@ -1380,30 +1412,76 @@ def _plan_iterations(args: argparse.Namespace) -> Optional[dict]:
                 )
         axes.append((param, Path(filepath).stem, values))
 
-    total = 1
+    cartesian = 1
     for _, _, values in axes:
-        total *= len(values)
+        cartesian *= len(values)
+
+    # --limit truncates the Cartesian; ceiling, not requirement (limit > cartesian → clamp).
+    effective = cartesian if limit is None else min(cartesian, limit)
+    total = effective * batch
 
     if total > args.max_iterations:
         raise ValueError(
             f"{total} iterations exceeds --max-iterations={args.max_iterations}. "
-            f"Raise --max-iterations or narrow the iteration files."
+            f"Raise --max-iterations, lower --batch, lower --limit, "
+            f"or narrow the iteration files."
         )
 
     input_tokens: Dict[str, str] = {name: stem for name, stem, _ in axes}
-    input_tokens["_primary"] = axes[0][1]
+    if axes:
+        input_tokens["_primary"] = axes[0][1]
 
-    return {"axes": axes, "total": total, "input_tokens": input_tokens}
+    return {
+        "axes": axes,
+        "cartesian": cartesian,
+        "effective_combos": effective,
+        "batch": batch,
+        "total": total,
+        "input_tokens": input_tokens,
+    }
 
 
 def _iteration_combos(plan: dict) -> Any:
-    """Yield param-patch dicts, one per Cartesian combination, in CLI order."""
+    """Yield param-patch dicts in execution order.
+
+    For each of `effective_combos` Cartesian combinations (truncated by --limit),
+    yield the combination `batch` times consecutively. Pure-batch plans (empty
+    axes, batch > 1) yield empty dicts `batch` times — the caller treats an
+    empty patch as "use base config unchanged."
+
+    Backward-compat: if a plan dict was built without the new `effective_combos`
+    / `batch` keys (e.g. a hand-built test mock), fall back to full Cartesian
+    with batch=1.
+    """
     import itertools
     axes = plan["axes"]
+    batch = plan.get("batch", 1)
+    if "effective_combos" in plan:
+        effective = plan["effective_combos"]
+    else:
+        # Backward-compat for older test mocks (test_iterate.py:215, 232) that
+        # hand-build plans with only {axes, total, input_tokens}. Derive full
+        # Cartesian from axes; combined with batch=1 default this preserves the
+        # pre-`--limit` / pre-`--batch` behaviour for those mocks.
+        effective = 1
+        for axis in axes:
+            effective *= len(axis[2])
+
+    if not axes:
+        # Pure-batch mode: yield the empty patch `batch` times.
+        for _ in range(batch):
+            yield {}
+        return
+
     names = [a[0] for a in axes]
     value_lists = [a[2] for a in axes]
+    count = 0
     for combo in itertools.product(*value_lists):
-        yield dict(zip(names, combo))
+        if count >= effective:
+            break
+        for _ in range(batch):
+            yield dict(zip(names, combo))
+        count += 1
 
 
 def _iteration_replaces_loras(plan: Optional[dict], base_loras: list) -> bool:
@@ -1541,6 +1619,18 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
         if _iteration_replaces_loras(plan, base_loras):
             print("WARNING: --iterate lora replaces --lora / sidecar loras for every iteration.",
                   file=sys.stderr)
+        # Footgun guard: --batch >1 with a fixed seed AND no --iterate seed axis means
+        # every repeat will produce an identical image. Warn but proceed — see
+        # `feedback_warn_dont_block` user memory.
+        if (plan.get("batch", 1) > 1
+                and p.get("seed", -1) != -1
+                and "seed" not in iterated_axes):
+            print(
+                f"WARNING: --batch {plan['batch']} with --seed {p.get('seed')} "
+                f"(fixed) will produce {plan['batch']} identical images per "
+                f"combination. Use --seed -1 for fresh random seeds per repeat.",
+                file=sys.stderr,
+            )
         if not _confirm_iteration(plan["total"], args.yes):
             print("Aborted.", file=sys.stderr)
             return 1
@@ -1684,16 +1774,17 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
 def main() -> int:
     args = _parse_args()
     if args.json:
-        # --iterate is not yet expressible in the JSON bridge contract
-        # (see ADR-008 §"Interaction with --json mode"). Reject rather than
-        # silently ignore — adding iteration semantics to the JSON schema is
-        # separate design work gated by the LLM-agent-bridge slice.
-        if args.iterate:
+        # Iteration semantics (--iterate, --batch, --limit) are not yet
+        # expressible in the JSON bridge contract (see ADR-008 §"Interaction
+        # with --json mode"). Reject rather than silently ignore — adding
+        # iteration to the JSON schema is separate design work gated by the
+        # LLM-agent-bridge slice.
+        if args.iterate or args.batch != 1 or args.limit is not None:
             json.dump({
                 "status": "error",
-                "error": "--iterate is not supported in --json mode; an iteration "
-                         "schema will be added to the JSON bridge contract in a "
-                         "future release",
+                "error": "--iterate / --batch / --limit are not supported in "
+                         "--json mode; iteration semantics will be added to the "
+                         "JSON bridge contract in a future release",
                 "error_type": "IterationNotSupported",
                 "contract_version": CONTRACT_VERSION,
             }, sys.stdout, indent=2)

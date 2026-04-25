@@ -418,7 +418,268 @@ with tempfile.TemporaryDirectory() as tmp:
           ok_shape,
           f"stdout={proc.stdout[:300]!r}")
     check("--json + --iterate: message includes the ADR-specified phrasing",
-          "iteration schema will be added" in proc.stdout)
+          "iteration semantics will be added" in proc.stdout)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n── _plan_iterations: --limit ────────────────────────────────")
+
+with tempfile.TemporaryDirectory() as tmp:
+    prompts = os.path.join(tmp, "prompts.json")
+    write_json(["a", "b", "c", "d", "e"], prompts)
+
+    # --limit truncates Cartesian to first N; ceiling, not requirement.
+    plan = g._plan_iterations(make_args(
+        iterate=[["prompt", prompts]], limit=3,
+    ))
+    check("--limit 3 on 5 prompts: cartesian = 5",
+          plan["cartesian"] == 5)
+    check("--limit 3 on 5 prompts: effective_combos = 3",
+          plan["effective_combos"] == 3)
+    check("--limit 3 on 5 prompts: total = 3 (batch default 1)",
+          plan["total"] == 3)
+
+    # limit > cartesian: clamps, no error.
+    plan = g._plan_iterations(make_args(
+        iterate=[["prompt", prompts]], limit=10,
+    ))
+    check("--limit 10 on 5 prompts: effective = 5 (clamps, no error)",
+          plan["effective_combos"] == 5 and plan["total"] == 5)
+
+    # limit applies BEFORE max-iterations check.
+    plan = g._plan_iterations(make_args(
+        iterate=[["prompt", prompts]], limit=2, max_iterations=2,
+    ))
+    check("--limit 2 + --max-iterations 2: succeeds (limit caps first)",
+          plan["total"] == 2)
+
+    # limit = cartesian: no-op.
+    plan = g._plan_iterations(make_args(
+        iterate=[["prompt", prompts]], limit=5,
+    ))
+    check("--limit equal to cartesian: total unchanged",
+          plan["total"] == 5)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n── _plan_iterations: --batch ────────────────────────────────")
+
+with tempfile.TemporaryDirectory() as tmp:
+    prompts = os.path.join(tmp, "prompts.json")
+    write_json(["a", "b", "c"], prompts)
+
+    # --batch alone (no --iterate): degenerate plan, axes empty, total = batch.
+    plan = g._plan_iterations(make_args(batch=5))
+    check("--batch 5 alone: plan returned (not None)",
+          plan is not None)
+    check("--batch 5 alone: axes empty",
+          plan["axes"] == [])
+    check("--batch 5 alone: cartesian = 1",
+          plan["cartesian"] == 1)
+    check("--batch 5 alone: effective_combos = 1",
+          plan["effective_combos"] == 1)
+    check("--batch 5 alone: total = 5",
+          plan["total"] == 5)
+    check("--batch 5 alone: input_tokens has no _primary",
+          "_primary" not in plan["input_tokens"])
+
+    # --batch 1 with no --iterate: no plan (back to single-gen path).
+    plan = g._plan_iterations(make_args(batch=1))
+    check("--batch 1 alone: plan is None (no plan needed)",
+          plan is None)
+
+    # --batch with --iterate: multiplies.
+    plan = g._plan_iterations(make_args(
+        iterate=[["prompt", prompts]], batch=4,
+    ))
+    check("--batch 4 + 3-prompt iterate: cartesian = 3",
+          plan["cartesian"] == 3)
+    check("--batch 4 + 3-prompt iterate: effective_combos = 3",
+          plan["effective_combos"] == 3)
+    check("--batch 4 + 3-prompt iterate: total = 12 (3 × 4)",
+          plan["total"] == 12)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n── _plan_iterations: --limit + --batch interaction ──────────")
+
+with tempfile.TemporaryDirectory() as tmp:
+    prompts = os.path.join(tmp, "prompts.json")
+    write_json(list("abcdefghij"), prompts)  # 10 prompts
+
+    # --limit 2 --batch 3 on 10 prompts: 2 × 3 = 6 total.
+    plan = g._plan_iterations(make_args(
+        iterate=[["prompt", prompts]], limit=2, batch=3,
+    ))
+    check("--limit 2 --batch 3: effective_combos = 2 (limit applies first)",
+          plan["effective_combos"] == 2)
+    check("--limit 2 --batch 3: total = 6 (limit × batch)",
+          plan["total"] == 6)
+
+    # max-iterations applies to TOTAL, not pre-batch.
+    try:
+        g._plan_iterations(make_args(
+            iterate=[["prompt", prompts]], limit=2, batch=10,
+            max_iterations=5,
+        ))
+        check("--limit 2 --batch 10 vs --max-iterations 5: raises ValueError",
+              False, "did not raise")
+    except ValueError as e:
+        check("--limit 2 --batch 10 vs --max-iterations 5: raises ValueError",
+              "20 iterations exceeds --max-iterations=5" in str(e))
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n── _iteration_combos: --batch repetition ────────────────────")
+
+# Pure-batch plan: empty axes, batch > 1 → yield empty dicts.
+batch_only_plan = {
+    "axes": [],
+    "cartesian": 1,
+    "effective_combos": 1,
+    "batch": 4,
+    "total": 4,
+    "input_tokens": {},
+}
+combos = list(g._iteration_combos(batch_only_plan))
+check("pure --batch 4: yields 4 combos",
+      len(combos) == 4)
+check("pure --batch 4: each combo is empty dict (use base config)",
+      all(c == {} for c in combos))
+
+# Iterate + batch: each combo yielded `batch` times consecutively.
+batch_iterate_plan = {
+    "axes": [("prompt", "p", ["a", "b"])],
+    "cartesian": 2,
+    "effective_combos": 2,
+    "batch": 3,
+    "total": 6,
+    "input_tokens": {"prompt": "p", "_primary": "p"},
+}
+combos = list(g._iteration_combos(batch_iterate_plan))
+check("--batch 3 + 2-prompt iterate: yields 6 combos",
+      len(combos) == 6)
+check("--batch 3 + 2-prompt iterate: first 3 combos are prompt 'a'",
+      [c["prompt"] for c in combos[:3]] == ["a", "a", "a"])
+check("--batch 3 + 2-prompt iterate: last 3 combos are prompt 'b'",
+      [c["prompt"] for c in combos[3:]] == ["b", "b", "b"])
+
+# Limit + batch: only `effective_combos` distinct combos, each repeated `batch` times.
+limit_batch_plan = {
+    "axes": [("prompt", "p", ["a", "b", "c", "d", "e"])],
+    "cartesian": 5,
+    "effective_combos": 2,  # --limit 2
+    "batch": 3,
+    "total": 6,
+    "input_tokens": {"prompt": "p", "_primary": "p"},
+}
+combos = list(g._iteration_combos(limit_batch_plan))
+check("--limit 2 + --batch 3 + 5-prompt iterate: yields 6 combos",
+      len(combos) == 6)
+check("--limit 2 + --batch 3: only first 2 prompts appear",
+      set(c["prompt"] for c in combos) == {"a", "b"})
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n── _positive_int argparse type ──────────────────────────────")
+
+import argparse as _argparse
+try:
+    g._positive_int("5")
+    check("_positive_int('5') = 5", g._positive_int("5") == 5)
+except _argparse.ArgumentTypeError:
+    check("_positive_int('5') = 5", False, "raised unexpectedly")
+
+try:
+    g._positive_int("0")
+    check("_positive_int('0') raises", False, "did not raise")
+except _argparse.ArgumentTypeError:
+    check("_positive_int('0') raises", True)
+
+try:
+    g._positive_int("-3")
+    check("_positive_int('-3') raises", False, "did not raise")
+except _argparse.ArgumentTypeError:
+    check("_positive_int('-3') raises", True)
+
+try:
+    g._positive_int("notanumber")
+    check("_positive_int('notanumber') raises", False, "did not raise")
+except _argparse.ArgumentTypeError:
+    check("_positive_int('notanumber') raises", True)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n── --json + --batch / --limit rejection (subprocess) ──────")
+
+# Same rejection shape as --iterate: ADR-008 says iteration semantics
+# (including --batch and --limit) aren't expressible in the JSON contract v1.
+stdin_req = json.dumps({"contract_version": 1,
+                        "model": "/nonexistent",
+                        "prompt": "test"})
+
+for flag, value in [("--batch", "5"), ("--limit", "5")]:
+    proc = subprocess.run(
+        [sys.executable, "-m", "comfyless.generate",
+         "--json", flag, value],
+        input=stdin_req,
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).parent),
+    )
+    check(f"--json + {flag} {value}: exit code 1",
+          proc.returncode == 1)
+    try:
+        payload = json.loads(proc.stdout)
+        ok_shape = (payload.get("status") == "error"
+                    and payload.get("error_type") == "IterationNotSupported"
+                    and "contract_version" in payload)
+    except json.JSONDecodeError:
+        ok_shape = False
+    check(f"--json + {flag} {value}: contract-shaped IterationNotSupported error",
+          ok_shape, f"stdout={proc.stdout[:300]!r}")
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n── --limit / --batch CLI integration (subprocess) ───────────")
+
+with tempfile.TemporaryDirectory() as tmp:
+    prompts = os.path.join(tmp, "prompts.json")
+    write_json(["a", "b", "c"], prompts)
+
+    # --limit 0 → argparse error
+    proc = subprocess.run(
+        [sys.executable, "-m", "comfyless.generate",
+         "--prompt", "x", "--model", "/nonexistent",
+         "--iterate", "prompt", prompts, "--limit", "0", "--yes"],
+        input="", capture_output=True, text=True,
+        cwd=str(Path(__file__).parent),
+    )
+    check("--limit 0: argparse rejects",
+          proc.returncode != 0 and "positive integer" in proc.stderr)
+
+    # --batch 0 → argparse error
+    proc = subprocess.run(
+        [sys.executable, "-m", "comfyless.generate",
+         "--prompt", "x", "--model", "/nonexistent",
+         "--batch", "0", "--yes"],
+        input="", capture_output=True, text=True,
+        cwd=str(Path(__file__).parent),
+    )
+    check("--batch 0: argparse rejects",
+          proc.returncode != 0 and "positive integer" in proc.stderr)
+
+    # --batch alone with no --iterate, no --prompt: still hits required-field gate.
+    # This pins that --batch (unlike --iterate prompt) does NOT supply the prompt.
+    proc = subprocess.run(
+        [sys.executable, "-m", "comfyless.generate",
+         "--model", "/nonexistent",
+         "--batch", "3", "--yes"],
+        input="", capture_output=True, text=True,
+        cwd=str(Path(__file__).parent),
+    )
+    check("--batch 3 with no --prompt: still hits required-field gate",
+          "--prompt is required" in proc.stderr)
 
 
 # ──────────────────────────────────────────────────────────────────────

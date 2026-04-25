@@ -102,13 +102,36 @@ Each generation in the sweep is equivalent to running a single-gen `comfyless.ge
 
 Two complementary gates:
 
-1. **Hard cap `--max-iterations N`**: default **500**. Cartesian product of iteration axes is computed up front; exceeding `N` is a hard error, no generation. Provides a predictable non-interactive ceiling.
+1. **Hard cap `--max-iterations N`**: default **500**. Total run count (Cartesian × `--limit` × `--batch`) is computed up front; exceeding `N` is a hard error, no generation. Provides a predictable non-interactive ceiling.
 
 2. **Interactive confirmation over threshold**: if the computed total is **≥ 5 iterations**, print `Iteration inputs will result in X generations. Proceed? [y/N]` to stderr and read a line from stdin. Any non-`y`/`Y` answer aborts.
 
 **`--yes`** flag skips the interactive prompt (for scripted / cron use) but still honors the hard cap.
 
 Rationale for both: the cap catches "I accidentally loaded a 10,000-item prompt file," the prompt catches "I didn't realize `prompts × seeds × cfgs` came to 240."
+
+### Truncation and repetition: `--limit` and `--batch`
+
+Two flags that modify iteration count without changing the safety semantics above. `--max-iterations` remains the fail-closed ceiling; these layer on top.
+
+**`--limit N`**: deliberate truncation. After Cartesian expansion, take the first `N` tuples and discard the rest. A *ceiling* — not a requirement: if Cartesian total < `N`, run them all (no error). Use case: an outer bash loop varying model/cfg/steps where the inner iterate file holds 100 prompts but the user only wants the first 25 each invocation. Distinct from `--max-iterations` because exceeding `--max-iterations` is an error; `--limit` is silent truncation by design.
+
+**`--batch N`**: repeat each planned generation `N` times. The simplest possible iterate mode — alone it runs the base config `N` times, paired with `--iterate prompt p.json` it runs `N` shots at each prompt. Each repeat gets a fresh random seed when `--seed -1` (the intended use case: "give me 10 shots at this and let me pick"). When `--seed` is explicitly set AND `--batch > 1` AND no `--iterate seed` axis is active, comfyless emits a stderr warning that all repeats will produce identical images — but proceeds. The user is presumed to know what they want.
+
+**Order of operations** (deterministic, applied in this sequence):
+
+1. Build Cartesian product from `--iterate` axes.
+2. If `--limit N` is set, slice to first `N` combinations.
+3. If `--batch N` is set, repeat each remaining combination `N` times consecutively.
+4. Compute `total = combinations × batch`. Check against `--max-iterations` — error if over.
+5. Confirmation prompt if `total ≥ 5` (suppressed by `--yes`).
+6. Execute.
+
+**Edge cases:**
+- `--batch 5` alone (no `--iterate`) → 5 generations of the base config, fresh random seed each. Plan exists with empty axes.
+- `--limit 10` on a 3-prompt iterate → runs 3 (limit > total = no-op).
+- `--limit 0` or `--batch 0` → argparse error (positive int required).
+- `--batch 5 --iterate seed seeds.json` → allowed; user has explicitly chosen to combine. Each seed in the file runs 5 times. Total = `len(seeds) × 5`.
 
 ### Output naming
 
@@ -175,6 +198,7 @@ Tests: add a negative-case test for the validator (invalid file format, unknown 
 - **2026-04-23** — proposed. Initial spec after design discussion: Cartesian default, flat JSON list input, `%input%` token (source file stem), 500 hard cap + interactive confirm over 5 + `--yes` escape, rejected under `--json` mode in v1, per-image `iterate_batch_id` UUID for correlation.
 - **2026-04-24** — amended. Added File-format section with worked examples for each element-shape (strings, ints, floats, paths, LoRA stacks). Added `lora` to the supported param list with stack-replacement semantics (iterated stack overrides `--lora`; warn if both are supplied). Added self-describing file format to Alternatives Rejected.
 - **2026-04-24** — accepted and implemented. `comfyless/generate.py` gained `--iterate`, `--max-iterations`, `--yes` flags; 14 iteratable axes; Cartesian fan-out; `%input%`/`%input_<param>%` tokens with client-side pre-expansion before server delegation; `iterate_batch_id` UUID stamped into each sidecar JSON (PNG tEXt embedding deferred — would require server.py change behind §12 gate). New `test_iterate.py` with 52 tests covering validator edge cases, planning errors, Cartesian expansion, template tokens, lora-stack replacement, and `--json` + `--iterate` rejection. Reviewed by code-reviewer (Opus); two promise-drift blockers (missing `--json` guard, test gaps) caught and closed in the same slice before merge.
+- **2026-04-24** — extended with `--limit N` and `--batch N`. `--limit` truncates the post-Cartesian plan to the first N combinations (ceiling, not requirement). `--batch` repeats each remaining combination N times — alone, it's "run the base config N times with random seeds," paired with `--iterate` it's "N shots at each combination." Stderr warning when fixed `--seed` + `--batch > 1` without `--iterate seed` (footgun: identical images), per "warn, don't block on user-initiated footguns" feedback rule. Order of operations: Cartesian → limit → batch → max-iterations check → confirmation. Reviewed by code-reviewer (Opus).
 
 ## AI-Disclosure
 
