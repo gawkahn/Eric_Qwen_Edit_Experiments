@@ -19,9 +19,7 @@ module imports cleanly.
 
 import io
 import json
-import re
 import sys
-import tempfile
 from contextlib import redirect_stderr
 from pathlib import Path
 
@@ -225,10 +223,12 @@ check("type-mismatch warning names expected type",
 check("type-mismatch warning names actual type",
       "str" in err)
 
-# Union types: cfg_scale accepts int OR float, not bool trap (bool is
-# subclass of int, but isinstance(True, int) is True — schema does NOT
-# explicitly exclude bool; that's a known-accepted gap, documented here
-# as a negative-assertion test so future tightening is deliberate).
+# Union types: cfg_scale accepts int OR float. bool is a Python subclass
+# of int (isinstance(True, int) == True), so the schema does NOT
+# explicitly exclude bool — a documented gap. The True-input assertion
+# below pins the *current* accepted behavior so any future tightening
+# (e.g. adding `and not isinstance(value, bool)` to _validate_params)
+# fails this test deliberately rather than silently changing semantics.
 out, err = _capture_stderr(g._validate_params,
                            {"cfg_scale": 4}, source="unit")
 check("int accepted for cfg_scale (union type)",
@@ -238,6 +238,13 @@ out, err = _capture_stderr(g._validate_params,
                            {"cfg_scale": 4.5}, source="unit")
 check("float accepted for cfg_scale (union type)",
       out == {"cfg_scale": 4.5} and err == "")
+
+# Documented gap: bool passes as int. If a future change tightens this
+# (and breaks this test), update the schema, this test, AND the comment.
+out, err = _capture_stderr(g._validate_params,
+                           {"cfg_scale": True}, source="unit")
+check("bool accepted for cfg_scale (documented gap; bool is int-subclass)",
+      out == {"cfg_scale": True} and err == "")
 
 out, err = _capture_stderr(g._validate_params,
                            {"cfg_scale": "4.5"}, source="unit")
