@@ -426,6 +426,180 @@ check("overrides: malformed spec raises ValueError",
 
 
 # ──────────────────────────────────────────────────────────────────────
+print("\n── _explicit_override_keys (ADR-009) ───────────────────────────")
+
+check("override-keys: None → empty set",
+      g._explicit_override_keys(None) == set())
+check("override-keys: empty list → empty set",
+      g._explicit_override_keys([]) == set())
+
+_keys = g._explicit_override_keys(
+    ["cfg_scale=5", "garbage=X", "no-equals", "seed=42"]
+)
+check("override-keys: valid canonical keys captured",
+      "cfg_scale" in _keys and "seed" in _keys)
+check("override-keys: unknown canonical key filtered",
+      "garbage" not in _keys)
+check("override-keys: malformed spec (no =) ignored",
+      "no-equals" not in _keys)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n── FAMILY_DEFAULTS shape (ADR-009) ─────────────────────────────")
+
+from comfyless.family_defaults import FAMILY_DEFAULTS
+
+check("FAMILY_DEFAULTS is a dict",
+      isinstance(FAMILY_DEFAULTS, dict))
+check("FAMILY_DEFAULTS is non-empty",
+      len(FAMILY_DEFAULTS) > 0)
+
+for fam, entry in FAMILY_DEFAULTS.items():
+    check(f"FAMILY_DEFAULTS[{fam!r}] is a dict",
+          isinstance(entry, dict))
+
+# Every key in every family dict must be a canonical schema key — the
+# overlay applier silently skips unknown keys, but unknown entries here
+# are dead code that signals a family-defaults edit that drifted from
+# the schema.
+_bad_fam_keys: dict = {}
+for fam, entry in FAMILY_DEFAULTS.items():
+    bad = set(entry.keys()) - set(schema.keys())
+    if bad:
+        _bad_fam_keys[fam] = bad
+check("every FAMILY_DEFAULTS key is in COMFYLESS_SCHEMA",
+      not _bad_fam_keys,
+      f"bad: {_bad_fam_keys}")
+
+# Spot-check critical families' values are the documented model-card numbers.
+check("qwen-image: true_cfg_scale=4.0 (model card)",
+      FAMILY_DEFAULTS["qwen-image"].get("true_cfg_scale") == 4.0)
+check("qwen-image: steps=50 (model card)",
+      FAMILY_DEFAULTS["qwen-image"].get("steps") == 50)
+check("sdxl: cfg_scale=7.0 (SAI recommendation)",
+      FAMILY_DEFAULTS["sdxl"].get("cfg_scale") == 7.0)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n── _apply_family_defaults overlay (ADR-009) ────────────────────")
+
+import tempfile
+import shutil
+import atexit
+
+_tmpdirs_to_cleanup: list = []
+atexit.register(
+    lambda: [shutil.rmtree(d, ignore_errors=True) for d in _tmpdirs_to_cleanup]
+)
+
+
+def _make_fake_model(family_class_name: str) -> str:
+    """Create a tempdir with a synthetic model_index.json.
+
+    Returns the absolute path.  Cleanup is registered atexit so tests
+    don't leak /tmp dirs across runs.
+    """
+    d = tempfile.mkdtemp(prefix="fam_defaults_test_")
+    _tmpdirs_to_cleanup.append(d)
+    with open(Path(d) / "model_index.json", "w") as f:
+        json.dump({"_class_name": family_class_name}, f)
+    return d
+
+
+# detect_pipeline_class verifies the class is in the installed diffusers.
+# These three are core to the project; if any are missing the install is
+# broken and the test failure is a useful signal.
+_TEST_FAMILIES = {
+    "qwen-image": "QwenImagePipeline",
+    "sdxl":       "StableDiffusionXLPipeline",
+    "flux":       "FluxPipeline",
+}
+_paths = {fam: _make_fake_model(cls) for fam, cls in _TEST_FAMILIES.items()}
+
+# 1. No explicit, no iterated → family default writes.
+_p = {"model": _paths["sdxl"], "cfg_scale": 3.5}
+_capture_stderr(g._apply_family_defaults, _p, set(), set())
+check("overlay: sdxl writes cfg_scale=7.0 when key is not explicit",
+      _p["cfg_scale"] == 7.0,
+      f"got {_p.get('cfg_scale')!r}")
+
+# 2. Explicit set → NOT clobbered.
+_p = {"model": _paths["sdxl"], "cfg_scale": 3.5}
+_capture_stderr(g._apply_family_defaults, _p, {"cfg_scale"}, set())
+check("overlay: explicit cfg_scale preserved (not overwritten by family)",
+      _p["cfg_scale"] == 3.5)
+
+# 3. Iterated axis → NOT clobbered.
+_p = {"model": _paths["sdxl"], "cfg_scale": 3.5}
+_capture_stderr(g._apply_family_defaults, _p, set(), {"cfg_scale"})
+check("overlay: iterated cfg_scale preserved",
+      _p["cfg_scale"] == 3.5)
+
+# 4. qwen-image writes true_cfg_scale + steps simultaneously.
+_p = {"model": _paths["qwen-image"], "true_cfg_scale": None, "steps": 28}
+_capture_stderr(g._apply_family_defaults, _p, set(), set())
+check("overlay: qwen-image writes true_cfg_scale=4.0",
+      _p["true_cfg_scale"] == 4.0)
+check("overlay: qwen-image writes steps=50",
+      _p["steps"] == 50)
+
+# 5. Mixed: explicit one key, family fills the other.
+_p = {"model": _paths["qwen-image"], "true_cfg_scale": 6.0, "steps": 28}
+_capture_stderr(
+    g._apply_family_defaults, _p, {"true_cfg_scale"}, set(),
+)
+check("overlay: mixed — explicit true_cfg_scale preserved at 6.0",
+      _p["true_cfg_scale"] == 6.0)
+check("overlay: mixed — non-explicit steps still gets family value 50",
+      _p["steps"] == 50)
+
+# 6. Unknown family → no-op (class not in diffusers).
+_unknown = _make_fake_model("ThisPipelineClassDoesNotExist__zzz")
+_p = {"model": _unknown, "cfg_scale": 3.5}
+_capture_stderr(g._apply_family_defaults, _p, set(), set())
+check("overlay: unknown class → no-op (no exception, schema default kept)",
+      _p["cfg_scale"] == 3.5)
+
+# 7. Missing model key → no-op.
+_p = {"cfg_scale": 3.5}
+_capture_stderr(g._apply_family_defaults, _p, set(), set())
+check("overlay: missing model key → no-op",
+      _p == {"cfg_scale": 3.5})
+
+# 8. Missing model_index.json → no-op (empty tempdir).
+_empty = tempfile.mkdtemp(prefix="fam_defaults_empty_")
+_tmpdirs_to_cleanup.append(_empty)
+_p = {"model": _empty, "cfg_scale": 3.5}
+_capture_stderr(g._apply_family_defaults, _p, set(), set())
+check("overlay: missing model_index.json → no-op",
+      _p["cfg_scale"] == 3.5)
+
+# 9. Log line format on apply: family name, idx prefix, "defaults applied".
+_p = {"model": _paths["flux"]}
+_, _err = _capture_stderr(
+    g._apply_family_defaults, _p, set(), set(), idx=3,
+)
+check("overlay: log line names family",
+      "family=flux" in _err,
+      f"stderr={_err!r}")
+check("overlay: log line includes idx",
+      "iter 3" in _err,
+      f"stderr={_err!r}")
+check("overlay: log line includes 'defaults applied'",
+      "defaults applied" in _err,
+      f"stderr={_err!r}")
+
+# 10. No applied keys (all explicit) → no log line.
+_p = {"model": _paths["flux"], "cfg_scale": 1.0, "steps": 1}
+_, _err = _capture_stderr(
+    g._apply_family_defaults, _p, {"cfg_scale", "steps"}, set(),
+)
+check("overlay: silent when all family keys are explicit",
+      _err == "",
+      f"stderr={_err!r}")
+
+
+# ──────────────────────────────────────────────────────────────────────
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print("──────────────────────────────────────────────────")

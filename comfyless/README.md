@@ -20,16 +20,17 @@ Every feature reachable from the ComfyUI loader/generate node chain is reachable
 3. [Invocation modes](<#Invocation modes>)
 4. [CLI flag reference](<#CLI flag reference>)
 5. [Sidecar JSON and `--params` replay](<#Sidecar JSON and `--params` replay>)
-6. [Iteration mode (`--iterate`)](<#Iteration mode (--iterate)>)
-7. [Example walkthrough (Qwen-Image)](<#Example walkthrough (Qwen-Image)>)
-8. [Model families and what they accept](<#Model families and what they accept>)
-9. [Component overrides](<#Component overrides>)
-10. [LoRA](<#LoRA>)
-11. [VRAM knobs](<#VRAM knobs>)
-12. [Python function API](<#Python function API>)
-13. [JSON bridge mode](<#JSON bridge mode>)
-14. [Server mode](<#Server mode>)
-15. [Troubleshooting](<#Troubleshooting>)
+6. [Per-family defaults](<#Per-family defaults>)
+7. [Iteration mode (`--iterate`)](<#Iteration mode (--iterate)>)
+8. [Example walkthrough (Qwen-Image)](<#Example walkthrough (Qwen-Image)>)
+9. [Model families and what they accept](<#Model families and what they accept>)
+10. [Component overrides](<#Component overrides>)
+11. [LoRA](<#LoRA>)
+12. [VRAM knobs](<#VRAM knobs>)
+13. [Python function API](<#Python function API>)
+14. [JSON bridge mode](<#JSON bridge mode>)
+15. [Server mode](<#Server mode>)
+16. [Troubleshooting](<#Troubleshooting>)
 
 ---
 
@@ -337,11 +338,30 @@ Fields that couldn't be extracted are logged as warnings and must be filled in v
 
 ### Resolution order
 
-1. `--params` loads the base params (PNG or JSON)
-2. `--override KEY=VALUE` patches apply in order
-3. Any explicit `--flag VALUE` on the command line wins over both
+1. Schema defaults (`COMFYLESS_SCHEMA` in `comfyless/generate.py`)
+2. **Per-family defaults** for cfg/steps/etc. once the model family is detected (see below)
+3. `--params` loads the base params (PNG or JSON)
+4. `--override KEY=VALUE` patches apply in order
+5. Any explicit `--flag VALUE` on the command line wins over the above
+6. `--iterate <axis>` patches override per-iteration last
 
 The params file is the "recipe," `--override` is inline edits, and explicit flags are per-invocation trumps.
+
+---
+
+## Per-family defaults
+
+`comfyless` knows that different model families have different sweet spots. Setting `cfg=3.5` (the schema baseline) starves SDXL/Pony/Illustrious; Qwen-Image wants `true_cfg_scale=4.0` and 50 steps per its model card. Rather than relying on every caller to know each family's preference, `comfyless` overlays family-appropriate defaults automatically once it detects the family from `model_index.json`.
+
+**Where the values live:** [`comfyless/family_defaults.py`](family_defaults.py). One dict, alphabetical by family, one inline comment per entry naming the source. Editing this file is the only change needed to adjust a family's defaults.
+
+**What it controls (today):** `cfg_scale` / `true_cfg_scale` / `steps`. Other keys could be added by extending entries — `sampler` and `schedule` are already supported by the overlay applier and just don't have family-specific values yet.
+
+**Precedence:** family defaults sit between schema defaults and your sidecar/`--override`/explicit flags. Any value you specify deliberately wins. The exception is unset nullable params (e.g. `true_cfg_scale=None` from the schema baseline) — those count as "not explicit" and the family default fills them in. Iterated axes also win — `--iterate cfg_scale [3,4,5]` runs against the iterated values, not the family default.
+
+**When you'll see it:** every run logs `[comfyless] family=<name> defaults applied: <key>=<value>, ...` to stderr. The line is omitted if no family value was applied (because everything was already set).
+
+**Calibration status:** the round-one values in `family_defaults.py` are stubs from official model cards and community consensus. Per-prompt sensitivity is typically better expressed via `--params` sidecars than via further family-default tuning. See [`docs/decisions/ADR-009-per-family-default-params.md`](../docs/decisions/ADR-009-per-family-default-params.md) for the design rationale.
 
 ---
 

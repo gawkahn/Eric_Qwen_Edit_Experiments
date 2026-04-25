@@ -181,6 +181,13 @@ them. The dict is therefore designed for one-edit changes:
 ## Changelog
 
 - **2026-04-25** — proposed and accepted (this document).
+- **2026-04-25** — clarification (reviewer fold-in): the family overlay
+  applies to BOTH the in-process path and the daemon delegation path
+  in `_run_one`, since the overlay runs before the
+  `_delegate_to_server` call. Only `--json` mode skips the overlay
+  (caller responsibility, as documented above). No code change; this
+  is a documentation hedge against future refactors that might split
+  the paths.
 
 ## AI-Disclosure
 

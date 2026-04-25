@@ -58,6 +58,8 @@ from nodes.eric_diffusion_utils import (
 from nodes.eric_diffusion_samplers import sampler_choices, swap_sampler
 from nodes.eric_qwen_edit_lora import load_lora_with_key_fix
 
+from comfyless.family_defaults import FAMILY_DEFAULTS
+
 CONTRACT_VERSION = 1
 SAMPLER_NAMES = sampler_choices()
 SCHEDULE_NAMES = ["linear", "balanced", "karras"]
@@ -522,6 +524,71 @@ def _apply_overrides(params: dict, overrides: list) -> dict:
         key, _, raw = spec.partition("=")
         result[key.strip()] = _coerce(raw.strip())
     return _validate_params(result, source="override")
+
+
+def _explicit_override_keys(overrides: Optional[list]) -> set:
+    """Canonical schema keys named by --override specs.
+
+    Used to seed the explicit_keys tracker for the family-default
+    overlay (ADR-009).  Malformed specs and unknown keys are filtered
+    here — they're already reported by _apply_overrides' validation
+    pass, so we silently skip them rather than double-warning.
+    """
+    if not overrides:
+        return set()
+    keys: set = set()
+    for spec in overrides:
+        if "=" not in spec:
+            continue
+        key = spec.partition("=")[0].strip()
+        if key in COMFYLESS_SCHEMA:
+            keys.add(key)
+    return keys
+
+
+def _apply_family_defaults(
+    p_cur: dict,
+    explicit_keys: set,
+    iterated_axes: set,
+    *,
+    idx: Optional[int] = None,
+) -> None:
+    """Overlay FAMILY_DEFAULTS values onto p_cur in place.
+
+    Reads p_cur["model"] (must be already resolve_hf_path'd), detects
+    the family via detect_pipeline_class, and writes family-default
+    values for keys NOT in explicit_keys and NOT in iterated_axes.
+
+    No-op when:
+      - p_cur has no "model" key,
+      - detect_pipeline_class fails (missing/unreadable model_index.json),
+      - the family has no entry in FAMILY_DEFAULTS,
+      - every key in the family entry is already explicit or iterated.
+
+    See ADR-009 for the full precedence ladder.
+    """
+    model_path = p_cur.get("model")
+    if not model_path:
+        return
+    try:
+        _, _, family = detect_pipeline_class(model_path)
+    except (ValueError, OSError):
+        return
+    fam_defaults = FAMILY_DEFAULTS.get(family, {})
+    if not fam_defaults:
+        return
+    applied: Dict[str, Any] = {}
+    for key, value in fam_defaults.items():
+        if key in explicit_keys or key in iterated_axes:
+            continue
+        if key not in COMFYLESS_SCHEMA:
+            continue
+        p_cur[key] = value
+        applied[key] = value
+    if applied:
+        kv = ", ".join(f"{k}={v!r}" for k, v in applied.items())
+        prefix = f"[comfyless] iter {idx}: " if idx is not None else "[comfyless] "
+        _log(f"{prefix}family={family} defaults applied: {kv}")
 
 
 def _build_call_kwargs(
@@ -1526,12 +1593,21 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
     flags (non-None) win over the sidecar.
     """
     # ── Build effective params ────────────────────────────────────────
+    # explicit_keys tracks every canonical key that came from a deliberate
+    # source (sidecar / --override / non-None CLI flag).  The family-default
+    # overlay (ADR-009) writes ONLY into keys NOT in this set, which is how
+    # we distinguish "user said 3.5" from "schema seeded 3.5" once both
+    # are resident in p as cfg_scale=3.5.
+    explicit_keys: set = set()
+
     if args.params:
         try:
             p = _load_params(args.params)
         except (OSError, json.JSONDecodeError, ValueError) as e:
             print(f"Error loading --params {args.params!r}: {e}", file=sys.stderr)
             return 1
+        explicit_keys |= set(p.keys())
+        explicit_keys |= _explicit_override_keys(args.override)
         try:
             p = _apply_overrides(p, args.override)
         except ValueError as e:
@@ -1539,7 +1615,9 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
             return 1
     else:
         # No sidecar: seed with schema defaults (skipping required fields
-        # which will be sourced from --model / --prompt below).
+        # which will be sourced from --model / --prompt below).  Note:
+        # --override only takes effect with --params (per its --help
+        # text); we don't apply overrides here.
         p = {
             k: default
             for k, (_type, default) in COMFYLESS_SCHEMA.items()
@@ -1555,6 +1633,13 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
         cli_val = _cli_value_for(args, canonical_key)
         if cli_val is not None:
             p[canonical_key] = cli_val
+            explicit_keys.add(canonical_key)
+
+    # --lora is the explicit channel for the loras stack; mirror sidecar
+    # symmetry so a future loras-bearing FAMILY_DEFAULTS entry would not
+    # clobber it.  (No family currently sets loras; this is preventative.)
+    if getattr(args, "lora", None):
+        explicit_keys.add("loras")
 
     # Final validation pass: catches anything an override injected that the
     # schema doesn't know about, or a CLI-merged value whose type is wrong.
@@ -1657,6 +1742,12 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                 except (ValueError, RuntimeError) as e:
                     print(f"Error resolving {_key}: {e}", file=sys.stderr)
                     return 1
+
+        # Family-default overlay (ADR-009): writes family-specific cfg/steps/etc.
+        # for keys not in explicit_keys and not in iterated_axes.  Runs AFTER
+        # HF resolution (model_index.json must be readable) and BEFORE the
+        # daemon delegation / generate() call so values flow through unchanged.
+        _apply_family_defaults(p_cur, explicit_keys, iterated_axes, idx=idx)
 
         # Delegate to daemon when --savepath or default --output; skip on explicit --output.
         using_default_output = args.output == "/tmp/comfyless.png"
