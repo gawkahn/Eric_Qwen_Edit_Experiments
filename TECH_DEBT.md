@@ -28,6 +28,21 @@ steps, max dimensions, and minimum time between model swaps would mitigate this.
 Low urgency on a single-user machine. Trigger: shared-machine deployment.
 See ADR-001.
 
+**No automated test for SGM-prefix + missing-key loader path** *(2026-04-24)*
+The `_load_stripped_in_memory` helper inside `_load_single_weights`
+(`nodes/eric_diffusion_utils.py`) has a known dtype-divergence trap when a
+checkpoint produces `missing_keys` under `load_state_dict(strict=False,
+assign=True)`. Today's fix raises and falls through to the temp-file path on
+that condition, but a regression here would only surface in live use with a
+real Flux/Klein finetune fixture (multi-GB safetensors with the
+`model.diffusion_model.` SGM prefix and an architecture mismatch vs the
+diffusers config). The bug from `eb571a8` (2026-04-21) reached the user
+because no test exercised this path. Trigger to revisit: any change to
+`_load_stripped_in_memory`, `_peek_dominant_prefix` thresholds, or the
+diffusers pin. Possible fix shapes: a tiny synthetic state-dict fixture that
+omits known keys + a stub config; OR a smoke-only integration test gated by
+an env var pointing at a real fixture path.
+
 **Client-side recv timeout is a flat 600s ceiling** *(2026-04-24)*
 `_CLIENT_RECV_TIMEOUT_SEC = 600.0` in `comfyless/server.py` is a compile-time
 constant. Realistic tail: a 50-MP Qwen-Image-2512 run at 50 steps with tile-VAE

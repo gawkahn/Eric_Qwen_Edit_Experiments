@@ -561,9 +561,23 @@ def _load_single_weights(component_class, weights_path: str, dtype,
         incompat = model.load_state_dict(stripped, strict=False, assign=True)
         del stripped
         if incompat.missing_keys:
-            print(f"[EricDiffusion] in-memory strip: "
-                  f"{len(incompat.missing_keys)} missing / "
-                  f"{len(incompat.unexpected_keys)} unexpected keys")
+            # In-memory path uses from_config() + load_state_dict(assign=True).
+            # Loaded params take target_dtype (we cast in the strip loop above),
+            # but missing keys retain from_config()'s default dtype (fp32). At
+            # generate time the bf16 text-encoder output hits a fp32 layer
+            # weight (e.g. Flux.2 context_embedder) and the mat-mul fails with
+            # "BFloat16 != float". Raising here defers to the temp-file path
+            # below, which routes through diffusers' from_single_file —
+            # historically the only working loader for SGM-prefixed checkpoints
+            # with missing keys. The in-memory perf optimization (commit
+            # eb571a8, 2026-04-21) still wins for the common no-missing-keys
+            # case; only fall through when the load wouldn't be usable.
+            raise RuntimeError(
+                f"in-memory strip produced "
+                f"{len(incompat.missing_keys)} missing / "
+                f"{len(incompat.unexpected_keys)} unexpected keys; "
+                f"deferring to temp-file fallback for dtype consistency"
+            )
         return model
 
     def _write_prefix_stripped_temp(src_path: str, prefix: str) -> str:
