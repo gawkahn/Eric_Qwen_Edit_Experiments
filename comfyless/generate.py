@@ -78,40 +78,127 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+# ── Params schema (single source of truth) ───────────────────────────────
+
+# Canonical name → (type-or-tuple-of-types, default).
+#
+# Defaults with value None mark REQUIRED fields (model, prompt) — the
+# required-field gate at _run_cli_mode() around the --model/--prompt check
+# still owns that check; the schema merely labels them.
+#
+# Types are checked by _validate_params via isinstance(); tuple targets
+# accept any listed type (e.g. int OR float for cfg_scale).  Coercion is
+# out of scope for this refactor (a string "4" stays a string + warning).
+#
+# Covers every param reachable by generate() that can originate from
+# sidecar JSON, Eric Diffusion Save chunks, ComfyUI prompt chunks, PNG
+# comfyless chunks, --override patches, or the CLI merge block.  Runtime-
+# only flags (precision, device, offload_vae, attention_slicing,
+# sequential_offload, allow_hf_download) flow straight from argparse and
+# are NOT sidecar-shaped, so they live outside the schema.
+COMFYLESS_SCHEMA: Dict[str, tuple] = {
+    # Required
+    "model":                (str,           None),
+    "prompt":               (str,           None),
+    # Text
+    "negative_prompt":      (str,           ""),
+    # Numerics
+    "seed":                 (int,           -1),
+    "steps":                (int,           28),
+    "cfg_scale":            ((int, float),  3.5),
+    # true_cfg_scale is nullable → None or number; the generate() sig
+    # treats None as "unset, fall back to cfg_scale".
+    "true_cfg_scale":       ((int, float, type(None)), None),
+    "width":                (int,           1024),
+    "height":               (int,           1024),
+    # Sampler / schedule identifiers
+    "sampler":              (str,           "default"),
+    "schedule":             (str,           "linear"),
+    # Encoder context length
+    "max_sequence_length":  (int,           512),
+    # Component overrides (empty string = "use base model's component")
+    "transformer_path":     (str,           ""),
+    "vae_path":             (str,           ""),
+    "text_encoder_path":    (str,           ""),
+    "text_encoder_2_path":  (str,           ""),
+    "vae_from_transformer": (bool,          False),
+    # LoRA stack — list of {"path": str, "weight": float} dicts.
+    "loras":                (list,          []),
+}
+
+
+# CLI argparse-attr name → canonical schema key.  Only names that DIFFER
+# from their canonical target.  Identical pairs (negative_prompt,
+# vae_from_transformer, model, prompt, seed, steps, width, height,
+# sampler, schedule) are NOT listed — _cli_value_for falls back to
+# getattr(args, canonical_key) for those.
+_CLI_TO_CANONICAL: Dict[str, str] = {
+    "cfg":         "cfg_scale",
+    "true_cfg":    "true_cfg_scale",
+    "max_seq_len": "max_sequence_length",
+    "transformer": "transformer_path",
+    "vae":         "vae_path",
+    "te1":         "text_encoder_path",
+    "te2":         "text_encoder_2_path",
+    "lora":        "loras",
+}
+
+
 # ── Sidecar / override helpers ───────────────────────────────────────────
 
+# Non-schema keys written by generate() into the metadata sidecar / PNG
+# chunk (timestamps, elapsed, etc).  Dropped on sidecar load so stale
+# metrics don't leak into the next run.  Strictly narrower than the schema
+# filter — these are known-and-intentional non-params, not "unknown to us".
 _SKIP_SIDECAR_KEYS = {"timestamp", "elapsed_seconds", "contract_version",
                       "lora_warnings", "model_family"}
 
-# Keys written by Eric Diffusion Save that are not comfyless CLI params.
-# model_path is handled separately (renamed → model).
-_ERIC_SAVE_DROP = _SKIP_SIDECAR_KEYS | {
-    "node_type", "model_name", "sampler_s2", "sampler_s3", "loras", "model_path",
-}
 
-_CLI_DEFAULTS = {
-    "negative_prompt": "",
-    "seed": -1,
-    "steps": 28,
-    "cfg": 3.5,
-    "true_cfg": None,
-    "width": 1024,
-    "height": 1024,
-    "sampler": "default",
-    "schedule": "linear",
-    "max_seq_len": 512,
-    "transformer_path": "",
-    "vae_path": "",
-    "text_encoder_path": "",
-    "text_encoder_2_path": "",
-    "vae_from_transformer": False,
-}
+def _type_name(t) -> str:
+    """Human-readable type name for validator warnings."""
+    if isinstance(t, tuple):
+        return " | ".join(_type_name(x) for x in t)
+    if t is type(None):
+        return "None"
+    return getattr(t, "__name__", str(t))
+
+
+def _validate_params(p: dict, *, source: str) -> dict:
+    """Clean an input params dict against COMFYLESS_SCHEMA.
+
+    Behavior:
+      - Unknown keys → DROPPED, warning logged to stderr naming key + source.
+      - Type mismatches → KEPT (no silent coercion), warning logged.
+      - Missing required keys → not flagged here (the CLI's required-field
+        gate owns that check; it runs after the final merge).
+      - Returns a new dict; does not mutate input.
+
+    `source` is a short human-readable string (e.g. "sidecar:/path/foo.json",
+    "eric-save:foo.png", "cli-merged") that appears in every warning so the
+    user can trace which layer introduced the bad key.
+    """
+    cleaned: Dict[str, Any] = {}
+    for key, value in p.items():
+        if key not in COMFYLESS_SCHEMA:
+            _log(f"[comfyless] schema: dropping unknown key {key!r} from {source}")
+            continue
+        expected_type, _default = COMFYLESS_SCHEMA[key]
+        # isinstance() accepts a tuple natively — use the raw expected_type.
+        if not isinstance(value, expected_type):
+            _log(
+                f"[comfyless] schema: {key!r} expected {_type_name(expected_type)}, "
+                f"got {type(value).__name__} from {source}"
+            )
+            # KEEP the value; the user can see the warning and debug.
+        cleaned[key] = value
+    return cleaned
 
 
 def _load_sidecar(path: str) -> dict:
     with open(path) as f:
         data = json.load(f)
-    return {k: v for k, v in data.items() if k not in _SKIP_SIDECAR_KEYS}
+    data = {k: v for k, v in data.items() if k not in _SKIP_SIDECAR_KEYS}
+    return _validate_params(data, source=f"sidecar:{path}")
 
 
 def _load_params(path: str) -> dict:
@@ -124,21 +211,36 @@ def _load_params(path: str) -> dict:
 def _extract_eric_save_params(params_json: str, path: str) -> dict:
     """Extract gen params from an Eric Diffusion Save 'parameters' tEXt chunk.
 
-    Renames model_path → model; drops node-internal fields not used by comfyless.
-    LoRA weights stored in the chunk are not replayed (format mismatch); use --lora.
+    Emits canonical schema keys only — node-internal fields and unknown keys
+    are dropped by _validate_params.  model_path is explicitly renamed to
+    model (the only non-canonical name Eric Diffusion Save emits that we
+    care about).  LoRA weights stored in the chunk are not replayed
+    (format mismatch); use --lora.
     """
     try:
         data = json.loads(params_json)
     except json.JSONDecodeError as e:
         raise ValueError(f"parameters chunk in {path!r} is not valid JSON: {e}")
 
-    out = {k: v for k, v in data.items() if k not in _ERIC_SAVE_DROP}
-    if "model_path" in data:
-        out["model"] = data["model_path"]
+    # Rename model_path → model BEFORE validation so the renamed key survives.
+    if "model_path" in data and "model" not in data:
+        data = dict(data)
+        data["model"] = data.pop("model_path")
+
+    had_loras = bool(data.get("loras"))
+
+    # Validator drops node-internal fields (node_type, model_name, sampler_s2,
+    # sampler_s3, model_path, etc.) as "unknown keys".  loras is a schema key
+    # but Eric Diffusion Save stores it in an unreplayable format — warn and
+    # drop before validation so the user relies on --lora explicitly.
+    if "loras" in data:
+        data = {k: v for k, v in data.items() if k != "loras"}
+
+    out = _validate_params(data, source=f"eric-save:{path}")
 
     _log(f"[comfyless] Eric Diffusion Save parameters chunk — extracted {sorted(out.keys())}")
 
-    if data.get("loras"):
+    if had_loras:
         print(
             "WARNING: LoRAs were active when this image was saved but will NOT be "
             "replayed.\n"
@@ -169,7 +271,8 @@ def _load_params_from_png(path: str) -> dict:
             data = json.loads(raw)
         except json.JSONDecodeError as e:
             raise ValueError(f"comfyless chunk in {path!r} is not valid JSON: {e}")
-        return {k: v for k, v in data.items() if k not in _SKIP_SIDECAR_KEYS}
+        data = {k: v for k, v in data.items() if k not in _SKIP_SIDECAR_KEYS}
+        return _validate_params(data, source=f"png:{path}")
 
     raw = info.get("parameters")
     if raw:
@@ -262,7 +365,7 @@ def _extract_comfyui_params(prompt_json: str) -> dict:
     if "model" not in params:
         _log("[comfyless] ComfyUI: model path not set — use --override model=<path>")
 
-    return params
+    return _validate_params(params, source="comfyui-prompt")
 
 
 def _coerce(value: str):
@@ -418,7 +521,7 @@ def _apply_overrides(params: dict, overrides: list) -> dict:
             raise ValueError(f"--override {spec!r}: expected key=value format")
         key, _, raw = spec.partition("=")
         result[key.strip()] = _coerce(raw.strip())
-    return result
+    return _validate_params(result, source="override")
 
 
 def _build_call_kwargs(
@@ -1323,6 +1426,20 @@ def _confirm_iteration(total: int, auto_yes: bool) -> bool:
     return ans.strip().lower() in ("y", "yes")
 
 
+def _cli_value_for(args: argparse.Namespace, canonical_key: str) -> Any:
+    """Return the argparse value for a canonical schema key, or None if unset.
+
+    Walks _CLI_TO_CANONICAL in reverse to find the argparse attribute name
+    that maps to the canonical key, then falls back to the canonical name
+    itself (for --model, --prompt, --seed, --steps, --width, --height,
+    --sampler, --schedule which are already canonical).
+    """
+    for cli_name, canon in _CLI_TO_CANONICAL.items():
+        if canon == canonical_key:
+            return getattr(args, cli_name, None)
+    return getattr(args, canonical_key, None)
+
+
 def _run_cli_mode(args: argparse.Namespace) -> int:
     """Human CLI mode: argparse flags, human-readable output.
 
@@ -1342,49 +1459,28 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
         except ValueError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 1
-        # Explicit CLI flags (sentinel = None means "not set") win over sidecar
-        for sidecar_key, cli_val in [
-            ("model",              args.model),
-            ("prompt",             args.prompt),
-            ("negative_prompt",    args.negative_prompt),
-            ("seed",               args.seed),
-            ("steps",              args.steps),
-            ("cfg_scale",          args.cfg),
-            ("true_cfg_scale",     args.true_cfg),
-            ("width",              args.width),
-            ("height",             args.height),
-            ("sampler",            args.sampler),
-            ("schedule",           args.schedule),
-            ("max_sequence_length", args.max_seq_len),
-            ("transformer_path",    args.transformer),
-            ("vae_path",            args.vae),
-            ("text_encoder_path",   args.te1),
-            ("text_encoder_2_path", args.te2),
-            ("vae_from_transformer", args.vae_from_transformer),
-        ]:
-            if cli_val is not None:
-                p[sidecar_key] = cli_val
     else:
-        d = _CLI_DEFAULTS
+        # No sidecar: seed with schema defaults (skipping required fields
+        # which will be sourced from --model / --prompt below).
         p = {
-            "model":               args.model,
-            "prompt":              args.prompt,
-            "negative_prompt":     args.negative_prompt   if args.negative_prompt is not None else d["negative_prompt"],
-            "seed":                args.seed              if args.seed              is not None else d["seed"],
-            "steps":               args.steps             if args.steps             is not None else d["steps"],
-            "cfg_scale":           args.cfg               if args.cfg               is not None else d["cfg"],
-            "true_cfg_scale":      args.true_cfg          if args.true_cfg          is not None else d["true_cfg"],
-            "width":               args.width             if args.width             is not None else d["width"],
-            "height":              args.height            if args.height            is not None else d["height"],
-            "sampler":             args.sampler           if args.sampler           is not None else d["sampler"],
-            "schedule":            args.schedule          if args.schedule          is not None else d["schedule"],
-            "max_sequence_length": args.max_seq_len       if args.max_seq_len       is not None else d["max_seq_len"],
-            "transformer_path":    args.transformer       if args.transformer       is not None else d["transformer_path"],
-            "vae_path":            args.vae               if args.vae               is not None else d["vae_path"],
-            "text_encoder_path":   args.te1               if args.te1               is not None else d["text_encoder_path"],
-            "text_encoder_2_path": args.te2               if args.te2               is not None else d["text_encoder_2_path"],
-            "vae_from_transformer": args.vae_from_transformer if args.vae_from_transformer is not None else d["vae_from_transformer"],
+            k: default
+            for k, (_type, default) in COMFYLESS_SCHEMA.items()
+            if default is not None and k != "loras"
         }
+
+    # Explicit CLI flags (sentinel = None means "not set") win over whatever
+    # the sidecar / overrides / defaults put in the dict.  Driven off the
+    # schema so every canonical key is considered exactly once.
+    for canonical_key in COMFYLESS_SCHEMA:
+        if canonical_key == "loras":
+            continue  # loras is sourced from --lora via _parse_lora_arg below
+        cli_val = _cli_value_for(args, canonical_key)
+        if cli_val is not None:
+            p[canonical_key] = cli_val
+
+    # Final validation pass: catches anything an override injected that the
+    # schema doesn't know about, or a CLI-merged value whose type is wrong.
+    p = _validate_params(p, source="cli-merged")
 
     # ── Plan iterations (no-op when --iterate is absent) ──────────────────
     # Run BEFORE the required-field check so that --iterate prompt/--iterate model
@@ -1500,9 +1596,9 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                 args.savepath,
                 p_cur["model"],
                 seed_for_path,
-                p_cur.get("steps", _CLI_DEFAULTS["steps"]),
-                p_cur.get("cfg_scale", _CLI_DEFAULTS["cfg"]),
-                p_cur.get("sampler", _CLI_DEFAULTS["sampler"]),
+                p_cur.get("steps", COMFYLESS_SCHEMA["steps"][1]),
+                p_cur.get("cfg_scale", COMFYLESS_SCHEMA["cfg_scale"][1]),
+                p_cur.get("sampler", COMFYLESS_SCHEMA["sampler"][1]),
                 transformer_path=p_cur.get("transformer_path", ""),
                 iterate_inputs=iterate_inputs,
             )
