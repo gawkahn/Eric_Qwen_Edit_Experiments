@@ -503,9 +503,14 @@ def _reject_unsupported_flags(args: argparse.Namespace) -> Optional[str]:
         bad.append("--width / --height (Cascade dimensions are JSON-owned)")
     if args.sampler is not None or args.schedule is not None:
         bad.append("--sampler / --schedule (Cascade scheduler is fixed: DDPMWuerstchenScheduler)")
-    if args.iterate:
-        bad.append("--iterate (Cascade iterates via positional configs: "
-                   "--model stablecascade c1.json c2.json ...)")
+    # --iterate: only `prompt` and `seed` axes are meaningful for cascade. Topology
+    # iteration uses positional configs instead.
+    bad_axes = [param for param, _ in (args.iterate or []) if param not in ("prompt", "seed")]
+    if bad_axes:
+        bad.append(
+            f"--iterate {bad_axes[0]} (Cascade --iterate supports only `prompt` and `seed`; "
+            f"topology variations use positional configs: --model stablecascade c1.json c2.json ...)"
+        )
     if args.params is not None or args.override:
         bad.append("--params / --override (Cascade replays via positional config paths; "
                    "edit a saved sidecar JSON and pass it as a positional arg instead)")
@@ -602,16 +607,39 @@ def dispatch(args: argparse.Namespace, config_paths: List[str]) -> int:
             return 2
         configs.append((p, cfg))
 
+    # ── Read --iterate axes (cascade-supported subset: prompt, seed) ──
+    iterate_lists: Dict[str, List[Any]] = {}
+    for param, file_path in (args.iterate or []):
+        if not os.path.isfile(file_path):
+            print(f"Error: --iterate {param}: file not found: {file_path}", file=sys.stderr)
+            return 2
+        try:
+            with open(file_path) as f:
+                data = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"Error: --iterate {param}: {file_path!r}: invalid JSON: {e}", file=sys.stderr)
+            return 2
+        if not isinstance(data, list) or not data:
+            print(f"Error: --iterate {param}: {file_path!r}: must be a non-empty JSON list",
+                  file=sys.stderr)
+            return 2
+        iterate_lists[param] = data
+
     # ── Build flat run plan ───────────────────────────────────────────
-    # Each plan entry = (cfg_path, cfg_dict, batch_index_within_config).
-    # Plan order: c1×batch_0, c1×batch_1, ..., c2×batch_0, c2×batch_1, ...
-    # This grouping lets us load each config's pipelines once and reuse across
-    # its batch slots before disposing.
+    # Each plan entry = (cfg_path, cfg_dict, batch_index, prompt_override, seed_override).
+    # _override slots are None when no --iterate axis covers that field, in which
+    # case the per-run seed/prompt resolution falls back to CLI > sidecar > random.
+    # Plan order groups by cfg first so pipelines load once per cfg, then expands
+    # batch × prompt × seed within each cfg.
     batch = max(int(args.batch or 1), 1)
-    plan: List[Tuple[str, Dict[str, Any], int]] = []
+    prompts_axis = iterate_lists.get("prompt", [None])  # [None] = no override
+    seeds_axis   = iterate_lists.get("seed",   [None])
+    plan: List[Tuple[str, Dict[str, Any], int, Any, Any]] = []
     for cfg_path, cfg in configs:
         for batch_index in range(batch):
-            plan.append((cfg_path, cfg, batch_index))
+            for prompt_iter in prompts_axis:
+                for seed_iter in seeds_axis:
+                    plan.append((cfg_path, cfg, batch_index, prompt_iter, seed_iter))
 
     # Apply --limit: silent truncation (ceiling, not requirement). Matches ADR-008
     # and ADR-010 §2 semantics.
@@ -648,11 +676,17 @@ def dispatch(args: argparse.Namespace, config_paths: List[str]) -> int:
     prior_pipe = None
     decoder_pipe = None
 
-    for run_index, (cfg_path, cfg, batch_index) in enumerate(plan):
-        # Per-config replay defaults from JSON (CLI overrides if present).
-        prompt = cli_prompt if cli_prompt is not None else cfg.get("prompt")
+    for run_index, (cfg_path, cfg, batch_index, prompt_iter, seed_iter) in enumerate(plan):
+        # Prompt resolution: --iterate prompt wins > CLI --prompt > JSON `prompt`.
+        if prompt_iter is not None:
+            prompt = prompt_iter
+        elif cli_prompt is not None:
+            prompt = cli_prompt
+        else:
+            prompt = cfg.get("prompt")
         if not prompt:
-            print(f"Error: no prompt provided (--prompt or {cfg_path!r}'s 'prompt' field)",
+            print(f"Error: no prompt provided (--prompt, --iterate prompt, "
+                  f"or {cfg_path!r}'s 'prompt' field)",
                   file=sys.stderr)
             fail_count += 1
             continue
@@ -687,13 +721,24 @@ def dispatch(args: argparse.Namespace, config_paths: List[str]) -> int:
         if prior_pipe is None or decoder_pipe is None:
             continue
 
-        if cli_seed_raw is not None:
-            raw_seed = cli_seed_raw
-        elif "seed" in cfg:
-            raw_seed = cfg["seed"]
+        # Seed resolution: --iterate seed wins > CLI --seed > JSON `seed` > random.
+        # When --iterate seed is supplying the value, batch_index does NOT add to it
+        # (the user explicitly listed each seed they wanted).
+        if seed_iter is not None:
+            try:
+                eff_seed = _resolve_seed(int(seed_iter))
+            except (TypeError, ValueError):
+                print(f"Error: --iterate seed value {seed_iter!r} is not an int", file=sys.stderr)
+                fail_count += 1
+                continue
         else:
-            raw_seed = -1
-        eff_seed = _effective_seed_for_batch(raw_seed, batch_index)
+            if cli_seed_raw is not None:
+                raw_seed = cli_seed_raw
+            elif "seed" in cfg:
+                raw_seed = cfg["seed"]
+            else:
+                raw_seed = -1
+            eff_seed = _effective_seed_for_batch(raw_seed, batch_index)
 
         out_path = _resolve_output_path(args.output, total, run_index)
         _log(f"[comfyless] cascade run {run_index + 1}/{total} : seed={eff_seed} → {out_path}")

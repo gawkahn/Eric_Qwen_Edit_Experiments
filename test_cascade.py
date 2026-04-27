@@ -319,8 +319,13 @@ with tempfile.TemporaryDirectory() as tmp:
     rc = c.dispatch(make_cli_args(sampler="multistep2"), [cfg_path])
     check("--sampler rejected", rc == 2)
 
-    rc = c.dispatch(make_cli_args(iterate=[("seed", "/tmp/seeds.json")]), [cfg_path])
-    check("--iterate rejected", rc == 2)
+    # --iterate prompt and --iterate seed are SUPPORTED axes. Bad iterate axes
+    # (e.g. cfg_scale, model) are rejected.
+    rc = c.dispatch(make_cli_args(iterate=[("cfg_scale", "/tmp/cfgs.json")]), [cfg_path])
+    check("--iterate cfg_scale rejected (unsupported axis)", rc == 2)
+
+    rc = c.dispatch(make_cli_args(iterate=[("model", "/tmp/models.json")]), [cfg_path])
+    check("--iterate model rejected (unsupported axis)", rc == 2)
 
     rc = c.dispatch(make_cli_args(params="/tmp/foo.json"), [cfg_path])
     check("--params rejected", rc == 2)
@@ -430,6 +435,84 @@ with tempfile.TemporaryDirectory() as tmp:
     check("--limit smaller than total does not pre-reject",
           rc != 2 or rc == 3,
           f"expected pipeline-build failure (rc=3), got rc={rc}")
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n── dispatch: --iterate prompt / seed accepted ───────────────")
+
+with tempfile.TemporaryDirectory() as tmp:
+    cfg_path = os.path.join(tmp, "cfg.json")
+    write_json(minimal, cfg_path)
+    prompts_path = os.path.join(tmp, "prompts.json")
+    write_json(["a", "b", "c"], prompts_path)
+    seeds_path = os.path.join(tmp, "seeds.json")
+    write_json([1, 2], seeds_path)
+
+    # --iterate prompt: passes flag rejection; fails downstream at pipeline build
+    # (no real weights). rc != 2 means it got past flag rejection.
+    rc = c.dispatch(make_cli_args(iterate=[("prompt", prompts_path)]), [cfg_path])
+    check("--iterate prompt accepted (passes rejection)", rc != 2,
+          f"expected pipeline-build failure (rc=3), got rc={rc}")
+
+    rc = c.dispatch(make_cli_args(iterate=[("seed", seeds_path)]), [cfg_path])
+    check("--iterate seed accepted (passes rejection)", rc != 2,
+          f"got rc={rc}")
+
+    # Combined prompt + seed → Cartesian.
+    rc = c.dispatch(make_cli_args(iterate=[("prompt", prompts_path), ("seed", seeds_path)]),
+                    [cfg_path])
+    check("--iterate prompt + seed accepted", rc != 2,
+          f"got rc={rc}")
+
+    # Bad axes raise.
+    bad_path = os.path.join(tmp, "bad.json")
+    write_json(["x"], bad_path)
+    rc = c.dispatch(make_cli_args(iterate=[("cfg_scale", bad_path)]), [cfg_path])
+    check("--iterate cfg_scale rejected", rc == 2)
+
+    # Mixed: one good, one bad → rejected.
+    rc = c.dispatch(make_cli_args(iterate=[("prompt", prompts_path), ("cfg_scale", bad_path)]),
+                    [cfg_path])
+    check("--iterate prompt + cfg_scale (mixed) rejected", rc == 2)
+
+    # Empty iterate file rejected.
+    empty_path = os.path.join(tmp, "empty.json")
+    write_json([], empty_path)
+    rc = c.dispatch(make_cli_args(iterate=[("prompt", empty_path)]), [cfg_path])
+    check("--iterate empty list rejected", rc == 2)
+
+    # Missing iterate file rejected.
+    rc = c.dispatch(
+        make_cli_args(iterate=[("prompt", "/tmp/no-such-prompts.json")]), [cfg_path]
+    )
+    check("--iterate missing file rejected", rc == 2)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n── plan expansion math (cfg × batch × prompt × seed) ────────")
+
+# Verify the plan-build math without actually invoking dispatch (which needs
+# pipelines). We exercise the same loop structure inline.
+def _build_plan(num_configs, batch, num_prompts, num_seeds):
+    cfg_stub = {"stage_c": "x", "stage_b": "y"}
+    configs = [(f"c{i}.json", cfg_stub) for i in range(num_configs)]
+    prompts = list(range(num_prompts)) if num_prompts else [None]
+    seeds = list(range(num_seeds)) if num_seeds else [None]
+    plan = []
+    for cfg_path, cfg in configs:
+        for batch_index in range(max(batch, 1)):
+            for p in prompts:
+                for s in seeds:
+                    plan.append((cfg_path, cfg, batch_index, p, s))
+    return plan
+
+check("1 cfg × 1 batch × 1 prompt × 1 seed = 1 run", len(_build_plan(1, 1, 0, 0)) == 1)
+check("1 cfg × 1 batch × 3 prompts × 1 seed = 3 runs", len(_build_plan(1, 1, 3, 0)) == 3)
+check("1 cfg × 2 batch × 3 prompts × 1 seed = 6 runs", len(_build_plan(1, 2, 3, 0)) == 6)
+check("1 cfg × 1 batch × 3 prompts × 2 seeds = 6 runs", len(_build_plan(1, 1, 3, 2)) == 6)
+check("2 cfg × 1 batch × 3 prompts × 2 seeds = 12 runs", len(_build_plan(2, 1, 3, 2)) == 12)
+check("plan grouped by cfg first",
+      [e[0] for e in _build_plan(2, 1, 2, 0)] == ["c0.json", "c0.json", "c1.json", "c1.json"])
 
 
 # ──────────────────────────────────────────────────────────────────────

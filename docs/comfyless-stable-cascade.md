@@ -76,18 +76,35 @@ The loader branches on `os.path.isfile` vs `os.path.isdir`. The JSON field name 
 
 ---
 
-## Iteration: pass multiple configs
+## Iteration
+
+Two ways to expand a single invocation into many runs.
+
+**Topology iteration — pass multiple configs.** Each positional config is a complete cascade (paths, dtypes, denoising params). Configs run left-to-right; pipelines tear down and rebuild between configs.
 
 ```bash
 $PY -m comfyless.generate \
-    --model stablecascade c1.json c2.json c3.json \
+    --model stablecascade full.json lite.json \
     --prompt "..." --seed 42 \
-    --output /tmp/sweep_%input%.png
+    --output /tmp/cascade-output
 ```
 
-Configs run left-to-right. The pipelines are torn down and rebuilt at each config boundary (no cross-config caching). Within a single config, `--batch N` runs N iterations against the loaded pipelines before disposal. `--limit M` caps the total run count across all configs.
+**Prompt / seed iteration — `--iterate prompt` or `--iterate seed`.** Cascade-supported subset of the standard `--iterate` axis system (ADR-008). Both accept a JSON list file. Cartesian-product when both are given.
 
-This is intentionally simpler than the `--iterate` axis system used elsewhere — Cascade has too few real swap candidates to justify Cartesian-product machinery. Each config is a complete, self-contained representation; we never patch one into another.
+```bash
+$PY -m comfyless.generate \
+    --model stablecascade full.json \
+    --iterate prompt /path/to/prompts.json \
+    --seed 42 \
+    --output /tmp/cascade-sweep \
+    --max-iterations 1500
+```
+
+Other `--iterate` axes (`cfg_scale`, `model`, `transformer`, …) are rejected — those are JSON-config concerns. Within a sweep, pipelines load once per config and are reused across all prompts × seeds × batch repetitions of that config before disposal.
+
+**`--batch N`** runs N repetitions per (config, prompt, seed) tuple. Pair with `--seed -1` for fresh random seeds per repeat.
+
+**`--limit M`** caps the total run count across all expanded combinations (silent truncation, ceiling not requirement). **`--max-iterations N`** is a hard fail-closed cap (default 500).
 
 ---
 

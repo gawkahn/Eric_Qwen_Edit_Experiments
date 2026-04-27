@@ -285,3 +285,18 @@ landing the alt-file ergonomics, daily-use cost is low.
   this ADR → `docs/comfyless-stable-cascade.md` → `convert_cascade_comfyui.py`
   → `comfyless/cascade.py` + dispatch fork → tests → `code-reviewer`
   (Opus) → commit.
+
+- **2026-04-26 (amendment)**: Original decision said `--iterate` was
+  rejected wholesale ("Cascade iterates via positional configs"). That
+  reasoning held for *topology* iteration but starved the legitimate
+  prompt/seed sweep use case — the user's documented 1000-prompt ×
+  multi-model word-salad workflow needs *one* config and *N* prompts,
+  not the inverse. Loosened to accept the `--iterate prompt` and
+  `--iterate seed` axes only; other axes (`cfg_scale`, `model`,
+  `transformer`, etc.) remain rejected as JSON-config concerns. Plan
+  expansion order: cfg (outer) × batch × prompt × seed (innermost), so
+  pipelines load once per config and are reused across the sweep.
+  `--limit` and `--max-iterations` apply to the post-Cartesian total.
+  Decision: §2 still holds for topology; §1's "no Cartesian-product
+  machinery" is narrowed to "no cfg-axis Cartesian," prompt/seed
+  Cartesian is a small bounded extension.
