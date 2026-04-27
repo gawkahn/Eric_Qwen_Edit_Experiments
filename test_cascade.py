@@ -274,6 +274,96 @@ with tempfile.TemporaryDirectory() as tmp:
 
 
 # ──────────────────────────────────────────────────────────────────────
+print("\n── _scan_existing_offset / continuation numbering ───────────")
+
+with tempfile.TemporaryDirectory() as tmp:
+    # Empty dir → offset 0.
+    check("empty dir → offset 0", c._scan_existing_offset(tmp) == 0)
+
+    # Dir with cascade_0001…0050.png → offset 50.
+    for i in range(1, 51):
+        Path(os.path.join(tmp, f"cascade_{i:04d}.png")).touch()
+    check("50 existing files → offset 50", c._scan_existing_offset(tmp) == 50)
+
+    # Non-matching files don't affect offset.
+    Path(os.path.join(tmp, "random.png")).touch()
+    Path(os.path.join(tmp, "cascade.png")).touch()  # no number, ignored
+    Path(os.path.join(tmp, "cascade_0001.json")).touch()  # sidecar, ignored
+    check("non-matching files don't change offset", c._scan_existing_offset(tmp) == 50)
+
+    # Sparse / non-contiguous: highest wins.
+    Path(os.path.join(tmp, "cascade_9999.png")).touch()
+    check("sparse + highest wins", c._scan_existing_offset(tmp) == 9999)
+
+    # Offset feeds _resolve_output_path correctly.
+    out = c._resolve_output_path(tmp, total_iterations=100, run_index=0, dir_offset=50)
+    check("dir_offset=50, run 0 → cascade_0051.png",
+          out == os.path.join(tmp, "cascade_0051.png"))
+    out = c._resolve_output_path(tmp, total_iterations=100, run_index=99, dir_offset=50)
+    check("dir_offset=50, run 99 → cascade_0150.png",
+          out == os.path.join(tmp, "cascade_0150.png"))
+
+    # Single-iter + dir_offset=0 keeps the unnumbered cascade.png form.
+    out = c._resolve_output_path(tmp, total_iterations=1, run_index=0, dir_offset=0)
+    check("dir + single + offset=0 → cascade.png (legacy unnumbered form)",
+          out == os.path.join(tmp, "cascade.png"))
+
+    # Single-iter + dir_offset>0 → numbered (continuation).
+    out = c._resolve_output_path(tmp, total_iterations=1, run_index=0, dir_offset=42)
+    check("dir + single + offset>0 → cascade_NNNN.png (continuation)",
+          out == os.path.join(tmp, "cascade_0043.png"))
+
+# File-shaped base offset scan (uses the file's stem as the prefix).
+with tempfile.TemporaryDirectory() as tmp:
+    base = os.path.join(tmp, "myrun.png")
+    Path(os.path.join(tmp, "myrun_0001.png")).touch()
+    Path(os.path.join(tmp, "myrun_0007.png")).touch()
+    Path(os.path.join(tmp, "other_0099.png")).touch()  # different stem, ignored
+    check("file-base offset scan: highest matching stem wins",
+          c._scan_existing_offset(base) == 7)
+    out = c._resolve_output_path(base, total_iterations=10, run_index=0, dir_offset=7)
+    check("file-base + offset → <stem>_<NNNN>.png continues",
+          out == os.path.join(tmp, "myrun_0008.png"))
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n── _resolve_cascade_savepath / template expansion ───────────")
+
+# Build a minimal cfg dict.
+sp_cfg = {"prior_steps": 20, "prior_cfg_scale": 4.0}
+
+with tempfile.TemporaryDirectory() as tmp:
+    # %input% expansion via iterate_inputs.
+    template = os.path.join(tmp, "%input%", "cascade")
+    iterate_inputs = {"prompt": "prompt1-100", "_primary": "prompt1-100"}
+    out = c._resolve_cascade_savepath(template, eff_seed=42, cfg=sp_cfg,
+                                       iterate_inputs=iterate_inputs)
+    check("%input% expands and writes into per-input subdir",
+          out == os.path.join(tmp, "prompt1-100", "cascade_0001.png"))
+    Path(out).touch()
+
+    # Second call to the same template auto-counters past existing.
+    out = c._resolve_cascade_savepath(template, eff_seed=42, cfg=sp_cfg,
+                                       iterate_inputs=iterate_inputs)
+    check("savepath auto-counter increments past existing",
+          out == os.path.join(tmp, "prompt1-100", "cascade_0002.png"))
+
+    # Different %input% goes to a different dir, fresh counter.
+    out = c._resolve_cascade_savepath(template, eff_seed=42, cfg=sp_cfg,
+                                       iterate_inputs={"prompt": "prompt101-200",
+                                                       "_primary": "prompt101-200"})
+    check("different %input% → different subdir, fresh counter",
+          out == os.path.join(tmp, "prompt101-200", "cascade_0001.png"))
+
+    # %seed% expansion.
+    template_seed = os.path.join(tmp, "seed_%seed%", "cascade")
+    out = c._resolve_cascade_savepath(template_seed, eff_seed=42, cfg=sp_cfg,
+                                       iterate_inputs={})
+    check("%seed% expands",
+          out == os.path.join(tmp, "seed_42", "cascade_0001.png"))
+
+
+# ──────────────────────────────────────────────────────────────────────
 print("\n── _split_model_arg in generate.py ───────────────────────────")
 
 ns = argparse.Namespace(model=None)
@@ -335,8 +425,13 @@ with tempfile.TemporaryDirectory() as tmp:
     rc = c.dispatch(make_cli_args(override=["foo=bar"]), [cfg_path])
     check("--override rejected", rc == 2)
 
+    # --savepath is now SUPPORTED (template expansion). Passes flag rejection;
+    # fails downstream at pipeline build (no real weights). rc != 2 means it
+    # got past flag rejection.
     rc = c.dispatch(make_cli_args(savepath="/tmp/x_%seed%"), [cfg_path])
-    check("--savepath rejected", rc == 2)
+    check("--savepath accepted (template expansion supported)",
+          rc != 2,
+          f"expected pipeline-build failure (rc=3), got rc={rc}")
 
     rc = c.dispatch(make_cli_args(max_seq_len=512), [cfg_path])
     check("--max-seq-len rejected", rc == 2)

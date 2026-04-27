@@ -464,24 +464,68 @@ def run_one(
 #  Output path resolution + sidecar write
 # ════════════════════════════════════════════════════════════════════════
 
-def _resolve_output_path(base: str, total_iterations: int, run_index: int) -> str:
+_NUMBERED_PNG_RE = __import__("re").compile(r"^(.+?)_(\d+)\.png$")
+
+
+def _scan_existing_offset(base: str) -> int:
+    """Return the highest existing `<stem>_NNNN.png` index that would collide
+    with the names this dispatch is about to write. Returns 0 if nothing
+    matches. Used to continue numbering across multiple invocations writing
+    to the same directory rather than clobbering — e.g. a bash loop that
+    runs `--iterate prompt prompt1-100.json`, then `prompt101-200.json`,
+    each with `--output <same-dir>`, gets cascade_0001…0100, then
+    cascade_0101…0200, and so on.
+    """
+    import re
+    if os.path.isdir(base):
+        parent = base
+        stem = "cascade"
+    else:
+        p = Path(base)
+        parent = str(p.parent)
+        stem = p.stem
+    if not os.path.isdir(parent):
+        return 0
+    pattern = re.compile(rf"^{re.escape(stem)}_(\d+)\.png$")
+    highest = 0
+    try:
+        entries = os.listdir(parent)
+    except OSError:
+        return 0
+    for fname in entries:
+        m = pattern.match(fname)
+        if m:
+            n = int(m.group(1))
+            if n > highest:
+                highest = n
+    return highest
+
+
+def _resolve_output_path(
+    base: str, total_iterations: int, run_index: int, *, dir_offset: int = 0
+) -> str:
     """Pick the output filename for one run.
 
     Rules:
-    - `base` is a directory: always emit `<base>/cascade.png` (single iter) or
-      `<base>/cascade_NNNN.png` (multi iter).
-    - `base` is a file path AND total_iterations == 1: write exactly to `base`.
-    - `base` is a file path AND total_iterations > 1: treat `base` as a stem;
-      emit `<dir>/<stem>_NNNN<.ext>` with a 4-digit run index.
+    - `base` is a directory: emit `<base>/cascade_NNNN.png`. NNNN starts at
+      `dir_offset + 1` so multiple invocations to the same dir continue
+      numbering rather than clobbering. Special case: if `total_iterations == 1`
+      AND `dir_offset == 0`, emit `<base>/cascade.png` (single-shot, no
+      number — the legacy unnumbered form).
+    - `base` is a file path AND `total_iterations == 1`: write exactly to
+      `base` (caller chose the exact path; overwrite is their call).
+    - `base` is a file path AND `total_iterations > 1`: emit
+      `<dir>/<stem>_NNNN<.ext>`, NNNN starts at `dir_offset + 1`.
 
-    Single iter to a directory base is symmetric with multi iter (was a gap
-    that would have crashed at PIL save).
+    `dir_offset` is computed once per dispatch via `_scan_existing_offset` so
+    the run loop can pass it in cheaply per call.
     """
     if os.path.isdir(base):
         Path(base).mkdir(parents=True, exist_ok=True)
-        if total_iterations == 1:
+        if total_iterations == 1 and dir_offset == 0:
             return os.path.join(base, "cascade.png")
-        return os.path.join(base, f"cascade_{run_index + 1:04d}.png")
+        nnnn = dir_offset + run_index + 1
+        return os.path.join(base, f"cascade_{nnnn:04d}.png")
 
     if total_iterations == 1:
         Path(base).parent.mkdir(parents=True, exist_ok=True)
@@ -491,7 +535,45 @@ def _resolve_output_path(base: str, total_iterations: int, run_index: int) -> st
     p.parent.mkdir(parents=True, exist_ok=True)
     stem = p.stem
     suffix = p.suffix or ".png"
-    return str(p.parent / f"{stem}_{run_index + 1:04d}{suffix}")
+    nnnn = dir_offset + run_index + 1
+    return str(p.parent / f"{stem}_{nnnn:04d}{suffix}")
+
+
+def _resolve_cascade_savepath(
+    template: str,
+    *,
+    eff_seed: int,
+    cfg: Dict[str, Any],
+    iterate_inputs: Dict[str, str],
+) -> str:
+    """Resolve --savepath for cascade. Expands the standard comfyless tokens
+    (%input%, %date:fmt%, %seed%, %model%, etc.) via the same machinery the
+    other families use, then appends `_NNNN.png` with an auto-counter that
+    scans the resolved parent directory each call to avoid collisions —
+    matches the cascade `_NNNN.png` naming convention used by --output.
+    Family-specific tokens map to: %cfg% → prior_cfg_scale, %steps% →
+    prior_steps, %sampler% → "default".
+    """
+    from comfyless.generate import _expand_savepath_template
+    expanded = _expand_savepath_template(
+        template,
+        model_path="stablecascade",
+        seed=eff_seed,
+        steps=cfg["prior_steps"],
+        cfg_scale=cfg["prior_cfg_scale"],
+        sampler="default",
+        transformer_path="",
+        iterate_inputs=iterate_inputs,
+    )
+    parent = Path(expanded).parent
+    parent.mkdir(parents=True, exist_ok=True)
+    stem = Path(expanded).name or "cascade"
+    counter = 1
+    while True:
+        candidate = parent / f"{stem}_{counter:04d}.png"
+        if not candidate.exists():
+            return str(candidate)
+        counter += 1
 
 
 def _write_sidecar(image_path: str, sidecar: Dict[str, Any]) -> str:
@@ -548,8 +630,11 @@ def _reject_unsupported_flags(args: argparse.Namespace) -> Optional[str]:
     if args.params is not None or args.override:
         bad.append("--params / --override (Cascade replays via positional config paths; "
                    "edit a saved sidecar JSON and pass it as a positional arg instead)")
-    if args.savepath is not None:
-        bad.append("--savepath (Cascade output paths use --output directly; auto-suffix on multi-run)")
+    # --savepath is now supported (token expansion via comfyless.generate's
+    # template machinery). Cascade-specific tokens supplied:
+    # %input% / %input_<param>% (iterate file basename), %date:fmt%, %seed%,
+    # %model% (always "stablecascade"), %prompt%. Family-specific tokens
+    # like %cfg% / %steps% map to prior_cfg_scale / prior_steps.
     if args.max_seq_len is not None:
         bad.append("--max-seq-len (not applicable to Cascade's CLIP-G text encoder)")
     if args.attention_slicing or args.sequential_offload or args.offload_vae:
@@ -703,6 +788,29 @@ def dispatch(args: argparse.Namespace, config_paths: List[str]) -> int:
     cli_neg      = args.negative_prompt or ""
     cli_seed_raw = args.seed
 
+    # ── Output path setup ─────────────────────────────────────────────
+    # --output mode: scan target dir once for existing cascade_NNNN.png to
+    # continue numbering rather than clobber. --savepath mode auto-counters
+    # per-template-expanded-dir at write time, so no offset needed here.
+    if args.savepath is None:
+        output_offset = _scan_existing_offset(args.output)
+        if output_offset > 0:
+            _log(f"[comfyless] continuing numbering past existing files: "
+                 f"first new image will be cascade_{output_offset+1:04d}.png")
+    else:
+        output_offset = 0
+
+    # iterate_inputs feeds %input% / %input_<param>% expansion in --savepath.
+    # Per generate.py's _expand_iterate_tokens: %input% reads the special key
+    # "_primary" (alias for the first --iterate axis); %input_<param>% reads
+    # the axis name directly.
+    iterate_inputs = {
+        param: os.path.splitext(os.path.basename(file_path))[0]
+        for param, file_path in (args.iterate or [])
+    }
+    if args.iterate:
+        iterate_inputs["_primary"] = iterate_inputs[args.iterate[0][0]]
+
     # ── Run loop ──────────────────────────────────────────────────────
     iterate_batch_id = uuid.uuid4().hex
     fail_count = 0
@@ -774,7 +882,17 @@ def dispatch(args: argparse.Namespace, config_paths: List[str]) -> int:
                 raw_seed = -1
             eff_seed = _effective_seed_for_batch(raw_seed, batch_index)
 
-        out_path = _resolve_output_path(args.output, total, run_index)
+        if args.savepath is not None:
+            out_path = _resolve_cascade_savepath(
+                args.savepath,
+                eff_seed=eff_seed,
+                cfg=cfg,
+                iterate_inputs=iterate_inputs,
+            )
+        else:
+            out_path = _resolve_output_path(
+                args.output, total, run_index, dir_offset=output_offset,
+            )
         _log(f"[comfyless] cascade run {run_index + 1}/{total} : seed={eff_seed} → {out_path}")
 
         try:
