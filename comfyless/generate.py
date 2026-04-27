@@ -1019,8 +1019,11 @@ def _parse_args() -> argparse.Namespace:
                    metavar="KEY=VALUE",
                    help="Override a param from --params (repeatable). "
                         "E.g. --override model=/path/sdxl --override cfg_scale=8")
-    p.add_argument("--model", type=str, default=None,
-                   help="Path to diffusers model directory")
+    p.add_argument("--model", nargs="+", default=None,
+                   help="Path to diffusers model directory. "
+                        "Stable Cascade special form: "
+                        "'--model stablecascade <config.json> [config2.json] ...' "
+                        "— see docs/comfyless-stable-cascade.md.")
     p.add_argument("--prompt", type=str, default=None,
                    help="Generation prompt")
     p.add_argument("--negative-prompt", type=str, default=None,
@@ -1862,8 +1865,47 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
     return 0
 
 
+def _split_model_arg(args: argparse.Namespace) -> List[str]:
+    """Normalize argparse's nargs='+' --model from list back to a string for the
+    rest of the codebase. Returns the list of *extra* positional values (used by
+    the Cascade dispatch for config paths after the `stablecascade` sentinel).
+
+    After this returns, `args.model` is either None or a single string — every
+    downstream code path that reads args.model continues to work unchanged.
+    """
+    if args.model is None:
+        return []
+    if not isinstance(args.model, list):
+        # Defensive: argparse should always hand us a list, but tolerate a string
+        # if some test or future caller bypasses parsing.
+        return []
+    extras = args.model[1:]
+    args.model = args.model[0]
+    return extras
+
+
 def main() -> int:
     args = _parse_args()
+    cascade_extras = _split_model_arg(args)
+
+    # ── Stable Cascade dispatch fork ──────────────────────────────────────
+    # Sentinel `--model stablecascade <config.json> [config2.json] ...` activates
+    # the JSON-config family. Has its own dispatch entirely separate from the
+    # standard --model path. See ADR-010 + docs/comfyless-stable-cascade.md.
+    from comfyless.cascade import CASCADE_SENTINEL, dispatch as _cascade_dispatch
+    if args.model == CASCADE_SENTINEL:
+        return _cascade_dispatch(args, cascade_extras)
+    if cascade_extras:
+        # User passed multiple values to --model but the first wasn't `stablecascade`.
+        # Most likely a path with spaces/typo; refuse rather than silently drop.
+        print(
+            f"Error: --model received {1 + len(cascade_extras)} values but the first "
+            f"({args.model!r}) is not the cascade sentinel. Quote paths with spaces, "
+            f"or use '--model stablecascade <config.json> ...' for Stable Cascade.",
+            file=sys.stderr,
+        )
+        return 2
+
     if args.json:
         # Iteration semantics (--iterate, --batch, --limit) are not yet
         # expressible in the JSON bridge contract (see ADR-008 §"Interaction

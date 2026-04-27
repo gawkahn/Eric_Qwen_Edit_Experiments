@@ -1,0 +1,20 @@
+{
+  "_comment": "Default Stable Cascade config — full Stage C + full Stage B from the SAI main repo. See docs/comfyless-stable-cascade.md.",
+
+  "stage_c": "/home/gawkahn/projects/ai-lab/ai-base/models/hf-local/stable_cascade/stage_c_bf16.safetensors",
+  "stage_b": "/home/gawkahn/projects/ai-lab/ai-base/models/hf-local/stable_cascade/stage_b_bf16.safetensors",
+
+  "scaffolding_repo": "/home/gawkahn/projects/ai-lab/ai-base/models/hf-local/stable_cascade",
+
+  "prior_dtype":   "bf16",
+  "decoder_dtype": "fp16",
+  "vae_dtype":     "fp32",
+
+  "prior_steps":       20,
+  "prior_cfg_scale":   4.0,
+  "decoder_steps":     10,
+  "decoder_cfg_scale": 0.0,
+
+  "width":  1024,
+  "height": 1024
+}
