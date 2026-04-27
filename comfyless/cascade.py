@@ -50,14 +50,17 @@ PRIOR_CONFIG_DIRS = {
 }
 
 _DTYPE_DEFAULTS = {
-    # SAI model card recommends bf16 prior + fp16 decoder for a slight speed/VRAM
-    # win, but the deprecated diffusers Cascade integration mishandles the
-    # bf16→fp16 boundary when the two pipelines are composed manually (as we do
-    # to support per-stage path swaps). Default to bf16 everywhere — overridable
-    # in JSON for users who explicitly want the model-card recipe.
+    # SAI model card uses bf16 prior + fp16 decoder; the Paella VAE inside the
+    # decoder pipeline ends up at decoder_dtype because the SAI example casts
+    # the whole pipe via from_pretrained(torch_dtype=...). Defaulting all three
+    # to bf16 gives a single uniform dtype across every internal boundary
+    # (prior→decoder→vae). Users can override per-stage in JSON; the run_one
+    # boundary cast covers prior→decoder, but decoder→vqgan is internal to the
+    # decoder pipeline and not interceptable, so vae_dtype != decoder_dtype is
+    # currently advisory only — see backlog item.
     "prior_dtype":   "bf16",
     "decoder_dtype": "bf16",
-    "vae_dtype":     "fp32",   # Paella VAE always fp32
+    "vae_dtype":     "bf16",
 }
 
 _PARAM_DEFAULTS = {
@@ -358,13 +361,21 @@ def build_pipelines(cfg: Dict[str, Any], device: str, allow_hf_download: bool):
     # buffer in each pipeline. Without the explicit dtype, `from_single_file`'s
     # config-based architecture instantiation can leave a few bias tensors at
     # fp16 even when torch_dtype=bfloat16 was requested at load time, producing
-    # the "Input type BFloat16 and bias type Half should be the same" error
-    # mid-forward. Pipeline-level cast eliminates the cross-precision mix.
-    # (vqgan stays fp32 inside the decoder pipeline because Cascade's
-    # PaellaVQModel must operate in fp32 — we explicitly recast it back below.)
+    # "Input type BFloat16 and bias type Half should be the same" mid-forward.
+    # Pipeline-level cast eliminates the cross-precision mix.
     prior_pipe   = prior_pipe.to(device, dtype=prior_dtype)
     decoder_pipe = decoder_pipe.to(device, dtype=decoder_dtype)
-    decoder_pipe.vqgan = decoder_pipe.vqgan.to(device=device, dtype=vae_dtype)
+    # Honor an explicit vae_dtype override only when it differs from decoder_dtype.
+    # Same-dtype is the safe path (no boundary inside the decoder pipeline);
+    # the override exists for users who explicitly want a different VAE dtype
+    # but is currently advisory because the decoder→vqgan cast is internal to
+    # the decoder pipeline and not interceptable. Backlog: hook to cast latents
+    # before vqgan.decode() to honor mismatched vae_dtype cleanly.
+    if vae_dtype != decoder_dtype:
+        _log(f"[comfyless] cascade: vae_dtype={cfg['vae_dtype']!r} differs from "
+             f"decoder_dtype={cfg['decoder_dtype']!r}; recasting vqgan but the "
+             f"decoder→vqgan boundary may produce a dtype-mismatch error mid-forward.")
+        decoder_pipe.vqgan = decoder_pipe.vqgan.to(device=device, dtype=vae_dtype)
     return prior_pipe, decoder_pipe
 
 

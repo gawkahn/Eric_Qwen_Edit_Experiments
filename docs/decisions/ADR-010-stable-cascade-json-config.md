@@ -287,19 +287,27 @@ landing the alt-file ergonomics, daily-use cost is low.
   (Opus) → commit.
 
 - **2026-04-26 (dtype default change)**: ADR §3 originally specified
-  `decoder_dtype` default `fp16` per SAI model card. Empirically, the
-  deprecated diffusers Cascade pipelines (deprecated as of 0.35.2)
-  mishandle the bf16→fp16 boundary when prior and decoder pipelines
-  are composed manually rather than via a single `from_pretrained` —
-  the prior emits bf16 `image_embeddings`, the fp16 decoder's first
-  Linear sees mismatched input/bias dtypes mid-forward. Two changes:
-  (a) `run_one` now casts `image_embeddings` to whatever dtype the
-  decoder actually has, fixing the model-card recipe explicitly; (b)
-  default `decoder_dtype` flipped to `bf16` so the safe path is the
-  default. Users who want the SAI model-card recipe still get it by
-  setting `"decoder_dtype": "fp16"` in the JSON. Marginal cost: tiny
-  speed/VRAM regression vs the model card; benefit: defaults that
-  actually work on the deprecated upstream code path.
+  `decoder_dtype` default `fp16` and `vae_dtype` default `fp32` per
+  SAI model card. Empirically, the deprecated diffusers Cascade
+  pipelines (deprecated as of 0.35.2) propagate dtypes raw across
+  internal boundaries: prior→decoder boundary (image_embeddings) and
+  decoder→vqgan boundary (latents). Each boundary triggers an
+  "Input type X and bias type Y should be the same" error if the
+  upstream and downstream dtypes differ. Three changes: (a) `run_one`
+  casts `image_embeddings` to the decoder's actual dtype, fixing the
+  prior→decoder boundary; (b) default `decoder_dtype` flipped to
+  `bf16`; (c) default `vae_dtype` flipped to `bf16` (was `fp32` based
+  on a wrong assumption that PaellaVQModel must run fp32 — SAI's own
+  example casts the whole pipe to fp16 including the vqgan, so bf16
+  is fine). The decoder→vqgan boundary is internal to the decoder
+  pipeline and not interceptable from `run_one`, so vae_dtype
+  different from decoder_dtype is currently advisory only — the
+  pipeline emits a warning and recasts vqgan, but a mid-forward
+  error is possible. Backlog: insert a hook between
+  `decoder.forward` and `vqgan.decode` to honor mismatched vae_dtype
+  cleanly. Net effect of defaults change: uniform bf16 throughout
+  is the only walked path; users who need fp16-decoder or fp32-vae
+  for empirical reasons can override but tread carefully.
 
 - **2026-04-26 (amendment)**: Original decision said `--iterate` was
   rejected wholesale ("Cascade iterates via positional configs"). That

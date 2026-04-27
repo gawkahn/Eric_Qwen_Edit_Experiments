@@ -126,7 +126,8 @@ check("minimal config keeps stage_b", out["stage_b"] == "/tmp/b.safetensors")
 check("default prior_dtype = bf16",   out["prior_dtype"] == "bf16")
 check("default decoder_dtype = bf16 (safe; sidesteps deprecated diffusers cross-dtype quirk)",
       out["decoder_dtype"] == "bf16")
-check("default vae_dtype = fp32",     out["vae_dtype"] == "fp32")
+check("default vae_dtype = bf16 (uniform with decoder)",
+      out["vae_dtype"] == "bf16")
 check("default prior_steps = 20",     out["prior_steps"] == 20)
 check("default prior_cfg_scale = 4.0",   out["prior_cfg_scale"] == 4.0)
 check("default decoder_steps = 10",   out["decoder_steps"] == 10)

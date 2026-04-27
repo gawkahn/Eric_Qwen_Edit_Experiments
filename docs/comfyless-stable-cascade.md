@@ -52,7 +52,7 @@ Inference order is **C → B → A**. Stages C and B are large diffusion network
 
   "prior_dtype":   "bf16",   // safe default
   "decoder_dtype": "bf16",   // safe default; SAI model card suggests fp16, see note below
-  "vae_dtype":     "fp32",   // Paella VAE always fp32
+  "vae_dtype":     "bf16",   // safe default; matches decoder for uniform dtype throughout
 
   "prior_steps":       20,
   "prior_cfg_scale":   4.0,

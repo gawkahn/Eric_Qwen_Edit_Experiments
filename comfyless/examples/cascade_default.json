@@ -8,7 +8,7 @@
 
   "prior_dtype":   "bf16",
   "decoder_dtype": "bf16",
-  "vae_dtype":     "fp32",
+  "vae_dtype":     "bf16",
 
   "prior_steps":       20,
   "prior_cfg_scale":   4.0,
