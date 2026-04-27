@@ -349,8 +349,17 @@ def build_pipelines(cfg: Dict[str, Any], device: str, allow_hf_download: bool):
         latent_dim_scale=10.67,
     )
 
-    prior_pipe   = prior_pipe.to(device)
-    decoder_pipe = decoder_pipe.to(device)
+    # `.to(device, dtype=...)` forces a uniform dtype across every parameter and
+    # buffer in each pipeline. Without the explicit dtype, `from_single_file`'s
+    # config-based architecture instantiation can leave a few bias tensors at
+    # fp16 even when torch_dtype=bfloat16 was requested at load time, producing
+    # the "Input type BFloat16 and bias type Half should be the same" error
+    # mid-forward. Pipeline-level cast eliminates the cross-precision mix.
+    # (vqgan stays fp32 inside the decoder pipeline because Cascade's
+    # PaellaVQModel must operate in fp32 — we explicitly recast it back below.)
+    prior_pipe   = prior_pipe.to(device, dtype=prior_dtype)
+    decoder_pipe = decoder_pipe.to(device, dtype=decoder_dtype)
+    decoder_pipe.vqgan = decoder_pipe.vqgan.to(device=device, dtype=vae_dtype)
     return prior_pipe, decoder_pipe
 
 
