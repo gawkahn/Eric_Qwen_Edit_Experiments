@@ -286,6 +286,21 @@ landing the alt-file ergonomics, daily-use cost is low.
   → `comfyless/cascade.py` + dispatch fork → tests → `code-reviewer`
   (Opus) → commit.
 
+- **2026-04-26 (dtype default change)**: ADR §3 originally specified
+  `decoder_dtype` default `fp16` per SAI model card. Empirically, the
+  deprecated diffusers Cascade pipelines (deprecated as of 0.35.2)
+  mishandle the bf16→fp16 boundary when prior and decoder pipelines
+  are composed manually rather than via a single `from_pretrained` —
+  the prior emits bf16 `image_embeddings`, the fp16 decoder's first
+  Linear sees mismatched input/bias dtypes mid-forward. Two changes:
+  (a) `run_one` now casts `image_embeddings` to whatever dtype the
+  decoder actually has, fixing the model-card recipe explicitly; (b)
+  default `decoder_dtype` flipped to `bf16` so the safe path is the
+  default. Users who want the SAI model-card recipe still get it by
+  setting `"decoder_dtype": "fp16"` in the JSON. Marginal cost: tiny
+  speed/VRAM regression vs the model card; benefit: defaults that
+  actually work on the deprecated upstream code path.
+
 - **2026-04-26 (amendment)**: Original decision said `--iterate` was
   rejected wholesale ("Cascade iterates via positional configs"). That
   reasoning held for *topology* iteration but starved the legitimate

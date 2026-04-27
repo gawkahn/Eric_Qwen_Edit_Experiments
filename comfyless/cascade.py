@@ -50,8 +50,13 @@ PRIOR_CONFIG_DIRS = {
 }
 
 _DTYPE_DEFAULTS = {
-    "prior_dtype":   "bf16",   # SAI model card: prior runs bf16
-    "decoder_dtype": "fp16",   # SAI model card: decoder runs fp16
+    # SAI model card recommends bf16 prior + fp16 decoder for a slight speed/VRAM
+    # win, but the deprecated diffusers Cascade integration mishandles the
+    # bf16→fp16 boundary when the two pipelines are composed manually (as we do
+    # to support per-stage path swaps). Default to bf16 everywhere — overridable
+    # in JSON for users who explicitly want the model-card recipe.
+    "prior_dtype":   "bf16",
+    "decoder_dtype": "bf16",
     "vae_dtype":     "fp32",   # Paella VAE always fp32
 }
 
@@ -416,9 +421,18 @@ def run_one(
     )
     prior_seconds = time.time() - t0
 
+    # Cast image_embeddings to the decoder's actual dtype. Prior may run at a
+    # different dtype than decoder (e.g. SAI model card: bf16 prior + fp16
+    # decoder); the embeddings tensor flows raw between them, so without an
+    # explicit cast at the boundary the decoder's first Linear sees mismatched
+    # input/bias dtypes ("Input type BFloat16 and bias type Half should be
+    # the same"). Probe the decoder for whatever dtype it ended up at.
+    decoder_actual_dtype = next(decoder_pipe.decoder.parameters()).dtype
+    image_embeddings = prior_out.image_embeddings.to(decoder_actual_dtype)
+
     t0 = time.time()
     decoder_out = decoder_pipe(
-        image_embeddings=prior_out.image_embeddings,
+        image_embeddings=image_embeddings,
         prompt=prompt,
         negative_prompt=negative_prompt,
         num_inference_steps=cfg["decoder_steps"],

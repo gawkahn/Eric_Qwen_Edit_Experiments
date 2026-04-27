@@ -50,8 +50,8 @@ Inference order is **C → B → A**. Stages C and B are large diffusion network
   "stage_a":          "/abs/path/stable_cascade/vqgan",  // default: scaffolding_repo's vqgan/
   "scaffolding_repo": "stabilityai/stable-cascade",      // provides text_encoder/, tokenizer/, scheduler/
 
-  "prior_dtype":   "bf16",   // SAI model card recommendation
-  "decoder_dtype": "fp16",   // SAI model card recommendation
+  "prior_dtype":   "bf16",   // safe default
+  "decoder_dtype": "bf16",   // safe default; SAI model card suggests fp16, see note below
   "vae_dtype":     "fp32",   // Paella VAE always fp32
 
   "prior_steps":       20,
@@ -132,7 +132,7 @@ This is the first concrete instance of the broader **parallel `-comfyless` libra
 For the user's hardware (24 GB consumer GPU) and the SAI guidance:
 
 - **Full variants**: full Stage C (3.6B) + full Stage B (1.5B). The lite variants exist (`stage_c_lite_*`, `stage_b_lite_*`) and will load if the JSON points at them, but the SAI model card explicitly says they're inferior. By policy: don't use them. By code: nothing prevents it.
-- **bf16 prior + fp16 decoder.** SAI ships every weight pre-cast; mismatched dtypes still load (cast happens at `from_single_file` time) but you spend memory bandwidth for the cast.
+- **bf16 everywhere.** The SAI model card recommends bf16 prior + fp16 decoder for a slight speed/VRAM win, but the (deprecated upstream as of diffusers 0.35.2) Cascade pipelines mishandle the bf16→fp16 boundary when the two pipelines are composed manually. Defaulting both to bf16 sidesteps the integration bug. To opt into the model-card recipe explicitly, set `"decoder_dtype": "fp16"` in the JSON — `run_one` casts `image_embeddings` to the decoder's dtype at the boundary, so it works, just on a less-walked code path.
 - **20 prior steps / 10 decoder steps / prior CFG 4.0 / decoder CFG 0.0.** SAI's documented sweet spot. Stable Cascade also has a fast path at 10 prior / 4 decoder steps if you want to trade quality for speed.
 
 ---

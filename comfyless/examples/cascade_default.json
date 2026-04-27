@@ -7,7 +7,7 @@
   "scaffolding_repo": "/home/gawkahn/projects/ai-lab/ai-base/models/hf-local/stable_cascade",
 
   "prior_dtype":   "bf16",
-  "decoder_dtype": "fp16",
+  "decoder_dtype": "bf16",
   "vae_dtype":     "fp32",
 
   "prior_steps":       20,
