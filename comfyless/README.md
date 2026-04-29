@@ -617,6 +617,8 @@ On load, comfyless reads `model_index.json` and detects a `model_family`. CFG ro
 
 If you're loading a model not in the table, comfyless will still try — it introspects `pipeline.__call__` and only passes kwargs the pipeline accepts. Watch stderr for `[comfyless] Unknown model_family=…` to know this path fired.
 
+**Stable Cascade** uses a separate dispatch path triggered by the literal sentinel `--model stablecascade <config.json>` — it doesn't appear in the table above because it loads three independent weight files (Stage C / B / A) instead of one pipeline class. JSON config owns topology + denoising params; the rest of the CLI surface (`--prompt`, `--seed`, `--output`, `--savepath`, `--batch`, `--limit`, plus `--iterate prompt|seed`) works the same. See [`docs/comfyless-stable-cascade.md`](../docs/comfyless-stable-cascade.md) for the full reference and [ADR-010](../docs/decisions/ADR-010-stable-cascade-json-config.md) for the design rationale.
+
 ---
 
 ## Component overrides

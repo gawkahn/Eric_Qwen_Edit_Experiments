@@ -172,3 +172,25 @@ Queued in Backlog.
 - **Why not now:** Breaking change to the `--override` interface; needs a deprecation period or a single coordinated rename. The `--json` bridge mode also uses `--override` so both surfaces must change together.
 - **Suggested fix:** Decide on one convention (`param=value` or `--param value`) and apply consistently. User preference is `param=value`; `--override` is the odd one out. Alternatively, accept both syntaxes in `_apply_overrides()` as a transition path.
 - **Priority:** Low
+
+---
+
+## Stable Cascade
+
+### [Code] Cascade decoder→vqgan dtype-mismatch hook
+- **Location:** `comfyless/cascade.py` — `build_pipelines` vae_dtype block; `run_one` decoder call
+- **Observed:** 2026-04-27 during cascade dtype-boundary debugging (commits `e791462`, `dd196c1`)
+- **Why not now:** The walked path defaults all three stages to `bf16` (commit `dd196c1`), which makes every internal boundary same-dtype and avoids the issue. When a user explicitly sets `vae_dtype != decoder_dtype` in the JSON config, today's behavior is: emit a stderr advisory, recast `decoder_pipe.vqgan` to the requested dtype, and rely on the user accepting the risk that the deprecated `StableCascadeDecoderPipeline.__call__` may still emit "Input type X / bias type Y should be the same" mid-forward (the cast from decoder latents to vqgan input is *internal* to the decoder pipeline call and not interceptable from `run_one`). For the stated single-user threat model and SAI's recommended recipes, this is acceptable.
+- **Suggested fix:** Register a `forward_pre_hook` on `decoder_pipe.vqgan.decode` (or wrap the bound method) that casts the incoming latents tensor to the vqgan's parameter dtype before the call. ~10 lines + 2 tests (one mismatched-dtype config that today warns-and-runs, one that today crashes; both should pass after the hook).
+- **Trigger:** First user/test that requires a non-bf16 decoder + non-matching vae combo, OR any change to `comfyless/cascade.py`'s dtype handling block that revisits this code.
+- **Priority:** Low
+- **References:** ADR-010 second amendment (Changelog); cascade.py inline comment near `_DTYPE_DEFAULTS`.
+
+### [Out-of-scope features for Cascade] *(reference only — not active debt)*
+ADR-010's "Deferred / Out of Scope" section formally declares the following non-goals for v1; revisit only if empirical use surfaces demand:
+- LoRA support for the Cascade prior or decoder (~40 community LoRAs vs. thousands for SDXL/Flux makes the integration cost disproportionate).
+- Image-variation conditioning via `image=` to the prior (`feature_extractor` + `image_encoder` are deliberately left at `None`).
+- Stage A weight-swap UI (the JSON field exists; no published Stage A variants are known to be worth swapping).
+- ControlNet variants (the SAI repo carries a `controlnet/` directory; not wired).
+- Lite-variant filename detection or warning (permissive, doc-only policy — by design).
+- Other `--iterate` axes beyond `prompt` and `seed` for cascade dispatch (cfg, model, transformer, etc. are JSON-config concerns, not iterate axes — ADR-010 amendment 3).

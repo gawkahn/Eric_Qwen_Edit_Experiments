@@ -56,11 +56,15 @@ python -m py_compile nodes/<file>.py   # syntax check a single file
 ```bash
 python3 test_manual_loop.py        # 186 tests: samplers, manual loop, encode helper, Qwen edit
 python3 test_multistage.py         # 141 tests: multistage infrastructure
+python3 test_params_schema.py      # 135 tests: comfyless COMFYLESS_SCHEMA + adapters
+python3 test_cascade.py            # 129 tests: comfyless Stable Cascade dispatch (ADR-010)
+python3 test_iterate.py            #  92 tests: comfyless --iterate (ADR-008)
 python3 test_samplers.py           #  41 tests: custom schedulers / sampler swap
-python3 test_iterate.py            #  55 tests: comfyless --iterate (ADR-008)
 python3 test_server_robustness.py  #   8 tests: comfyless IPC timeouts + BrokenPipe survival
 ```
-All five suites use the ComfyUI venv's Python; run them via `/home/gawkahn/projects/ai-lab/ai-stack-data/comfy-dev/run/venv/bin/python3` when working outside of ComfyUI. Total 431 tests; expect 0 failures.
+All seven suites use the ComfyUI venv's Python; run them via `/home/gawkahn/projects/ai-lab/ai-stack-data/comfy-dev/run/venv/bin/python3` when working outside of ComfyUI. Total 732 unit tests; expect 0 failures.
+
+`test_flux2.py` is a live GPU smoke test that performs an actual Flux.2 generation — separate from the unit suites above. Run only when you need to verify end-to-end Flux.2 behavior.
 
 ## Git commit conventions for this repo
 

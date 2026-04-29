@@ -1,7 +1,7 @@
 # ADR-006: Comfyless Dual-Mode Design and JSON Bridge Contract
 
 **Date:** 2026-04-21 (written retroactively; decision made ~2026-04-14)
-**Status:** accepted
+**Status:** accepted (superseded in part by ADR-011 — the LLM-agent transport role only; CLI / sidecar / `--params` replay / stdout-stderr split parts remain in force)
 
 ---
 
@@ -81,6 +81,7 @@ in Backlog Ideas.
 - ~2026-04-20: Component loader parity (`fcadfd0`)
 - ~2026-04-21: `--attention-slicing` / `--sequential-offload` added (`3ab8a5a`)
 - 2026-04-21: ADR written retroactively; decision still active
+- 2026-04-28: Superseded in part by [ADR-011](ADR-011-comfyless-mcp-server.md). Specifically superseded: the `--json` bridge mode as the *planned* LLM-agent calling surface, and the contract-version field as the LLM-side schema-drift detector (MCP's initialize handshake replaces it). NOT superseded: the dual-mode CLI entry point, sidecar JSON discipline, `--params` / `--override` replay semantics, and the strict stdout/stderr split *within* `--json` mode for any caller still using it. The existing `_run_json_mode` implementation is preserved at zero further investment per ADR-011 §5; future deprecation is a separate decision. Driver: `local_agents` project surfaced MCP as the clear preference for the LLM-tool integration; ADR-006 predates both `local_agents` and the broader MCP ecosystem and never had MCP in its alternatives list.
 
 ## AI-Disclosure
 
