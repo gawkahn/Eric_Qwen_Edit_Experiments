@@ -7,15 +7,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project documentation artifacts
 
+**Vault project root:** `~/obsidian/vaults/vault1/10_Projects/Image_gen/`
+
 Rules for ADRs, security reviews, and the tech debt register are in §12 of
 `~/.claude/CLAUDE.md`. Local paths for this project:
 
-- **Repo:** `docs/decisions/`, `docs/security/`, `TECH_DEBT.md` at project root
-- **Obsidian:** `~/obsidian/vaults/vault1/10_Projects/Image_gen/Decisions/`,
-  `Security/`, `Tech_Debt.md`
+- **Repo:** `docs/decisions/`, `docs/security/`, `docs/vision/`, `TECH_DEBT.md` at project root
+- **Vault mirrors:** `Decisions/`, `Security/`, `Vision/`, `Tech_Debt.md`,
+  `Backlog.md`, `Comfyless_Manual.md` (all under the Vault project root above)
 
 This is a solo personal project — `docs/` in the repo is the canonical store.
-Obsidian copies are a personal reference mirror.
+Vault copies are a personal reference mirror.
 
 ---
 
