@@ -43,6 +43,27 @@ diffusers pin. Possible fix shapes: a tiny synthetic state-dict fixture that
 omits known keys + a stub config; OR a smoke-only integration test gated by
 an env var pointing at a real fixture path.
 
+**Comfyless server failed-load / OOM-cascade recovery (regression)** *(2026-05-04)*
+A failed model load (commonly OOM, also corrupted-checkpoint and similar)
+sometimes leaves the daemon in a partial state where the *unload* path also
+fails, which then makes the *next* load fail with OOM (residual VRAM not freed).
+**Recurred 2026-05-01 despite belief the original fix landed in or before the
+2026-04-23 hardening slice** — first investigation step is to identify what was
+*thought* fixed vs. what *actually* shipped, before designing the next fix.
+Likely touches `comfyless/server.py` model-cache eviction path. Stdio v1 MCP
+(slice 1) inherits parent-process recovery semantics so a daemon crash is
+observable and restartable by the client; this is daemon-hygiene affecting
+regular comfyless use. **Hard precondition before any non-stdio MCP transport
+ADR (HTTP/SSE) drafts** — same gate as the runtime-core cluster's HTTP-readiness
+preconditions. Suggested fix shape (post-investigation): treat any load
+exception as "eviction needed" and free the partial state before the next
+request; possibly process-isolation per generation if VRAM accounting can't be
+made reliable. May warrant its own ADR if the fix is non-trivial. Cross-refs
+the existing "Daemon request rate limiting / VRAM exhaustion" entry above
+(that one is preventive, this one is recovery). See Backlog Queued entry
+"Comfyless server failed-load / OOM-cascade resilience" for the architectural
+gate framing.
+
 **Client-side recv timeout is a flat 600s ceiling** *(2026-04-24)*
 `_CLIENT_RECV_TIMEOUT_SEC = 600.0` in `comfyless/server.py` is a compile-time
 constant. Realistic tail: a 50-MP Qwen-Image-2512 run at 50 steps with tile-VAE
