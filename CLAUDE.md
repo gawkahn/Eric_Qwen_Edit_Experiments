@@ -106,11 +106,12 @@ See the general `Git Commit Discipline` rule in `~/.claude/CLAUDE.md` for the ca
 
 **Remote sync cadence:**
 
-The global `Git Commit Discipline` rule "Never push to remote without explicit user approval" still holds. The repo-specific addition is about *when* to seek that approval: **after every user-approved slice commit, proactively ask whether to push.** Do not silently defer pushes to end-of-session — that caused local to drift 47 commits ahead of remote before being noticed on 2026-04-21.
+The global `Git Commit Discipline` rule "Never push to remote without explicit user approval" still holds. The repo-specific addition is about *when* to seek that approval: **after a logical batch of related commits concludes, proactively ask whether to push the batch.** A logical batch is what would be one PR if PR requirements were active — typically 1–5 commits sharing a coherent purpose (a feature slice, a clean-up batch, a multi-commit fix, an ADR + matching slice-Vision update). Do **not** ask after every commit individually — that pattern was an overcorrection from the 2026-04-21 47-commit-drift incident and treats the remote as raw off-site backup rather than as a logical-batch boundary. (Updated 2026-05-04.)
 
-- Default flow: commit → ask the user "push `origin main` now?" → push on yes, hold on no.
-- If the user's slice-approval message already said to push (e.g. "commit and push this"), that's the push approval — no second ask for that one.
-- "Hold" on one commit does not extend to the next — ask again after the next slice.
+- Default flow: commit → continue working until the batch concludes → ask the user "push `origin main` now?" → push on yes, hold on no.
+- If the user's batch-approval message already said to push (e.g. "commit and push this batch"), that's the push approval — no second ask for that one.
+- "Hold" on one batch does not extend to the next — ask again after the next batch concludes.
+- **Drift floor (don't lose this):** the 47-commit drift on 2026-04-21 is still the worst case to avoid. If commit count grows past ~5 without a clean batch boundary in sight, surface that as a flag rather than continuing silently. A session that ends with a long uncommitted-and-unpushed batch should explicitly state where the natural batch boundary was missed.
 - Force push, skipping hooks (`--no-verify`), and signing bypass remain separate per-invocation approvals regardless.
 
 ## Review bar (this project)
