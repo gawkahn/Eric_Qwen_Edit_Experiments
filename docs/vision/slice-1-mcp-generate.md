@@ -44,6 +44,8 @@ Land a minimal `generate` MCP tool in `comfyless/mcp_server.py` exposing a stdio
 8. If `model` is absent in the tool input AND `--default-model` is configured at spawn, the server resolves the omitted field to the configured default path. The resolved default path goes through the SAME realpath + `_within(--model-base)` validation at request time as a caller-supplied `model`. No bypass. (2026-04-30 Changelog amendment)
 9. If `model` is absent AND `--default-model` is NOT configured, the call returns a structured MCP error naming the missing field. No silent fallback to "first model in `--model-base`" or any other heuristic. (2026-04-30 Changelog amendment)
 10. Server startup fails closed if `--default-model` is set but does not realpath-resolve to a real path under `--model-base` (covers nonexistent path, non-directory file, symlink escaping `--model-base`). (2026-04-30 Changelog amendment)
+11. **No sidecar JSON file is written to disk for an MCP-driven `generate` call.** The resolved-params blob is returned inline in the MCP response frame only. The CLI path (and the legacy `--json` bridge) is untouched and continues to write sidecars per ADR-006. (2026-05-02 Changelog amendment, §2)
+12. **PNG `comfyless` tEXt chunks embedded in MCP-returned images carry no absolute filesystem paths.** Path-typed fields (`model`, `transformer_path`, `vae_path`, `text_encoder_path`, `text_encoder_2_path`, `loras[].path`, and the cascade `stage_*` / `scaffolding_repo` fields) are reduced to basenames before embedding (or pass through as the original HF repo ID if that's what the caller supplied). `output_path` and `savepath` are not embedded at all in MCP-returned PNGs. All non-path generation parameters (`prompt`, `negative_prompt`, `seed`, `steps`, `cfg_scale`, `true_cfg_scale`, `sampler`, `scheduler`, `width`, `height`, `model_family`, LoRA `weight`, etc.) are retained verbatim. CLI-driven calls retain full-path embedding (existing behavior). The MCP redaction map is shared in code with the §3b audit-line field list so the two cannot drift. (2026-05-02 Changelog amendment, §3e)
 
 ## Failure semantics
 
@@ -86,6 +88,17 @@ Land a minimal `generate` MCP tool in `comfyless/mcp_server.py` exposing a stdio
 - **N20:** `generate` with cascade selected, `cascade_config.scaffolding_repo` outside `--model-base` → structured MCP error, no scaffolding load.
 - **N21:** Cascade dispatch via `generate` honors `allow_hf_download=False` for prior/decoder/vqgan loaders too — extension of N11 to cover cascade-specific call sites.
 - **N22:** Cascade dispatch via `generate` writes an audit line that retains `cascade_config.stage_*` paths (paths are not redacted; only `prompt` and `negative_prompt` are dropped per invariant 5).
+
+**MCP-returned artifact discipline (2026-05-02 Changelog amendment):**
+
+- **N23:** A successful `generate` call via MCP does NOT produce a sidecar `.json` file in `--output-dir`. Assert by listing `--output-dir` before and after the call; only the new `.png` appears, no companion `.json`.
+- **N24:** A successful CLI-driven `generate` call (executed in the same test run via the existing CLI surface) DOES produce a sidecar `.json`. Confirms the MCP suppression is path-specific and did not regress the CLI behavior.
+- **N25:** A successful `generate` call via MCP returns the resolved-params blob inline in the MCP response frame. Captured response is parsed and asserted to contain the full param set (paths in this in-frame blob may carry full paths — only the on-disk PNG embedding is redacted; the in-frame blob is the agent's authoritative record).
+- **N26:** PNG `comfyless` tEXt chunk on an MCP-returned image contains the model basename only — no directory component. Read the chunk back from the saved PNG and assert `model` equals `os.path.basename(input_model_path)`. Same assertion for `transformer_path`, `vae_path`, `text_encoder_path`, `text_encoder_2_path`, `loras[*].path`, `cascade_config.stage_c`, `cascade_config.stage_b`, `cascade_config.stage_a`, `cascade_config.scaffolding_repo` whenever those fields are set.
+- **N27:** PNG `comfyless` tEXt chunk on an MCP-returned image does NOT contain `output_path` or `savepath` keys at all (not even as basenames; these fields are dropped entirely from the embedding for MCP calls).
+- **N28:** PNG `comfyless` tEXt chunk on an MCP-returned image retains `prompt`, `negative_prompt`, `seed`, `steps`, `cfg_scale`, `true_cfg_scale`, `sampler`, `scheduler`, `width`, `height`, `model_family`, and `loras[*].weight` verbatim. The redaction is path-only — gen params are not stripped.
+- **N29:** PNG `comfyless` tEXt chunk on a CLI-driven generation continues to embed full paths. Confirms the redaction is conditioned on caller and did not regress the CLI behavior.
+- **N30:** When the input `model` is an HF repo ID (not an absolute path), the MCP-returned PNG's `model` field passes through unchanged (HF repo IDs are not paths and should not be reduced to a basename).
 
 ## Proof hooks
 

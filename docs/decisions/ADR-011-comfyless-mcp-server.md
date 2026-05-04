@@ -239,3 +239,44 @@ Rejected. MCP's strength is per-tool JSONSchema. Collapsing five tools into one 
   **No re-audit for this amendment.** The path-allowlist mechanism is unchanged — the default path goes through the same `realpath` + `_within` check as caller-supplied paths, and the cascade fields gain the existing rule rather than introduce a new one. Slice-1 implementation review (`code-reviewer` Opus + `security-auditor` Opus before commit per project CLAUDE.md, since the MCP server is a new surface) covers the design + implementation together. User approved this amendment without re-firing security-auditor on the ADR.
 
   Slice-1 Vision captured as `docs/vision/slice-1-mcp-generate.md` (mirrored to Obsidian) so future cold-start sessions can pick up without re-reading the session-dump transcript.
+
+- **2026-05-02 (MCP-returned artifact policy + image-upload-as-seed deferred)**: Pre-implementation review surfaced three artifact-handling concerns that are easier to capture before slice-1 code lands than to retrofit. None of them changes the core decision (MCP as the LLM-agent calling interface); all three refine what the agent gets back, what gets written to disk, and what the agent is allowed to send in.
+
+  **§2 amendment — `generate` output contract.** The `generate` tool output is amended from "output path, resolved-params sidecar JSON, elapsed seconds" to:
+  - **Output path** — absolute path to the generated PNG (under `--output-dir`, unchanged from §3a).
+  - **Resolved-params blob** — returned **inline in the MCP response frame**. **No sidecar JSON file is written to disk for MCP-driven calls.** The CLI path (and the legacy `--json` bridge per §5) continues to write sidecars per ADR-006; only the MCP path suppresses the disk write.
+  - **Elapsed seconds** — unchanged.
+
+  Rationale: MCP-driven generations are one-and-done from the LLM-session perspective. The MCP client may retain images for the session if it chooses; durable archival of params belongs to the user's deliberate save action, not the server's default. The resolved-params blob is still available to the agent in the same response — it just doesn't accumulate stray `.json` files in `--output-dir` next to every generation. This is also a defense-in-depth measure: a sidecar on disk is one more unredacted-paths object the user could share without realizing.
+
+  **§3e (new) — MCP-returned artifact redaction.** PNG `comfyless` tEXt chunks embedded in MCP-returned images MUST NOT contain absolute filesystem paths. The redaction maps each path-typed field to its basename (or its HF repo ID if the input was an HF repo ID, in which case it passes through unchanged):
+  - `model`, `transformer_path`, `vae_path`, `text_encoder_path`, `text_encoder_2_path`, `loras[].path` → filename only (no directory component).
+  - `cascade_config.stage_c`, `cascade_config.stage_b`, `cascade_config.stage_a`, `cascade_config.scaffolding_repo` → same treatment.
+  - `output_path`, `savepath` → not embedded at all in MCP-returned PNGs (the agent already has the output path in the MCP response frame; baking it into the image is redundant and leaks the configured `--output-dir` to anyone the image is later shared with).
+
+  All non-path generation parameters are retained in the chunk verbatim: `prompt`, `negative_prompt`, `seed`, `steps`, `cfg_scale`, `true_cfg_scale`, `sampler`, `scheduler`, `width`, `height`, `model_family`, LoRA `weight` values, etc. The model/LoRA *identity* is preserved as a filename so an agent can request "same model, different sampler" without server-side state.
+
+  CLI-driven calls retain full-path embedding in the PNG chunk (existing behavior). The MCP path is the asymmetric case — same architectural rule as the audit-log redaction in §3b: **machine boundary fails closed; human boundary keeps the full record**. The redaction map is shared in code with the §3b audit-line field list so they cannot drift.
+
+  Implementation site: the existing PNG-chunk write path (verified during slice 1) gains a `caller=mcp` branch that runs the redaction map before embedding. Slice 1 lands this; the CLI path is untouched.
+
+  **§7 Deferred / Out of Scope addition — Image-upload-with-metadata as a generation seed.** New use case surfaced 2026-05-02: an LLM client supplies an image carrying ComfyUI workflow metadata (the most likely shape) or comfyless's own PNG `comfyless` chunk, and asks `generate` (or a future tool) to use the embedded parameters as the base config for a new generation. Useful for "regenerate this image with a different sampler" when the user uploaded the image rather than the LLM having generated it.
+
+  **Status: deferred pending dedicated `security-auditor` review.** This is a potential information-leak surface — an extraction-then-validate flow is probeable: the agent can construct synthetic images claiming arbitrary `model` / `loras[].path` values and observe the server's response shape to enumerate what is and isn't installed under `--model-base`. Even an "invalid path" error that names the missing component leaks installation state.
+
+  Possible mitigations to evaluate (not committed to until reviewed):
+  - **Refuse entirely.** Require the LLM to enumerate via `list_models` / `list_loras` and construct the request inline. Simplest; loses the "user uploaded a ComfyUI workflow image, please redo with my edits" use case.
+  - **Validate against allowlist with generic-error responses.** Image-extracted params round-trip through `list_models` / `list_loras` validation; any allowlist miss returns a single generic error message that does not distinguish "model not found" from "malformed metadata" from "weight format unsupported." Requires very careful response shaping to avoid timing or error-class oracles.
+  - **Restrict the extraction surface to non-identifying gen params.** Drop all model/transformer/LoRA/VAE/TE references during extraction; keep only `prompt`, `negative_prompt`, `seed`, `steps`, `cfg_scale`, `sampler`, `scheduler`, `width`, `height`. The agent must still pick a model itself via `list_models`. Loses fidelity but eliminates the probe surface.
+
+  No commitment to any approach until `security-auditor` (Opus) review produces a design recommendation. Tracking entry: backlog Queued ("MCP image-upload-as-seed input surface").
+
+  **Open question — LLM-as-judge entrypoint signature.** The auto-refinement loop (Backlog Ideas) needs a loop driver that calls `generate` with concrete model/LoRA references. Two architectural shapes are possible:
+  - **Catalog-routed (current direction).** Loop driver consults the LoRA catalog (Queued) for path resolution, then calls `generate` over MCP with paths in. The MCP redaction (§3e above) still applies to the returned image. Path info never reaches the LLM judge — only the redacted PNG and the resolved-params blob with basenames.
+  - **Privileged-judge entrypoint.** A separate non-MCP entrypoint for trusted loop drivers that returns full paths in its response (so the judge can plan "swap to lora at /m/y.safetensors"). Distinct from the agent-facing `generate`; not exposed via MCP.
+
+  Decision deferred until the loop controller is being built. Slice 1 commits only to the catalog-routed shape (no path leakage on the MCP surface). The privileged entrypoint is a future ADR if it's ever needed.
+
+  **No re-audit for this amendment.** Two of the three changes (sidecar suppression for MCP, PNG path redaction in §3e) tighten existing surfaces along the same architectural axis as §3b's audit-log redaction; no new threat surface is introduced. The third (image-upload-as-seed) is explicitly deferred and not implemented — the security-auditor review when that work is picked up covers its design and implementation together. The slice-1 implementation review (`code-reviewer` Opus + `security-auditor` Opus before commit per project CLAUDE.md) covers the §2 / §3e changes alongside the rest of slice 1.
+
+  Slice-1 Vision (`docs/vision/slice-1-mcp-generate.md`) gains two new invariants (PNG redaction + no-sidecar-on-MCP) and corresponding negative cases in the same edit; vault mirror updated.
