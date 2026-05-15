@@ -1,8 +1,8 @@
 # ADR-012: One Canonical Machine-Boundary Validator for Comfyless
 
 **Date:** 2026-05-04
-**Status:** proposed
-**AI-Disclosure:** Claude (Opus 4.7, 1M context) authored; Grant to review.
+**Status:** accepted
+**AI-Disclosure:** Claude (Opus 4.7, 1M context) authored; Grant reviewed and accepted 2026-05-15.
 **Cross-references:** ADR-001 (daemon socket security — validator plugs into the existing `_validate_request` shape), ADR-006 (`--json` bridge — explicit non-target; CLI / sidecar path stays permissive), ADR-009 (per-family defaults overlay — schema evolution rules unchanged), ADR-011 (MCP server — consumer; slice 1 imports the canonical validator from line one).
 **Triggering review:** Codex code review 2026-05-01 — findings 02 F2 ("Server Request Schema Does Not Match COMFYLESS_SCHEMA"), 03 SF1 ("Server Schema Drift At IPC Boundary"), 04 Rec 2 ("Treat COMFYLESS_SCHEMA As A Real Contract Module"), 05 Gap 2 ("Server Schema vs COMFYLESS_SCHEMA"). Vision artifact: `docs/vision/slice-machine-boundary-validator.md` (committed `567fba3`).
 
@@ -128,3 +128,4 @@ A timeline alternative: ship MCP slice 1 with its own validator, then unify late
 ## Changelog
 
 - **2026-05-04 (initial draft)**: ADR drafted in response to codex 2026-05-01 review's findings 02 F2 / 03 SF1 / 04 Rec 2 / 05 Gap 2 plus the 2026-04-23 LoRA-weight TECH_DEBT entry. Records the canonical-validator decision, the canonical-type-per-field schema collapse, the int→float safe-cast in one direction only, and the boundary-asymmetry rule (machine fail-closed; human warn-and-keep). Cross-referenced from ADR-011 2026-05-04 Changelog amendment §(a) as the prerequisite for slice 1. Vision artifact already committed (`567fba3`); slice implementation gated on this ADR being accepted. AI-Disclosure: Claude (Opus 4.7, 1M context) authored; Grant to review.
+- **2026-05-15 (accepted)**: Grant accepted ADR as written; no design changes. Validator slice may now begin per the Vision artifact at `docs/vision/slice-machine-boundary-validator.md`. Slice is itself L3 / Red Zone — both `code-reviewer` and `security-auditor` (Opus, pinned at invocation per project CLAUDE.md review-bar) run before commit. Ordering remains: validator slice → ADR-011 slice 1 (`generate` MCP tool).
