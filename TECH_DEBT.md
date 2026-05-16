@@ -170,6 +170,15 @@ Queued in Backlog.
 - **Trigger:** Next server-touching commit or schema tidy pass.
 - **Priority:** Low
 - **Pending closure by:** *(2026-05-04)* validator harmonization slice — `docs/vision/slice-machine-boundary-validator.md`, ADR-012 forthcoming. Vision invariant 5 unifies LoRA-weight validation across machine-boundary call sites; invariant 4 makes `weight` canonical-`float` with safe `int → float` cast at the validator boundary, structurally enforcing the type-check this entry calls for. Original suggested-fix shape is superseded by the validator slice's per-LoRA validation helper. Mark `Resolved:` here (per global §12) when the validator slice ships.
+- **Resolved: 2026-05-16** — closed by ADR-012 validator slice (commits `58ef335`..`57bd650`). `validate_lora_entry` in `comfyless/params_validation.py` enforces both `path` and `weight` as required fields; canonical-`float` typing rejects `bool` and rejects `str`/`None`; safe `int → float` cast applied at the validator boundary. Called from `comfyless/server.py:_validate_request` (step 3) AND `comfyless/generate.py:_validate_iterate_value` lora_stack branch (step 4) — single source of truth across both machine-boundary call sites. The 2026-04-23 §12 review's finding 9 (bool-as-int subtype loophole) is also closed by the same slice — the canonical validator rejects `bool` BEFORE the `int` accept branch in `_KIND_INT` and `_KIND_FLOAT`. Cross-site parity proved by the N18 grid (38 fixtures) in `test_machine_boundary_validator.py`. Step-3 security review at `docs/security/review-validator-slice-step3-2026-05-16.md`.
+
+### [Security] Server path-error audit log drops `prompt` only, not `negative_prompt`
+- **Location:** `comfyless/server.py:302-303` (in `_handle_connection`'s path-error branch)
+- **Observed:** 2026-05-16 step-3 security audit of the validator slice (`docs/security/review-validator-slice-step3-2026-05-16.md`, finding 8)
+- **Why not now:** Pre-existing — not introduced by the validator slice; out of step-3 edit scope. ADR-011 §3b (round-1 fold-in F-4, 2026-04-28) committed to dropping BOTH `prompt` AND `negative_prompt` from machine-boundary audit lines; this `_handle_connection` path-error log line was written before ADR-011 landed and drops only `prompt`.
+- **Suggested fix:** in the `redacted = {...}` dict comprehension at line 302, exclude `negative_prompt` alongside `prompt`. One-line change: `redacted = {k: v for k, v in req.items() if k not in ("prompt", "negative_prompt")}`. Add a regression test asserting both keys are absent from the audit-line content.
+- **Trigger:** Next `_handle_connection`-touching commit; or before ADR-011 slice 1 (MCP `generate` tool) lands and the audit pattern becomes a published contract.
+- **Priority:** Medium
 
 ### [Security] resolve_hf_path hardening — follow-up from §12 review (2026-04-23)
 - **Location:** `nodes/eric_diffusion_utils.py` (`resolve_hf_path`, `_is_hf_repo_id`) + `comfyless/generate.py` `_run_cli_mode`
