@@ -2,8 +2,8 @@
 
 **Date:** 2026-05-01
 **ADR:** ADR-012 (to be authored before code lands; this Vision is the planning artifact). Cross-references ADR-001 (daemon socket security), ADR-006 (`--json` bridge), ADR-009 (per-family defaults overlay), ADR-011 (MCP server — consumer of this validator).
-**Status:** drafted by Claude (Opus 4.7, 1M context); awaiting Grant review.
-**AI-Disclosure:** Claude (Opus 4.7, 1M context) authored; Grant to review.
+**Status:** approved 2026-05-15 — ADR-012 accepted; implementation underway via the validator slice.
+**AI-Disclosure:** Claude (Opus 4.7, 1M context) authored; Grant reviewed and approved.
 **Triggering review:** Codex code review 2026-05-01 — findings `02 F2`, `03 SF1`, `04 Rec 2`, `05 Gap 2`.
 
 ---
