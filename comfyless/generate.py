@@ -59,6 +59,7 @@ from nodes.eric_diffusion_samplers import sampler_choices, swap_sampler
 from nodes.eric_qwen_edit_lora import load_lora_with_key_fix
 
 from comfyless.family_defaults import FAMILY_DEFAULTS
+from comfyless.params_validation import validate_lora_entry
 
 CONTRACT_VERSION = 1
 SAMPLER_NAMES = sampler_choices()
@@ -1366,14 +1367,17 @@ def _validate_iterate_value(value: Any, expected: Any) -> bool:
     if expected == "lora_stack":
         if not isinstance(value, list):
             return False
-        for item in value:
-            if not isinstance(item, dict) or "path" not in item:
-                return False
-            if not isinstance(item["path"], str):
-                return False
-            if "weight" in item and not isinstance(item["weight"], (int, float)):
-                return False
-            if isinstance(item.get("weight"), bool):
+        # Per-entry validation delegates to the canonical machine-boundary
+        # validator per ADR-012 §6 / Vision invariant 5 (step 4 of validator
+        # slice). One bad entry rejects the whole axis (matches the
+        # fail-closed posture of machine-boundary surfaces).
+        #
+        # Contract tightening vs the prior local check: missing 'weight' now
+        # rejects (was previously accepted; downstream code at lines 855, 927,
+        # and 1276 defaulted to 1.0 — those defaults no longer rescue an
+        # under-specified iterate input file).
+        for i, item in enumerate(value):
+            if not validate_lora_entry(item, i).ok:
                 return False
         return True
     if expected is int:

@@ -339,6 +339,73 @@ check(
     detail=f"violations at lines: {[v.lineno for v in _violations_server]}",
 )
 
+# N19 second site: iterate's lora_stack branch in _validate_iterate_value.
+# Walk generate.py's AST, find the FunctionDef, then find the If statement
+# whose test is `expected == "lora_stack"`, then check its body.
+_generate_src = (Path(__file__).parent / "comfyless" / "generate.py").read_text()
+_generate_tree = ast.parse(_generate_src)
+_violations_iterate = []
+for node in ast.walk(_generate_tree):
+    if isinstance(node, ast.FunctionDef) and node.name == "_validate_iterate_value":
+        for sub in node.body:
+            if not isinstance(sub, ast.If):
+                continue
+            test = sub.test
+            # Match `expected == "lora_stack"`.
+            if (isinstance(test, ast.Compare)
+                and isinstance(test.left, ast.Name)
+                and test.left.id == "expected"
+                and len(test.ops) == 1
+                and isinstance(test.ops[0], ast.Eq)
+                and len(test.comparators) == 1
+                and isinstance(test.comparators[0], ast.Constant)
+                and test.comparators[0].value == "lora_stack"):
+                _violations_iterate = list(_isinstance_violations_in_body(sub.body))
+                break
+        break
+
+check(
+    "N19: zero forbidden isinstance(int|float|bool|str) in iterate lora_stack branch",
+    not _violations_iterate,
+    detail=f"violations at lines: {[v.lineno for v in _violations_iterate]}",
+)
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n== N18 cross-site iterate: _validate_iterate_value lora_stack matches validate_lora_entry ==")
+
+# Activated step 4. Iterate's per-LoRA validator takes a list of LoRA dicts;
+# the canonical helper takes single entries. Build a mini-grid of single-
+# entry fixtures and assert iterate(_validate_iterate_value([entry], "lora_stack"))
+# matches validate_lora_entry(entry, 0).ok for every case.
+import comfyless.generate as gen_mod  # noqa: E402
+
+_LORA_GRID = [
+    # (name,                              entry,                                            expected_ok)
+    ("valid: path + float weight",        {"path": "/x.sft", "weight": 0.8},                True),
+    ("valid: path + int weight (cast)",   {"path": "/x.sft", "weight": 1},                  True),
+    ("valid: path + zero weight",         {"path": "/x.sft", "weight": 0.0},                True),
+    ("reject: missing weight",            {"path": "/x.sft"},                               False),
+    ("reject: missing path",              {"weight": 0.8},                                  False),
+    ("reject: bool weight",               {"path": "/x.sft", "weight": True},               False),
+    ("reject: str weight",                {"path": "/x.sft", "weight": "heavy"},            False),
+    ("reject: None weight",               {"path": "/x.sft", "weight": None},               False),
+    ("reject: int path",                  {"path": 42, "weight": 0.8},                      False),
+    ("reject: non-dict entry",            "not a dict",                                     False),
+    # Extra-keys pass-through: unknown-key tightening is out of scope per
+    # Vision; validate_lora_entry preserves unknown keys verbatim (e.g. 'rank',
+    # 'alpha' kohya metadata). Lock the contract surface for iterate consumers.
+    ("valid: extra keys preserved",       {"path": "/x.sft", "weight": 0.8, "rank": 64},    True),
+]
+
+for name, entry, expected_ok in _LORA_GRID:
+    canonical_ok = validate_lora_entry(entry, 0).ok
+    iterate_ok = gen_mod._validate_iterate_value([entry], "lora_stack")
+    check(
+        f"N18 iterate cross-site: {name}",
+        canonical_ok == iterate_ok == expected_ok,
+        detail=f"canonical={canonical_ok}, iterate={iterate_ok}, expected={expected_ok}",
+    )
+
 # ──────────────────────────────────────────────────────────────────────
 print("\n== N20: validator does no filesystem IO ==")
 

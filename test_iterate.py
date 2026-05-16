@@ -84,11 +84,15 @@ check("lora_stack accepts single-item stack",
           [{"path": "/x.safetensors", "weight": 0.8}],
           "lora_stack",
       ) is True)
-check("lora_stack accepts stack without weight",
+# Behavior tightening per ADR-012 §6 / Vision invariant 5 (validator slice
+# step 4, 2026-05-16): missing 'weight' now rejects. Was previously accepted
+# (downstream code defaulted to 1.0); the canonical validator requires both
+# 'path' and 'weight' explicit.
+check("lora_stack rejects stack without weight (ADR-012 §6)",
       g._validate_iterate_value(
           [{"path": "/x.safetensors"}],
           "lora_stack",
-      ) is True)
+      ) is False)
 check("lora_stack rejects non-list top-level",
       g._validate_iterate_value({"path": "/x.safetensors"}, "lora_stack") is False)
 check("lora_stack rejects item without path",
