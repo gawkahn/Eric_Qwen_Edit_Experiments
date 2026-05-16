@@ -96,13 +96,19 @@ for n, field in [
           and result.error["field"] == field
           and "bool" in result.error["reason"])
 
-# Parametric N1-N7: derive numeric-field list from _SCHEMA_KIND itself so that
-# a future field addition without a corresponding test cannot silently weaken
-# the bool-reject branch. Closes step-1 security-audit finding 1.
-print("\n== Parametric bool-reject coverage (security-audit F1) ==")
+# Parametric N1-N7: derive numeric-field list from SCHEMA_KIND + _RUNTIME_KIND
+# itself so that a future field addition without a corresponding test cannot
+# silently weaken the bool-reject branch. Closes step-1 security-audit finding 1
+# and step-3 security-audit finding 9 (runtime-kind coverage extension).
+print("\n== Parametric bool-reject coverage (security-audit F1 + F9) ==")
 
 _NUMERIC_KINDS = {pv._KIND_INT, pv._KIND_FLOAT, pv._KIND_FLOAT_NONE}
-for field, kind in pv.SCHEMA_KIND.items():
+# pv._RUNTIME_KIND is private to params_validation but the test legitimately
+# reaches into it: any numeric field added to runtime-only schema must auto-
+# cover via this loop (step-3 audit F9). Today _RUNTIME_KIND has no numeric
+# fields (only str / bool) so the loop is preventive.
+_PARAMETRIC_FIELDS = {**pv.SCHEMA_KIND, **pv._RUNTIME_KIND}
+for field, kind in _PARAMETRIC_FIELDS.items():
     if kind not in _NUMERIC_KINDS:
         continue
     # Required fields (model, prompt) are always str; numeric fields are all
@@ -236,8 +242,102 @@ for name, payload, expected_ok in _GRID:
           detail=f"got ok={result.ok}, error={result.error}")
 
 # ──────────────────────────────────────────────────────────────────────
-print("\n== N19: grep static check (skipped — activates in steps 3/4) ==")
-print("  SKIP  N19: server.py / iterate LoRA-axis still own isinstance until steps 3-4")
+print("\n== N18 cross-site: server._validate_request matches canonical ==")
+
+# Activated step 3 — server.py:_validate_request now wraps the canonical
+# validator. For every grid fixture, server and canonical must return the
+# same accept/reject decision. Step 4 extends this to iterate's per-LoRA
+# helper.
+import comfyless.server as server_mod  # noqa: E402
+
+for name, payload, expected_ok in _GRID:
+    server_err = server_mod._validate_request(payload)
+    server_ok = server_err is None
+    canonical_ok = validate_machine_request(payload).ok
+    check(
+        f"N18 cross-site: {name} (server={server_ok}, canonical={canonical_ok})",
+        server_ok == canonical_ok,
+        detail=f"server_err={server_err!r}",
+    )
+
+# Server-only branches the canonical validator doesn't model (request type
+# semantic check + required-field presence). The N18 grid can't cover these
+# because they're server-specific by design; lock them with targeted asserts.
+# Closes step-3 code-reviewer suggestion 1.
+print("\n  -- server-only branches (canonical doesn't model these) --")
+
+check("server: type=ping accepted (no further checks)",
+      server_mod._validate_request({"type": "ping"}) is None)
+check("server: type=unload accepted (no further checks)",
+      server_mod._validate_request({"type": "unload"}) is None)
+check("server: type=garbage rejected",
+      server_mod._validate_request({"type": "garbage"})
+      and "Unknown request type" in server_mod._validate_request({"type": "garbage"}))
+check("server: generate missing model rejected",
+      server_mod._validate_request({"type": "generate", "prompt": "hi"})
+      == "Missing required field: 'model'")
+check("server: generate missing prompt rejected",
+      server_mod._validate_request({"type": "generate", "model": "/m/foo"})
+      == "Missing required field: 'prompt'")
+
+# Verify F6 fold-in: server's _validate_request mutates req in place with the
+# validator's int→float safe cast. Confirms the cast actually propagates to
+# downstream consumers, not just to result.payload.
+_req_with_int_cfg = {
+    "type": "generate", "model": "/m/foo", "prompt": "hi", "cfg_scale": 4,
+}
+server_mod._validate_request(_req_with_int_cfg)
+check("server: int→float cast propagated to caller's req dict (F6 fold-in)",
+      _req_with_int_cfg["cfg_scale"] == 4.0
+      and isinstance(_req_with_int_cfg["cfg_scale"], float))
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n== N19: zero isinstance(int|float|bool|str) in server._validate_request ==")
+
+# Activated step 3. AST-walks server.py, finds the _validate_request
+# FunctionDef, asserts its body contains no Call to isinstance whose
+# second-arg names int / float / bool / str. The check is structurally
+# tight — immune to formatting and comment shenanigans.
+
+_FORBIDDEN_TYPES = {"int", "float", "bool", "str"}
+_server_src = (Path(__file__).parent / "comfyless" / "server.py").read_text()
+_server_tree = ast.parse(_server_src)
+
+def _isinstance_violations_in_body(body):
+    """Yield Call nodes inside `body` whose shape is isinstance(X, T1[, T2, ...])
+    with at least one T in _FORBIDDEN_TYPES."""
+    for node in ast.walk(ast.Module(body=body, type_ignores=[])):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Name) and func.id == "isinstance"):
+            continue
+        if len(node.args) < 2:
+            continue
+        type_arg = node.args[1]
+        # Direct: isinstance(x, str)
+        type_names = []
+        if isinstance(type_arg, ast.Name):
+            type_names.append(type_arg.id)
+        # Tuple union: isinstance(x, (int, float))
+        elif isinstance(type_arg, ast.Tuple):
+            for elt in type_arg.elts:
+                if isinstance(elt, ast.Name):
+                    type_names.append(elt.id)
+        if any(t in _FORBIDDEN_TYPES for t in type_names):
+            yield node
+
+_violations_server = []
+for node in ast.walk(_server_tree):
+    if isinstance(node, ast.FunctionDef) and node.name == "_validate_request":
+        _violations_server = list(_isinstance_violations_in_body(node.body))
+        break
+
+check(
+    "N19: zero forbidden isinstance(int|float|bool|str) in server._validate_request",
+    not _violations_server,
+    detail=f"violations at lines: {[v.lineno for v in _violations_server]}",
+)
 
 # ──────────────────────────────────────────────────────────────────────
 print("\n== N20: validator does no filesystem IO ==")

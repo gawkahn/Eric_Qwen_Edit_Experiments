@@ -38,6 +38,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from comfyless.params_validation import validate_machine_request
+
 
 # Wire-protocol guardrails (see docs/security/review-comfyless-server-2026-04-23.md)
 _MAX_FRAME_BYTES = 1 << 20   # 1 MiB; real requests are < 10 KiB
@@ -90,74 +92,60 @@ def socket_path() -> Path:
 #  Request schema validation
 # ════════════════════════════════════════════════════════════════════════
 
-_GENERATE_REQUIRED: Dict[str, type] = {
-    "model":  str,
-    "prompt": str,
-}
+def _validate_request(req: Any) -> Optional[str]:
+    """Return an error string if the request is malformed, else None.
 
-_GENERATE_OPTIONAL: Dict[str, Any] = {
-    "negative_prompt":     str,
-    "seed":                int,
-    "steps":               int,
-    "cfg_scale":           float,
-    "true_cfg_scale":      (float, type(None)),
-    "width":               int,
-    "height":              int,
-    "sampler":             str,
-    "schedule":            str,
-    "max_sequence_length": int,
-    "loras":               list,
-    "precision":           str,
-    "offload_vae":         bool,
-    "attention_slicing":   bool,
-    "sequential_offload":  bool,
-    "transformer_path":    str,
-    "vae_path":            str,
-    "text_encoder_path":   str,
-    "text_encoder_2_path": str,
-    "vae_from_transformer": bool,
-    "savepath":            str,
-}
+    Type-rule validation delegates to comfyless.params_validation per ADR-012
+    (accepted 2026-05-15). This function owns three server-specific concerns
+    the canonical validator does not:
+      - Request-type-tag semantic check ('generate' | 'unload' | 'ping')
+      - Required-field presence (canonical declares defaults, not required-ness)
+      - Null-byte path defense (kept here as filesystem defense-in-depth,
+        not type validity; see step-3 commit body for the rationale)
 
+    No isinstance() predicates appear in this function's body — the N19 grep
+    invariant from the slice Vision is now active for server.py.
+    """
+    # Canonical type validation handles non-dict payloads + every type rule.
+    result = validate_machine_request(req)
+    if not result.ok:
+        err = result.error
+        if err["field"] == "<root>":
+            return f"Request must be a dict; {err['reason']}"
+        return f"Field {err['field']!r}: {err['reason']}"
 
-def _validate_request(req: dict) -> Optional[str]:
-    """Return an error string if the request is malformed, else None."""
+    # Propagate the validator's int→float safe-cast (ADR-012 §3) into the
+    # caller's request dict so downstream consumers see the cast-applied
+    # values rather than the un-cast wire input. Closes step-3 security-
+    # auditor finding 6 (validated-payload-discarded parity gap).
+    req.update(result.payload)
+
+    # Type-tag semantic check (the canonical validator type-checks 'type' as
+    # a string but does not enforce the allowed-value set).
     req_type = req.get("type")
     if req_type not in ("generate", "unload", "ping"):
         return f"Unknown request type: {req_type!r}. Expected: generate | unload | ping"
     if req_type != "generate":
         return None
 
-    for field, expected in _GENERATE_REQUIRED.items():
-        if field not in req:
-            return f"Missing required field: {field!r}"
-        if not isinstance(req[field], expected):
-            return (f"Field {field!r}: expected {expected.__name__}, "
-                    f"got {type(req[field]).__name__}")
+    # Required-field presence — server-specific; the canonical validator's
+    # schema declares defaults but has no notion of "required."
+    if "model" not in req:
+        return "Missing required field: 'model'"
+    if "prompt" not in req:
+        return "Missing required field: 'prompt'"
 
-    for field, expected in _GENERATE_OPTIONAL.items():
-        val = req.get(field)
-        if val is None:
-            continue
-        if isinstance(expected, tuple):
-            if not isinstance(val, expected):
-                names = " | ".join(t.__name__ for t in expected)
-                return f"Field {field!r}: expected {names}, got {type(val).__name__}"
-        elif not isinstance(val, expected):
-            return (f"Field {field!r}: expected {expected.__name__}, "
-                    f"got {type(val).__name__}")
-
+    # Null-byte path defense. Kept server-specific rather than migrated into
+    # the canonical validator (option discussed in the step-1 security
+    # review): null-byte rejection is filesystem-defense-in-depth, adjacent
+    # to but not the same concern as type validity. Centralizing it would
+    # also tighten prompts/etc. unnecessarily. Future slice may revisit.
     for i, lora in enumerate(req.get("loras") or []):
-        if not isinstance(lora, dict) or "path" not in lora:
-            return f"loras[{i}]: expected {{\"path\": str, \"weight\": float}}"
-        if not isinstance(lora["path"], str):
-            return f"loras[{i}].path: expected str"
         if "\x00" in lora["path"]:
             return f"loras[{i}].path: null byte not allowed"
-
     for field in _PATH_FIELDS:
-        val = req.get(field)
-        if isinstance(val, str) and "\x00" in val:
+        val = req.get(field, "")
+        if val and "\x00" in val:
             return f"Field {field!r}: null byte not allowed"
 
     return None
