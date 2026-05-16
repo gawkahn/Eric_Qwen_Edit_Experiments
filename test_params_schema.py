@@ -46,8 +46,14 @@ print("── COMFYLESS_SCHEMA shape ──────────────�
 
 schema = g.COMFYLESS_SCHEMA
 
-check("schema is a dict",
-      isinstance(schema, dict))
+# COMFYLESS_SCHEMA is wrapped in MappingProxyType (read-only) per ADR-012
+# step-2 hardening — the structural-immutability check the step-2 reviewer
+# called out (F2). MappingProxyType is a `Mapping` but NOT a `dict`
+# subclass; tightening the assertion to Mapping accepts both shapes.
+import collections.abc as _abc  # noqa: E402
+
+check("schema is a Mapping (dict or MappingProxyType)",
+      isinstance(schema, _abc.Mapping))
 check("schema is non-empty",
       len(schema) > 0)
 
@@ -223,28 +229,28 @@ check("type-mismatch warning names expected type",
 check("type-mismatch warning names actual type",
       "str" in err)
 
-# Union types: cfg_scale accepts int OR float. bool is a Python subclass
-# of int (isinstance(True, int) == True), so the schema does NOT
-# explicitly exclude bool — a documented gap. The True-input assertion
-# below pins the *current* accepted behavior so any future tightening
-# (e.g. adding `and not isinstance(value, bool)` to _validate_params)
-# fails this test deliberately rather than silently changing semantics.
+# Canonical type per ADR-012 (accepted 2026-05-15): cfg_scale is canonical
+# float. _validate_params remains warn-and-keep (Vision invariant 7) — its
+# acceptance set is unchanged from the prior (int, float) declaration, but
+# its warning set grew: int inputs that previously silently passed now
+# surface a type-mismatch warning. The value still flows through.
 out, err = _capture_stderr(g._validate_params,
                            {"cfg_scale": 4}, source="unit")
-check("int accepted for cfg_scale (union type)",
-      out == {"cfg_scale": 4} and err == "")
+check("int kept for cfg_scale (warn, value preserved — warn-set grew per ADR-012)",
+      out == {"cfg_scale": 4} and "cfg_scale" in err)
 
 out, err = _capture_stderr(g._validate_params,
                            {"cfg_scale": 4.5}, source="unit")
-check("float accepted for cfg_scale (union type)",
+check("float accepted for cfg_scale (canonical type, no warning)",
       out == {"cfg_scale": 4.5} and err == "")
 
-# Documented gap: bool passes as int. If a future change tightens this
-# (and breaks this test), update the schema, this test, AND the comment.
+# bool is now rejected at the type-check level (closes the prior documented
+# gap). _validate_params still keeps the value per invariant 7; the warn
+# surfaces it for human attention.
 out, err = _capture_stderr(g._validate_params,
                            {"cfg_scale": True}, source="unit")
-check("bool accepted for cfg_scale (documented gap; bool is int-subclass)",
-      out == {"cfg_scale": True} and err == "")
+check("bool kept for cfg_scale (warn — bool-as-int gap surfaced per ADR-012)",
+      out == {"cfg_scale": True} and "cfg_scale" in err)
 
 out, err = _capture_stderr(g._validate_params,
                            {"cfg_scale": "4.5"}, source="unit")

@@ -102,7 +102,7 @@ for n, field in [
 print("\n== Parametric bool-reject coverage (security-audit F1) ==")
 
 _NUMERIC_KINDS = {pv._KIND_INT, pv._KIND_FLOAT, pv._KIND_FLOAT_NONE}
-for field, kind in pv._SCHEMA_KIND.items():
+for field, kind in pv.SCHEMA_KIND.items():
     if kind not in _NUMERIC_KINDS:
         continue
     # Required fields (model, prompt) are always str; numeric fields are all
@@ -348,7 +348,7 @@ except dataclasses.FrozenInstanceError:
 
 # Module-level dicts are read-only (MappingProxyType per security-audit F7).
 try:
-    pv._SCHEMA_KIND["cfg_scale"] = pv._KIND_INT  # type: ignore[index]
+    pv.SCHEMA_KIND["cfg_scale"] = pv._KIND_INT  # type: ignore[index]
     check("schema map: mutation raises TypeError", False,
           detail="MappingProxyType allowed mutation")
 except TypeError:

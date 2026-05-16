@@ -88,62 +88,16 @@ def _log(msg: str) -> None:
 # required-field gate at _run_cli_mode() around the --model/--prompt check
 # still owns that check; the schema merely labels them.
 #
-# Types are checked by _validate_params via isinstance(); tuple targets
-# accept any listed type (e.g. int OR float for cfg_scale).  Coercion is
-# out of scope for this refactor (a string "4" stays a string + warning).
+# Types are checked by _validate_params via isinstance(); the schema's
+# expected-type element may be a tuple of types for nullable fields. Coercion
+# is out of scope (a string "4" stays a string + warning).
 #
-# Covers every param reachable by generate() that can originate from
-# sidecar JSON, Eric Diffusion Save chunks, ComfyUI prompt chunks, PNG
-# comfyless chunks, --override patches, or the CLI merge block.  Runtime-
-# only flags (precision, device, offload_vae, attention_slicing,
-# sequential_offload, allow_hf_download) flow straight from argparse and
-# are NOT sidecar-shaped, so they live outside the schema.
-COMFYLESS_SCHEMA: Dict[str, tuple] = {
-    # Required
-    "model":                (str,           None),
-    "prompt":               (str,           None),
-    # Text
-    "negative_prompt":      (str,           ""),
-    # Numerics
-    "seed":                 (int,           -1),
-    "steps":                (int,           28),
-    "cfg_scale":            ((int, float),  3.5),
-    # true_cfg_scale is nullable → None or number; the generate() sig
-    # treats None as "unset, fall back to cfg_scale".
-    "true_cfg_scale":       ((int, float, type(None)), None),
-    "width":                (int,           1024),
-    "height":               (int,           1024),
-    # Sampler / schedule identifiers
-    "sampler":              (str,           "default"),
-    "schedule":             (str,           "linear"),
-    # Encoder context length
-    "max_sequence_length":  (int,           512),
-    # Component overrides (empty string = "use base model's component")
-    "transformer_path":     (str,           ""),
-    "vae_path":             (str,           ""),
-    "text_encoder_path":    (str,           ""),
-    "text_encoder_2_path":  (str,           ""),
-    "vae_from_transformer": (bool,          False),
-    # LoRA stack — list of {"path": str, "weight": float} dicts.
-    "loras":                (list,          []),
-}
-
-
-# CLI argparse-attr name → canonical schema key.  Only names that DIFFER
-# from their canonical target.  Identical pairs (negative_prompt,
-# vae_from_transformer, model, prompt, seed, steps, width, height,
-# sampler, schedule) are NOT listed — _cli_value_for falls back to
-# getattr(args, canonical_key) for those.
-_CLI_TO_CANONICAL: Dict[str, str] = {
-    "cfg":         "cfg_scale",
-    "true_cfg":    "true_cfg_scale",
-    "max_seq_len": "max_sequence_length",
-    "transformer": "transformer_path",
-    "vae":         "vae_path",
-    "te1":         "text_encoder_path",
-    "te2":         "text_encoder_2_path",
-    "lora":        "loras",
-}
+# COMFYLESS_SCHEMA and _CLI_TO_CANONICAL moved to comfyless.params_schema as
+# part of the ADR-012 step-2 schema collapse — the canonical-key + canonical-
+# type declarations now live next to the validator that consumes them. The
+# names are re-exported here so external consumers (test_params_schema.py,
+# downstream importers) keep working.
+from comfyless.params_schema import COMFYLESS_SCHEMA, _CLI_TO_CANONICAL  # noqa: E402,F401
 
 
 # ── Sidecar / override helpers ───────────────────────────────────────────

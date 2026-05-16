@@ -40,7 +40,7 @@ _KIND_LIST       = "list"
 # structurally impossible — the validator is security truth and the canonical
 # schema must not be reachable for runtime modification. See ADR-012 §5
 # (pure function discipline) and step-1 security review finding 7.
-_SCHEMA_KIND = types.MappingProxyType({
+SCHEMA_KIND = types.MappingProxyType({
     "model":                _KIND_STR,
     "prompt":               _KIND_STR,
     "negative_prompt":      _KIND_STR,
@@ -76,7 +76,7 @@ _RUNTIME_KIND = types.MappingProxyType({
 })
 
 
-_ALL_FIELDS = types.MappingProxyType({**_SCHEMA_KIND, **_RUNTIME_KIND})
+_ALL_FIELDS = types.MappingProxyType({**SCHEMA_KIND, **_RUNTIME_KIND})
 
 
 @dataclass(frozen=True)
