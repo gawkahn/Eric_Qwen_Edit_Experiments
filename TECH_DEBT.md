@@ -126,6 +126,26 @@ Trigger: first report of the ceiling tripping, OR first commit that adds a model
 family with known-longer generation times. See
 `docs/security/review-server-timeout-brokenpipe-2026-04-24.md` (LOW finding).
 
+**Pre-existing `torch.load()` CWE-502 sites in `nodes/eric_diffusion_utils.py`** *(2026-05-17)*
+Semgrep flags 5 call sites that use `torch.load()` for checkpoint-weights deserialization:
+`nodes/eric_diffusion_utils.py:519, 555, 596, 764, 833` (inside `_load_single_weights`,
+`_load_stripped_in_memory`, `_write_prefix_stripped_temp`, `load_component`, and the
+direct-load fallback). All are loading caller-supplied model weight files (`.safetensors`
+or `.bin`/`.pt`/`.pth`), so the attack model is "user already pointed the loader at a
+malicious checkpoint" — the broader checkpoint-loading surface, not just these lines.
+Mitigations to consider: (a) pass `weights_only=True` to every `torch.load` call (already
+used in 2 of the 5 sites — verify and add to the rest); (b) prefer `safetensors.torch.load_file`
+over `torch.load` where the file extension is `.safetensors` (already true on the
+primary path; this would close the legacy `.bin`/`.pt`/`.pth` paths); (c) fickling-style
+scanning. Out of scope for slice `hunyuan-support` (Step 2 of ADR-014 only touched
+`_FAMILY_PATTERNS` at line 30-47, far from these helpers). Surfaced by `code-reviewer`
+(Opus) round-1 on Step 2 of slice `hunyuan-support` (2026-05-17, commit 270bce2);
+verdict was CLEAN with the suggestion to log here rather than bundle into the slice.
+Trigger to revisit: next deliberate change touching `_load_single_weights`,
+`_load_stripped_in_memory`, `_write_prefix_stripped_temp`, or `load_component` (the
+4 functions containing these 5 lines), OR any commit that adds support for a new
+checkpoint format that would land in the same helpers.
+
 ---
 
 ## Dependencies
