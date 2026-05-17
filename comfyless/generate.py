@@ -1078,7 +1078,16 @@ def _parse_lora_arg(spec: str) -> Dict[str, Any]:
 
 
 def _run_json_mode() -> int:
-    """Agent bridge: read JSON from stdin, write JSON to stdout."""
+    """Agent bridge: read JSON from stdin, write JSON to stdout.
+
+    LEGACY: this mode is the pre-MCP LLM-agent transport per ADR-011 §5.
+    New LLM-agent integration goes through MCP: `python -m
+    comfyless.mcp_server --output-dir ... --model-base ...`. This mode is
+    preserved at zero further investment for any non-LLM scripted caller
+    still using it. MCP supersedes for any new integration work.
+
+    See docs/decisions/ADR-011-comfyless-mcp-server.md §5.
+    """
     try:
         raw = sys.stdin.read()
         req = json.loads(raw)

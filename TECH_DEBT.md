@@ -7,6 +7,18 @@ Format: **Item** — why deferred, what triggers revisiting.
 
 ## Security
 
+**MCP server: TOCTOU between `realpath` and `_within` in `_validate_startup_args`** *(2026-05-16)*
+`comfyless/mcp_server.py:_validate_startup_args` calls `os.path.realpath(default_model)` once,
+then `_within(resolved_default, resolved_base)` which calls `realpath` again internally
+(`comfyless/server.py:160-161`). An attacker with write access inside `--model-base` could
+swap the symlink target between the two calls so the second `realpath` sees a different
+post-resolution path than the first. Bounded by the same-uid stdio MCP threat model (the
+attacker already has the daemon's privileges; ADR-011 §7 defers anything beyond same-uid).
+Surfaced by slice-1 step-1 security-auditor F1 LOW. Trigger to revisit: any commit that
+weakens the same-uid assumption — HTTP transport ADR, multi-tenant deployment, network
+exposure. Fix shape: cache `os.path.realpath(p)` once and pass the cached value to a `_within`
+form that does NOT re-resolve. See docs/security/review-slice-1-mcp-step1-2026-05-16.md F1.
+
 **`SO_PEERCRED` check on daemon `--unload`** *(2026-04-21)*
 Any local user can send a shutdown request to the comfyless daemon and kill it.
 On a single-user workstation this is a minor nuisance with no data-loss risk.
