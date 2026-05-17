@@ -1,8 +1,8 @@
 # Slice 0c Vision — Comfyless CUDA / torch realignment from ComfyUI's pin
 
 **Date:** 2026-05-16
-**ADR:** to be drafted as part of this slice — "Comfyless dep divergence from ComfyUI's torch pin" (architectural moment when comfyless's deploy env stops tracking ComfyUI's torch choice).
-**Status:** proposed — awaiting Grant's approval. Designed for execution in a parallel 4th Claude session (worktree of choice) running independently from slice 1, Hunyuan-Image, and LoRA-convert sessions.
+**ADR:** to be drafted as part of this slice — "Comfyless dep divergence from ComfyUI's torch pin" (architectural moment when comfyless's deploy env stops tracking ComfyUI's torch choice). Drafted as `docs/decisions/ADR-013-comfyless-torch-divergence.md`.
+**Status:** approved (2026-05-16). Executing in the `eric-cuda-upgrade` worktree on branch `eric-cuda-upgrade`, parallel to slice 1, Hunyuan-Image, and LoRA-convert sessions.
 **AI-Disclosure:** Claude (Opus 4.7, 1M context) authored; Grant reviewed.
 
 ---
@@ -130,3 +130,22 @@ Files the concurrent sessions own that slice 0c MUST NOT TOUCH:
 `uv.lock` is the merge hotspot. Slice 0c rebases on top of any lock-touching commit that lands while it's in flight. The concurrent sessions DO NOT touch the lock unless they need a new dep — and if they do, they coordinate with slice 0c through Grant first.
 
 When slice 0c lands, the concurrent sessions each run `uv sync` to refresh their respective `.venv`s and re-run their test suites to verify no regression from the bump.
+
+## Changelog
+
+- **2026-05-16 (status: approved + six open questions resolved + slice shape pinned)**: Grant approved the slice. Pre-flight PyPI inspection of available `torch` wheels resolved the open questions as follows:
+
+  - **Q1 (CUDA target).** Resolved: **cu130, forced.** No cu131+ wheel exists on PyPI. Both `torch==2.11.0` and the latest stable `torch==2.12.0` (released 2026-05-13) ship as cu130-class wheels — both require `cuda-toolkit==13.0.2` and the `nvidia-*-cu13` family. The host's 13.2 driver runs cu130 wheels via NVIDIA's forward-compat contract; that is what the existing ComfyUI venv has been doing. There is no choice to make.
+  - **Q2 (index).** Resolved: **PyPI default wheel — no pytorch.org index pin.** uv resolves `torch==<ver>` to PyPI's default Linux wheel cleanly; adding a pytorch.org index makes `uv sync` operator-dependent for zero benefit at cu130. ADR-013 notes: if PyPI ever stops shipping cu13x as default, re-evaluate.
+  - **Q3 (similarity threshold).** Resolved: **pixel-MSE ≤ 1.0** on PIL RGB 0–255 (proof-hooks line 47 default kept; LPIPS alternative rejected). Avoids pulling `lpips` (+ torchvision + scipy + cached perceptual weights) as an 11th dep used only for one validation step. Pixel-MSE catches wheel-level numerical drift, which is the actual failure mode the slice screens for.
+  - **Q4 (invariant 9 shape).** Resolved: **shape (b) — explicit divergence comment in both `requirements.txt` and `pyproject.toml`.** Even though today's pins are unchanged, the comment block establishes the divergence rule in the files operators read first.
+  - **Q5 (`--require-hashes` opt-in).** Resolved: **do NOT opt in.** L2 slice; `uv.lock` already records per-artifact integrity hashes and `uv sync` verifies them. `--require-hashes` is a pip-side discipline that would only bite the `pip install -r requirements.txt` path ComfyUI Manager drives — which this slice explicitly does not want to harden. No marginal value at this risk level.
+  - **Q6 (live smoke).** Resolved: **Qwen-Image, 256×256, 2 steps, seed=12345, true_cfg_scale=2.0, sampler=euler, schedule=linear, prompt `"a red cube on a white table"`.** Weights already in local HF cache (`/mnt/nvme-8tb/hf`); smallest VRAM footprint; exercises loader + transformer + VAE decode end-to-end. Exact invocation recorded in ADR-013 Changelog.
+
+  **Slice shape: A — unchanged pins, establish divergence only.** All five ML pins stay at current versions (`torch==2.11.0`, `diffusers==0.37.1`, `transformers==5.5.3`, `accelerate==1.13.0`, `peft==0.18.1`). The slice's load-bearing work is: standing up the divergent `.venv` via `uv sync`, landing ADR-013, adding the comment block to `pyproject.toml` + `requirements.txt`, updating CLAUDE.md line 67 (test-runner path + 8 suites + 850 tests). No SHA churn in `uv.lock`. Invariant 5 ("monotonic or unchanged") satisfied by the unchanged branch. Rationale: `torch==2.11.0+cu130` already satisfies invariants 1 + 2; the 2.11→2.12 bump on this codebase is mostly aesthetic (same CUDA target; the triton 3.6→3.7 improvement is dead code without `torch.compile`; cudnn/nccl/cusparselt are micro-version bumps; ~8 new NVIDIA-lib SHAs to audit for no API/feature we use today). The architectural rule lands now; the FIRST future slice that has a real reason to diverge picks up the version-bump cost then.
+
+  **Two corrections folded:**
+  - **Test-suite count + 8th suite.** Invariant 6 names 8 suites + 850 tests, which is correct. Project CLAUDE.md line 67 still names 7 suites + 732 tests — stale since the validator slice landed. CLAUDE.md update is in this slice's scope (per orientation prompt) and travels with the test-runner-path flip. No Vision edit needed.
+  - **Manifest-agreement proof hook.** Line 101's `awk | sed | xargs` shape doesn't preserve order as written. Change Contract substitutes a simpler shape (one-line diff between the deps stanza and `requirements.txt`). No Vision edit needed; proof hook intent stands.
+
+  **Reviewer cadence locked.** `code-reviewer` (Opus) on each code-touching commit; `security-auditor` (Opus) on the ADR-013 design before code lands. Both passed `model: "opus"` explicitly at invocation per global §5A. Security review saved to `docs/security/review-slice-0c-2026-05-16.md`, referenced from ADR-013 Changelog.
