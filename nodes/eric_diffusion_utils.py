@@ -34,6 +34,11 @@ _FAMILY_PATTERNS = [
     ("flux2",               "flux2"),
     ("chroma",              "chroma"),
     ("flux",                "flux"),
+    # Hunyuan-Image — refiner first per ADR-014 §3 (first-match-wins after
+    # lowercase + strip _/-; "hunyuanimagerefiner" must shadow "hunyuanimage"
+    # to keep HunyuanImageRefinerPipeline from collapsing into the base slot).
+    ("hunyuanimagerefiner", "hunyuan-image-refiner"),
+    ("hunyuanimage",        "hunyuan-image"),
     ("auraflow",            "auraflow"),
     ("stablediffusion3",    "sd3"),
     ("stablediffusionxl",   "sdxl"),
