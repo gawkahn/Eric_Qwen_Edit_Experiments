@@ -52,14 +52,23 @@ from comfyless.server import _within
 # Path-typed fields whose values are paths that should be reduced to
 # basenames before PNG-embedding (step 2 / invariant 12) AND that should
 # be retained in audit lines (step 1+ / invariant 5: audit retains path
-# fields; only prompt/negative_prompt are dropped). Cascade-side path
-# fields (stage_c/stage_b/stage_a/scaffolding_repo) are added in step 3.
+# fields; only prompt/negative_prompt are dropped).
 _MCP_PATH_TYPED_FIELDS = (
     "model",
     "transformer_path",
     "vae_path",
     "text_encoder_path",
     "text_encoder_2_path",
+)
+
+# Cascade-specific path-typed fields nested under cascade_config (step 3).
+# Same redaction rules as _MCP_PATH_TYPED_FIELDS, but applied to the
+# cascade_config sub-dict rather than the top-level metadata.
+_MCP_CASCADE_PATH_TYPED_FIELDS = (
+    "stage_c",
+    "stage_b",
+    "stage_a",
+    "scaffolding_repo",
 )
 
 # Fields dropped entirely from audit lines per invariant 5.
@@ -115,6 +124,15 @@ def redact_metadata_for_png(metadata: dict) -> dict:
             {**l, "path": _basename_or_repo_id(l.get("path", ""))}
             for l in out["loras"]
         ]
+    # Cascade-side redaction (step 3): basename each cascade_config.stage_*
+    # / scaffolding_repo. Non-path fields inside cascade_config (e.g.
+    # prior_steps, decoder_steps, prior_dtype) are retained verbatim.
+    if "cascade_config" in out and isinstance(out["cascade_config"], dict):
+        cc = dict(out["cascade_config"])
+        for field in _MCP_CASCADE_PATH_TYPED_FIELDS:
+            if field in cc and cc[field]:
+                cc[field] = _basename_or_repo_id(cc[field])
+        out["cascade_config"] = cc
     out.pop("output_path", None)
     out.pop("savepath", None)
     return out
@@ -402,13 +420,9 @@ async def _call_tool_impl(
             )
 
         if "cascade_config" in arguments:
-            raise _MCPHandlerError(
-                "CascadeNotYetWired",
-                "Cascade dispatch via cascade_config lands in slice 1 "
-                "step 3; see docs/vision/slice-1-mcp-generate.md",
-            )
-
-        result = await _handle_generate(cfg, arguments)
+            result = await _handle_generate_cascade(cfg, arguments)
+        else:
+            result = await _handle_generate(cfg, arguments)
         _emit_audit_line(
             name, arguments, status="ok",
             elapsed_seconds=time.monotonic() - t0,
@@ -648,6 +662,168 @@ async def _handle_generate(
         "output_path": output_path,
         "resolved_params": metadata,
         "elapsed_seconds": metadata.get("elapsed_seconds"),
+    }
+    return [TextContent(type="text", text=json.dumps(response, default=str))]
+
+
+async def _handle_generate_cascade(
+    cfg: _StartupConfig,
+    arguments: dict,
+) -> list[TextContent]:
+    """Stable Cascade dispatch via cascade_config.
+
+    Same Red Zone discipline as `_handle_generate`: canonical validation
+    → null-byte gate → cascade-config schema validation → HF resolution
+    (allow_download=False at every call site, including cascade-specific
+    ones) → path-allowlist for cascade_config.stage_* + scaffolding_repo
+    → output-path containment → in-process cascade.build_pipelines +
+    cascade.run_one → cascade._save_with_metadata with mcp_caller=True.
+    """
+    # 1 — Canonical type validation (top-level types only; cascade_config
+    # passes through as a generic object).
+    from comfyless.params_validation import validate_machine_request
+    val = validate_machine_request(arguments)
+    if not val.ok:
+        err = val.error or {}
+        raise _MCPHandlerError(
+            "ValidationError",
+            f"validation failed: {err.get('field')}: {err.get('reason')}",
+        )
+    payload: dict = dict(val.payload or {})
+
+    # 1.5 — Required-prompt gate (server-specific; matches non-cascade path
+    # and the daemon's missing-prompt check at server.py:133-136).
+    if not (payload.get("prompt") or "").strip():
+        raise _MCPHandlerError(
+            "MissingField",
+            "validation failed: prompt: required field absent",
+        )
+
+    # 1.6 — Null-byte path defense (mirrors non-cascade handler and the
+    # daemon's server.py:138-149 block). Cascade_config sub-fields are
+    # checked AFTER cascade.validate_config below — but the top-level
+    # savepath / loras path fields (if any) need the same gate here.
+    for _nb_field in ("savepath",):
+        if "\x00" in (payload.get(_nb_field) or ""):
+            raise _MCPHandlerError(
+                "ValidationError",
+                f"validation failed: {_nb_field}: null byte not allowed",
+            )
+
+    # 2 — Cascade-config schema validation (cascade-side; ADR-010).
+    raw_cc = payload.get("cascade_config")
+    if not isinstance(raw_cc, dict):
+        raise _MCPHandlerError(
+            "ValidationError",
+            "validation failed: cascade_config: expected object",
+        )
+    from comfyless.cascade import validate_config as _cascade_validate_config
+    try:
+        cfg_cc = _cascade_validate_config(raw_cc, source="mcp_request")
+    except (ValueError, TypeError) as e:
+        # cascade.validate_config names the offending field; keep the
+        # category but suppress the value (which is agent input).
+        raise _MCPHandlerError(
+            "ValidationError",
+            f"validation failed: cascade_config: {type(e).__name__}",
+        ) from None
+
+    # 2.5 — Null-byte path defense on cascade_config path-typed fields.
+    for _nb_field in _MCP_CASCADE_PATH_TYPED_FIELDS:
+        if "\x00" in (cfg_cc.get(_nb_field) or ""):
+            raise _MCPHandlerError(
+                "ValidationError",
+                f"validation failed: cascade_config.{_nb_field}: null byte not allowed",
+            )
+
+    # 3 — Resolve HF repo IDs in cascade_config to local paths.
+    from nodes.eric_diffusion_utils import resolve_hf_path
+    try:
+        resolved_cc = dict(cfg_cc)
+        for field in _MCP_CASCADE_PATH_TYPED_FIELDS:
+            v = (cfg_cc.get(field) or "").strip()
+            if v:
+                resolved_cc[field] = resolve_hf_path(v, allow_download=False)
+    except ValueError:
+        raise _MCPHandlerError(
+            "HFCacheMiss",
+            "validation failed: cascade HF repo not in local cache (set up "
+            "via `huggingface-cli download <repo>` first; MCP server does "
+            "not perform downloads)",
+        ) from None
+
+    # 4 — Path allowlist for cascade-specific fields against --model-base.
+    for field in _MCP_CASCADE_PATH_TYPED_FIELDS:
+        p = (resolved_cc.get(field) or "").strip()
+        if not p:
+            continue
+        if not p.startswith("/"):
+            raise _MCPHandlerError(
+                "PathAllowlist",
+                f"validation failed: cascade_config.{field} must be absolute",
+            )
+        if not _within(p, cfg.model_base):
+            raise _MCPHandlerError(
+                "PathAllowlist",
+                f"validation failed: cascade_config.{field} outside --model-base",
+            )
+
+    # 5 — Output-path resolution. Cascade dispatch ignores top-level model/
+    # seed for savepath token expansion; mirror the daemon's cascade savepath
+    # resolver in spirit. Use the model-token = "stablecascade" sentinel for
+    # template expansion (cascade.py's existing pattern).
+    #
+    # Note: cascade ignores top-level `model`; --default-model does NOT apply
+    # to cascade dispatch (topology is in cascade_config). The "stablecascade"
+    # sentinel is non-path text the savepath resolver inserts into the
+    # {model} template token. This asymmetry vs `_handle_generate` is by
+    # design: cascade's identity is its config, not a single weight directory.
+    output_path = _resolve_mcp_output_path(
+        cfg,
+        {**payload, "model": payload.get("model") or "stablecascade"},
+    )
+
+    # 6 — Build pipelines + run (HARD-CODED allow_hf_download=False per
+    # invariant 4; cascade-specific extension of P3).
+    from comfyless.cascade import (
+        build_pipelines as _cascade_build_pipelines,
+        run_one as _cascade_run_one,
+        _save_with_metadata as _cascade_save_with_metadata,
+    )
+    prior_pipe, decoder_pipe = _cascade_build_pipelines(
+        resolved_cc, device="cuda", allow_hf_download=False,
+    )
+    pil, runtime = _cascade_run_one(
+        prior_pipe, decoder_pipe, resolved_cc,
+        prompt=payload["prompt"],
+        negative_prompt=payload.get("negative_prompt", ""),
+        seed=int(payload.get("seed") or 0),
+        device="cuda",
+    )
+
+    # 7 — Build metadata and save PNG (with MCP redaction map applied).
+    import datetime as _dt
+    metadata = {
+        "prompt": payload["prompt"],
+        "negative_prompt": payload.get("negative_prompt", ""),
+        "model": "stablecascade",
+        "model_family": "stablecascade",
+        "cascade_config": resolved_cc,
+        "seed": int(payload.get("seed") or 0),
+        "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "prior_seconds": runtime.get("prior_seconds"),
+        "decoder_seconds": runtime.get("decoder_seconds"),
+        "elapsed_seconds": (runtime.get("prior_seconds", 0) or 0)
+                           + (runtime.get("decoder_seconds", 0) or 0),
+    }
+    _cascade_save_with_metadata(pil, output_path, metadata, mcp_caller=True)
+
+    # 8 — Inline response (no sidecar on disk; in-frame blob carries full
+    # paths — only the PNG embedding is redacted).
+    response = {
+        "output_path": output_path,
+        "resolved_params": metadata,
+        "elapsed_seconds": metadata["elapsed_seconds"],
     }
     return [TextContent(type="text", text=json.dumps(response, default=str))]
 

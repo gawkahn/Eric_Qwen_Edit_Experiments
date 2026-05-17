@@ -984,18 +984,247 @@ check("F2: whitespace-only `prompt` → MCP error",
 
 
 # ════════════════════════════════════════════════════════════════════════
-print("\n== Step 2: cascade_config branch (step-3 deferral) ==")
+print("\n== Step 3: cascade dispatch (N19, N20, N21, N22) ==")
+# ════════════════════════════════════════════════════════════════════════
+#
+# cascade dispatch is exercised with mocked build_pipelines + run_one to
+# isolate the path-validation surface from torch/diffusers load overhead.
+
+import comfyless.cascade as cas_mod  # noqa: E402
+
+def _mock_cascade_build_pipelines(cfg_cc, device, allow_hf_download):
+    return (_FakePipe(), _FakePipe())  # prior, decoder
+
+def _mock_cascade_run_one(prior, decoder, cfg_cc, *, prompt, negative_prompt,
+                          seed, device):
+    img = Image.new("RGB", (16, 16), "white")
+    return img, {"prior_seconds": 0.05, "decoder_seconds": 0.02}
+
+
+def _call_cascade(cfg, args, *, mock_hf_miss=False):
+    """Invoke _call_tool_impl with cascade mocks; capture stderr."""
+    captured_err = io.StringIO()
+    raised = None
+    result = None
+    patches = [
+        unittest.mock.patch.object(sys, "stderr", captured_err),
+        unittest.mock.patch.object(cas_mod, "build_pipelines",
+                                   _mock_cascade_build_pipelines),
+        unittest.mock.patch.object(cas_mod, "run_one", _mock_cascade_run_one),
+    ]
+    if mock_hf_miss:
+        import huggingface_hub as _hh
+        patches.append(unittest.mock.patch.object(
+            _hh, "snapshot_download",
+            lambda repo_id, **_: (_ for _ in ()).throw(LocalEntryNotFoundError(repo_id)),
+        ))
+    from contextlib import ExitStack
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        try:
+            result = _run(mcps._call_tool_impl(cfg, "generate", args))
+        except ValueError as e:
+            raised = str(e)
+    return result, raised, captured_err.getvalue()
+
+
+def _good_cascade_args(inside_path):
+    """Build a cascade_config that uses only paths inside --model-base."""
+    return {
+        "prompt": "a cat",
+        "cascade_config": {
+            "stage_c": inside_path,
+            "stage_b": inside_path,
+            "stage_a": inside_path,
+            "scaffolding_repo": inside_path,
+        },
+    }
+
+
+# Cascade happy-path: success returns inline blob + writes redacted PNG
+mb, out, _inside, cfg = _setup_mb_and_out()
+result, err, stderr = _call_cascade(cfg, _good_cascade_args(_inside))
+check("cascade happy-path: success returns TextContent response",
+      result is not None and err is None,
+      detail=f"err={err!r}")
+if result is not None:
+    resp = _json.loads(result[0].text)
+    check("cascade happy-path: response carries resolved_params with cascade_config",
+          isinstance(resp.get("resolved_params", {}).get("cascade_config"), dict))
+    check("cascade happy-path: response carries elapsed_seconds",
+          "elapsed_seconds" in resp and resp["elapsed_seconds"] >= 0)
+    # Verify the on-disk PNG carries BASENAME-redacted cascade fields
+    if os.path.exists(resp["output_path"]):
+        png_meta = _read_comfyless_chunk(resp["output_path"])
+        cc_embedded = png_meta.get("cascade_config", {})
+        check("cascade PNG embeds basename for cascade_config.stage_c",
+              cc_embedded.get("stage_c") == os.path.basename(_inside))
+        check("cascade PNG embeds basename for cascade_config.scaffolding_repo",
+              cc_embedded.get("scaffolding_repo") == os.path.basename(_inside))
+        check("cascade PNG drops output_path",
+              "output_path" not in png_meta)
+        check("cascade PNG retains `prompt` verbatim",
+              png_meta.get("prompt") == "a cat")
+        # Audit-line check: cascade audit retains stage_* paths verbatim
+        check("N22: cascade audit retains stage_c (path NOT redacted in audit)",
+              _inside in stderr,
+              detail="audit-line should contain the FULL stage_c path")
+        check("N22: cascade audit drops `prompt`",
+              "a cat" not in stderr)
+
+# N19: stage_c outside --model-base
+mb, out, _inside, cfg = _setup_mb_and_out()
+bad_args = _good_cascade_args(_inside)
+bad_args["cascade_config"]["stage_c"] = "/etc/anything"
+result, err, stderr = _call_cascade(cfg, bad_args)
+check("N19: cascade_config.stage_c outside --model-base → MCP error",
+      result is None and err is not None
+      and "cascade_config.stage_c outside --model-base" in err)
+check("N19: cascade allowlist rejection audited as PathAllowlist",
+      "PathAllowlist" in stderr)
+
+# N20: scaffolding_repo outside --model-base
+mb, out, _inside, cfg = _setup_mb_and_out()
+bad_args = _good_cascade_args(_inside)
+bad_args["cascade_config"]["scaffolding_repo"] = "/etc/anything"
+result, err, stderr = _call_cascade(cfg, bad_args)
+check("N20: cascade_config.scaffolding_repo outside --model-base → MCP error",
+      result is None and err is not None
+      and "cascade_config.scaffolding_repo outside --model-base" in err)
+
+# N21: allow_hf_download=False enforcement extends to cascade
+# Spy on resolve_hf_path; assert every recorded allow_download is False.
+mb, out, _inside, cfg = _setup_mb_and_out()
+recorded_calls = []
+original_resolve = eu.resolve_hf_path
+
+def _spy_resolve_cascade(path, *, allow_download=False):
+    recorded_calls.append((path, allow_download))
+    return original_resolve(path, allow_download=allow_download)
+
+with unittest.mock.patch.object(sys, "stderr", io.StringIO()), \
+     unittest.mock.patch.object(eu, "resolve_hf_path", _spy_resolve_cascade), \
+     unittest.mock.patch.object(cas_mod, "build_pipelines", _mock_cascade_build_pipelines), \
+     unittest.mock.patch.object(cas_mod, "run_one", _mock_cascade_run_one):
+    try:
+        _run(mcps._call_tool_impl(cfg, "generate", _good_cascade_args(_inside)))
+    except ValueError:
+        pass
+check("N21: cascade resolve_hf_path calls recorded (at least 1)",
+      len(recorded_calls) >= 1, detail=f"calls={len(recorded_calls)}")
+check("N21: cascade-side every recorded allow_download is False",
+      all(ad is False for (_p, ad) in recorded_calls),
+      detail=f"truthy: {[c for c in recorded_calls if c[1]]}")
+
+# Cascade-side null-byte rejection on stage_c
+mb, out, _inside, cfg = _setup_mb_and_out()
+bad_args = _good_cascade_args(_inside)
+bad_args["cascade_config"]["stage_c"] = _inside + "\x00null"
+result, err, stderr = _call_cascade(cfg, bad_args)
+check("cascade null byte in stage_c → ValidationError",
+      result is None and err is not None
+      and "cascade_config.stage_c: null byte not allowed" in err)
+check("cascade null-byte audit class is ValidationError",
+      "ValidationError" in stderr and "InternalError" not in stderr)
+
+# Cascade-side missing-prompt
+mb, out, _inside, cfg = _setup_mb_and_out()
+bad_args = _good_cascade_args(_inside)
+del bad_args["prompt"]
+result, err, stderr = _call_cascade(cfg, bad_args)
+check("cascade missing-prompt → MissingField (BEFORE build_pipelines)",
+      result is None and err is not None
+      and "prompt: required field absent" in err)
+check("cascade missing-prompt audit class is MissingField",
+      "MissingField" in stderr)
+
+# Cascade-side: cascade_config missing required fields (stage_c, stage_b)
+mb, out, _inside, cfg = _setup_mb_and_out()
+result, err, stderr = _call_cascade(cfg, {
+    "prompt": "p",
+    "cascade_config": {},  # missing stage_c, stage_b
+})
+check("cascade_config missing required fields → ValidationError",
+      result is None and err is not None
+      and "cascade_config" in err)
+
+# cascade_config: not a dict
+mb, out, _inside, cfg = _setup_mb_and_out()
+result, err, stderr = _call_cascade(cfg, {
+    "prompt": "p",
+    "cascade_config": "not a dict",
+})
+check("cascade_config not a dict → ValidationError",
+      result is None and err is not None
+      and "cascade_config" in err)
+
+
+# ════════════════════════════════════════════════════════════════════════
+print("\n== Step 3: redact_metadata_for_png cascade extension (unit) ==")
 # ════════════════════════════════════════════════════════════════════════
 
-mb, out, _inside, cfg = _setup_mb_and_out()
-result, err, stderr = _call(cfg, {
-    "prompt": "p", "model": _inside,
-    "cascade_config": {"stage_c": "/m/cascade_c", "stage_b": "/m/cascade_b"},
-})
-check("cascade_config branch: rejected with NotYetWired (step 3 lands)",
-      result is None and err is not None and "step 3" in err.lower())
-check("cascade_config branch: audit line records CascadeNotYetWired",
-      "CascadeNotYetWired" in stderr)
+cc_md = {
+    "model": "stablecascade",
+    "prompt": "x",
+    "seed": 1,
+    "cascade_config": {
+        "stage_c": "/abs/path/to/stage-c",
+        "stage_b": "/abs/path/to/stage-b",
+        "stage_a": "/abs/path/to/stage-a",
+        "scaffolding_repo": "/abs/path/to/scaffolding",
+        "prior_steps": 20,
+        "decoder_steps": 10,
+        "prior_cfg_scale": 4.0,
+        "width": 1024,
+        "height": 1024,
+    },
+    "output_path": "/abs/output.png",
+}
+red_cc = mcps.redact_metadata_for_png(cc_md)
+cc_red = red_cc.get("cascade_config", {})
+check("cascade redaction: stage_c basenamed",
+      cc_red.get("stage_c") == "stage-c")
+check("cascade redaction: stage_b basenamed",
+      cc_red.get("stage_b") == "stage-b")
+check("cascade redaction: stage_a basenamed",
+      cc_red.get("stage_a") == "stage-a")
+check("cascade redaction: scaffolding_repo basenamed",
+      cc_red.get("scaffolding_repo") == "scaffolding")
+check("cascade redaction: non-path cascade_config fields retained verbatim",
+      cc_red.get("prior_steps") == 20
+      and cc_red.get("decoder_steps") == 10
+      and cc_red.get("prior_cfg_scale") == 4.0
+      and cc_red.get("width") == 1024)
+check("cascade redaction: output_path still dropped at top level",
+      "output_path" not in red_cc)
+check("cascade redaction: model field still retained (top-level)",
+      red_cc.get("model") == "stablecascade")
+
+# HF repo IDs inside cascade_config pass through unchanged
+cc_hf = {
+    "model": "stablecascade",
+    "cascade_config": {
+        "stage_c": "stabilityai/stable-cascade-prior",
+        "scaffolding_repo": "stabilityai/stable-cascade",
+        "prior_steps": 20,
+    },
+}
+red_hf = mcps.redact_metadata_for_png(cc_hf)
+check("cascade redaction: HF repo IDs in cascade_config pass through",
+      red_hf["cascade_config"]["stage_c"] == "stabilityai/stable-cascade-prior"
+      and red_hf["cascade_config"]["scaffolding_repo"] == "stabilityai/stable-cascade")
+
+
+# ════════════════════════════════════════════════════════════════════════
+print("\n== Step 3: _MCP_CASCADE_PATH_TYPED_FIELDS hygiene ==")
+# ════════════════════════════════════════════════════════════════════════
+
+check("_MCP_CASCADE_PATH_TYPED_FIELDS is a tuple",
+      isinstance(mcps._MCP_CASCADE_PATH_TYPED_FIELDS, tuple))
+check("_MCP_CASCADE_PATH_TYPED_FIELDS contains the 4 cascade path fields",
+      set(mcps._MCP_CASCADE_PATH_TYPED_FIELDS) ==
+      {"stage_c", "stage_b", "stage_a", "scaffolding_repo"})
 
 
 # ════════════════════════════════════════════════════════════════════════

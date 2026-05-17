@@ -584,9 +584,25 @@ def _write_sidecar(image_path: str, sidecar: Dict[str, Any]) -> str:
     return sidecar_path
 
 
-def _save_with_metadata(pil_image, path: str, metadata: Dict[str, Any]) -> None:
-    """Save PNG with a comfyless tEXt chunk. Mirrors generate.py's helper."""
+def _save_with_metadata(
+    pil_image,
+    path: str,
+    metadata: Dict[str, Any],
+    *,
+    mcp_caller: bool = False,
+) -> None:
+    """Save PNG with a comfyless tEXt chunk. Mirrors generate.py's helper.
+
+    When mcp_caller=True (slice-1 invariant 12 / N22), the embedded metadata
+    is run through the MCP redaction map first: path-typed fields (including
+    nested cascade_config.stage_* / scaffolding_repo) are basenamed,
+    output_path / savepath dropped, non-path fields retained verbatim. CLI
+    callers leave mcp_caller=False and embed full paths (existing behavior).
+    """
     from PIL.PngImagePlugin import PngInfo
+    if mcp_caller:
+        from comfyless.mcp_server import redact_metadata_for_png
+        metadata = redact_metadata_for_png(metadata)
     pnginfo = PngInfo()
     pnginfo.add_text("comfyless", json.dumps(metadata, default=str))
     pil_image.save(path, pnginfo=pnginfo)
