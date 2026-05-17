@@ -7,3 +7,4 @@ safetensors==0.7.0
 pillow==12.2.0
 numpy==2.4.4
 mcp==1.27.0
+click==8.3.2
