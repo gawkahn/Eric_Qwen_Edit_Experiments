@@ -73,6 +73,54 @@ _audit_write_failures: list = []
 
 
 # ════════════════════════════════════════════════════════════════════════
+# PNG metadata redaction for MCP-returned images  (invariant 12)
+# ════════════════════════════════════════════════════════════════════════
+
+def _basename_or_repo_id(value: str) -> str:
+    """If value is an HF repo ID, return it unchanged (per invariant 12 / N30);
+    else return os.path.basename(value)."""
+    if not isinstance(value, str) or not value:
+        return value
+    # Local-import keeps the comfyless.mcp_server module light when imported
+    # from comfyless.generate's lazy-import path (avoid pulling diffusers
+    # transitively at module import time).
+    from nodes.eric_diffusion_utils import _is_hf_repo_id
+    if _is_hf_repo_id(value):
+        return value
+    return os.path.basename(value)
+
+
+def redact_metadata_for_png(metadata: dict) -> dict:
+    """Apply invariant 12's redaction map to a generation-metadata dict.
+
+    Called by comfyless.generate._save_with_metadata when its mcp_caller
+    flag is True. Returns a NEW dict (does not mutate the input). Single
+    source of truth for which fields are path-typed at the MCP boundary
+    (cf. _MCP_PATH_TYPED_FIELDS); step 3 will extend this when cascade
+    fields land.
+
+    Rules:
+      - Path-typed top-level fields → basename, or pass-through if the
+        original value was an HF repo ID (N30).
+      - loras[].path → basename per entry (or HF repo-ID pass-through).
+      - output_path, savepath → DROPPED entirely (invariant 12 / N27).
+      - All other fields → retained verbatim (invariant 12 / N28).
+    """
+    out: dict = dict(metadata)
+    for field in _MCP_PATH_TYPED_FIELDS:
+        if field in out and out[field]:
+            out[field] = _basename_or_repo_id(out[field])
+    if "loras" in out and isinstance(out["loras"], list):
+        out["loras"] = [
+            {**l, "path": _basename_or_repo_id(l.get("path", ""))}
+            for l in out["loras"]
+        ]
+    out.pop("output_path", None)
+    out.pop("savepath", None)
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════════
 # Tool description text (refinable per ADR-011 §2 amendment 2026-04-30)
 # ════════════════════════════════════════════════════════════════════════
 
@@ -311,39 +359,349 @@ async def _list_tools_impl(cfg: _StartupConfig) -> list[Tool]:
     )]
 
 
+class _MCPHandlerError(Exception):
+    """Known-shape handler error carrying both an audit error_class string
+    and an already-sanitized message for the agent.
+
+    Step-1 reviewer carry-forward F1/F4: every exception path inside
+    _call_tool_impl must reach the framework's outer except with a SAFE
+    str(e); _MCPHandlerError exists so known-shape errors carry their own
+    sanitized message instead of going through _sanitize_error.
+    """
+
+    def __init__(self, error_class: str, safe_message: str) -> None:
+        self.error_class = error_class
+        self.safe_message = safe_message
+        super().__init__(safe_message)
+
+
 async def _call_tool_impl(
     cfg: _StartupConfig,
     name: str,
     arguments: dict,
 ) -> list[TextContent]:
-    """Slice-1-step-1 stub: emit audit line + raise NotImplementedError.
+    """Dispatch one MCP tools/call invocation.
 
-    Step 2 replaces the body with: canonical validate_machine_request →
-    path-allowlist check → default-model resolution → in-process
-    _load_pipeline + generate (with allow_hf_download=False hard-coded)
-    → inline resolved-params response.
+    Slice 1 step 2 wires the `generate` handler for non-cascade families.
+    Cascade requests (cascade_config present in arguments) are rejected
+    with a NotYetWired error; step 3 fills that branch.
+
+    Every code path emits exactly one audit line (invariant 5). All
+    internal exceptions are caught and routed through either a
+    pre-sanitized _MCPHandlerError message OR _sanitize_error, so the
+    framework's outer `except Exception → str(e)` (which does NOT strip
+    tracebacks) never sees raw exception text (step-1 reviewer F1/F4).
     """
     t0 = time.monotonic()
-    if name != "generate":
+
+    try:
+        if name != "generate":
+            raise _MCPHandlerError(
+                "UnknownTool",
+                f"Unknown tool: {name!r}",
+            )
+
+        if "cascade_config" in arguments:
+            raise _MCPHandlerError(
+                "CascadeNotYetWired",
+                "Cascade dispatch via cascade_config lands in slice 1 "
+                "step 3; see docs/vision/slice-1-mcp-generate.md",
+            )
+
+        result = await _handle_generate(cfg, arguments)
         _emit_audit_line(
-            name, arguments, status="error",
-            error_class="UnknownTool",
+            name, arguments, status="ok",
             elapsed_seconds=time.monotonic() - t0,
         )
-        raise ValueError(f"Unknown tool: {name!r}")
+        return result
+    except _MCPHandlerError as e:
+        _emit_audit_line(
+            name, arguments, status="error",
+            error_class=e.error_class,
+            elapsed_seconds=time.monotonic() - t0,
+        )
+        # safe_message is pre-sanitized; ValueError(str) is the framework's
+        # outer-except shape.
+        raise ValueError(e.safe_message)
+    except BaseException as e:  # noqa: BLE001 — defense in depth
+        # Unexpected internal exceptions: full traceback to stderr (audit
+        # stream); category-shaped sanitized string to the agent.
+        safe = _sanitize_error(e, "internal_error")
+        _emit_audit_line(
+            name, arguments, status="error",
+            error_class="InternalError",
+            elapsed_seconds=time.monotonic() - t0,
+        )
+        raise ValueError(safe)
 
-    # Invariant 5: emit audit line on every rejection. The step-1 stub
-    # rejects every call uniformly.
-    _emit_audit_line(
-        name, arguments, status="error",
-        error_class="NotImplementedYet",
-        elapsed_seconds=time.monotonic() - t0,
+
+async def _handle_generate(
+    cfg: _StartupConfig,
+    arguments: dict,
+) -> list[TextContent]:
+    """The actual generate-tool body. Raises _MCPHandlerError on every known
+    failure category; unknown exceptions propagate up to _call_tool_impl's
+    BaseException catch.
+    """
+    # 1 — Canonical type validation (ADR-012). FIRST handler action after
+    # audit-line setup, per security-auditor F3.
+    from comfyless.params_validation import validate_machine_request
+    val = validate_machine_request(arguments)
+    if not val.ok:
+        err = val.error or {}
+        raise _MCPHandlerError(
+            "ValidationError",
+            f"validation failed: {err.get('field')}: {err.get('reason')}",
+        )
+    payload: dict = dict(val.payload or {})
+
+    # 1.5 — Required-field presence (server-specific; canonical validator
+    # is type-only per ADR-012 design). Mirrors the daemon's missing-prompt
+    # gate at server.py:133-136. Required BEFORE expensive _load_pipeline
+    # so we fail-fast on malformed input — security-auditor step-2 F2.
+    if not (payload.get("prompt") or "").strip():
+        raise _MCPHandlerError(
+            "MissingField",
+            "validation failed: prompt: required field absent",
+        )
+
+    # 1.6 — Null-byte path defense (daemon parity; server.py:138-149).
+    # os.path.realpath raises on NUL; without this check the NUL would
+    # escape `_check_paths` (step 5 below) and fall into the outer
+    # BaseException handler, producing audit class "InternalError" instead
+    # of the correct "ValidationError" and emitting a stderr-side traceback
+    # on malformed input — security-auditor step-2 F1.
+    for _nb_field in (
+        "model", "transformer_path", "vae_path",
+        "text_encoder_path", "text_encoder_2_path", "savepath",
+    ):
+        if "\x00" in (payload.get(_nb_field) or ""):
+            raise _MCPHandlerError(
+                "ValidationError",
+                f"validation failed: {_nb_field}: null byte not allowed",
+            )
+    for _nb_i, _nb_lora in enumerate(payload.get("loras") or []):
+        if "\x00" in (_nb_lora.get("path") or ""):
+            raise _MCPHandlerError(
+                "ValidationError",
+                f"validation failed: loras[{_nb_i}].path: null byte not allowed",
+            )
+
+    # 2 — --default-model fallback (invariants 8, 9; N15, N16).
+    model_input = (payload.get("model") or "").strip()
+    if not model_input:
+        if cfg.default_model is None:
+            raise _MCPHandlerError(
+                "MissingField",
+                "validation failed: model: required field absent and "
+                "--default-model not configured at spawn",
+            )
+        model_input = cfg.default_model
+    payload["model"] = model_input
+
+    # 3 — Defense-in-depth re-validation of --default-model at request time
+    # (invariant 8). Startup already validated; the within-check fires here
+    # whenever the active model EQUALS the configured default — which covers
+    # BOTH the omitted-model fallback path (model_input was just assigned)
+    # AND the agent-passed-default-path-explicitly case (string equality with
+    # the realpath'd cfg.default_model). Catches a hypothetical post-startup
+    # symlink swap that would have escaped the model-base. Note: this is in
+    # addition to the per-request _check_paths step 5 below, which validates
+    # ANY model path (default or not) against --model-base.
+    if cfg.default_model is not None and model_input == cfg.default_model:
+        if not _within(cfg.default_model, cfg.model_base):
+            raise _MCPHandlerError(
+                "DefaultModelEscape",
+                "validation failed: --default-model no longer resolves "
+                "under --model-base",
+            )
+
+    # 4 — Resolve HF repo IDs to local paths (HARD-CODED allow_download=
+    # False per invariant 4). The agent-supplied INPUT is kept separately
+    # so PNG-redaction can pass HF repo IDs through unchanged (N30).
+    from nodes.eric_diffusion_utils import resolve_hf_path
+    try:
+        resolved: dict = {}
+        for field in (
+            "model", "transformer_path", "vae_path",
+            "text_encoder_path", "text_encoder_2_path",
+        ):
+            v = (payload.get(field) or "").strip()
+            if v:
+                resolved[field] = resolve_hf_path(v, allow_download=False)
+        loras_resolved: list = []
+        for i, lora in enumerate(payload.get("loras") or []):
+            lpath = (lora.get("path") or "").strip()
+            loras_resolved.append({
+                **lora,
+                "path": resolve_hf_path(lpath, allow_download=False),
+            })
+    except ValueError:
+        # ValueError surfaces when allow_download=False and the repo is
+        # not in the local cache (HFCacheMiss path; N10). DO NOT echo the
+        # repo ID back — that's an enumeration oracle.
+        raise _MCPHandlerError(
+            "HFCacheMiss",
+            "validation failed: HF repo not in local cache (set up via "
+            "`huggingface-cli download <repo>` first; MCP server does "
+            "not perform downloads)",
+        ) from None
+
+    # 5 — Path allowlist against --model-base (invariant 2; N5-N9).
+    # Reuse the daemon's _check_paths helper verbatim.
+    from comfyless.server import _check_paths
+    resolved_payload = {**payload, **resolved}
+    if loras_resolved:
+        resolved_payload["loras"] = loras_resolved
+    err_msg = _check_paths(resolved_payload, cfg.model_base)
+    if err_msg:
+        # _check_paths returns "field path outside --model-base: '/x/y'"
+        # — split on the first colon so the rejected VALUE is not echoed
+        # back (avoid enumeration oracle on the model_base tree).
+        safe_head = err_msg.split(":", 1)[0] if ":" in err_msg else err_msg
+        raise _MCPHandlerError(
+            "PathAllowlist",
+            f"validation failed: {safe_head}",
+        )
+
+    # 6 — Output-path resolution + containment under --output-dir
+    # (invariant 3; N8).
+    try:
+        output_path = _resolve_mcp_output_path(cfg, payload)
+    except _MCPHandlerError:
+        raise
+    except Exception as e:
+        # savepath template expansion / collision logic can raise;
+        # treat as a path-validation failure and DO NOT echo the value.
+        raise _MCPHandlerError(
+            "OutputPath",
+            f"validation failed: output_path resolution rejected "
+            f"({type(e).__name__})",
+        ) from None
+
+    # 7 — Load + generate (HARD-CODED allow_hf_download=False per
+    # invariant 4; in-process — no daemon delegation in slice 1, see
+    # TECH_DEBT entry "MCP server: daemon delegation deferred").
+    #
+    # Operator-tuning knobs (precision / offload_vae / attention_slicing /
+    # sequential_offload) are deliberately NOT exposed on the MCP schema
+    # (_GENERATE_INPUT_SCHEMA additionalProperties:False blocks them). These
+    # are server-side perf concerns the operator picks at spawn time, not
+    # something the LLM agent should be tuning per-call. Hard-coded defaults
+    # match the CLI's defaults; a future slice may add operator-side spawn
+    # flags (e.g. --precision, --offload-vae) if the demand surfaces.
+    from comfyless.generate import _load_pipeline, generate
+    pipe, model_family, guidance_embeds = _load_pipeline(
+        resolved["model"],
+        precision="bf16",
+        device="cuda",
+        offload_vae=False,
+        transformer_path=resolved.get("transformer_path", "") or "",
+        vae_path=resolved.get("vae_path", "") or "",
+        text_encoder_path=resolved.get("text_encoder_path", "") or "",
+        text_encoder_2_path=resolved.get("text_encoder_2_path", "") or "",
+        vae_from_transformer=bool(payload.get("vae_from_transformer")),
+        attention_slicing=False,
+        sequential_offload=False,
+        allow_hf_download=False,
     )
-    raise NotImplementedError(
-        "generate handler is scaffolded in slice 1 step 1; the actual "
-        "wiring lands in step 2. See "
-        "docs/vision/slice-1-mcp-generate.md"
+    cached = {
+        "pipeline": pipe,
+        "model_family": model_family,
+        "guidance_embeds": guidance_embeds,
+    }
+    metadata = generate(
+        model_path=resolved["model"],
+        prompt=payload["prompt"],
+        output_path=output_path,
+        negative_prompt=payload.get("negative_prompt", ""),
+        seed=payload.get("seed", -1),
+        steps=payload.get("steps", 28),
+        cfg_scale=payload.get("cfg_scale", 3.5),
+        true_cfg_scale=payload.get("true_cfg_scale"),
+        width=payload.get("width", 1024),
+        height=payload.get("height", 1024),
+        max_sequence_length=payload.get("max_sequence_length", 512),
+        sampler=payload.get("sampler", "default"),
+        schedule=payload.get("schedule", "linear"),
+        loras=loras_resolved or [],
+        precision="bf16",
+        device="cuda",
+        offload_vae=False,
+        attention_slicing=False,
+        sequential_offload=False,
+        transformer_path=resolved.get("transformer_path", "") or "",
+        vae_path=resolved.get("vae_path", "") or "",
+        text_encoder_path=resolved.get("text_encoder_path", "") or "",
+        text_encoder_2_path=resolved.get("text_encoder_2_path", "") or "",
+        vae_from_transformer=bool(payload.get("vae_from_transformer")),
+        allow_hf_download=False,
+        _cached_pipeline=cached,
+        mcp_caller=True,  # signals _save_with_metadata to apply MCP redaction
     )
+
+    # 8 — Build inline response (invariant 11: no sidecar on disk; the
+    # resolved-params blob is returned in-frame instead). The IN-FRAME
+    # blob carries the FULL paths (the agent's authoritative record);
+    # only the on-disk PNG metadata is redacted to basenames.
+    response = {
+        "output_path": output_path,
+        "resolved_params": metadata,
+        "elapsed_seconds": metadata.get("elapsed_seconds"),
+    }
+    return [TextContent(type="text", text=json.dumps(response, default=str))]
+
+
+def _resolve_mcp_output_path(
+    cfg: _StartupConfig,
+    payload: dict,
+) -> str:
+    """Resolve the MCP-side output path under --output-dir.
+
+    If `savepath` is supplied, run it through the existing template
+    expansion machinery and `_within(--output-dir)`-check the result.
+    Otherwise auto-generate a non-colliding `comfyless####.png` under
+    --output-dir. Raises _MCPHandlerError on containment failure.
+    """
+    from comfyless.generate import _expand_savepath_template, _resolve_savepath
+    savepath = payload.get("savepath")
+    if savepath:
+        safe_template = savepath.lstrip("/").lstrip("\\")
+        full_template = str(os.path.join(cfg.output_dir, safe_template))
+        _txp = (payload.get("transformer_path") or "")
+        expanded = _expand_savepath_template(
+            full_template, payload["model"],
+            payload.get("seed", -1), payload.get("steps", 28),
+            payload.get("cfg_scale", 3.5), payload.get("sampler", "default"),
+            transformer_path=_txp,
+        )
+        if not _within(os.path.dirname(expanded) or cfg.output_dir, cfg.output_dir):
+            raise _MCPHandlerError(
+                "OutputPath",
+                "validation failed: savepath template expands outside --output-dir",
+            )
+        output_path = _resolve_savepath(
+            full_template, payload["model"],
+            payload.get("seed", -1), payload.get("steps", 28),
+            payload.get("cfg_scale", 3.5), payload.get("sampler", "default"),
+            transformer_path=_txp,
+        )
+    else:
+        counter = 1
+        while True:
+            candidate = str(os.path.join(cfg.output_dir, f"comfyless{counter:04d}.png"))
+            if not os.path.exists(candidate):
+                output_path = candidate
+                break
+            counter += 1
+
+    # Belt-and-suspenders re-check of the final path.
+    if not _within(output_path, cfg.output_dir):
+        raise _MCPHandlerError(
+            "OutputPath",
+            "validation failed: resolved output_path escaped --output-dir",
+        )
+    return output_path
 
 
 # ════════════════════════════════════════════════════════════════════════

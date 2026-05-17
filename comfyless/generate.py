@@ -463,9 +463,30 @@ def _resolve_savepath(
         counter += 1
 
 
-def _save_with_metadata(pil_image, path: str, metadata: dict) -> None:
-    """Save a PIL image as PNG with comfyless metadata embedded as a tEXt chunk."""
+def _save_with_metadata(
+    pil_image,
+    path: str,
+    metadata: dict,
+    *,
+    mcp_caller: bool = False,
+) -> None:
+    """Save a PIL image as PNG with comfyless metadata embedded as a tEXt chunk.
+
+    When mcp_caller=True (slice-1 invariant 12 / N26-N28), the embedded
+    metadata is passed through the MCP redaction map first: path-typed
+    fields are reduced to basenames (or HF repo IDs passed through),
+    output_path / savepath are dropped entirely, non-path generation
+    parameters are retained verbatim. CLI / daemon callers leave
+    mcp_caller=False and the on-disk PNG embeds full paths (existing
+    behavior; N29 regression guard).
+    """
     from PIL.PngImagePlugin import PngInfo
+    if mcp_caller:
+        # Lazy import keeps comfyless.mcp_server off the import path for
+        # callers that never touch MCP (avoids transitively requiring the
+        # mcp SDK at every generate() entry).
+        from comfyless.mcp_server import redact_metadata_for_png
+        metadata = redact_metadata_for_png(metadata)
     pnginfo = PngInfo()
     pnginfo.add_text("comfyless", json.dumps(metadata, default=str))
     pil_image.save(path, pnginfo=pnginfo)
@@ -796,6 +817,7 @@ def generate(
     sequential_offload: bool = False,
     allow_hf_download: bool = False,
     _cached_pipeline: Optional[Dict[str, Any]] = None,
+    mcp_caller: bool = False,
 ) -> Dict[str, Any]:
     """Generate a single image and save it.
 
@@ -944,7 +966,7 @@ def generate(
 
     # ── Save PNG with embedded metadata ──────────────────────────────
     pil_image = result.images[0]
-    _save_with_metadata(pil_image, output_path, metadata)
+    _save_with_metadata(pil_image, output_path, metadata, mcp_caller=mcp_caller)
     _log(f"[comfyless] Saved: {output_path}")
 
     # ── Clean up VAE ──────────────────────────────────────────────────

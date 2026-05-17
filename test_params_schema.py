@@ -118,6 +118,9 @@ _generate_canonical = {
         "output_path", "precision", "device", "offload_vae",
         "attention_slicing", "sequential_offload", "allow_hf_download",
         "_cached_pipeline",
+        # MCP-internal call-shape flag; signals _save_with_metadata to apply
+        # invariant-12 PNG redaction. Not user-facing; not a sidecar param.
+        "mcp_caller",
     }
 }
 _missing_from_schema = _generate_canonical - set(schema.keys())

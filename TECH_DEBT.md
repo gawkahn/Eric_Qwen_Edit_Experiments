@@ -7,6 +7,45 @@ Format: **Item** — why deferred, what triggers revisiting.
 
 ## Security
 
+**MCP server: HF-cache-hit vs cache-miss is observably distinguishable to the agent** *(2026-05-17)*
+`comfyless/mcp_server.py:_handle_generate` step 4 (HF resolution) runs
+BEFORE step 5 (path allowlist). An agent probing HF repo IDs can distinguish
+three outcomes by error class — cached + inside `--model-base` (success);
+cached + outside `--model-base` (`PathAllowlist`); not cached (`HFCacheMiss`).
+The repo ID itself is suppressed from both error strings (colon-split + `from
+None` cause-chain), but the per-class signal lets the agent enumerate which
+HF repos are present in the local cache. Bounded by same-uid stdio MCP threat
+model (the agent already runs generation; cache contents are not an
+independent secret). Surfaced by slice-1 step-2 security-auditor F3 LOW.
+Trigger to revisit: HTTP-transport ADR, multi-tenant agent surface, or any
+threat-model change that elevates the agent from trusted-to-generate-on-this-
+host. Fix shape: unify the agent-facing error class to a generic
+"validation failed: model not available" for both miss-and-outside-base
+cases while retaining the finer-grained `HFCacheMiss`/`PathAllowlist`
+classes on the stderr audit line for operator visibility.
+See `docs/security/review-slice-1-mcp-step2-2026-05-17.md` F3.
+
+**MCP server: daemon delegation deferred** *(2026-05-17)*
+`comfyless/mcp_server.py:_call_tool_impl` (slice 1 step 2) runs generation
+in-process only; it does NOT auto-detect and delegate to the running
+Unix-socket daemon as ADR-011 §1 describes ("delegates to the running
+daemon... fall back to in-process when no socket is present"). Reason:
+the daemon's existing `_save_with_metadata` embeds full paths into PNG
+tEXt chunks, which violates slice-1 invariant 12 (MCP-returned PNGs must
+carry basenames only). Implementing daemon-side MCP awareness requires
+either (a) a `caller=mcp` field in the daemon's wire protocol so the
+daemon applies the redaction map server-side, OR (b) the MCP server
+reading the daemon's output PNG and rewriting the tEXt chunk after the
+daemon finishes. Both expand scope; user approved deferring to a future
+slice + ADR-011 Changelog amendment. Trade-off: MCP-driven generations
+do not share the daemon's cross-call model cache, so every MCP `generate`
+reloads from disk. Bounded — LLM-driven workflows tend to be fewer larger
+calls vs. interactive CLI use. Trigger to revisit: any user-reported
+latency complaint about MCP-driven generations, OR an LLM-judge / auto-
+refinement loop being wired (those workflows are call-count-heavy and
+would benefit from caching). See ADR-011 §1, slice-1 invariant 12,
+`docs/security/review-slice-1-mcp-step1-2026-05-16.md`.
+
 **MCP server: TOCTOU between `realpath` and `_within` in `_validate_startup_args`** *(2026-05-16)*
 `comfyless/mcp_server.py:_validate_startup_args` calls `os.path.realpath(default_model)` once,
 then `_within(resolved_default, resolved_base)` which calls `realpath` again internally
