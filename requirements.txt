@@ -1,3 +1,18 @@
+# ── Comfyless dep-divergence rule (ADR-013, 2026-05-16) ─────────────────
+# The comfyless dev/test environment is the uv-managed `.venv` created by
+# `uv sync`. The pin set below is chosen for the comfyless deploy
+# environment, not for ComfyUI Manager compatibility. ComfyUI Manager
+# installs the node pack via `pip install -r requirements.txt` and that
+# path is supported for the node pack only — comfyless dev/test must use
+# `uv sync` (not `pip install -r requirements.txt`) so the lockfile-hash
+# integrity contract (see ADR-013 §5) holds. Pins in this file may
+# diverge from ComfyUI's bundled torch in the future; when that happens,
+# ComfyUI Manager installs may surface as a resolver conflict against
+# ComfyUI core — that conflict is upstream's resolver, not a node-pack
+# break. See `docs/decisions/ADR-013-comfyless-torch-divergence.md` for
+# the architectural rule, and `pyproject.toml` / `uv.lock` for the
+# comfyless-side dep contract.
+# ────────────────────────────────────────────────────────────────────────
 torch==2.11.0
 diffusers==0.37.1
 transformers==5.5.3
@@ -6,6 +21,7 @@ peft==0.18.1
 safetensors==0.7.0
 pillow==12.2.0
 numpy==2.4.4
+scipy==1.17.1
 mcp==1.27.0
 click==8.3.2
 scipy==1.17.1
