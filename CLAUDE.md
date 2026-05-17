@@ -44,7 +44,11 @@ This repo uses two tools deliberately:
 - **Comfyless dev path** — `uv` is the preferred tool for local development, testing, and reproducibility work. `pyproject.toml` is the human-edited source of truth for dep declarations; `uv.lock` is the machine-generated full transitive lock (kept in version control so `uv sync` is reproducible across machines). `.python-version` pins the interpreter.
 
 Rules:
+<<<<<<< HEAD
 - **`pyproject.toml` and `requirements.txt` must agree on direct deps at all times** — both list the same 11 top-level pins in the same order (`torch`, `diffusers`, `transformers`, `accelerate`, `peft`, `safetensors`, `pillow`, `numpy`, `mcp`, `click`, `scipy`). Any dep bump edits both.
+=======
+- **`pyproject.toml` and `requirements.txt` must agree on direct deps at all times** — both list the same 11 top-level pins in the same order (`torch`, `diffusers`, `transformers`, `accelerate`, `peft`, `safetensors`, `pillow`, `numpy`, `scipy`, `mcp`, `click`). Any dep bump edits both.
+>>>>>>> e001431 (docs(claude.md): test-runner → ./.venv; 8 suites / 850 tests; 11 pins)
 - **`uv.lock` is regenerated whenever `pyproject.toml` changes** — `uv lock` after the edit, then commit pyproject + requirements + lock together in one slice.
 - **Do NOT edit `uv.lock` by hand.** It's machine output.
 - Fresh dev setup: `uv sync` (creates `.venv` matching the lock). ComfyUI install still uses pip as before — no change for downstream users.
@@ -56,15 +60,16 @@ python -m py_compile nodes/<file>.py   # syntax check a single file
 
 **Test suites (no CI, run manually):**
 ```bash
-python3 test_manual_loop.py        # 186 tests: samplers, manual loop, encode helper, Qwen edit
-python3 test_multistage.py         # 141 tests: multistage infrastructure
-python3 test_params_schema.py      # 135 tests: comfyless COMFYLESS_SCHEMA + adapters
-python3 test_cascade.py            # 129 tests: comfyless Stable Cascade dispatch (ADR-010)
-python3 test_iterate.py            #  92 tests: comfyless --iterate (ADR-008)
-python3 test_samplers.py           #  41 tests: custom schedulers / sampler swap
-python3 test_server_robustness.py  #   8 tests: comfyless IPC timeouts + BrokenPipe survival
+python3 test_manual_loop.py                 # 186 tests: samplers, manual loop, encode helper, Qwen edit
+python3 test_multistage.py                  # 141 tests: multistage infrastructure
+python3 test_params_schema.py               # 135 tests: comfyless COMFYLESS_SCHEMA + adapters
+python3 test_cascade.py                     # 129 tests: comfyless Stable Cascade dispatch (ADR-010)
+python3 test_machine_boundary_validator.py  # 118 tests: machine-boundary validator (ADR-012)
+python3 test_iterate.py                     #  92 tests: comfyless --iterate (ADR-008)
+python3 test_samplers.py                    #  41 tests: custom schedulers / sampler swap
+python3 test_server_robustness.py           #   8 tests: comfyless IPC timeouts + BrokenPipe survival
 ```
-All seven suites use the ComfyUI venv's Python; run them via `/home/gawkahn/projects/ai-lab/ai-stack-data/comfy-dev/run/venv/bin/python3` when working outside of ComfyUI. Total 732 unit tests; expect 0 failures.
+All eight suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 850 unit tests; expect 0 failures.
 
 `test_flux2.py` is a live GPU smoke test that performs an actual Flux.2 generation — separate from the unit suites above. Run only when you need to verify end-to-end Flux.2 behavior.
 
