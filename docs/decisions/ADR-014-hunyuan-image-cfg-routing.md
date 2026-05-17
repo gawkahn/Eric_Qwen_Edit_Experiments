@@ -135,6 +135,27 @@ infixes break the `hunyuanimage` substring after the
 diffusers releases that ship new `Hunyuan*` pipeline classes should
 re-run this audit as a one-line check in an ADR amendment.
 
+**Important caveat on the refiner family slot — it is defensive, not a
+commitment to the end-state for refiner support.** Per the
+HunyuanImageRefinerPipeline `__call__` inspection (signature confirmed
+via `inspect.signature` at decision time): the refiner is structurally
+an **edit / image-to-image pipeline** in the SDXL-refiner sense, not a
+Cascade-style mandatory second stage. Base `HunyuanImagePipeline` produces
+a complete saveable image on its own — the official upstream usage example
+saves `pipe(prompt, ...).images[0]` directly to disk with no refiner pass.
+The refiner is opt-in polish: it consumes a complete image (`image:
+PipelineImageInput | None`), runs ~4 default denoising steps, and outputs
+a refined image; it uses a distinct VAE class (`AutoencoderKLHunyuanImageRefiner`)
+and is distributed as a separate HF model. When refiner support eventually
+lands as its own slice, the natural architectural home is the existing
+**edit-pipeline surface** (where `EricDiffusionEdit` already takes image
+slots and GEN_METADATA), NOT the `GEN_PIPELINE` family system this ADR
+extends — the family-pattern slot reserved here exists only to prevent
+accidental misroute of a refiner-loaded checkpoint through the base CFG
+branch via substring overlap. The future-refiner slice may dissolve the
+`hunyuan-image-refiner` family string entirely in favor of an edit-side
+analog; this is left open.
+
 ### 4. Family-defaults row in `comfyless/family_defaults.py`
 
 Add one alphabetically-ordered entry:
@@ -321,6 +342,7 @@ explicitly preserves consolidation as Queued.
 
 - 2026-05-17 — proposed (initial draft, Vision-aligned).
 - 2026-05-17 — `code-reviewer` (Opus) round-1 pass: 1 MEDIUM + 3 LOW + 2 INFO findings. All actionable findings folded inline: (a) MEDIUM — Rejected B rewritten to capture the real failure mode (hard `ValueError` from pipeline runtime assertion `pipeline_hunyuanimage.py:727-728`, not silent degradation); (b) LOW — Context docstring/signature default mismatch noted; (c) LOW — Rejected F added (wait for runtime-core consolidation); (d) LOW — §3 Hunyuan class-roster audit appended; (e) INFO — §7 STOP-condition for unexpected caller-supplied component paths appended. Format-compliance INFO and §6 deferral INFO required no change. Status: `proposed` → `accepted`.
+- 2026-05-17 — §3 amended with a "refiner family slot is defensive, not end-state" caveat. Triggered by Grant's prompt asking whether refiner support is Cascade-style mandatory or SDXL-style optional. Confirmed SDXL-style via `HunyuanImageRefinerPipeline.__call__` signature inspection: takes `image: PipelineImageInput | None`, ~4 default steps, distinct refiner VAE, distributed as a separate HF model. Future-refiner slice belongs on the edit-pipeline surface (`EricDiffusionEdit` etc.), not on `GEN_PIPELINE`. The reserved family slot is purely a defensive misroute-blocker. Status remains `accepted` — no decision reversal, only sharpening of the deferral's framing.
 
 ## AI-Disclosure
 
