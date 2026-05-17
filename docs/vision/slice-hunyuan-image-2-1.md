@@ -34,7 +34,7 @@ no PII, auth, billing, or audit-trail surfaces; not a Red Zone change).
   `nodes/eric_diffusion_generate.py:_build_call_kwargs`,
   `comfyless/generate.py:_build_call_kwargs`,
   `comfyless/family_defaults.py:FAMILY_DEFAULTS`, new `test_hunyuan.py`, new
-  `docs/decisions/ADR-013-hunyuan-image-cfg-routing.md` + Obsidian mirror.
+  `docs/decisions/ADR-014-hunyuan-image-cfg-routing.md` + Obsidian mirror.
   Excludes: HunyuanImage-3.0 (deferred to ai-stack), HunyuanDiTPipeline,
   HunyuanImageRefinerPipeline, edit/inpaint/ControlNet variants,
   latent-upscale, runtime-core CFG consolidation (cluster Queued), MCP
@@ -178,28 +178,20 @@ matters):
   silently. (This forces a deliberate naming choice during the change
   plan.)
 
-**Regression hook** — the seven existing CPU suites must continue to pass
-with 0 failures:
+**Regression hook** — the eight existing CPU suites (850 tests) must
+continue to pass with 0 failures. Per ADR-013 the test runner is the
+comfyless uv-managed `./.venv/bin/python3` (created by `uv sync` in this
+worktree; one-time setup if absent — see Changelog §1):
 
 ```bash
-/home/gawkahn/projects/ai-lab/ai-stack-data/comfy-dev/run/venv/bin/python3 test_manual_loop.py \
-  && /home/gawkahn/projects/ai-lab/ai-stack-data/comfy-dev/run/venv/bin/python3 test_multistage.py \
-  && /home/gawkahn/projects/ai-lab/ai-stack-data/comfy-dev/run/venv/bin/python3 test_params_schema.py \
-  && /home/gawkahn/projects/ai-lab/ai-stack-data/comfy-dev/run/venv/bin/python3 test_cascade.py \
-  && /home/gawkahn/projects/ai-lab/ai-stack-data/comfy-dev/run/venv/bin/python3 test_iterate.py \
-  && /home/gawkahn/projects/ai-lab/ai-stack-data/comfy-dev/run/venv/bin/python3 test_samplers.py \
-  && /home/gawkahn/projects/ai-lab/ai-stack-data/comfy-dev/run/venv/bin/python3 test_server_robustness.py
+./.venv/bin/python3 test_manual_loop.py && ./.venv/bin/python3 test_multistage.py && ./.venv/bin/python3 test_params_schema.py && ./.venv/bin/python3 test_cascade.py && ./.venv/bin/python3 test_machine_boundary_validator.py && ./.venv/bin/python3 test_iterate.py && ./.venv/bin/python3 test_samplers.py && ./.venv/bin/python3 test_server_robustness.py
 ```
 
 **Live GPU smoke** (separate, outside the unit gate — performed once after
 the code lands and once weights are on disk):
 
 ```bash
-/home/gawkahn/projects/ai-lab/ai-stack-data/comfy-dev/run/venv/bin/python3 -m comfyless.generate \
-  --model <hunyuan-2.1-local-path> \
-  --prompt "a quiet alpine lake at dawn, photorealistic" \
-  --aspect 1:1 --target-mp 1.0 \
-  --savepath /tmp/hunyuan-smoke.png
+./.venv/bin/python3 -m comfyless.generate --model <hunyuan-2.1-local-path> --prompt "a quiet alpine lake at dawn, photorealistic" --aspect 1:1 --target-mp 1.0 --savepath /tmp/hunyuan-smoke.png
 ```
 
 Smoke pass criterion: file written, PNG has comfyless metadata chunk,
@@ -207,13 +199,15 @@ Smoke pass criterion: file written, PNG has comfyless metadata chunk,
 
 ## §12 artifacts required before code
 
-- **`ADR-013-hunyuan-image-cfg-routing.md`** — documents the introduction
+- **`ADR-014-hunyuan-image-cfg-routing.md`** — documents the introduction
   of the third CFG routing shape (`distilled_guidance_scale`), the choice
   to keep two parallel `_build_call_kwargs` copies (extending the existing
   pattern that the runtime-core cluster will eventually consolidate), the
   family-string naming choice (`hunyuan-image` vs. `hunyuan` — naming locks
   in routing eligibility), and the deliberate exclusion of the
-  refiner / DiT / 3.0 variants. Mirror to Obsidian `Decisions/`.
+  refiner / DiT / 3.0 variants. Mirror to Obsidian `Decisions/`. (Number
+  bumped from the original draft's ADR-013 because that slot was taken by
+  the slice-0c comfyless torch-divergence ADR landed 2026-05-16.)
 - **Security review:** NOT required — no Red Zone surface, no new
   caller-supplied path widening, no IPC change, no new external-input
   ingestion. The §12 trigger list (CLAUDE.md "Review bar") names IPC,
@@ -263,4 +257,39 @@ Smoke pass criterion: file written, PNG has comfyless metadata chunk,
 - Approved 2026-05-16.
 - Backlog updated (Obsidian `Image_gen/Backlog.md`): 2.1 promoted to
   Immediate, 3.0 deferred to ai-stack.
-- Next action: `/change-slice` → ADR-013 draft → implementation.
+- Next action: `/change-slice` → ADR-014 draft → implementation.
+
+## Changelog
+
+### 2026-05-17 — Re-baseline after slice 0c landed on main
+
+Slice 0c (comfyless CUDA / torch realignment) landed on `main` while this
+Vision was holding (commits `16ef0b7`/`c8244c4`/`fa9e0f4`/`44f55cc`). The
+Hunyuan Vision was rebased on top; three knock-on adjustments folded into
+the artifact:
+
+1. **Test runner path.** Proof-hook regression command + live-smoke command
+   flipped from
+   `/home/gawkahn/projects/ai-lab/ai-stack-data/comfy-dev/run/venv/bin/python3`
+   to `./.venv/bin/python3` (this repo's uv-managed venv, per ADR-013).
+   Operational prerequisite captured as the first Change-Plan step:
+   `uv sync` in this `hunyuan-support` worktree — the slice 0c `.venv`
+   lives in the worktree that ran it (`eric-cuda-upgrade`), so this
+   worktree needs its own `uv sync` before the regression hook can run.
+2. **Test suite count.** The regression hook now lists 8 suites (850
+   tests), adding `test_machine_boundary_validator.py` (118 tests, ADR-012)
+   to match the post-slice-0c CLAUDE.md gate.
+3. **ADR number.** Original draft reserved `ADR-013`; that slot is taken
+   by `ADR-013-comfyless-torch-divergence.md`. The Hunyuan CFG-routing ADR
+   becomes **`ADR-014-hunyuan-image-cfg-routing.md`**.
+
+**Reviewer-plan check against ADR-013 §8 trailing note.** ADR-013 §8
+specifies that future slices which **move an ML-stack pin** layer
+`security-auditor` (Opus) onto each code-touching commit IN ADDITION TO
+`code-reviewer`. The Hunyuan slice consumes the existing
+diffusers 0.37.1 surface (`HunyuanImagePipeline` is already exported);
+zero pin movement. The trailing note does **not** apply — reviewer plan
+remains `code-reviewer` (Opus, pinned at invocation) after each
+non-trivial step; no per-commit `security-auditor`.
+
+**Invariants and out-of-scope unchanged.** Risk level unchanged (L2).
