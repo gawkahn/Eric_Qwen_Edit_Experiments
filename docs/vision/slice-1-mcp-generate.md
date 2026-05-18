@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-30
 **ADR:** [ADR-011](../decisions/ADR-011-comfyless-mcp-server.md) — see the 2026-04-30 Changelog amendment for the cascade-in-slice-1 + `--default-model` decisions reflected here.
-**Status:** approved by Grant 2026-04-30; awaiting `/change-slice` to start the Change Contract.
+**Status:** approved by Grant 2026-04-30 → implemented 2026-05-17 (commits `a42e90d`, `9c067ad`, `9c24eb7`); slice closed.
 **AI-Disclosure:** Claude (Opus 4.7, 1M context) authored; Grant reviewed and approved.
 
 ---
