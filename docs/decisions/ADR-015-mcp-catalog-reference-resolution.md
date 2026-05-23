@@ -1,0 +1,145 @@
+# ADR-015: Catalog-Mediated Model/LoRA Reference Resolution for the MCP Surface
+
+**Date:** 2026-05-21
+**Status:** accepted (security-auditor round 2 CLEAN after MEDIUM-4 fold-in, 2026-05-23)
+**AI-Disclosure:** Claude (Opus 4.7, 1M context) authored; Grant reviewed.
+**Relates to:** [ADR-011](ADR-011-comfyless-mcp-server.md) (MCP as the LLM-agent calling interface — core decision unchanged; §2/§3a/§3b/§3e contract details and the §3d slice plan are revised by this ADR). [ADR-001](ADR-001-daemon-socket-security.md) (the `_within` / `_check_paths` helpers reused here). Connects to the long-planned LoRA registry / Civitai catalog (Backlog Queued; ADR-011 §7 deferral "LoRA registry / catalog tool").
+
+---
+
+## Context
+
+ADR-011 made comfyless's MCP `generate` tool accept loadable-weight references — `model`, `transformer_path`, `vae_path`, `text_encoder_path`, `text_encoder_2_path`, `loras[].path`, and cascade `stage_*` / `scaffolding_repo` — as **absolute filesystem paths** (or HF repo IDs), and validate each at the request boundary with `os.path.realpath` + `_within(--model-base)` (slice 1, shipped at commit `9c24eb7`). The `generate` *response* returns a `resolved_params` blob carrying those **full absolute paths** back to the agent ("the agent's authoritative record"; ADR-011 §2 2026-05-02 amendment), with redaction applied only to the durable on-disk PNG metadata (§3e) and the audit log (§3b).
+
+A slice-2 (`extract_params`) design review surfaced that exposing absolute paths to the LLM agent — and accepting them as input — is the wrong trust model for this surface, on two independent grounds:
+
+1. **Input attack surface.** Accepting a caller-supplied path means the server must defend `realpath` + symlink-escape + traversal + null-byte attacks on every weight-reference field, on every call, forever. That defense exists in slice 1 and works — but it exists *because* untrusted input drives a filesystem path. The entire class of attack is an artifact of the chosen reference model.
+
+2. **Output exposure.** Returning absolute paths hands a (potentially prompt-injectable) agent a map of the `--model-base` tree — filesystem reconnaissance value that the agent has no legitimate need for, and that can leak onward into anything the agent's transcript touches.
+
+The agent does not need paths. It needs *identity*: "the qwen-image model", "the anime-style LoRA", at a given weight. Like a UI dropdown, the caller should see the values it must choose among (names + generation parameters) while the absolute locations stay server-side and are not caller-affectable.
+
+There is also a standing operational motivation. comfyless is intended to ship as a substrate for an LLM-driven harness (`local_agents`) and potentially as a package bundling a curated model/LoRA set. Today, absolute-path correctness is a cross-cutting assumption: the agent holds paths, sidecars store paths, the MCP contract speaks paths. If the filesystem layout changes — a drive remount (this host is a mergerfs union; see global filesystem constraints), a package install at a new prefix, a reorganized model tree — every path-bearing artifact and every cached agent assumption breaks. Routing all references through a single name→path catalog means **the catalog is the only thing that updates** when the filesystem moves; nothing else relies on path correctness.
+
+This is a Red Zone surface change (it alters the MCP reference contract — the LLM-agent input/output boundary). It *reduces* the threat surface, but per global §12 and the project CLAUDE.md it requires this ADR before code and a `security-auditor` (Opus) review of the target state before implementation.
+
+## Decision
+
+Adopt **catalog-mediated reference resolution** for the comfyless MCP surface. Model, LoRA, and component references are **opaque catalog names**, not filesystem paths, in both directions (agent input and server response). A server-side catalog is the single source of truth mapping `name → absolute path`.
+
+### 1. The catalog
+
+A spawn-time, in-memory mapping `name → entry`, where `entry = {abs_path, kind: "model" | "lora" | "component", model_family?, source: "scan" | "manifest", ...}`.
+
+**Construction (v1):**
+
+- **Scan** `--model-base` to discover loadable weights and derive a default name for each (from the directory/file basename for local entries; from the repo ID for already-cached HF entries — no network, consistent with ADR-011 §3 `allow_hf_download=False`).
+- **Scan does not follow symlinks (security-auditor HIGH-2).** The scan does not descend into or mint catalog entries from symlinked directories/files. A symlink's *link path* must never become a catalog name independent of its target. (Rationale: a pre-spawn-crafted symlink whose link-name basenames differently from its target would otherwise inject an operator-unintended name→path edge. Following-then-`_within`-checking-the-realpath was considered and rejected for v1 as more surface than the zero-config scan needs; an operator who wants a weight reachable under a friendly alias uses the manifest, which is explicit and audit-logged.) Every entry's recorded `abs_path` is the `realpath` of a non-symlink scan hit.
+- **Name normalization (security-auditor HIGH-2).** Before collision detection *and* before storing as a lookup key, every derived/assigned name is normalized: Unicode **NFC** plus an explicit case policy — **names are compared case-sensitively, and the catalog rejects at startup any two entries whose names are equal under a case-insensitive comparison** (so a case-folding host filesystem cannot collapse two keys the operator believes distinct). The same normalization runs on the request-side candidate name in §2 step 1, so a request and a key cannot disagree on normalization.
+- **Optional operator manifest** — a new spawn-time flag `--catalog <abs-path.json>` mapping explicit names → references. References may be absolute filesystem paths or HF repo IDs (matching the existing scan's two source kinds). The manifest assigns friendly names and aliases. This is what a packaged distribution ships.
+- **Manifest HF-source build-time policy (security-auditor MEDIUM-4).** When a manifest entry targets an HF repo ID, catalog build resolves it via `resolve_hf_path(..., allow_download=False)` to obtain its local `abs_path`, identically to scan-discovered HF entries (no network; consistent with ADR-011 §3 first exclusion). If the repo ID is **not** in the local HF cache at spawn time, the server **fails to start** with a message naming the manifest entry's name and the repo ID — same fail-closed posture as `--model-base` escape and collision. This is the operator-visible startup channel (not the agent-facing uniform error of §2 step 2); naming the offending entry to the operator is debugging information for the operator's own manifest, not an oracle. Rationale: silently dropping a manifest entry on cache miss would mean the operator's declared catalog disagrees with the running catalog with no clear signal; deferring HF resolution to request time would violate the §1 invariant that every entry's `abs_path` is resolved at build time and would erode the symmetry between local-path and HF-source entries.
+- **Collision rule (fail-closed at startup, security-auditor HIGH-2).** The server **fails to start**, naming the ambiguous name, when *either*: (a) the scan yields two distinct realpaths deriving the same (normalized) name, *or* (b) a manifest-assigned name collides (under the §1 normalization) with a scan-derived name that points at a **different** realpath. A manifest entry may **alias an additional name** to a path or **assign a name to a path the scan also found** (same realpath — harmless), but it may **not silently shadow** a distinct scanned path under a colliding name — that is the same "pick one" confused-deputy hazard the scan rule forbids. Intentional overrides are expressed by the operator removing/renaming the conflicting entry, not by silent precedence.
+- Every catalog entry's `abs_path` is `realpath`-resolved and `_within(--model-base)`-checked **at catalog-build time** (defense in depth; see §4 on the model-base relationship). A manifest entry that escapes `--model-base` fails startup.
+
+The catalog is built once at spawn and held in `_StartupConfig` (extends the existing slice-1 config object). No per-request filesystem scan.
+
+### 2. Name resolution (the request-time rule)
+
+When the agent supplies a reference value `R` for any weight field (`model`, `loras[].name`, components, cascade `stage_*` / `scaffolding_repo`):
+
+1. **Normalize to a name.** If `R` contains a path separator (or is otherwise path-shaped), reduce it to `os.path.basename(R)` and treat that as the candidate name. A bare name is used as-is. The candidate is then **name-normalized** by the same rule the catalog uses at build time (Unicode NFC + the case policy fixed in §1) before lookup, so a request name and a catalog key cannot disagree on normalization.
+2. **Look up** the normalized candidate name in the catalog.
+   - **Hit:** use the catalog's `abs_path`. The agent's supplied directory component, if any, is **discarded** — the catalog path is authoritative. If a directory component *was* discarded (i.e. `R` was path-shaped), the response carries an **INFO-level notice**: `"reference '<name>' resolved via catalog; supplied path discarded — do not rely on paths for later actions."` This makes the discard explicit so the agent does not treat its supplied path as confirmed-correct. (Implementation note for slice 3: the notice interpolates the resolved *catalog name* only — never the agent-supplied raw `R`, which may carry attacker-chosen directory text that must not round-trip into the agent transcript. INFO-2.)
+   - **Miss / any resolution failure → a single uniform agent-facing error.** This is the load-bearing security commitment of this ADR (security-auditor HIGH-1 + MEDIUM-1). **All** reference-resolution failure causes return the **same** structured MCP error class and message to the agent — `"reference not available"` — with no distinguishing detail: catalog miss, a catalog *hit* whose `abs_path` no longer realpath-resolves or fails request-time `_within` (step 3), HF-cache miss on an HF-sourced entry, and malformed-reference rejection are **indistinguishable** in the agent-facing frame. The fine-grained cause (`UnknownName` / `PathMoved` / `HFCacheMiss` / `WithinFailure`) is written **only** to the stderr audit line for the operator. Rationale: distinguishing these is exactly the enumeration oracle. The agent learns nothing about the filesystem from a failure; legitimate discovery of what *is* available happens through `list_models` / `list_loras`, the deliberately-public catalog contract. **This uniform-error contract closes the HF-cache enumeration oracle recorded in `TECH_DEBT.md` Security 2026-05-17** — that entry's trigger ("MCP reference-resolution surface next reworked") is met by this ADR; mark it resolved when slice 3 ships the uniform error. (Note this *replaces* — does not merely co-exist with — the slice-1 `PathAllowlist`/`HFCacheMiss` class split; the earlier "strictly safer than slice-1" framing only holds once the uniform error is implemented, not from the name model alone.)
+3. **Request-time `_within` fails closed.** The resolved `abs_path` still passes `realpath` + `_within(--model-base)` at request time (cheap defense-in-depth; the catalog *should* only hold in-base paths, but the load boundary verifies regardless — a drive remount or operator move between spawn and request can invalidate a catalog `abs_path`, MEDIUM-1). On failure the server **rejects** with the uniform error of step 2; it **never** falls back to the stale catalog path and never proceeds to load. HF resolution (`resolve_hf_path`, `allow_hf_download=False`) still applies to HF-sourced catalog entries, and its cache-miss likewise surfaces as the uniform error.
+
+The basename-strip rule (step 1) is what dissolves the CLI-sidecar-stores-full-paths wrinkle: a stored absolute path is just a path-shaped `R` that basenames to a catalog name like any other input.
+
+### 3. Contract changes (input and output)
+
+- **`generate` / `iterate` input.** `model` and component fields, and `loras[].name` (renamed from `loras[].path`), are catalog names. The JSONSchema `description` states: "catalog name (discover via `list_models` / `list_loras`); a path-shaped value has its directory discarded and its basename resolved via the catalog." Cascade `cascade_config.stage_*` / `scaffolding_repo` likewise become names. `output_path` / `savepath` are **unchanged** by this ADR — they are write destinations under `--output-dir`, already a separate containment root (ADR-011 §3a) and already dropped from MCP-returned PNG metadata (§3e); they are not weight references and the catalog does not govern them.
+- **`generate` / `iterate` / `extract_params` output.** Path-typed weight fields in any MCP response (`resolved_params`, the extract blob) are rendered as **catalog names**, never absolute paths. Non-path generation parameters (`prompt`, `negative_prompt`, `seed`, `steps`, `cfg_scale`, `true_cfg_scale`, `sampler`, `scheduler`, `width`, `height`, `model_family`, LoRA `weight`) are unchanged. Responses gain an optional `notices: [{level, message}]` array carrying the §2 path-discard INFO notice and the §3 `extract_params` not-in-catalog notice.
+- **`extract_params` reverse mapping.** When a read sidecar stores an absolute path, the handler basenames it and reverse-looks-up the catalog. Hit → the catalog name. Miss (a sidecar referencing a weight not in the catalog — e.g. a model the human CLI used directly) → return the **basename** (filename only, never the directory) plus an INFO notice `"reference not in catalog; returned as filename"`. The absolute directory never crosses the boundary; the surfaced basename does carry one bit ("a weight with this filename was used outside the catalog"), and that exposure is acceptable on the stated threat model for a specific reason: the sidecar itself lives under `--output-dir`, was produced by the user's own runs, and the same-uid agent could already read it directly (ADR-011 §3 second exclusion gates the *path* the agent supplies; the file's contents past the gate are user-readable data). The alternative tightening, available if this filename-existence signal is ever judged material, is to drop the field entirely from the response and surface only the notice — flagged here so the choice is named, not lost. (security-auditor MEDIUM-2.)
+
+### 4. Relationship to `--model-base` (v1 vs end-state)
+
+**v1 (this ADR):** the catalog is a *naming and indirection layer on top of* `--model-base`. `--model-base` remains the containment root: every catalog entry must resolve within it, and the request-time `_within` check stays as defense-in-depth. Slice-1's containment guarantees are preserved, not replaced.
+
+**End-state (deferred, viable, not committed):** the catalog becomes the *sole* holder of absolute-path knowledge, and `generate` — both the MCP path **and** the CLI path — resolves every name through the in-process catalog (`LLM → generate → catalog → real data`; equally `human CLI → generate → catalog → real data`). At that point the catalog supersedes `--model-base` as the authority and weight paths exist in exactly one place in the system. This is the operational end-state Grant described; v1 deliberately keeps `--model-base` as a safety net so the migration is incremental and reversible. Promoting the catalog to sole authority is a future ADR amendment, gated on the CLI-path migration.
+
+**Preconditions for the end-state amendment (security-auditor MEDIUM-3).** The future amendment that drops `--model-base` and the request-time `_within` defense-in-depth (§2 step 3) may **not** be drafted until **both** of these have shipped and are covered by passing negative tests, not merely committed in ADR text:
+
+1. The §1 catalog construction invariants — no-follow-symlinks during scan, NFC + case-policy name normalization at build AND at request normalization, and the unified scan-and-manifest collision rule — are implemented and have negative-test coverage for each invariant.
+2. The §2 step 2 uniform-error contract is shipped in `mcp_server.py` — all reference-resolution failure causes return one identical agent-facing error class/message, with fine-grained cause on stderr only.
+
+Removing the request-time `_within` net before these land would leave the catalog as a single point of trust with no second check; the safety net stays until what replaces it is real and tested.
+
+**HTTP-transport carry-forward (security-auditor INFO-3).** The uniform-error contract (§2 step 2) is calibrated to the stdio same-uid threat model. Under any future HTTP/SSE transport (ADR-011 §6, separate ADR) the error-class oracle escalates from a same-uid agent learning local layout to a network actor enumerating the host. The uniform-error contract is therefore a **hard precondition** that must be in force before any HTTP-transport ADR drafts — alongside the existing ADR-011 §3d gates (runtime-core cluster and failed-load/OOM-cascade resilience).
+
+### 5. Slice plan (revises ADR-011 §3d)
+
+ADR-011's renumbered slice plan was: 1 `generate` [done] → 2 `extract_params` → 3 `list_models`/`list_loras` → 4 `iterate` → 5 `edit` stub. This ADR reorders so the catalog (the keystone everything else now depends on) lands first:
+
+| New slice | Scope | Risk / notes |
+|---|---|---|
+| 1 | `generate` (path-based, incl. cascade) | **DONE** (`9c24eb7`). Migrated to names in new-slice 3. |
+| **2 (new)** | **Catalog infrastructure + `list_models` + `list_loras`.** Build the spawn-time catalog (scan + optional `--catalog` manifest, collision fail-closed, build-time `_within`). Expose it read-only via `list_models` / `list_loras` returning **names** (+ family, kind), no paths. Additive — does not touch `generate`. | L3 Red Zone (new spawn-time file-read for manifest; catalog is the new security keystone). code-reviewer + security-auditor. |
+| 3 | **Migrate `generate` (+ cascade) to catalog names.** Input fields become names (basename-strip rule); response `resolved_params` returns names; add `notices` with the path-discard INFO. The slice-1 path-allowlist code stays as request-time defense-in-depth on resolved paths. | L3 Red Zone — changes shipped slice-1 contract. code-reviewer + security-auditor. |
+| 4 | `extract_params` (JSON sidecar reader). Returns names via reverse catalog lookup; basename-fallback + notice on catalog miss. Two ordered checks (realpath-first `.json` + `_within(--output-dir)`) per ADR-011 §3 second exclusion still apply to the *sidecar path* argument. | L3 Red Zone (caller-supplied file read). code-reviewer + security-auditor. |
+| 5 | `iterate` (ADR-008 axes; cascade subset). Base config uses catalog names. Server-side `--mcp-max-iterations` cap (ADR-011 §3c). | L3 Red Zone. |
+| 6 | `edit` stub (schema-declared slot; `NotImplementedError`-shaped). | L2. |
+
+The previously-drafted `docs/vision/slice-2-mcp-extract-params.md` is repurposed: its `extract_params` content moves to new-slice 4 and gains the names-return contract; the new-slice-2 catalog Vision is authored fresh when implementation begins.
+
+## Alternatives Rejected
+
+### A. Keep absolute paths; redact only the `extract_params` output to basenames
+
+Rejected. This was the original slice-2 Q1 "basename-redacted" option. It leaves `generate` still *accepting* paths as input, so the input attack surface (the larger of the two concerns) is untouched, and it creates an asymmetry: `generate` shows full paths in its own response while `extract_params` shows basenames, and the agent must still send a path back to `generate` to replay. Half-measure that satisfies neither the security nor the operational motivation.
+
+### B. Catalog supersedes `--model-base` immediately (the end-state, now)
+
+Rejected for v1. Promoting the catalog to sole path-authority and routing the CLI path through it too is the right end-state (§4) but bundles a migration of the shipped CLI generate path into this change. Too large for one decision; loses the incremental safety net. Deferred to a future amendment, explicitly preserved as viable.
+
+### C. Opaque per-session handles / IDs instead of names
+
+Rejected. Returning an opaque token (`model_ref: "h7f3a2"`) the agent echoes back is maximally hiding, but requires server-side per-session state mapping tokens → entries, and produces references that are meaningless across sessions and un-loggable for the operator. Stable human-meaningful names give the same path-hiding property, survive restarts, are self-documenting in audit lines, and let the operator reason about what the agent requested. The catalog name *is* the right granularity of opacity.
+
+### D. Resolve names in `local_agents` (the harness), not comfyless
+
+Rejected for the resolver, accepted as a complement. The harness could hold a name→path map and pass paths to comfyless. But then comfyless still accepts paths (input attack surface remains) and still must defend them, and the path-hiding depends on every caller behaving — comfyless would not be safe by construction. The catalog must live in comfyless so the MCP surface is safe regardless of caller. `local_agents` may layer its own higher-level catalog/routing on top (e.g. Civitai metadata), consuming comfyless's `list_models` — that composition is welcome and orthogonal.
+
+### E. Reject path-shaped input outright (no basename-strip)
+
+Rejected in favor of Grant's basename-strip + INFO-notice rule. Hard-rejecting any path-shaped reference is cleaner in the abstract, but it makes the surface brittle against the common, benign case of an agent replaying a stored sidecar value or a lightly-hallucinated path. Basename-stripping with an explicit "path discarded" notice is tolerant of that input while still treating the directory as fully untrusted — the catalog name is the only thing that decides what loads. This matches the project's "warn, don't block on user/agent footguns" posture.
+
+## Deferred / Out of Scope
+
+- **Catalog as sole path-authority + CLI-path migration** (§4 end-state) — future amendment; v1 keeps `--model-base` as containment root.
+- **Civitai / LoRA registry metadata** (trigger words, base-model compatibility, hashes) layered on the catalog — Backlog Queued; the catalog here is the path-resolution substrate it will extend.
+- **Short-name fuzzy resolution / aliases beyond exact name match** — v1 is exact-name (+ basename-of-path). Fuzzy/alias matching is a later refinement once `list_models` gives the agent the exact vocabulary.
+- **Returning generated image *bytes* (`ImageContent`) so an LLM judge can see output** — separate concern surfaced during this discussion (today `generate` returns only a path); belongs to the LLM-as-judge loop work, not this ADR. Backlog flag.
+- **Hot-reload of the catalog** without server restart — v1 builds at spawn only. A reload tool/signal is a later polish item.
+- **`output_path` / `savepath` indirection** — these are write destinations, not weight references; unchanged here.
+
+## Changelog
+
+- **2026-05-21 (initial draft)**: Decision drafted after the slice-2 (`extract_params`) design review concluded that absolute paths should never cross the MCP boundary in either direction. Adopts catalog-mediated name↔path resolution: opaque catalog names on agent input/output, server-side catalog as single source of path truth, basename-strip + INFO-notice rule for path-shaped input (Grant, 2026-05-21), `unknown <kind>` errors initially argued as non-oracular because catalog membership is discoverable by design. `--model-base` retained as v1 containment root; catalog-as-sole-authority + CLI migration deferred as a viable end-state. Revises ADR-011 §2/§3 contract details and reorders its §3d slice plan (catalog + `list_models`/`list_loras` become new-slice 2; `generate` migration new-slice 3; `extract_params` new-slice 4). `security-auditor` (Opus) review of this target state queued before any code lands; Status flips to `accepted` if it returns CLEAN (or after fold-in). ADR-011 gains a Changelog pointer here.
+
+- **2026-05-22 (security-auditor round-1 fold-in)**: Round-1 review (saved to `docs/security/review-adr-015-catalog-reference-2026-05-22.md`) returned `CHANGES REQUIRED` with 2 HIGH + 3 MEDIUM + 3 INFO. Folded:
+  - **HIGH-1 (uniform error contract)**: §2 step 2 rewritten — *all* reference-resolution failure causes (catalog miss, catalog hit whose `abs_path` moved/vanished, HF-cache miss, request-time `_within` failure) now return one identical agent-facing error (`"reference not available"`), with fine-grained cause (`UnknownName` / `PathMoved` / `HFCacheMiss` / `WithinFailure`) on the stderr audit line only. The earlier "miss is not an oracle" argument is corrected — non-oracular requires the uniform-error contract, not just catalog discoverability. This **closes** the HF-cache enumeration oracle recorded in `TECH_DEBT.md` Security 2026-05-17 (mark resolved when slice 3 ships).
+  - **HIGH-2 (catalog construction invariants)**: §1 expanded — scan does **not** follow symlinks (no symlink-link-name catalog entries); names normalized with Unicode NFC + a case-sensitive-with-case-insensitive-collision-rejection policy at build AND at request candidate normalization (§2 step 1); the collision rule now covers manifest-shadows-distinct-scanned-path as well as scan-internal collisions, fail-closed in both directions.
+  - **MEDIUM-1 (request-time `_within` fails closed)**: §2 step 3 rewritten — request-time `realpath`/`_within` failure on a catalog hit rejects with the §2 step 2 uniform error and never falls back to the stale catalog path.
+  - **MEDIUM-2 (`extract_params` basename-fallback justification)**: §3 reworded — the basename surface IS a one-bit existence signal (a weight with this filename was used outside the catalog), accepted on the stated threat model because the sidecar is user-produced under `--output-dir` and the same-uid agent could read it directly; the "drop the field entirely" tightening is named as available if the signal is ever judged material.
+  - **MEDIUM-3 (end-state precondition)**: §4 expanded — the future amendment that drops `--model-base` and request-time `_within` may not draft until the §1 construction invariants and the §2 uniform-error contract are both shipped with negative-test coverage, not merely designed.
+  - **INFO-2 (notice-text sanitization)**: §2 step 2 Hit notice gained an implementation note for slice 3 — notices interpolate the resolved catalog name only, never the agent-supplied raw reference value.
+  - **INFO-3 (HTTP-transport carry-forward)**: §4 gained a §6-pointing clause — the uniform-error contract is a hard precondition for any future HTTP-transport ADR alongside the existing ADR-011 §3d gates.
+  - **INFO-1**: noted; no ADR change needed (confirmation that ADR-011 invariants are preserved).
+
+  Re-firing `security-auditor` round 2 on the amended ADR per the round-1 reviewer's advisory (HIGH-1 changes a load-bearing claim). Status flips from `proposed` to `accepted` if round 2 returns CLEAN.
+
+- **2026-05-23 (security-auditor round-2 verification + MEDIUM-4 fold-in → CLEAN, Status accepted)**: Round-2 review (appended to `docs/security/review-adr-015-catalog-reference-2026-05-22.md`) verified each round-1 fold-in landed as text where the contract lives — not just summarized in the Changelog — including the load-bearing HIGH-1 uniform-error contract at §2 step 2 and the HIGH-2 catalog-construction invariants at §1. Round-2 verdict: `CHANGES REQUIRED — minor`, with one new finding (MEDIUM-4) and one INFO-4 portability note. Folded:
+  - **MEDIUM-4 (manifest+HF-source policy)**: §1 gained an explicit clause — manifest entries may target HF repo IDs; catalog build resolves them via `resolve_hf_path(..., allow_download=False)`; a build-time HF cache miss **fails startup** naming the manifest entry and the repo ID. Operator-visible startup channel only (not the agent-facing uniform error of §2 step 2). Picks option (a) from the auditor's three-way choice — matches the project's fail-closed-at-startup posture for collisions and `--model-base` escape and preserves the §1 invariant that every entry's `abs_path` is resolved at build time.
+  - **INFO-4 (case-folding host portability)**: noted in the round-2 review for the slice-2 Vision author to carry as a one-line operator-guidance note when slice 2 is written. No ADR change.
+
+  Round 2 advisory: MEDIUM-4 fold-in is mechanical (not a contract change), so round 3 is not required. Status flipped from `proposed` to `accepted`. Implementation may now begin per the §5 revised slice plan (slice 2: catalog + `list_models` + `list_loras`). Slice 2 runs `code-reviewer` AND `security-auditor` (both Opus, model pinned at invocation per global §5A) before commit.
