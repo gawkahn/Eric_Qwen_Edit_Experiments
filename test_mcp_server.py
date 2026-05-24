@@ -1458,6 +1458,607 @@ check(
 
 
 # ════════════════════════════════════════════════════════════════════════
+print("\n== Slice 2 Step 2: build_catalog + scan + manifest ==")
+# ════════════════════════════════════════════════════════════════════════
+#
+# Step 2 lands the catalog data structure, name normalization, scan
+# walker, manifest parser, and build_catalog() orchestrator. Tests
+# exercise build_catalog() directly against fixture --model-base trees
+# and fixture manifests; the MCP-server spawn-time wiring lands in
+# Step 3 and is tested through the CLI there.
+#
+# Coverage maps to Vision negative cases N1-N15 + N24-N26 + N28.
+# (N16-N23 + N27 wait for Step 4's list_* tools.)
+
+import os as _os  # already imported as os; alias avoids any shadow inside loops
+
+
+def _make_loras_fixture(model_base: str, names: list) -> None:
+    """Create `<model_base>/loras/<name>.safetensors` regular files."""
+    lora_dir = os.path.join(model_base, "loras")
+    os.makedirs(lora_dir, exist_ok=True)
+    for n in names:
+        with open(os.path.join(lora_dir, f"{n}.safetensors"), "wb") as f:
+            f.write(b"fake-lora-bytes")
+
+
+def _make_transformer_fixture(model_base: str, subdir: str,
+                              names: list) -> None:
+    """Create `<model_base>/<subdir>/<name>.safetensors` regular files."""
+    tdir = os.path.join(model_base, subdir)
+    os.makedirs(tdir, exist_ok=True)
+    for n in names:
+        with open(os.path.join(tdir, f"{n}.safetensors"), "wb") as f:
+            f.write(b"fake-transformer-bytes")
+
+
+def _make_model_fixture(model_base: str, name: str,
+                        class_name: str = "QwenImagePipeline") -> str:
+    """Create `<model_base>/<name>/model_index.json` (regular file)."""
+    mdir = os.path.join(model_base, name)
+    os.makedirs(mdir, exist_ok=True)
+    with open(os.path.join(mdir, "model_index.json"), "w",
+              encoding="utf-8") as f:
+        json.dump({"_class_name": class_name}, f)
+    return mdir
+
+
+def _write_manifest(model_base: str, entries: dict) -> str:
+    """Write a JSON manifest under `<model_base>/.catalog.json` and return
+    the path."""
+    path = os.path.join(model_base, ".catalog.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(entries, f)
+    return path
+
+
+def _assert_raises(label: str, fn, exc_type, *, message_contains=None):
+    """Call fn() expecting `exc_type` (CatalogBuildError typically).
+
+    Optional `message_contains` asserts the exception message contains
+    the given substring(s) — pass a string or list. Records one check()
+    per assertion (raised-correct-type + message-contains-each).
+    """
+    raised = None
+    try:
+        fn()
+    except exc_type as e:
+        raised = e
+    except BaseException as e:  # noqa: BLE001
+        check(f"{label} raises {exc_type.__name__}",
+              False,
+              detail=f"got {type(e).__name__}: {e}")
+        return
+    check(f"{label} raises {exc_type.__name__}",
+          raised is not None,
+          detail="no exception raised")
+    if raised is None or message_contains is None:
+        return
+    msg = str(raised)
+    needles = [message_contains] if isinstance(message_contains, str) \
+        else message_contains
+    for needle in needles:
+        check(f"{label} message contains {needle!r}",
+              needle in msg,
+              detail=f"got {msg!r}")
+
+
+# ── normalize_name + _add_entry basics ─────────────────────────────────
+
+check("normalize_name produces NFC form",
+      cat_mod.normalize_name("café") == "café")
+check("normalize_name is idempotent on ASCII",
+      cat_mod.normalize_name("foo") == "foo")
+
+# _add_entry collision: same name + same abs_path = harmless alias
+_cat: cat_mod.CatalogDict = {}
+_e1 = {"abs_path": "/x/y", "kind": "model", "source": "scan",
+        "model_family": "qwen-image", "target_family": None}
+_e2 = {"abs_path": "/x/y", "kind": "model", "source": "manifest",
+        "model_family": "qwen-image", "target_family": None}
+cat_mod._add_entry(_cat, _e1, "foo")
+cat_mod._add_entry(_cat, _e2, "foo")  # same abs_path -> harmless
+check("_add_entry: same name + same abs_path is harmless alias",
+      "foo" in _cat and _cat["foo"]["source"] == "scan")
+
+# _add_entry collision: same name + different abs_path = fail closed
+_cat = {}
+_e3 = {"abs_path": "/x/y", "kind": "model", "source": "scan",
+        "model_family": None, "target_family": None}
+_e4 = {"abs_path": "/x/z", "kind": "model", "source": "manifest",
+        "model_family": None, "target_family": None}
+cat_mod._add_entry(_cat, _e3, "foo")
+_assert_raises(
+    "_add_entry: same name + different abs_path",
+    lambda: cat_mod._add_entry(_cat, _e4, "foo"),
+    cat_mod.CatalogBuildError,
+    message_contains=["'foo'", "two distinct paths"],
+)
+
+# _add_entry collision: case-insensitive collision rejected
+_cat = {}
+cat_mod._add_entry(_cat, _e3, "Foo")
+_assert_raises(
+    "_add_entry: case-insensitive collision rejected (Foo vs foo)",
+    lambda: cat_mod._add_entry(_cat, _e4, "foo"),
+    cat_mod.CatalogBuildError,
+    message_contains=["case-insensitively"],
+)
+
+
+# ── N1, N2, N3: --catalog file-level failures ──────────────────────────
+
+with tempfile.TemporaryDirectory() as _td:
+    _mb = os.path.realpath(_td)
+    # N1: --catalog points at nonexistent path
+    _assert_raises(
+        "N1: --catalog nonexistent path fails",
+        lambda: cat_mod.build_catalog(_mb, "/tmp/nonexistent-cat-xyz.json"),
+        cat_mod.CatalogBuildError,
+        message_contains="regular file",
+    )
+    # N2: --catalog points at a directory
+    _dir_path = os.path.join(_mb, "a-directory-not-a-file")
+    os.makedirs(_dir_path)
+    _assert_raises(
+        "N2: --catalog pointing at a directory fails",
+        lambda: cat_mod.build_catalog(_mb, _dir_path),
+        cat_mod.CatalogBuildError,
+        message_contains="regular file",
+    )
+    # N3: --catalog malformed JSON
+    _bad_path = os.path.join(_mb, "bad.json")
+    with open(_bad_path, "w") as f:
+        f.write("{not-valid-json")
+    _assert_raises(
+        "N3: --catalog malformed JSON fails",
+        lambda: cat_mod.build_catalog(_mb, _bad_path),
+        cat_mod.CatalogBuildError,
+        message_contains="valid UTF-8 JSON",
+    )
+    # N3-bonus: --catalog top-level is a list, not object
+    _list_path = os.path.join(_mb, "list.json")
+    with open(_list_path, "w", encoding="utf-8") as f:
+        json.dump(["not", "object"], f)
+    _assert_raises(
+        "N3-bonus: --catalog top-level non-object fails",
+        lambda: cat_mod.build_catalog(_mb, _list_path),
+        cat_mod.CatalogBuildError,
+        message_contains="top-level must be a JSON object",
+    )
+
+# Manifest size cap (MEDIUM-1-equivalent for the manifest file)
+with tempfile.TemporaryDirectory() as _td:
+    _mb = os.path.realpath(_td)
+    _big_path = os.path.join(_mb, "big.json")
+    _padding = "x" * (cat_mod._MAX_MANIFEST_BYTES)
+    with open(_big_path, "w", encoding="utf-8") as f:
+        f.write('{"_pad":"' + _padding + '"}')
+    _assert_raises(
+        "manifest exceeding _MAX_MANIFEST_BYTES rejected at startup",
+        lambda: cat_mod.build_catalog(_mb, _big_path),
+        cat_mod.CatalogBuildError,
+        message_contains="exceeds",
+    )
+
+
+# ── N4: manifest entry shape validation ────────────────────────────────
+
+with tempfile.TemporaryDirectory() as _td:
+    _mb = os.path.realpath(_td)
+
+    # N4a: entry value not an object
+    _path = _write_manifest(_mb, {"bad": "not-an-object"})
+    _assert_raises(
+        "N4a: manifest entry value not an object",
+        lambda: cat_mod.build_catalog(_mb, _path),
+        cat_mod.CatalogBuildError,
+        message_contains=["'bad'", "JSON object"],
+    )
+
+    # N4b: entry missing 'target'
+    _path = _write_manifest(_mb, {"bad": {"kind": "model"}})
+    _assert_raises(
+        "N4b: manifest entry missing 'target'",
+        lambda: cat_mod.build_catalog(_mb, _path),
+        cat_mod.CatalogBuildError,
+        message_contains=["'bad'", "target"],
+    )
+
+    # N4c: entry missing 'kind'
+    _path = _write_manifest(_mb, {"bad": {"target": "/abs/path"}})
+    _assert_raises(
+        "N4c: manifest entry missing 'kind'",
+        lambda: cat_mod.build_catalog(_mb, _path),
+        cat_mod.CatalogBuildError,
+        message_contains=["'bad'", "kind"],
+    )
+
+    # N4d: entry 'kind' not in _KINDS
+    _path = _write_manifest(
+        _mb, {"bad": {"target": "/abs", "kind": "vae"}})
+    _assert_raises(
+        "N4d: manifest entry kind not in {model,lora,transformer}",
+        lambda: cat_mod.build_catalog(_mb, _path),
+        cat_mod.CatalogBuildError,
+        message_contains=["invalid 'kind'", "'vae'"],
+    )
+
+    # N4e: entry has unknown extra keys
+    _path = _write_manifest(_mb, {
+        "bad": {"target": "/abs", "kind": "model", "evil": "field"}
+    })
+    _assert_raises(
+        "N4e: manifest entry with unknown extra keys",
+        lambda: cat_mod.build_catalog(_mb, _path),
+        cat_mod.CatalogBuildError,
+        message_contains=["unknown keys", "evil"],
+    )
+
+    # N4f: target_family on kind:"model" → rejected
+    _path = _write_manifest(_mb, {
+        "bad": {"target": "/abs", "kind": "model",
+                "target_family": "qwen-image"}
+    })
+    _assert_raises(
+        "N4f: target_family only allowed on kind:'lora'",
+        lambda: cat_mod.build_catalog(_mb, _path),
+        cat_mod.CatalogBuildError,
+        message_contains=["target_family", "kind:'lora'"],
+    )
+
+    # N4g: empty-string entry name
+    _path = _write_manifest(_mb, {
+        "": {"target": "/abs/path", "kind": "model"}
+    })
+    _assert_raises(
+        "N4g: empty-string entry name",
+        lambda: cat_mod.build_catalog(_mb, _path),
+        cat_mod.CatalogBuildError,
+        message_contains="empty-string entry name",
+    )
+
+    # N4h: NUL byte in manifest target raises CatalogBuildError (NOT
+    # bare ValueError from os.path.realpath). security-auditor MEDIUM-1
+    # folded 2026-05-24: the pre-check matches the project pattern in
+    # server.py and mcp_server.py and preserves the CatalogBuildError-
+    # only contract that Step 3 will wrap into click.BadParameter.
+    _path = _write_manifest(_mb, {
+        "nul": {"target": "/abs/path\x00/etc/passwd", "kind": "model"}
+    })
+    _assert_raises(
+        "N4h: NUL byte in manifest target -> CatalogBuildError (not ValueError)",
+        lambda: cat_mod.build_catalog(_mb, _path),
+        cat_mod.CatalogBuildError,
+        message_contains=["'nul'", "null byte"],
+    )
+
+
+# ── N5, N6: manifest target escapes --model-base ────────────────────────
+
+with tempfile.TemporaryDirectory() as _td:
+    _mb = os.path.realpath(_td)
+    # N5: target is an absolute path outside --model-base
+    _path = _write_manifest(_mb, {
+        "escape": {"target": "/etc/passwd-fake.safetensors",
+                   "kind": "lora"}
+    })
+    _assert_raises(
+        "N5: manifest target outside --model-base after realpath",
+        lambda: cat_mod.build_catalog(_mb, _path),
+        cat_mod.CatalogBuildError,
+        message_contains=["'escape'", "outside"],
+    )
+
+with tempfile.TemporaryDirectory() as _outside_td:
+    # N6: manifest target is a symlink resolving outside --model-base
+    _outside_real = os.path.realpath(_outside_td)
+    _outside_target = os.path.join(_outside_real, "real.safetensors")
+    with open(_outside_target, "wb") as f:
+        f.write(b"outside-content")
+    with tempfile.TemporaryDirectory() as _td:
+        _mb = os.path.realpath(_td)
+        _link = os.path.join(_mb, "evil.safetensors")
+        os.symlink(_outside_target, _link)
+        _path = _write_manifest(_mb, {
+            "evil": {"target": _link, "kind": "lora"}
+        })
+        _assert_raises(
+            "N6: manifest symlink target resolves outside --model-base",
+            lambda: cat_mod.build_catalog(_mb, _path),
+            cat_mod.CatalogBuildError,
+            message_contains=["'evil'", "outside"],
+        )
+
+
+# ── N7: manifest HF repo ID not in local cache ─────────────────────────
+
+with tempfile.TemporaryDirectory() as _td:
+    _mb = os.path.realpath(_td)
+    _path = _write_manifest(_mb, {
+        "missing": {"target": "FakeOrg/NonExistentRepo-xyzzy-12345",
+                    "kind": "model"}
+    })
+    # The repo ID doesn't exist in the cache; resolve_hf_path raises
+    # ValueError → CatalogBuildError naming both the entry and the repo.
+    _assert_raises(
+        "N7: manifest HF repo ID not in local cache fails",
+        lambda: cat_mod.build_catalog(_mb, _path),
+        cat_mod.CatalogBuildError,
+        message_contains=["'missing'", "FakeOrg/NonExistentRepo-xyzzy-12345",
+                          "local HF cache"],
+    )
+
+
+# ── N8: scan-internal collision (two paths same normalized name) ───────
+
+with tempfile.TemporaryDirectory() as _td:
+    _mb = os.path.realpath(_td)
+    # Two loras/ subdirs with the same filename stem → scan collision
+    os.makedirs(os.path.join(_mb, "a", "loras"))
+    os.makedirs(os.path.join(_mb, "b", "loras"))
+    with open(os.path.join(_mb, "a", "loras", "dupname.safetensors"),
+              "wb") as f:
+        f.write(b"a")
+    with open(os.path.join(_mb, "b", "loras", "dupname.safetensors"),
+              "wb") as f:
+        f.write(b"b")
+    _assert_raises(
+        "N8: scan-internal name collision (two paths -> same name)",
+        lambda: cat_mod.build_catalog(_mb, None),
+        cat_mod.CatalogBuildError,
+        message_contains=["'dupname'", "two distinct paths"],
+    )
+
+
+# ── N9: manifest shadows scan at different realpath ────────────────────
+
+with tempfile.TemporaryDirectory() as _td:
+    _mb = os.path.realpath(_td)
+    _make_loras_fixture(_mb, ["scanlora"])
+    # Manifest declares "scanlora" pointing at a different file
+    _other_path = os.path.join(_mb, "other.safetensors")
+    with open(_other_path, "wb") as f:
+        f.write(b"other")
+    _path = _write_manifest(_mb, {
+        "scanlora": {"target": _other_path, "kind": "lora"}
+    })
+    _assert_raises(
+        "N9: manifest shadows scan name at different realpath",
+        lambda: cat_mod.build_catalog(_mb, _path),
+        cat_mod.CatalogBuildError,
+        message_contains=["'scanlora'", "two distinct paths"],
+    )
+
+
+# ── N10: case-insensitive name collision ───────────────────────────────
+
+with tempfile.TemporaryDirectory() as _td:
+    _mb = os.path.realpath(_td)
+    _make_loras_fixture(_mb, ["FooBar"])
+    _other = os.path.join(_mb, "other.safetensors")
+    with open(_other, "wb") as f:
+        f.write(b"other")
+    _path = _write_manifest(_mb, {
+        "foobar": {"target": _other, "kind": "lora"}
+    })
+    _assert_raises(
+        "N10: case-insensitive name collision (FooBar vs foobar)",
+        lambda: cat_mod.build_catalog(_mb, _path),
+        cat_mod.CatalogBuildError,
+        message_contains=["case-insensitively"],
+    )
+
+
+# ── N11, N28: symlinks do NOT mint independent catalog entries ─────────
+
+with tempfile.TemporaryDirectory() as _td:
+    _mb = os.path.realpath(_td)
+    _make_loras_fixture(_mb, ["real_lora"])
+    # Add a symlink alongside the real file → should be skipped
+    _real_path = os.path.join(_mb, "loras", "real_lora.safetensors")
+    _link_path = os.path.join(_mb, "loras", "link_lora.safetensors")
+    os.symlink(_real_path, _link_path)
+    _catalog = cat_mod.build_catalog(_mb, None)
+    check(
+        "N11: symlink .safetensors under loras/ does NOT mint an entry",
+        "link_lora" not in _catalog,
+    )
+    check(
+        "N11 cross-check: real_lora IS in catalog (one entry, not two)",
+        "real_lora" in _catalog and len(_catalog) == 1,
+    )
+
+with tempfile.TemporaryDirectory() as _outside_td:
+    # N28: symlink at checkpoints/link.safetensors → target also outside
+    # conventional dirs → both symlink and target are skipped (zero
+    # catalog entries from this fixture).
+    _outside_real = os.path.realpath(_outside_td)
+    _outside_target = os.path.join(_outside_real, "elsewhere.safetensors")
+    with open(_outside_target, "wb") as f:
+        f.write(b"outside")
+    with tempfile.TemporaryDirectory() as _td:
+        _mb = os.path.realpath(_td)
+        os.makedirs(os.path.join(_mb, "checkpoints"))
+        _link = os.path.join(_mb, "checkpoints", "link.safetensors")
+        os.symlink(_outside_target, _link)
+        _catalog = cat_mod.build_catalog(_mb, None)
+        check(
+            "N28: symlink checkpoints/link.safetensors (target outside) "
+            "mints zero entries",
+            _catalog == {},
+        )
+
+
+# ── N12: manifest alias to same realpath is harmless ───────────────────
+
+with tempfile.TemporaryDirectory() as _td:
+    _mb = os.path.realpath(_td)
+    _make_loras_fixture(_mb, ["mylora"])
+    _real = os.path.realpath(os.path.join(_mb, "loras",
+                                           "mylora.safetensors"))
+    _path = _write_manifest(_mb, {
+        "mylora": {"target": _real, "kind": "lora"}
+    })
+    # Should NOT raise; existing scan entry retained.
+    _catalog = cat_mod.build_catalog(_mb, _path)
+    check(
+        "N12: manifest alias to same realpath is harmless (no error)",
+        "mylora" in _catalog and _catalog["mylora"]["abs_path"] == _real,
+    )
+    check(
+        "N12: scan-derived source retained after harmless alias",
+        _catalog["mylora"]["source"] == "scan",
+    )
+
+
+# ── N13, N14, N15: spawn-succeeds-cleanly cases ────────────────────────
+
+with tempfile.TemporaryDirectory() as _td:
+    _mb = os.path.realpath(_td)
+    # N13: empty --model-base + no manifest → empty catalog
+    _catalog = cat_mod.build_catalog(_mb, None)
+    check("N13: empty model-base + no manifest -> empty catalog",
+          _catalog == {})
+
+with tempfile.TemporaryDirectory() as _td:
+    _mb = os.path.realpath(_td)
+    _make_loras_fixture(_mb, ["lora1", "lora2"])
+    # N14: spawn without --catalog (None) → catalog is just the scan
+    _catalog = cat_mod.build_catalog(_mb, None)
+    check("N14: no --catalog flag -> catalog is just the scan",
+          set(_catalog.keys()) == {"lora1", "lora2"})
+    check("N14: all scan entries marked source='scan'",
+          all(e["source"] == "scan" for e in _catalog.values()))
+
+with tempfile.TemporaryDirectory() as _td:
+    _mb = os.path.realpath(_td)
+    _make_loras_fixture(_mb, ["lora1"])
+    _path = _write_manifest(_mb, {})  # empty manifest object
+    # N15: manifest with no entries → catalog is just the scan
+    _catalog = cat_mod.build_catalog(_mb, _path)
+    check("N15: empty manifest -> catalog is just the scan",
+          set(_catalog.keys()) == {"lora1"})
+
+
+# ── N24: transformer-kind scan classification ──────────────────────────
+
+with tempfile.TemporaryDirectory() as _td:
+    _mb = os.path.realpath(_td)
+    _make_transformer_fixture(_mb, "checkpoints", ["foo"])
+    _make_transformer_fixture(_mb, "diffusion_models", ["bar"])
+    _catalog = cat_mod.build_catalog(_mb, None)
+    check("N24: .safetensors in checkpoints/ -> kind:'transformer'",
+          _catalog.get("foo", {}).get("kind") == "transformer")
+    check("N24: .safetensors in diffusion_models/ -> kind:'transformer'",
+          _catalog.get("bar", {}).get("kind") == "transformer")
+    check("N24: transformer entries marked source='scan'",
+          _catalog["foo"]["source"] == "scan"
+          and _catalog["bar"]["source"] == "scan")
+    check("N24: transformer entries have no model_family (scan-derived)",
+          _catalog["foo"]["model_family"] is None
+          and _catalog["bar"]["model_family"] is None)
+
+
+# ── N25: .safetensors outside conventional dirs is SKIPPED ─────────────
+
+with tempfile.TemporaryDirectory() as _td:
+    _mb = os.path.realpath(_td)
+    # File directly under model-base root (not in any conventional dir)
+    with open(os.path.join(_mb, "orphan_root.safetensors"), "wb") as f:
+        f.write(b"orphan")
+    # File in an unconventional subdir name (not loras/checkpoints/diffusion_models)
+    os.makedirs(os.path.join(_mb, "random_dir"))
+    with open(os.path.join(_mb, "random_dir",
+                            "orphan_sub.safetensors"), "wb") as f:
+        f.write(b"orphan2")
+    _catalog = cat_mod.build_catalog(_mb, None)
+    check("N25: .safetensors at model-base root is SKIPPED",
+          "orphan_root" not in _catalog)
+    check("N25: .safetensors in unconventional subdir is SKIPPED",
+          "orphan_sub" not in _catalog)
+    check("N25: scan with only unconventional files -> empty catalog",
+          _catalog == {})
+
+
+# ── N26: manifest declares transformer outside conventional dirs ───────
+
+with tempfile.TemporaryDirectory() as _td:
+    _mb = os.path.realpath(_td)
+    # Drop a transformer .safetensors at a random location
+    os.makedirs(os.path.join(_mb, "random"))
+    _target = os.path.join(_mb, "random", "my_transformer.safetensors")
+    with open(_target, "wb") as f:
+        f.write(b"transformer")
+    _path = _write_manifest(_mb, {
+        "my_transformer": {"target": _target, "kind": "transformer",
+                           "model_family": "qwen-image"}
+    })
+    _catalog = cat_mod.build_catalog(_mb, _path)
+    check("N26: manifest mints kind:'transformer' for unconventional path",
+          _catalog.get("my_transformer", {}).get("kind") == "transformer")
+    check("N26: manifest entry's source is 'manifest'",
+          _catalog["my_transformer"]["source"] == "manifest")
+    check("N26: manifest-declared model_family is preserved",
+          _catalog["my_transformer"]["model_family"] == "qwen-image")
+
+
+# ── model + manifest integration (positive smoke) ──────────────────────
+
+with tempfile.TemporaryDirectory() as _td:
+    _mb = os.path.realpath(_td)
+    _make_model_fixture(_mb, "qwen-image", "QwenImagePipeline")
+    _make_loras_fixture(_mb, ["anime_lora"])
+    _make_transformer_fixture(_mb, "checkpoints", ["dit_v1"])
+    # Manifest adds a friendly target_family on the scanned lora,
+    # using same-realpath alias.
+    _real_lora = os.path.realpath(
+        os.path.join(_mb, "loras", "anime_lora.safetensors"))
+    _path = _write_manifest(_mb, {
+        "anime_lora": {"target": _real_lora, "kind": "lora",
+                       "target_family": "qwen-image"},
+    })
+    _catalog = cat_mod.build_catalog(_mb, _path)
+    check("integration: catalog has model+lora+transformer entries",
+          set(_catalog.keys()) == {"qwen-image", "anime_lora", "dit_v1"})
+    check("integration: model entry has model_family from scan",
+          _catalog["qwen-image"]["model_family"] == "qwen-image")
+    check("integration: model entry source='scan'",
+          _catalog["qwen-image"]["source"] == "scan")
+    check("integration: lora kind correct",
+          _catalog["anime_lora"]["kind"] == "lora")
+    check("integration: transformer kind correct",
+          _catalog["dit_v1"]["kind"] == "transformer")
+
+
+# ── Module-import contract carries forward from Step 1 ─────────────────
+
+# Verify build_catalog can be CALLED without ever importing torch (the
+# only torch-pulling import is the lazy resolve_hf_path inside the
+# manifest HF-source branch, which only fires when a manifest entry
+# names an HF repo ID). build_catalog with scan-only or local-path-
+# only manifest entries must stay torch-free in a fresh interpreter.
+
+_proc = _subprocess.run(
+    [sys.executable, "-c",
+     "import sys; import os; import tempfile; "
+     "import comfyless.catalog as c; "
+     "td = tempfile.mkdtemp(); "
+     "os.makedirs(os.path.join(td, 'loras')); "
+     "open(os.path.join(td, 'loras', 'x.safetensors'), 'wb').close(); "
+     "c.build_catalog(td, None); "
+     "print('torch_imported=' + str('torch' in sys.modules))"],
+    capture_output=True, text=True, cwd=str(Path(__file__).parent),
+)
+check(
+    "build_catalog(scan-only) does NOT trigger torch import "
+    "(Step 1 HIGH-1 contract carries forward)",
+    _proc.returncode == 0 and "torch_imported=False" in _proc.stdout,
+    detail=f"stdout={_proc.stdout!r} stderr={_proc.stderr!r}",
+)
+
+
+# ════════════════════════════════════════════════════════════════════════
 print("\n== Module hygiene ==")
 # ════════════════════════════════════════════════════════════════════════
 
