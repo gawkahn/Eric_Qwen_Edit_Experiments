@@ -79,6 +79,74 @@ utils_mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(utils_mod)
 
 
+# ── Load the two _build_call_kwargs copies (Step 3) ────────────────────────
+# comfyless is a real package on the path — direct import works (the same way
+# test_cascade.py imports it).
+import comfyless.generate as cg
+
+# nodes/eric_diffusion_generate.py uses relative imports
+# (from .eric_qwen_edit_utils / .eric_diffusion_samplers / .eric_diffusion_utils).
+# Loading it standalone would fail the relative imports, and loading the real
+# nodes package would drag in the full ComfyUI node surface via nodes/__init__.py.
+# Register a bare 'nodes' package + stub the three sibling modules it imports at
+# top level (none are used by _build_call_kwargs), then load just the module.
+_nodes_pkg = types.ModuleType("nodes")
+_nodes_pkg.__path__ = ["nodes"]
+sys.modules["nodes"] = _nodes_pkg
+for _name, _attrs in [
+    ("nodes.eric_qwen_edit_utils",   {"pil_to_tensor": lambda *a, **k: None}),
+    ("nodes.eric_diffusion_samplers",
+     {"sampler_choices": lambda *a, **k: ["default"], "swap_sampler": None}),
+    ("nodes.eric_diffusion_utils",   {"build_model_metadata": lambda *a, **k: {}}),
+]:
+    _stub_mod = types.ModuleType(_name)
+    for _k, _v in _attrs.items():
+        setattr(_stub_mod, _k, _v)
+    sys.modules[_name] = _stub_mod
+
+_gspec = importlib.util.spec_from_file_location(
+    "nodes.eric_diffusion_generate", "nodes/eric_diffusion_generate.py"
+)
+gen_nodes = importlib.util.module_from_spec(_gspec)
+sys.modules["nodes.eric_diffusion_generate"] = gen_nodes
+_gspec.loader.exec_module(gen_nodes)
+
+
+class _StubPipe:
+    """Minimal pipe whose __call__ signature exposes the params the
+    introspecting CFG branches probe. Never actually invoked — _build_call_kwargs
+    only reads inspect.signature(pipe.__call__) for the flux/auraflow branches;
+    the hunyuan-image branch doesn't touch pipe at all."""
+
+    def __call__(self, prompt=None, negative_prompt=None, guidance_scale=None,
+                 max_sequence_length=None, **kw):  # pragma: no cover
+        raise NotImplementedError
+
+
+def _cg_kwargs(model_family, negative_prompt, cfg_scale=3.25, guidance_embeds=True):
+    """Call the comfyless _build_call_kwargs with fixed positional shape."""
+    return cg._build_call_kwargs(
+        _StubPipe(), model_family, guidance_embeds,
+        "a prompt", negative_prompt,
+        1024, 1024, 50, cfg_scale,
+        None,   # true_cfg_scale
+        512,    # max_sequence_length
+        None,   # generator
+    )
+
+
+def _nodes_kwargs(model_family, negative_prompt, cfg_scale=3.25, guidance_embeds=True):
+    """Call the nodes _build_call_kwargs with fixed positional shape."""
+    return gen_nodes._build_call_kwargs(
+        _StubPipe(), model_family, guidance_embeds,
+        "a prompt", negative_prompt,
+        1024, 1024, 50, cfg_scale,
+        512,    # max_sequence_length
+        None,   # generator
+        None,   # on_step_end
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────
 print("── infer_model_family: Hunyuan-Image base + refiner ───────────")
 
@@ -221,6 +289,69 @@ with tempfile.TemporaryDirectory() as tmpdir:
         lambda: utils_mod.detect_pipeline_class(tmpdir),
         ValueError,
     )
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── _build_call_kwargs: hunyuan-image CFG routing (invariant 2) ─")
+
+# Positive: both copies route cfg_scale → distilled_guidance_scale, forward a
+# set negative_prompt, and omit the kwargs that belong to other families.
+for label, fn in (("comfyless", _cg_kwargs), ("nodes", _nodes_kwargs)):
+    kw = fn("hunyuan-image", "blurry", cfg_scale=3.25)
+    check(f"{label}: hunyuan-image sets distilled_guidance_scale=cfg_scale",
+          kw.get("distilled_guidance_scale") == 3.25, f"got {kw!r}")
+    check(f"{label}: hunyuan-image omits guidance_scale",
+          "guidance_scale" not in kw)
+    check(f"{label}: hunyuan-image omits true_cfg_scale",
+          "true_cfg_scale" not in kw)
+    check(f"{label}: hunyuan-image forwards negative_prompt when set",
+          kw.get("negative_prompt") == "blurry")
+    check(f"{label}: hunyuan-image omits max_sequence_length",
+          "max_sequence_length" not in kw,
+          "Hunyuan signature has no max_sequence_length (ADR-014 §2)")
+
+# Cross-copy consistency on the CFG-routing decision — the part invariant 2
+# says must be identical in both copies. The two base dicts differ by
+# callback_on_step_end (nodes-only), so compare only the CFG-relevant keys.
+_cfg_keys = ("distilled_guidance_scale", "guidance_scale", "true_cfg_scale",
+             "negative_prompt", "max_sequence_length")
+_cg = _cg_kwargs("hunyuan-image", "blurry")
+_nd = _nodes_kwargs("hunyuan-image", "blurry")
+check(
+    "both copies route hunyuan-image identically (CFG-relevant keys)",
+    {k: _cg.get(k) for k in _cfg_keys} == {k: _nd.get(k) for k in _cfg_keys},
+    f"comfyless={_cg!r} nodes={_nd!r}",
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── _build_call_kwargs: empty negative_prompt is omitted ───────")
+
+for label, fn in (("comfyless", _cg_kwargs), ("nodes", _nodes_kwargs)):
+    kw = fn("hunyuan-image", "")
+    check(f"{label}: empty negative_prompt omitted from kwargs",
+          "negative_prompt" not in kw)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── _build_call_kwargs: distilled key NOT smeared (negative case)")
+
+# Invariant 2 negative: a non-Hunyuan family must NOT receive
+# distilled_guidance_scale. Proves the new branch is gated on the family
+# string, not appended to the base dict for everyone. The "foobar" row
+# probes the unknown-family introspection fallback — the candidates dict
+# in that path lists guidance_scale + true_cfg_scale but not
+# distilled_guidance_scale, so the kwarg must not appear even for a
+# pipe whose __call__ signature happens to accept it.
+for fam in ("flux", "qwen-image", "sdxl", "auraflow", "foobar"):
+    # qwen-image is the only one of these that is NOT guidance-distilled.
+    embeds = fam != "qwen-image"
+    cgk = _cg_kwargs(fam, "y", cfg_scale=4.0, guidance_embeds=embeds)
+    check(f"comfyless: {fam} does NOT get distilled_guidance_scale",
+          "distilled_guidance_scale" not in cgk, f"got {cgk!r}")
+    ndk = _nodes_kwargs(fam, "y", cfg_scale=4.0, guidance_embeds=embeds)
+    check(f"nodes: {fam} does NOT get distilled_guidance_scale",
+          "distilled_guidance_scale" not in ndk, f"got {ndk!r}")
 
 
 # ──────────────────────────────────────────────────────────────────────

@@ -601,6 +601,17 @@ def _build_call_kwargs(
             kwargs["negative_prompt"] = negative_prompt
         return kwargs
 
+    if model_family == "hunyuan-image":
+        # Hunyuan-Image 2.1: guidance-distilled — distilled_guidance_scale is
+        # the documented call kwarg, NOT guidance_scale or true_cfg_scale
+        # (ADR-014 §2). negative_prompt forwarded when set; the pipeline
+        # decides whether to use it (ADR-014 §5). max_sequence_length is not
+        # in this pipeline's signature, so it is not passed.
+        kwargs = {**base, "distilled_guidance_scale": cfg_scale}
+        if negative_prompt:
+            kwargs["negative_prompt"] = negative_prompt
+        return kwargs
+
     if model_family in ("flux", "flux2", "flux2klein", "chroma"):
         kwargs = {**base, "guidance_scale": cfg_scale}
         sig = inspect.signature(pipe.__call__)
