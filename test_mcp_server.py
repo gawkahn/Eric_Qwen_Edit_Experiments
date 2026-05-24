@@ -37,6 +37,7 @@ import ast
 import asyncio
 import inspect
 import io
+import json
 import os
 import re
 import sys
@@ -46,10 +47,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import comfyless.catalog as cat_mod  # noqa: E402
 import comfyless.mcp_server as mcps  # noqa: E402
 import comfyless.generate as gen_mod  # noqa: E402
 from click.testing import CliRunner  # noqa: E402
 from mcp.types import Tool  # noqa: E402
+from nodes.eric_diffusion_utils import infer_model_family  # noqa: E402
 
 
 passed = 0
@@ -1225,6 +1228,233 @@ check("_MCP_CASCADE_PATH_TYPED_FIELDS is a tuple",
 check("_MCP_CASCADE_PATH_TYPED_FIELDS contains the 4 cascade path fields",
       set(mcps._MCP_CASCADE_PATH_TYPED_FIELDS) ==
       {"stage_c", "stage_b", "stage_a", "scaffolding_repo"})
+
+
+# ════════════════════════════════════════════════════════════════════════
+print("\n== Slice 2 Step 1: scan_model_family (catalog scan-time helper) ==")
+# ════════════════════════════════════════════════════════════════════════
+#
+# Characterization tests for the new comfyless.catalog.scan_model_family
+# helper. The helper is the scan-time companion to
+# nodes.eric_diffusion_utils.detect_pipeline_class — it returns the
+# model_family string for a diffusers-pipeline directory without requiring
+# the pipeline class to be importable in the running diffusers version.
+# Tests prove (a) it returns the SAME family strings as the existing
+# infer_model_family mapping for every supported family (characterization),
+# (b) it returns None on every non-usable input (permissive failure mode),
+# (c) it works for class names diffusers doesn't ship — proving scan-time
+# independence from the operator's diffusers installation.
+
+def _write_model_index(parent_dir: str, _class_name) -> str:
+    """Write a minimal model_index.json into a fresh child dir of parent_dir.
+
+    Returns the child dir's absolute path. Use with tempfile.TemporaryDirectory
+    as the parent. _class_name may be a string (placed under _class_name),
+    None (the key is omitted entirely), or any other value (placed verbatim
+    — used by the not-a-string negative case).
+    """
+    child = os.path.join(parent_dir, "model_dir")
+    os.makedirs(child, exist_ok=True)
+    idx: dict = {}
+    if _class_name is not _CLASS_NAME_OMIT:
+        idx["_class_name"] = _class_name
+    with open(os.path.join(child, "model_index.json"), "w") as f:
+        json.dump(idx, f)
+    return child
+
+
+_CLASS_NAME_OMIT = object()  # sentinel: omit _class_name entirely
+
+
+# Characterization: scan_model_family agrees with the existing
+# infer_model_family mapping for every supported pipeline class family
+# (the _FAMILY_PATTERNS list in nodes/eric_diffusion_utils.py).
+_CHARACTERIZATION_CASES = [
+    ("QwenImagePipeline",            "qwen-image"),
+    ("QwenImageEditPlusPipeline",    "qwen-edit"),
+    ("FluxPipeline",                 "flux"),
+    ("Flux2Pipeline",                "flux2"),
+    ("Flux2KleinPipeline",           "flux2klein"),
+    ("ChromaPipeline",               "chroma"),
+    ("AuraFlowPipeline",             "auraflow"),
+    ("StableDiffusion3Pipeline",     "sd3"),
+    ("StableDiffusionXLPipeline",    "sdxl"),
+    ("StableDiffusionPipeline",      "sd1"),
+    ("ZImagePipeline",               "zimage"),
+]
+
+for _cls_name, _expected in _CHARACTERIZATION_CASES:
+    with tempfile.TemporaryDirectory() as _td:
+        _model_dir = _write_model_index(_td, _cls_name)
+        _got = cat_mod.scan_model_family(_model_dir)
+        check(
+            f"scan_model_family({_cls_name!r}) -> {_expected!r}",
+            _got == _expected,
+            detail=f"got {_got!r}",
+        )
+        # Cross-check vs the single-source-of-truth helper.
+        check(
+            f"scan_model_family({_cls_name!r}) matches infer_model_family",
+            _got == infer_model_family(_cls_name),
+        )
+
+# Negative: model_dir does not exist
+check(
+    "scan_model_family on nonexistent dir returns None",
+    cat_mod.scan_model_family(
+        "/tmp/nonexistent-comfyless-catalog-fixture-xyzzy"
+    ) is None,
+)
+
+# Negative: dir exists but lacks model_index.json
+with tempfile.TemporaryDirectory() as _td:
+    check(
+        "scan_model_family on dir without model_index.json returns None",
+        cat_mod.scan_model_family(_td) is None,
+    )
+
+# Negative: model_index.json is a directory, not a regular file
+with tempfile.TemporaryDirectory() as _td:
+    os.makedirs(os.path.join(_td, "model_index.json"))  # dir, not file
+    check(
+        "scan_model_family when model_index.json is a directory returns None",
+        cat_mod.scan_model_family(_td) is None,
+    )
+
+# Negative: malformed JSON
+with tempfile.TemporaryDirectory() as _td:
+    with open(os.path.join(_td, "model_index.json"), "w") as f:
+        f.write("{not-valid-json")
+    check(
+        "scan_model_family on malformed JSON returns None",
+        cat_mod.scan_model_family(_td) is None,
+    )
+
+# Negative: top-level is a list, not an object
+with tempfile.TemporaryDirectory() as _td:
+    with open(os.path.join(_td, "model_index.json"), "w") as f:
+        json.dump(["not", "an", "object"], f)
+    check(
+        "scan_model_family on non-object model_index.json returns None",
+        cat_mod.scan_model_family(_td) is None,
+    )
+
+# Negative: _class_name key omitted entirely
+with tempfile.TemporaryDirectory() as _td:
+    _model_dir = _write_model_index(_td, _CLASS_NAME_OMIT)
+    check(
+        "scan_model_family with no _class_name field returns None",
+        cat_mod.scan_model_family(_model_dir) is None,
+    )
+
+# Negative: _class_name is empty string
+with tempfile.TemporaryDirectory() as _td:
+    _model_dir = _write_model_index(_td, "")
+    check(
+        "scan_model_family with empty _class_name returns None",
+        cat_mod.scan_model_family(_model_dir) is None,
+    )
+
+# Negative: _class_name is null (not a string)
+with tempfile.TemporaryDirectory() as _td:
+    _model_dir = _write_model_index(_td, None)
+    check(
+        "scan_model_family with null _class_name returns None",
+        cat_mod.scan_model_family(_model_dir) is None,
+    )
+
+# Characterization: scan-time independence from diffusers installation.
+# A class name diffusers doesn't ship MUST still classify (best-effort
+# infer_model_family fallback). detect_pipeline_class would RAISE here;
+# scan_model_family must NOT.
+with tempfile.TemporaryDirectory() as _td:
+    _model_dir = _write_model_index(_td, "FuturePipelineXYZ")
+    _got = cat_mod.scan_model_family(_model_dir)
+    check(
+        "scan_model_family on unknown-to-diffusers class returns "
+        "infer_model_family fallback (proves scan-time independence)",
+        _got is not None and _got == infer_model_family("FuturePipelineXYZ"),
+        detail=f"got {_got!r}",
+    )
+
+# Security-auditor MEDIUM-1 (folded 2026-05-23): bloated model_index.json
+# exceeding _MAX_INDEX_BYTES (1 MiB) is rejected as None before json.loads
+# is called — caps spawn-time DoS when Step 2 fans the helper over many dirs.
+with tempfile.TemporaryDirectory() as _td:
+    _model_dir = os.path.join(_td, "model_dir")
+    os.makedirs(_model_dir)
+    _bloat_path = os.path.join(_model_dir, "model_index.json")
+    # Write 1 MiB + 1 byte of well-formed-prefix JSON padding so json.loads
+    # itself would succeed on a smaller version; the rejection must be on
+    # size alone, not parse failure.
+    _padding = " " * (cat_mod._MAX_INDEX_BYTES)  # exceeds cap by JSON wrapper
+    with open(_bloat_path, "w", encoding="utf-8") as f:
+        f.write('{"_class_name":"QwenImagePipeline","_pad":"' + _padding + '"}')
+    check(
+        "scan_model_family rejects model_index.json larger than "
+        "_MAX_INDEX_BYTES with None (MEDIUM-1: spawn-time DoS cap)",
+        cat_mod.scan_model_family(_model_dir) is None,
+    )
+
+# Sanity: a model_index.json just UNDER the cap still parses correctly
+# (proves the cap is the actual limit, not a too-tight reading).
+with tempfile.TemporaryDirectory() as _td:
+    _model_dir = os.path.join(_td, "model_dir")
+    os.makedirs(_model_dir)
+    # Build content that's well under the cap (50 KB of pad + valid JSON).
+    _small_pad = " " * 50_000
+    _under_path = os.path.join(_model_dir, "model_index.json")
+    with open(_under_path, "w", encoding="utf-8") as f:
+        f.write('{"_class_name":"QwenImagePipeline","_pad":"' + _small_pad + '"}')
+    check(
+        "scan_model_family accepts model_index.json well under "
+        "_MAX_INDEX_BYTES (positive complement to MEDIUM-1 test)",
+        cat_mod.scan_model_family(_model_dir) == "qwen-image",
+    )
+
+# Security-auditor MEDIUM-2 (folded 2026-05-23): explicit UTF-8 decoding,
+# independent of host locale. A model_index.json containing non-ASCII UTF-8
+# bytes parses correctly (and would not regress under `LANG=C` etc., which
+# this test cannot simulate but the explicit encoding=utf-8 argument
+# guarantees by construction).
+with tempfile.TemporaryDirectory() as _td:
+    _model_dir = os.path.join(_td, "model_dir")
+    os.makedirs(_model_dir)
+    # _class_name with non-ASCII char in a side field; the class_name
+    # itself stays ASCII so infer_model_family classifies as expected.
+    # The non-ASCII bytes exercise the UTF-8 decode path.
+    _utf8_idx = {"_class_name": "QwenImagePipeline", "_note": "café-é-emoji-🚀"}
+    with open(os.path.join(_model_dir, "model_index.json"),
+              "w", encoding="utf-8") as f:
+        json.dump(_utf8_idx, f, ensure_ascii=False)
+    check(
+        "scan_model_family decodes UTF-8 non-ASCII content correctly "
+        "(MEDIUM-2: locale-independent encoding)",
+        cat_mod.scan_model_family(_model_dir) == "qwen-image",
+    )
+
+# Module-import hygiene (HIGH-1 folded 2026-05-23): importing
+# `comfyless.catalog` must NOT trigger `import torch`. The torch import
+# is gated behind the lazy `from nodes.eric_diffusion_utils import
+# infer_model_family` inside scan_model_family's body.
+#
+# Subprocess check — by the time this test file runs, torch is already
+# imported (test imports cat_mod which in this fold no longer triggers it,
+# but earlier imports in the file pull torch in via other paths). A
+# clean-state assertion requires a fresh interpreter.
+import subprocess as _subprocess  # noqa: E402
+_proc = _subprocess.run(
+    [sys.executable, "-c",
+     "import sys; import comfyless.catalog; "
+     "print('torch_imported=' + str('torch' in sys.modules))"],
+    capture_output=True, text=True, cwd=str(Path(__file__).parent),
+)
+check(
+    "importing comfyless.catalog does NOT trigger torch import "
+    "(HIGH-1: lazy-import contract)",
+    _proc.returncode == 0 and "torch_imported=False" in _proc.stdout,
+    detail=f"stdout={_proc.stdout!r} stderr={_proc.stderr!r}",
+)
 
 
 # ════════════════════════════════════════════════════════════════════════
