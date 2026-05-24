@@ -355,6 +355,118 @@ for fam in ("flux", "qwen-image", "sdxl", "auraflow", "foobar"):
 
 
 # ──────────────────────────────────────────────────────────────────────
+print("── family_defaults: hunyuan-image row exists with ADR-014 §4 values")
+
+from comfyless.family_defaults import FAMILY_DEFAULTS
+
+check(
+    "FAMILY_DEFAULTS['hunyuan-image'] exists",
+    "hunyuan-image" in FAMILY_DEFAULTS,
+)
+check(
+    "FAMILY_DEFAULTS['hunyuan-image'] sets cfg_scale=3.25 (pipeline default)",
+    FAMILY_DEFAULTS.get("hunyuan-image", {}).get("cfg_scale") == 3.25,
+)
+check(
+    "FAMILY_DEFAULTS['hunyuan-image'] sets steps=50 (model card)",
+    FAMILY_DEFAULTS.get("hunyuan-image", {}).get("steps") == 50,
+)
+# Defensive: NOT true_cfg_scale (Hunyuan is distilled, not 2-pass CFG).
+check(
+    "FAMILY_DEFAULTS['hunyuan-image'] does NOT set true_cfg_scale",
+    "true_cfg_scale" not in FAMILY_DEFAULTS.get("hunyuan-image", {}),
+)
+# Defensive: NOT distilled_guidance_scale either — comfyless schema has no
+# such canonical key (ADR-014 §6); the overlay applier skips keys not in
+# COMFYLESS_SCHEMA, so listing it would be silently ignored AND misleading.
+check(
+    "FAMILY_DEFAULTS['hunyuan-image'] does NOT set distilled_guidance_scale "
+    "(not a COMFYLESS_SCHEMA key per ADR-014 §6)",
+    "distilled_guidance_scale" not in FAMILY_DEFAULTS.get("hunyuan-image", {}),
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── family_defaults: precedence ladder (ADR-009 + ADR-014 §4) ──")
+
+# End-to-end: _apply_family_defaults reads detect_pipeline_class to derive
+# the family, then walks FAMILY_DEFAULTS, skipping keys in explicit_keys /
+# iterated_axes / not-in-schema. Using the fixture model_index.json gives
+# a real end-to-end path (same test pattern as the detect_pipeline_class
+# fixture above).
+with tempfile.TemporaryDirectory() as tmpdir:
+    fixture_path = os.path.join(tmpdir, "model_index.json")
+    with open(fixture_path, "w") as f:
+        json.dump({"_class_name": "HunyuanImagePipeline"}, f)
+
+    # Case A — bare run: explicit_keys empty, iterated_axes empty. Family
+    # defaults SHOULD apply, overriding any schema default already in p_cur.
+    p_cur = {"model": tmpdir, "cfg_scale": 3.5, "steps": 28}  # schema defaults
+    cg._apply_family_defaults(p_cur, explicit_keys=set(), iterated_axes=set())
+    check(
+        "bare run: family default overrides schema default (cfg_scale 3.5 → 3.25)",
+        p_cur["cfg_scale"] == 3.25,
+        f"p_cur={p_cur!r}",
+    )
+    check(
+        "bare run: family default overrides schema default (steps 28 → 50)",
+        p_cur["steps"] == 50,
+    )
+
+    # Case B — explicit CLI override on cfg_scale. Family default for cfg_scale
+    # SHOULD be skipped; steps SHOULD still apply.
+    p_cur = {"model": tmpdir, "cfg_scale": 5.0, "steps": 28}
+    cg._apply_family_defaults(p_cur, explicit_keys={"cfg_scale"}, iterated_axes=set())
+    check(
+        "explicit cfg_scale in CLI: family default for cfg_scale skipped (stays 5.0)",
+        p_cur["cfg_scale"] == 5.0,
+    )
+    check(
+        "explicit cfg_scale in CLI: other family defaults still apply (steps → 50)",
+        p_cur["steps"] == 50,
+    )
+
+    # Case C — iterated axis. Same gate semantics as explicit_keys.
+    p_cur = {"model": tmpdir, "cfg_scale": 3.5, "steps": 28}
+    cg._apply_family_defaults(p_cur, explicit_keys=set(), iterated_axes={"steps"})
+    check(
+        "iterated steps axis: family default for steps skipped (stays 28)",
+        p_cur["steps"] == 28,
+    )
+    check(
+        "iterated steps axis: cfg_scale family default still applies (3.5 → 3.25)",
+        p_cur["cfg_scale"] == 3.25,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── family_defaults: missing row degrades gracefully (negative) ──")
+
+# Defends the overlay applier's robustness: removing the row must not crash
+# the call. The applier short-circuits on `not fam_defaults`; the absence
+# of an entry must not differ from the "family has no opinion" path.
+with tempfile.TemporaryDirectory() as tmpdir:
+    fixture_path = os.path.join(tmpdir, "model_index.json")
+    with open(fixture_path, "w") as f:
+        json.dump({"_class_name": "HunyuanImagePipeline"}, f)
+
+    saved = cg.FAMILY_DEFAULTS.pop("hunyuan-image")
+    try:
+        p_cur = {"model": tmpdir, "cfg_scale": 3.5, "steps": 28}
+        cg._apply_family_defaults(p_cur, explicit_keys=set(), iterated_axes=set())
+        check(
+            "missing hunyuan-image row: no crash, schema defaults retained (cfg_scale)",
+            p_cur["cfg_scale"] == 3.5,
+        )
+        check(
+            "missing hunyuan-image row: no crash, schema defaults retained (steps)",
+            p_cur["steps"] == 28,
+        )
+    finally:
+        cg.FAMILY_DEFAULTS["hunyuan-image"] = saved
+
+
+# ──────────────────────────────────────────────────────────────────────
 print(f"\n────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print(f"────────────────────────────────────────────────")

@@ -69,6 +69,16 @@ FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
     # Source: BFL Klein model card.
     "flux2klein": {"cfg_scale": 3.5, "steps": 24},
 
+    # ── hunyuan-image (Hunyuan-Image 2.1) ───────────────────────────────
+    # Guidance-distilled. cfg_scale routes to distilled_guidance_scale at
+    # call-build time per ADR-014 §2; the family-defaults overlay still
+    # operates on the canonical cfg_scale schema key (ADR-014 §4 — same
+    # pattern as the flux family). 3.25 / 50 matches both the
+    # HunyuanImagePipeline.__call__ signature defaults and the Tencent
+    # Hunyuan-Image 2.1 model card recommendation.
+    # Source: diffusers 0.37.1 HunyuanImagePipeline + Tencent model card.
+    "hunyuan-image": {"cfg_scale": 3.25, "steps": 50},
+
     # ── qwen-edit (Qwen-Image-Edit-2511) ────────────────────────────────
     # Edit pipeline uses true_cfg path. 30 steps tracks documented sweet
     # spot in pipelines/pipeline_qwen_edit.py.
