@@ -13,14 +13,15 @@ gated on `model_family == "hunyuan-image"`; no Red Zone surface; the
 
 ## Posture
 
-> **Posture:** Boundary: loader behavior (one conditional call). Risk
-> factors: small but real impact on the `hunyuan-image` runtime VAE
-> memory profile — disabling tiling for this family on small-VRAM
-> cards could OOM during decode if the 32× VAE actually does need
-> tiling at some output size. Defense: per-family skip rather than
-> universal disable; large-VRAM users (the design target) get clean
-> output, small-VRAM users (24/48 GB) can still opt back into tiling
-> via existing flags if needed. Not a security-truth surface.
+> **Posture:** Boundary: loader behavior (one conditional call) +
+> one new CLI flag. Risk factors: small but real impact on the
+> `hunyuan-image` runtime VAE memory profile — disabling tiling for
+> this family on small-VRAM cards could OOM during decode if the
+> 32× VAE actually does need tiling at some output size. Defense:
+> explicit `--vae-tiling` flag with a family-aware `auto` default;
+> large-VRAM users (the design target) get clean output by default,
+> small-VRAM users (24/48 GB) can force tiling on with `--vae-tiling
+> on`. Not a security-truth surface.
 
 ## Why this slice exists (context)
 
@@ -49,40 +50,43 @@ the SDXL VAE handles unti­led on a 24 GB card. Tiling for Hunyuan is:
 
 ## Intent
 
-Make the `enable_tiling()` call **per-family-conditional** in both loader
-paths. For `hunyuan-image`, skip the call by default. All other families
-behave identically to today (unconditional `enable_tiling()`).
+Make the `enable_tiling()` call **per-family-conditional and
+operator-controllable** in both loader paths via a new explicit
+`--vae-tiling on|off|auto` flag (default `auto`). Under `auto`:
+hunyuan-image gets tiling **off**; every other family gets tiling
+**on** (preserves current behavior). `--vae-tiling on` and
+`--vae-tiling off` are explicit overrides.
 
 ## Invariants (must always be true)
 
-1. **Hunyuan-image skip.** For a pipeline loaded with
-   `model_family == "hunyuan-image"`, `pipeline.vae.tile_enabled` (or
-   the equivalent diffusers introspection) is False unless the user
-   explicitly opted in.
-2. **All other families unchanged.** Every other family path
-   (qwen-*, flux*, sdxl, sd*, chroma, auraflow, zimage, stablecascade)
-   continues to have `enable_tiling()` called as before. Locked at
-   runtime by a per-family non-regression test in `test_hunyuan.py`
-   (using the same pipeline-class stub pattern from Step 3).
-3. **Opt-in escape hatch.** If a future user encounters Hunyuan tiling
-   needs (e.g. a 24 GB card trying to fit base + refiner), they can
-   re-enable via an existing CLI flag OR a new explicit one — *decide
-   in the change plan*. Recommended: piggyback on the existing
-   `--attention-slicing` / `--sequential-offload` flags (they're
-   memory-pressure indicators) by treating `--sequential-offload` as
-   the signal to keep VAE tiling on for hunyuan-image. Avoids adding a
-   new CLI flag for a corner case.
-4. **No new CLI surface widening** in v1 unless invariant 3's
-   piggyback isn't viable; the slice resolves which during the change
-   plan.
+1. **Hunyuan-image default-off under `auto`.** For a pipeline loaded
+   with `model_family == "hunyuan-image"` and `--vae-tiling auto`
+   (the default), `pipeline.vae.use_tiling` (or the equivalent
+   diffusers introspection) is False.
+2. **All other families default-on under `auto`.** Every other
+   family path (qwen-*, flux*, sdxl, sd*, chroma, auraflow, zimage,
+   stablecascade) with `--vae-tiling auto` continues to have
+   `enable_tiling()` called as before. Locked at runtime by a
+   per-family non-regression test in `test_hunyuan.py` (using the
+   same pipeline-class stub pattern from Step 3 of the base slice).
+3. **Explicit overrides honored.** `--vae-tiling on` forces tiling on
+   regardless of family. `--vae-tiling off` forces tiling off
+   regardless of family. The flag is the single, locally-reasoned
+   surface for VAE tiling — no implicit coupling with
+   `--sequential-offload` or other memory-pressure flags.
+4. **ComfyUI node-side parity.** The `Eric Diffusion Load Model`
+   node gains a corresponding optional `vae_tiling` input (string:
+   `"auto" | "on" | "off"`, default `"auto"`); the resulting
+   pipeline state matches the CLI semantics exactly.
 
 ## Failure semantics
 
 - **Hunyuan VAE OOM during decode** (unlikely on ≥40 GB cards, possible
-  on 24 GB cards if user disabled offload): operator sees a CUDA OOM
-  with a stderr hint pointing at the `--sequential-offload` flag (which
-  per invariant 3 also keeps tiling on for hunyuan-image). Recoverable
-  by re-running with the flag.
+  on 24 GB cards): operator sees a CUDA OOM with a stderr hint pointing
+  at `--vae-tiling on` as the explicit re-enable. Recoverable by
+  re-running with the flag.
+- **Invalid `--vae-tiling` value:** argparse-level rejection (`choices`
+  list); non-zero exit with usage message. No silent fallback.
 - **Pre-existing `enable_tiling()` semantics elsewhere:** untouched.
 
 ## Out of scope
@@ -91,33 +95,48 @@ behave identically to today (unconditional `enable_tiling()`).
   per-pipeline-class; we're not changing them).
 - Per-family memory-management refactor (the existing
   `--sequential-offload` / `--attention-slicing` / `--offload-vae`
-  flag surface stays).
+  flag surface stays — and stays decoupled from `--vae-tiling`).
 - Capability flags in GEN_PIPELINE for "needs-tiling" — too much
-  scope; the per-family conditional is enough for v1.
+  scope; the family-aware `auto` default is enough for v1.
 - Validating against the artifact reduction empirically — that's an
   A/B test described in the proof hooks (smoke + visual comparison),
   not part of the slice's logical contract.
+- Applying the same `--vae-tiling auto` semantics to a future Hunyuan
+  refiner pipeline. The refiner slice (see
+  `slice-hunyuan-image-2-1-refiner.md`) inherits this slice's
+  family-conditional logic and extends it to the refiner pipeline's
+  load path — handled there, not here.
 
 ## Proof hooks
 
 **Positive cases** (unit, CPU):
 
-- `test_hunyuan.py` extension: load the existing `HunyuanImagePipeline`
-  fixture path (already used in the Step 2 detect tests), call the
-  loader entry-point, assert the resulting pipeline's
-  `vae.use_tiling` (or `vae._tiling_enabled` — whatever the diffusers
-  introspection key is) is False.
-- Symmetric assertion for both code paths: load via
-  `EricDiffusionLoader.load_pipeline()` AND via comfyless'
-  `_load_pipeline()`; both leave tiling off for hunyuan-image.
-
-**Non-regression sweep:**
-
-- For each existing family (qwen-image, qwen-edit, flux*, sdxl, sd*,
-  chroma, auraflow, zimage), load via a fixture and assert
+- **Inv 1 — hunyuan auto-off.** Load the existing `HunyuanImagePipeline`
+  fixture (already used in Step 2 detect tests) with `vae_tiling="auto"`;
+  assert `pipeline.vae.use_tiling` is False. Symmetric assertion for
+  both code paths: via `EricDiffusionLoader.load_pipeline()` AND via
+  comfyless' `_load_pipeline()`.
+- **Inv 2 — non-hunyuan auto-on.** For each existing family
+  (qwen-image, qwen-edit, flux*, sdxl, sd*, chroma, auraflow, zimage,
+  stablecascade), load via fixture with `vae_tiling="auto"`; assert
   `vae.use_tiling` is True (current behavior). Lock against a future
   edit that mis-orders the conditional and accidentally skips tiling
   for everyone.
+- **Inv 3 — explicit overrides.** Two sub-cases:
+  - Load `HunyuanImagePipeline` with `vae_tiling="on"`; assert
+    `vae.use_tiling` is True (force-on wins over family default).
+  - Load a non-hunyuan family (e.g. qwen-image) with
+    `vae_tiling="off"`; assert `vae.use_tiling` is False (force-off
+    wins over family default).
+- **Inv 4 — ComfyUI node parity.** Drive `EricDiffusionLoader` with
+  the `vae_tiling` input set to each of `"auto" | "on" | "off"`;
+  assert the resulting `vae.use_tiling` matches the CLI semantics
+  for the loaded family.
+
+**Negative case:**
+
+- Argparse rejection of `--vae-tiling garbage` (or equivalent invalid
+  value); subprocess exits non-zero with usage message on stderr.
 
 **Regression hook:** full 10-suite gate + `test_hunyuan.py` extensions
 must continue to pass with 0 failures.
@@ -158,14 +177,9 @@ striations in the sky are visibly reduced or absent.
    `AutoencoderKLHunyuanImage` expose to indicate tiling state?
    Probably `vae.use_tiling` (the common pattern) but verify; the
    tests need a reliable accessor.
-2. **Piggyback vs new CLI flag (invariant 3).** Confirm
-   `--sequential-offload` as the re-enable signal, or add an explicit
-   `--vae-tiling` boolean. Lean toward piggyback; "warn, don't block"
-   memory applies to small-card users.
-3. **Should the skip extend to the future Hunyuan refiner pipeline
-   too?** Almost certainly yes (same 32× VAE class shape, same
-   reasoning). Handle when the refiner slice lands; for now the
-   Hunyuan-image skip is the immediate need.
+2. **Flag default sentinel name.** Confirm `auto` as the family-aware
+   default sentinel (vs e.g. `default` or empty-string). Lean
+   `auto` — matches familiar CLI convention (`--color auto`, etc.).
 
 ## Status
 

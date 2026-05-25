@@ -15,17 +15,20 @@ change — see §"Out of scope" for the recommended split).
 
 ## Posture
 
-> **Posture:** Boundary: domain rules (new dispatch path for the Hunyuan
-> base+refiner stage pair) + loader machinery (the refiner is a separate
-> diffusers pipeline that loads alongside the base and shares text encoders
-> at runtime). Risk factors: broad impact on the `hunyuan-image` family's
-> behavior (every prior bare-run now runs two stages instead of one — a
-> deliberate quality improvement, but a runtime-cost increase the user
-> sees as a 2× generation time); near security-truth surface (touches the
-> same `resolve_hf_path` + auto-detect codepath covered by the 2026-04-23
-> security review, though no behavioral change to the resolver itself);
-> *no Red Zone touch* in the recommended scope (reprompt model is
-> deliberately out of scope per §"Out of scope" §1).
+> **Posture:** Boundary: domain rules (new opt-in dispatch path for the
+> Hunyuan base+refiner stage pair) + loader machinery (the refiner is a
+> separate diffusers pipeline that loads alongside the base and shares
+> the Qwen2.5-VL text encoder at runtime) + IPC daemon wire-protocol
+> extension (`comfyless/server.py` gains an optional `refiner` field for
+> cached two-stage runs). Risk factors: meaningful impact on the
+> `hunyuan-image` family's behavior when `--refiner` is set (two-stage
+> run, ~2× generation time, ~80 GB peak VRAM with shared encoders); near
+> security-truth surface (touches `comfyless/server.py` — already a §12
+> surface — and reuses the existing `resolve_hf_path` resolver for the
+> new path). **No path-derivation auto-discovery** (deliberately rejected
+> to avoid widening the path attack surface; see Intent + Invariants 1).
+> *No Red Zone touch* (reprompt model is deliberately out of scope per
+> §"Out of scope" §1).
 
 ## Why this slice exists (context)
 
@@ -52,98 +55,160 @@ ADR-010, *not* the edit-pipeline surface.
 
 ## Intent
 
-Add **base + refiner chaining** as the default execution path for the
-`hunyuan-image` family in comfyless. Loading `hunyuan-image` discovers
-or accepts an adjacent `HunyuanImageRefinerPipeline` and chains it
-automatically after the base; the user sees one `generate` call
-producing one PNG, but two stages run under the hood. Failures of the
-refiner pipeline fall back to a loud-warning base-only output so the
-user is never silently blocked from getting *some* output. Adds the
-corresponding ComfyUI node-side support so the unified `Eric Diffusion
-Generate` flow also chains.
+Add **opt-in base + refiner chaining** for the `hunyuan-image` family
+in comfyless via an explicit `--refiner <path>` flag (and a matching
+ComfyUI node input). When `--refiner <path>` is set, the named refiner
+pipeline loads alongside the base and runs as a second stage; the user
+sees one `generate` call producing one PNG with two-stage metadata.
+When `--refiner` is unset on a `hunyuan-image` run, the slice emits a
+**loud stderr warning** ("hunyuan-image quality requires a refiner;
+pass `--refiner <path>`; download with `huggingface-cli download
+hunyuanvideo-community/HunyuanImage-2.1-Refiner-Diffusers`") and runs
+base-only with zero exit code (matches the project's "warn, don't
+block on user-initiated footguns" memory). **No filesystem search for
+sibling refiner directories** — operator must point at the refiner
+path explicitly. Adds IPC daemon support (cache-aware two-stage runs)
+so the operational value of `--serve` scales with the doubled model
+load.
 
 ## Invariants (must always be true)
 
-1. **Auto-discovery.** When `comfyless.generate --model <hunyuan-base-dir>`
-   is invoked with no `--refiner` flag, the slice attempts to discover a
-   sibling `*-Refiner-Diffusers/` directory (and/or an explicit
-   convention-named path). On discovery, the refiner is loaded and the
-   two-stage chain runs. On non-discovery, the slice runs base-only AND
-   emits a loud stderr warning telling the operator (a) the refiner was
-   not found, (b) where it looked, (c) that output quality will be
-   degraded, and (d) the exact `huggingface-cli download` command for
-   `hunyuanvideo-community/HunyuanImage-2.1-Refiner-Diffusers`.
-2. **Explicit override.** `--refiner <path-or-skip>` overrides the
-   discovery. `--refiner skip` runs base-only without the warning (power
-   user opt-out). `--refiner <path>` uses the named path explicitly.
-3. **Output identity.** A chained generation emits exactly one output PNG
-   at `--output` (refiner's output, not base's). The PNG `comfyless`
-   tEXt chunk carries explicit two-stage metadata: `pipeline:
-   "base+refiner"`, base/refiner model_path values (both basenames per
-   slice-1 invariant 12 when run from MCP; full paths from CLI / daemon
-   per N29 regression guard), `refiner_steps`, `refiner_cfg`. Base-only
-   generations carry the existing single-stage metadata shape (the new
-   keys are absent, not present-and-empty).
-4. **Family-defaults overlay extension.** `FAMILY_DEFAULTS["hunyuan-image"]`
-   gains `refiner_steps: 4`, `refiner_cfg: 3.5` (per
-   `HunyuanImageRefinerPipeline.__call__` signature defaults). These
-   flow through the same ADR-009 precedence ladder (explicit-CLI >
-   sidecar > family default > schema default). New canonical schema
-   keys (`refiner_steps`, `refiner_cfg`) are added to `COMFYLESS_SCHEMA`
-   and validated by the existing `test_params_schema` sweep.
-5. **CFG routing parity.** The refiner's `_build_call_kwargs` branch
+1. **Opt-in only — no filesystem search.** The slice MUST NOT derive
+   or stat sibling/parent/glob paths from `--model` to find a refiner.
+   The only way to enable the refiner stage is to set `--refiner <path>`
+   explicitly. Rationale: path-derivation on a caller-supplied input
+   widens the security surface (TOCTOU, containment escape, symlink
+   traversal interactions with the base path) — the same class of
+   concern `lora_audit.py` had to defend against. Locked at runtime
+   by a negative test asserting no `os.listdir` / `Path.glob` /
+   `Path.iterdir` calls are made against `--model`'s parent during a
+   bare `hunyuan-image` invocation.
+2. **Warn-don't-block on hunyuan-image without `--refiner`.** When
+   `model_family == "hunyuan-image"` and `--refiner` is unset, the
+   slice emits a loud stderr warning (text per Intent) and runs
+   base-only with zero exit code. Operator gets *an* image; the warning
+   makes the quality regression explicit. Matches the
+   `feedback_warn_dont_block` memory.
+3. **`--refiner <path>` is the single enable.** No `--refiner skip`
+   sentinel, no `--refiner auto`, no envvar override. The flag is
+   either unset (base-only + warning per invariant 2) or set to a
+   resolvable path (refiner stage runs). Path resolution goes through
+   the same `resolve_hf_path` machinery that handles `--model` — no
+   new resolver code.
+4. **Output identity.** A chained generation emits exactly one output
+   PNG at `--output` (refiner's output, not base's). The PNG
+   `comfyless` tEXt chunk carries explicit two-stage metadata:
+   `pipeline: "base+refiner"`, refiner model_path value (basename per
+   slice-1 invariant 12 when run from MCP; full path from CLI / daemon
+   per N29 regression guard), plus the effective `refiner_steps` and
+   `refiner_cfg` values for the run. Base-only generations carry the
+   existing single-stage metadata shape unchanged (the new keys are
+   absent, not present-and-empty).
+5. **Family-defaults overlay extension.** `FAMILY_DEFAULTS["hunyuan-image"]`
+   gains `refiner_steps: 4`, `refiner_cfg: 3.5` (per the **Tencent
+   refiner README** — diffusers signature default for cfg is 3.25 but
+   the README is authoritative, same lesson as the 2K-mandatory
+   amendment). These flow through the same ADR-009 precedence ladder
+   (explicit-CLI > sidecar > family default > schema default). New
+   canonical schema keys (`refiner_steps`, `refiner_cfg`) are added to
+   `COMFYLESS_SCHEMA` and validated by the existing `test_params_schema`
+   sweep. Both keys are no-ops when `--refiner` is unset.
+6. **CFG routing parity.** A new refiner-side call-kwargs branch
    matches the base's shape (cfg_scale → distilled_guidance_scale,
    negative_prompt forwarded if set), with the refiner's own
    `refiner_cfg` schema key feeding `distilled_guidance_scale` for the
    refiner call (analogous to how `true_cfg_scale` overrides cfg_scale
    for qwen-image).
-6. **No silent regressions on other families.** The new dispatch fork
-   only activates when `model_family == "hunyuan-image"`; every other
-   family path (qwen-*, flux*, sdxl, sd*, chroma, auraflow, zimage,
-   stablecascade) behaves identically pre- and post-slice. Locked at
-   runtime by the regression sweep in `test_hunyuan.py` (which already
-   spans 11 existing families).
-7. **No new MCP exposure.** This slice does NOT plumb `--refiner` /
-   `refiner_*` params through the MCP tool surface in this commit batch;
-   that's a separate slice with its own security review per ADR-011 §3d
-   ordering. The MCP `generate` tool continues to call into
-   `comfyless.generate.generate()` with its existing argument shape;
-   the new refiner kwargs default to "discover or warn" as in the CLI.
-8. **Memory ceiling.** A bare run with all three models cached
-   (reprompt would be 14 GB, base ~58 GB, refiner +20-25 GB delta over
-   shared encoders → peak ~80 GB *without* reprompt; this slice
-   excludes reprompt so peak is ~80 GB) fits within a single RTX PRO
-   6000 (102 GB) without `--sequential-offload` or balanced device_map.
-   24/48 GB cards still need `--sequential-offload` or balanced mode;
-   the slice does not change the existing offload-flag surface, so
-   smaller-card support continues to work via the existing flags.
+7. **LoRAs apply to base only.** The existing `--lora` machinery loads
+   into the base pipeline's transformer. The refiner has a separate
+   transformer with separate weights — base LoRAs would not produce
+   meaningful output on it. The slice MUST NOT call any LoRA loader
+   against the refiner pipeline. Locked at runtime by a negative test
+   asserting the refiner pipeline's transformer has no PEFT adapter
+   attached after a chained run with base LoRAs set. v1 ships no
+   refiner-side LoRA surface; a future slice can add `--refiner-lora`
+   if a use case emerges.
+8. **Scheduler / sampler / sigmas pinned per-pipeline.** The refiner
+   uses its own loaded scheduler config from disk
+   (`FlowMatchEulerDiscreteScheduler` instance from the refiner
+   checkpoint). The slice MUST NOT mutate the refiner's scheduler or
+   apply base-side `--sampler` / `--sigmas` swaps to it. v1 ships no
+   `--refiner-sampler` / `--refiner-sigmas` flags.
+9. **Shared text encoder (memory optimization, asymmetric).** The
+   refiner pipeline class only declares `text_encoder` (Qwen2.5-VL) —
+   it has no T5/`text_encoder_2` slot. Construction MUST inject the
+   base's loaded `text_encoder` and `tokenizer` into the refiner's
+   `from_pretrained(...)` call to avoid double-loading the ~14 GB VL
+   encoder. The base's T5/ByT5 stack is not relevant to the refiner
+   and is not shared. Locked at runtime by an assertion that
+   `id(base.text_encoder) == id(refiner.text_encoder)` after load.
+10. **No silent regressions on other families.** The new dispatch fork
+    only activates when `model_family == "hunyuan-image"` AND
+    `--refiner` is set; every other family path (qwen-*, flux*, sdxl,
+    sd*, chroma, auraflow, zimage, stablecascade) behaves identically
+    pre- and post-slice. Locked at runtime by the regression sweep in
+    `test_hunyuan.py` (which already spans 11 existing families).
+11. **IPC daemon support — wire-protocol extension.** `comfyless/server.py`
+    gains an optional `refiner` field in its request payload. When
+    present and non-empty, the daemon forwards it to the in-process
+    `generate()` call. The pipeline cache key is extended to include
+    the refiner path (or `None`) so a base+refiner request does not
+    collide with a base-only request for the same `--model`. Daemon
+    behavior for clients that omit the field is byte-for-byte
+    identical to today (additive field, not breaking).
+12. **No new MCP exposure.** This slice does NOT plumb `--refiner` /
+    `refiner_*` params through the MCP tool surface in this commit
+    batch; that's a separate slice with its own security review per
+    ADR-011 §3d ordering. The MCP `generate` tool continues to call
+    into `comfyless.generate.generate()` with its existing argument
+    shape; `refiner` defaults to unset (base-only + warning) for MCP
+    callers.
+13. **Memory ceiling.** A chained run with shared Qwen2.5-VL encoder
+    (~14 GB shared instead of ~28 GB doubled) plus base transformer
+    + base T5 + refiner transformer + refiner VAE fits within a
+    single RTX PRO 6000 (102 GB) at ~80 GB peak without
+    `--sequential-offload` or balanced device_map. 24/48 GB cards
+    still need `--sequential-offload` or balanced mode; the slice
+    does not change the existing offload-flag surface, so smaller-card
+    support continues to work via the existing flags.
 
 ## Failure semantics
 
-- **Refiner discovery miss + no `--refiner skip`:** loud stderr warning
-  + base-only run + non-zero exit code? *Reject — base-only with warning
-  + zero exit* is the right behavior (the operator gets *an* image; the
-  warning makes the regression explicit). This matches the
-  "warn-don't-block on user-initiated footguns" memory.
-- **Refiner load error (corrupt weights, missing component):** loud
-  stderr error citing which load step failed; base-only fallback with
-  loud warning; zero exit. Same posture.
-- **Refiner inference error mid-generation (OOM, timeout):** propagate
-  the error, but BEFORE propagation, emit a stderr line naming the
-  stage so an LLM/MCP caller can distinguish "base failed" from
-  "refiner failed." Non-zero exit.
-- **`--refiner skip` on a `hunyuan-image` run:** silent base-only run.
-  Equivalent to other families' behavior; documented opt-out for power
-  users who don't want refiner.
-- **Refiner family-defaults missing:** same as base — `_apply_family_defaults`
-  short-circuits gracefully, schema defaults (`refiner_steps` / `refiner_cfg`)
-  carry the run.
-- **Cross-family auto-discovery confusion:** if a user points the loader
-  at a non-Hunyuan model that happens to have a `*-Refiner-Diffusers/`
-  sibling (e.g. some hypothetical future Flux refiner), the refiner code
-  path remains gated on `model_family == "hunyuan-image"` so the sibling
-  is ignored for non-Hunyuan families. Locked by invariant 6 + an
-  invariant-6 negative test.
+- **`hunyuan-image` run with `--refiner` unset:** loud stderr warning
+  (text per Intent) + base-only run + zero exit code. Operator gets
+  *an* image; the warning makes the quality regression explicit.
+  Matches the `feedback_warn_dont_block` memory.
+- **`--refiner <path>` points at a nonexistent or unresolvable path:**
+  fail fast — same shape as `--model` resolution failure (clean
+  ValueError citing the unresolved path; non-zero exit). The opt-in
+  signal was explicit; the user wants the refiner, so a silent
+  fallback would mask the misconfiguration.
+- **`--refiner <path>` points at a non-`HunyuanImageRefinerPipeline`
+  pipeline** (wrong `_class_name`, e.g. a base pipeline by mistake):
+  clean error citing incompatible pipeline class; non-zero exit.
+  Refiner is opt-in and class-checked; no silent fallback.
+- **`--refiner` set on a non-hunyuan family** (e.g.
+  `--model <flux-dir> --refiner <hunyuan-refiner-dir>`): clean error
+  citing that refiner chaining is only supported for
+  `model_family == "hunyuan-image"`; non-zero exit. Locked by
+  invariant 10.
+- **Refiner load error mid-load** (corrupt weights, missing
+  component): clean error citing which load step failed; non-zero
+  exit. No base-only fallback — the operator opted in, so a silent
+  fallback would mask the breakage.
+- **Refiner inference error mid-generation** (OOM, CUDA error, etc.):
+  propagate the error, but BEFORE propagation emit a stderr line
+  naming the stage (`refiner` not `base`) so an LLM/MCP caller can
+  distinguish "base failed" from "refiner failed." Non-zero exit.
+- **Refiner family-defaults missing or partial:**
+  `_apply_family_defaults` short-circuits gracefully; schema defaults
+  (`refiner_steps`, `refiner_cfg`) carry the run.
+- **Daemon-mode cache collision risk:** the wire-protocol `refiner`
+  field is included in the cache key (invariant 11); a missing /
+  empty field is treated as `None`, distinct from any non-empty
+  path. A request that omits the field on a hot daemon previously
+  serving base+refiner does not get the cached two-stage pipeline
+  back — it triggers a fresh base-only load.
 
 ## Out of scope (explicit exclusions)
 
@@ -188,12 +253,11 @@ Generate` flow also chains.
    established here (comfyless dispatch fork for two-stage Hunyuan
    pipelines) may inform a future ai-stack-project slice that wraps
    Eric's nodes, but is out of scope here.
-7. **`comfyless/server.py` daemon integration.** The IPC daemon path
-   doesn't see the new refiner params yet — it continues to forward
-   what the existing wire protocol carries, and the daemon's
-   in-process `generate()` call inherits the auto-discover behavior.
-   Explicit refiner-aware wire fields are a follow-up slice with its
-   own ADR-001 amendment.
+7. **Refiner-side LoRA / sampler / sigmas / scheduler-swap surface.**
+   No `--refiner-lora`, `--refiner-sampler`, `--refiner-sigmas`, or
+   refiner-side scheduler-swap flags in v1 (invariants 7 and 8). The
+   refiner runs with its own loaded scheduler and no adapters. Add
+   only when a concrete use case lands.
 
 ## Proof hooks
 
@@ -205,43 +269,73 @@ gate CPU-only).
 
 **Positive cases** (one per invariant):
 
-- **Inv 1 — auto-discovery.** Two fixture dirs (base + sibling
-  `*-Refiner-Diffusers/`) → `_resolve_refiner_path` returns the sibling
-  path. Base only → returns None + emits the warning. Three sub-cases
-  (sibling present / sibling absent / explicit `--refiner skip`).
-- **Inv 2 — explicit override.** `--refiner /some/path` wins over
-  auto-discovery; `--refiner skip` opts out without warning;
-  `--refiner /nonexistent/path` raises clean ValueError (fail-closed).
-- **Inv 3 — output identity.** Mock PIL image through the two-stage
+- **Inv 1 — no filesystem search.** Monkeypatch `os.listdir`,
+  `Path.glob`, `Path.iterdir`, and `Path.exists` with spies; run a
+  bare `comfyless.generate --model <hunyuan-base-dir>` (no
+  `--refiner`); assert the spies are not called against the base
+  dir's parent or against any sibling-derived path. Locks the
+  "no path-derivation" invariant at runtime.
+- **Inv 2 — warn-don't-block.** Bare `hunyuan-image` run with
+  `--refiner` unset writes a single PNG with single-stage metadata
+  AND emits the documented stderr warning AND returns zero exit code.
+- **Inv 3 — opt-in via path.** `--refiner <fixture-refiner-dir>`
+  loads and chains. `--refiner` flag absent (already covered by
+  Inv 2). No third sub-case — there is no `skip` sentinel to test.
+- **Inv 4 — output identity.** Mock PIL image through the two-stage
   pipeline; assert exactly one PNG written; assert metadata chunk
-  carries `pipeline: "base+refiner"` + the new keys.
-- **Inv 4 — defaults overlay extension.** Same shape as the existing
+  carries `pipeline: "base+refiner"`, the refiner model_path
+  (basename or full per N29), and the effective `refiner_steps` /
+  `refiner_cfg` values. Base-only run carries no `pipeline` key.
+- **Inv 5 — defaults overlay extension.** Same shape as the existing
   Inv 3 of `test_hunyuan.py` but for `refiner_steps` / `refiner_cfg`.
-- **Inv 5 — CFG routing parity.** `_build_call_kwargs` extended branch
-  for the refiner; assert `distilled_guidance_scale` shape mirrors base.
-- **Inv 6 — non-regression.** Re-run the existing 11-family sweep;
-  assert refiner code path is gated on family == "hunyuan-image".
-- **Inv 7 — MCP path unchanged.** `test_mcp_server` continues to pass
-  with the same call-site shape (the MCP `generate` tool inherits the
-  new auto-discover behavior without any new request-schema fields).
-- **Inv 8 — memory ceiling claim.** This invariant is empirically
-  validated by the live smoke (single-GPU base+refiner run completes
-  without OOM); no CPU unit test.
+  Schema-key collision check against existing `COMFYLESS_SCHEMA`.
+- **Inv 6 — CFG routing parity.** Refiner-side `_build_call_kwargs`
+  branch; assert `distilled_guidance_scale` shape mirrors base.
+- **Inv 7 — LoRAs not applied to refiner.** Chained run with
+  `--lora <fixture-lora>`; assert base pipeline's transformer has a
+  PEFT adapter attached AND refiner pipeline's transformer does not.
+- **Inv 8 — scheduler/sigmas pinned.** Chained run with base-side
+  `--sampler` swap (if the family supports one); assert refiner's
+  `scheduler` instance is the one loaded from disk, untouched by
+  base-side mutations.
+- **Inv 9 — shared text encoder.** After construction,
+  `id(base.text_encoder) == id(refiner.text_encoder)`; refiner has
+  no `text_encoder_2` slot.
+- **Inv 10 — non-regression on other families.** Re-run the existing
+  11-family sweep; assert refiner code path is gated on
+  `family == "hunyuan-image" AND --refiner set`. Plus an extra case:
+  `--model <non-hunyuan>` with `--refiner <path>` set — should
+  raise (locked by §"Failure semantics").
+- **Inv 11 — daemon wire protocol.** Send an IPC request with the
+  new `refiner` field set; assert it reaches `generate()` and the
+  cache key reflects both `(model, refiner)`. Then send a follow-up
+  request omitting the field; assert it hits a fresh load (different
+  cache key) rather than reusing the two-stage pipeline.
+- **Inv 12 — MCP path unchanged.** `test_mcp_server` continues to
+  pass with the same call-site shape (the MCP `generate` tool sees
+  `refiner` default to unset; no new request-schema fields exposed).
+- **Inv 13 — memory ceiling claim.** Empirically validated by the
+  live smoke (single-GPU base+refiner run completes without OOM);
+  no CPU unit test.
 
 **Negative cases:**
 
-- Inv 1 negative — sibling dir exists but is NOT a refiner pipeline (wrong
-  `_class_name`): clean error, fall through to base-only with warning.
-- Inv 2 negative — `--refiner /path/to/non-hunyuan-pipeline` (e.g.
-  pointing at Flux): clean error citing incompatible pipeline.
-- Inv 3 negative — refiner inference error (synthetic exception
-  injection): error propagated; stderr names the stage; non-zero exit.
-- Inv 6 negative — load a non-Hunyuan model with a sibling
-  `*-Refiner-Diffusers/` dir; assert refiner code path NOT entered.
+- `--refiner /nonexistent/path`: clean ValueError; non-zero exit
+  (no silent fallback). Counterpart to invariant 3.
+- `--refiner /path/to/non-hunyuan-pipeline` (e.g. Flux): clean error
+  citing incompatible pipeline class; non-zero exit.
+- Refiner inference error (synthetic exception injection): error
+  propagated; stderr names `refiner` stage; non-zero exit.
+- `--model <non-hunyuan> --refiner <hunyuan-refiner>`: clean error;
+  non-zero exit.
+- Base LoRA applied → refiner transformer adapter count = 0
+  (invariant 7 negative).
+- IPC `refiner` field set to garbage type (non-string): wire-format
+  rejection; non-zero protocol error.
 
-**Regression hook** — full 10-suite gate + `test_hunyuan.py` extensions
-must continue to pass with 0 failures. Plus `test_mcp_server` re-validation
-(invariant 7).
+**Regression hook** — full 10-suite gate + `test_hunyuan.py`
+extensions + `test_server_robustness` + `test_mcp_server` must
+continue to pass with 0 failures.
 
 **Live GPU smoke** — empirical proof of quality improvement:
 
@@ -259,102 +353,118 @@ artifacts (sky banding, sail wrinkles, hull warping).
 
 - **`ADR-016-hunyuan-image-base-refiner-chain.md`** (next ADR number;
   verify ADR-015 is the most recent at slice start). Documents:
-  (a) the dispatch shape — auto-discover-and-chain in `comfyless/`
-  (Cascade-pattern analog to `comfyless/cascade.py`) vs explicit
-  two-step pipeline; (b) where the refiner pipeline lives in the
-  loader machinery (separate cache slot? share the GEN_PIPELINE cache
-  with a refiner-aware field?); (c) the `--refiner` flag semantics
-  (auto / explicit / skip); (d) the discovery convention (sibling
-  `*-Refiner-Diffusers/` only, or also a checked HF-cache fallback);
-  (e) defaults values + their sourcing; (f) shared-text-encoders
-  optimization (refiner pipeline loads should share `text_encoder` /
-  `text_encoder_2` instances with the base pipeline when possible);
-  (g) the metadata-chunk schema extension (new keys, what they mean);
-  (h) confirmation that this slice does NOT make `trust_remote_code`
-  changes (reprompt is a separate slice) — keeps reviewer plan at L2;
-  (i) explicit reference to ADR-014's 2026-05-24 §3 amendment that
-  motivated this slice.
-- **Security review:** NOT required at L2 (no Red Zone surface
-  touch, no `resolve_hf_path` / `_run_json_mode` / `comfyless/server.py`
-  edit, no IPC change, no caller-supplied-path widening beyond the
-  existing `--model` surface — `--refiner` adds a sibling path
-  semantics gated by the same `resolve_hf_path` resolver). **If during
-  implementation any of those surfaces unexpectedly need to be touched
-  (e.g. the refiner needs a new caller-supplied path widening for its
-  separate text encoder), STOP and re-evaluate per Vision §Reviewer-plan.**
+  (a) the dispatch shape — opt-in refiner stage in `comfyless/`,
+  driven by `--refiner <path>`, no path derivation, no auto-discovery;
+  (b) where the refiner pipeline lives in the loader machinery
+  (separate cache slot keyed on `(model, refiner)`); (c) the
+  `--refiner <path>` flag semantics (single enable, no `skip`/`auto`
+  sentinels; opt-in only) and the warning-on-unset behavior;
+  (d) defaults values + their sourcing (Tencent refiner README
+  cfg=3.5 / steps=4); (e) asymmetric shared-text-encoder optimization
+  (Qwen2.5-VL shared, T5/ByT5 not present on refiner); (f) the
+  metadata-chunk schema extension (`pipeline: "base+refiner"`,
+  refiner_path, refiner_steps, refiner_cfg keys); (g) refiner-side
+  LoRA / scheduler / sampler / sigmas pinning posture (none in v1);
+  (h) IPC daemon wire-protocol extension (additive `refiner` field;
+  cache key composition); (i) confirmation that this slice does NOT
+  make `trust_remote_code` changes (reprompt is a separate slice) —
+  keeps Red Zone framing out; (j) explicit reference to ADR-014's
+  2026-05-24 §3 amendment that motivated this slice.
+- **Security review REQUIRED** for the IPC daemon touch. Per project
+  CLAUDE.md "Review bar" §, any change to `comfyless/server.py` runs
+  `security-auditor`. Output saved to
+  `docs/security/review-hunyuan-refiner-server-<YYYY-MM-DD>.md` and
+  referenced from ADR-016 Changelog + the server.py-touching commit
+  body. Scope of the review: the new `refiner` wire field
+  (deserialization shape, validation, cache-key correctness, absence
+  of new path-derivation), plus a fresh look at the existing IPC
+  surface that has not yet had a §12 review (per CLAUDE.md "Debt:
+  No ADR or security review exists for `comfyless/server.py` (IPC)
+  … when either surface is next modified, write the missing review
+  before touching the code").
 
 ## Reviewer plan
 
 - **`code-reviewer` (Opus, `model: "opus"` at invocation per global
-  §5A and the broken-frontmatter workaround)** — run after each
-  non-trivial slice step, before commit. Non-negotiable.
-- **`security-auditor`** — not invoked for this slice (matches the
-  original Hunyuan-base slice's plan). If the reprompt-model
-  integration is folded in at any point, this changes to
-  `security-auditor` on every code-touching commit per ADR-013 §8
-  trailing-note's spirit applied to security-posture changes (not just
-  pin movement) — and the slice should be split first.
+  §5A and the broken-frontmatter workaround per memory
+  `feedback_agent_model_pin_broken`)** — run after each non-trivial
+  slice step, before commit. Non-negotiable.
+- **`security-auditor` (Opus, `model: "opus"` at invocation)** —
+  REQUIRED on every commit that touches `comfyless/server.py`
+  (invariant 11). Per project CLAUDE.md "Review bar" §. Output saved
+  to `docs/security/review-hunyuan-refiner-server-<YYYY-MM-DD>.md`
+  and referenced from ADR-016 Changelog + the touching commit body.
+  Also serves to close the pre-existing IPC §12 review debt.
 - **ADR-013 §8 trailing-note check:** this slice's success depends on
   the `hunyuanvideo-community/HunyuanImage-2.1-Refiner-Diffusers`
   package being installable against the existing `diffusers==0.37.1`
   pin. **If the refiner pipeline requires a diffusers bump, the
   trailing-note triggers and `security-auditor` layers onto every
-  code-touching commit.** Verify at slice start via `from diffusers
-  import HunyuanImageRefinerPipeline` on the existing pin (we already
-  confirmed `HunyuanImageRefinerPipeline` is exported by
-  `diffusers/__init__.py` in the original slice's ADR-014 §3 audit —
-  high confidence no bump needed, but verify before assuming).
+  code-touching commit (not just server.py-touching).** Verify at
+  slice start via `from diffusers import HunyuanImageRefinerPipeline`
+  on the existing pin (already confirmed exported by the diffusers
+  Vision-side check; ADR-014 §3 audit corroborates — high confidence
+  no bump needed, but verify before assuming).
 
 ## Open questions to settle in the ADR
 
-1. **Sibling-discovery convention.** Single fixed convention
-   (`<base-dir>-Refiner-Diffusers/` next to `<base-dir>/`)? Or
-   multi-strategy (sibling, HF-cache lookup for
-   `hunyuanvideo-community/HunyuanImage-2.1-Refiner-Diffusers`, env
-   var override)? Recommend: sibling-only as the v1, with explicit
-   `--refiner` as the escape hatch for everything else. Keeps the
-   loader simple.
-2. **Shared text-encoder optimization.** Both pipelines need Qwen2.5-VL
-   + T5 text encoders. Naively loading both pipelines independently
-   doubles encoder VRAM. Cleanest fix: load the base pipeline first,
-   construct the refiner pipeline by injecting the base's text
-   encoders + tokenizers + scheduler at `from_pretrained(...,
-   text_encoder=base.text_encoder, text_encoder_2=base.text_encoder_2,
-   tokenizer=base.tokenizer, tokenizer_2=base.tokenizer_2)`. Saves
-   ~24 GB VRAM. Verify the refiner pipeline class accepts these as
-   constructor args.
-3. **Refiner stage's input shape.** `HunyuanImageRefinerPipeline.__call__`
-   takes `image: PipelineImageInput | None`. Is that a PIL image or a
-   pre-decoded latent? If PIL, we VAE-encode the base output and feed
-   it to the refiner — but the refiner uses a DIFFERENT VAE class
-   (`AutoencoderKLHunyuanImageRefiner`). Need to confirm:
-   re-encode-via-refiner-VAE? or skip the VAE roundtrip entirely (some
-   refiners accept latent tensors directly via an `image_latents`
-   kwarg)? Inspect the refiner pipeline's `__call__` body during ADR.
-4. **PNG metadata schema versioning.** Adding new keys (`pipeline`,
-   `refiner_steps`, `refiner_cfg`, refiner model_path) to the existing
-   `comfyless` tEXt chunk. Backward compatibility: existing
+1. **Shared text-encoder injection mechanics.** Refiner declares only
+   `text_encoder` (Qwen2.5-VL) — no T5/`text_encoder_2`. Cleanest
+   approach: load base first, construct refiner via
+   `from_pretrained(refiner_path, text_encoder=base.text_encoder,
+   tokenizer=base.tokenizer, torch_dtype=…)`. Verify the diffusers
+   `HunyuanImageRefinerPipeline.from_pretrained` accepts these as
+   override kwargs (standard diffusers pattern, high confidence but
+   needs explicit check during ADR drafting).
+2. **Refiner input shape.** `HunyuanImageRefinerPipeline.__call__`
+   takes `image: PipelineImageInput | None`. Refiner uses a DIFFERENT
+   VAE class (`AutoencoderKLHunyuanImageRefiner`), so base's latents
+   are NOT valid input. v1 plan: PIL roundtrip (base decodes via its
+   VAE → PIL → refiner's `image` param → refiner re-encodes via its
+   own VAE). Investigation deferred to ADR-016: does the refiner
+   pipeline expose a direct latent path (`latents=` or `image_latents=`
+   kwarg) that bypasses its own encode entirely? Probably not since
+   the VAEs differ, but inspect `__call__` body for completeness.
+3. **PNG metadata schema additions.** New keys in the `comfyless`
+   tEXt chunk: `pipeline: "base+refiner"`, refiner model_path,
+   `refiner_steps`, `refiner_cfg`. Backward compatibility: existing
    sidecar-replay (`--params <prior-png>`) on a pre-refiner image:
-   missing keys default to base-only behavior (good). On a
-   refiner-aware image replayed by a pre-refiner comfyless build: the
-   build ignores unknown keys (good). Confirm both behaviors in tests.
-5. **ComfyUI generate-node integration.** Add a `refiner_path` /
-   `refiner_skip` input to the unified `Eric Diffusion Generate` node?
-   Or rely on auto-discover only on the ComfyUI side? Cleanest: add a
-   single optional `refiner_path` string input (default: empty =
-   auto-discover; sentinel "skip" = base-only; any other value =
-   explicit path).
-6. **Smoke command in the Vision proof hooks** assumes auto-discover
-   finds the sibling. If the smoke is run from a fresh host where the
-   refiner isn't yet downloaded, the warning fires + base-only runs.
-   Document the download command as part of the Vision's smoke setup
+   missing keys → base-only behavior (good). Refiner-aware image
+   replayed by a pre-refiner comfyless build: unknown keys ignored
+   (good). Confirm both behaviors in tests. ADR documents the schema.
+4. **ComfyUI generate-node integration.** Add a single optional
+   `refiner_path` string input to `Eric Diffusion Generate`
+   (default empty → base-only + warning; any non-empty value → opt-in
+   refiner stage). Mirrors the CLI exactly. No `refiner_skip` /
+   sentinel inputs; an empty string is the unset state.
+5. **Smoke command prerequisites.** The proof-hooks smoke assumes
+   the refiner directory is downloaded. The Vision smoke setup
+   documents the `huggingface-cli download
+   hunyuanvideo-community/HunyuanImage-2.1-Refiner-Diffusers` step
    so operators don't get surprised.
+6. **IPC cache eviction policy on refiner change.** When a daemon
+   already holds a hot `(model, None)` pipeline and receives a
+   request with `refiner` set, does it (a) evict the base-only entry
+   and load the two-stage pipeline, or (b) keep both cached
+   (memory-permitting)? Recommend (a) — single-slot cache is the
+   existing daemon shape; document explicitly in ADR-016 so operators
+   know switching modes incurs reload cost.
 
 ## Status
 
 - Drafted 2026-05-24 as the immediate-next slice after the
   `hunyuan-support` 2026-05-24 amendment (`3638daa`).
-- Awaiting Grant's review + approval before `/change-slice` →
+- Revised 2026-05-25 per Grant's review pass: removed auto-discovery
+  (security-surface widening); removed `--refiner skip` (redundant
+  with absence); refiner cfg/steps remain flag-addressable since the
+  pipeline accepts them independently; explicit LoRA / scheduler /
+  sampler / sigmas pinning posture documented (no v1 refiner-side
+  flags); IPC daemon support folded into scope (security-auditor
+  added); asymmetric shared-encoder optimization sharpened (Qwen2.5-VL
+  only, refiner has no T5 slot); refiner VAE class confirmed distinct
+  (PIL roundtrip is v1 plan, latent bypass investigation deferred to
+  ADR-016).
+- Awaiting Grant's re-review + approval before `/change-slice` →
   ADR-016 draft.
 - Next action after approval: download the
   `hunyuanvideo-community/HunyuanImage-2.1-Refiner-Diffusers` weights
