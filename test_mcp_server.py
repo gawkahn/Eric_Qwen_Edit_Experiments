@@ -47,6 +47,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import click  # noqa: E402
 import comfyless.catalog as cat_mod  # noqa: E402
 import comfyless.mcp_server as mcps  # noqa: E402
 import comfyless.generate as gen_mod  # noqa: E402
@@ -2056,6 +2057,228 @@ check(
     _proc.returncode == 0 and "torch_imported=False" in _proc.stdout,
     detail=f"stdout={_proc.stdout!r} stderr={_proc.stderr!r}",
 )
+
+
+# ════════════════════════════════════════════════════════════════════════
+print("\n== Slice 2 Step 3: --catalog flag + spawn-time wire-up ==")
+# ════════════════════════════════════════════════════════════════════════
+#
+# Invariants exercised here (see docs/vision/slice-2-mcp-catalog.md):
+#   - I1  catalog built once at server spawn, held on _StartupConfig
+#   - I7  startup fails closed on missing / malformed / schema-invalid /
+#         collision / symlink-escape (--catalog channel)
+#   - I13 --catalog declared as click option on main()
+#   - I14 _list_tools_impl still returns exactly ["generate"] (tool growth
+#         lands in Step 4)
+#   - N1–N7 the catalog-layer fail-closed cases (most are unit-tested in
+#         test_mcp_server's catalog section already; CLI-surface parity
+#         lives here so wiring regressions are caught)
+
+# --- Module-level checks (cheap; no fixtures) ---
+
+check("Step3: _StartupConfig.__slots__ includes 'catalog' (I1)",
+      "catalog" in mcps._StartupConfig.__slots__)
+
+# Inspect main()'s click option metadata via the click.Command params list.
+_main_params = {p.name: p for p in mcps.main.params}
+check("Step3: --catalog click option declared on main() (I13)",
+      "catalog" in _main_params)
+if "catalog" in _main_params:
+    _catalog_opt = _main_params["catalog"]
+    check("Step3: --catalog has 'catalog' option name (not positional)",
+          isinstance(_catalog_opt, click.Option))
+    check("Step3: --catalog is not required (operator-optional)",
+          _catalog_opt.required is False)
+    check("Step3: --catalog default is None",
+          _catalog_opt.default is None)
+    check("Step3: --catalog type is click.Path",
+          isinstance(_catalog_opt.type, click.Path))
+    if isinstance(_catalog_opt.type, click.Path):
+        check("Step3: --catalog click.Path(file_okay=True, dir_okay=False)",
+              _catalog_opt.type.file_okay is True
+              and _catalog_opt.type.dir_okay is False)
+
+
+# --- Failure-via-CliRunner cases (I7 / N1–N7 — operator stderr surface) ---
+
+# F1: --catalog nonexistent file → startup fails closed
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    nonexistent_catalog = os.path.join(tmp_base, "no-such-manifest.json")
+    result = runner.invoke(mcps.main, [
+        "--output-dir", tmp_out,
+        "--model-base", tmp_base,
+        "--catalog", nonexistent_catalog,
+    ])
+    check("Step3 F1: nonexistent --catalog file → non-zero exit (I7)",
+          result.exit_code != 0,
+          detail=f"exit={result.exit_code} stderr={(result.stderr or '')!r}")
+
+# F2: --catalog malformed JSON → startup fails closed
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    bad_manifest = os.path.join(tmp_base, "bad.json")
+    with open(bad_manifest, "w", encoding="utf-8") as f:
+        f.write("{this is not valid json")
+    result = runner.invoke(mcps.main, [
+        "--output-dir", tmp_out,
+        "--model-base", tmp_base,
+        "--catalog", bad_manifest,
+    ])
+    check("Step3 F2: malformed --catalog JSON → non-zero exit (I7)",
+          result.exit_code != 0,
+          detail=f"exit={result.exit_code}")
+
+# F3: --catalog points at a directory (not a file) → click rejects
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    a_dir = os.path.join(tmp_base, "i-am-a-directory")
+    os.makedirs(a_dir)
+    result = runner.invoke(mcps.main, [
+        "--output-dir", tmp_out,
+        "--model-base", tmp_base,
+        "--catalog", a_dir,
+    ])
+    check("Step3 F3: --catalog points at a directory → non-zero exit",
+          result.exit_code != 0,
+          detail=f"exit={result.exit_code}")
+
+# F4: manifest entry's target realpath-escapes --model-base → fail closed
+# (I7 / N6). The escape mechanism here is a non-symlink absolute path
+# pointing outside --model-base; the symlink variant of the same failure
+# is covered at the catalog-unit level (Step-2 tests).
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base, \
+     tempfile.TemporaryDirectory() as tmp_outside:
+    # Real target lives OUTSIDE model_base; manifest declares a target
+    # path that realpath() will resolve to the outside location.
+    outside_file = os.path.join(tmp_outside, "evil.safetensors")
+    open(outside_file, "wb").close()
+    manifest_path = os.path.join(tmp_base, "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "escape-attempt": {
+                "target": outside_file,
+                "kind": "lora",
+            },
+        }, f)
+    result = runner.invoke(mcps.main, [
+        "--output-dir", tmp_out,
+        "--model-base", tmp_base,
+        "--catalog", manifest_path,
+    ])
+    check("Step3 F4: manifest entry resolves outside --model-base → "
+          "non-zero exit (I7)",
+          result.exit_code != 0,
+          detail=f"exit={result.exit_code}")
+    check("Step3 F4: stderr names --catalog (operator-facing hint)",
+          "--catalog" in (result.output or "") + (result.stderr or ""),
+          detail=f"output={result.output!r} stderr={result.stderr!r}")
+
+# F5: --catalog string contains a NUL byte → fail closed at click parse
+# (click.Path.convert calls os.stat which rejects NULs)
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    result = runner.invoke(mcps.main, [
+        "--output-dir", tmp_out,
+        "--model-base", tmp_base,
+        "--catalog", "manifest\x00.json",
+    ])
+    check("Step3 F5: --catalog with embedded NUL → non-zero exit",
+          result.exit_code != 0,
+          detail=f"exit={result.exit_code}")
+
+# F5b: direct in-process call → explicit NUL pre-check yields a clean
+# click.BadParameter (defense-in-depth for non-CLI callers).
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    raised = None
+    try:
+        mcps._validate_startup_args(
+            output_dir=tmp_out, model_base=tmp_base,
+            default_model=None, mcp_max_iterations=100,
+            catalog="manifest\x00.json",
+        )
+    except click.BadParameter as e:
+        raised = e
+    except BaseException as e:
+        raised = f"UNEXPECTED-{type(e).__name__}: {e}"
+    check("Step3 F5b: _validate_startup_args raises click.BadParameter "
+          "on NUL in catalog",
+          isinstance(raised, click.BadParameter),
+          detail=f"raised={raised!r}")
+
+
+# --- Direct _validate_startup_args success cases (I1) ---
+
+# S1: spawn without --catalog → cfg.catalog populated from scan only
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    # Plant one scan-recognized entry: loras/scan-lora.safetensors
+    loras_dir = os.path.join(tmp_base, "loras")
+    os.makedirs(loras_dir)
+    scan_lora_path = os.path.join(loras_dir, "scan-lora.safetensors")
+    open(scan_lora_path, "wb").close()
+
+    cfg = mcps._validate_startup_args(
+        output_dir=tmp_out, model_base=tmp_base,
+        default_model=None, mcp_max_iterations=100,
+    )
+    check("Step3 S1: cfg.catalog is a dict (scan-only path)",
+          isinstance(cfg.catalog, dict))
+    check("Step3 S1: scan-only cfg.catalog contains scan-derived entry",
+          "scan-lora" in cfg.catalog,
+          detail=f"keys={list(cfg.catalog)!r}")
+    if "scan-lora" in cfg.catalog:
+        _entry = cfg.catalog["scan-lora"]
+        check("Step3 S1: scan-derived entry has source='scan'",
+              _entry.get("source") == "scan")
+        check("Step3 S1: scan-derived entry has kind='lora'",
+              _entry.get("kind") == "lora")
+
+# S2: spawn with --catalog → cfg.catalog has BOTH scan and manifest entries
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    # Scan side: one lora in loras/
+    loras_dir = os.path.join(tmp_base, "loras")
+    os.makedirs(loras_dir)
+    open(os.path.join(loras_dir, "scan-lora.safetensors"), "wb").close()
+
+    # Manifest side: one lora pointing at an under-base path
+    manifest_lora_path = os.path.join(tmp_base, "manifest-lora.safetensors")
+    open(manifest_lora_path, "wb").close()
+    manifest_path = os.path.join(tmp_base, "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "from-manifest": {
+                "target": manifest_lora_path,
+                "kind": "lora",
+            },
+        }, f)
+
+    cfg = mcps._validate_startup_args(
+        output_dir=tmp_out, model_base=tmp_base,
+        default_model=None, mcp_max_iterations=100,
+        catalog=manifest_path,
+    )
+    check("Step3 S2: cfg.catalog contains scan entry under --catalog",
+          "scan-lora" in cfg.catalog,
+          detail=f"keys={list(cfg.catalog)!r}")
+    check("Step3 S2: cfg.catalog contains manifest-declared entry",
+          "from-manifest" in cfg.catalog,
+          detail=f"keys={list(cfg.catalog)!r}")
+    if "from-manifest" in cfg.catalog:
+        check("Step3 S2: manifest entry has source='manifest'",
+              cfg.catalog["from-manifest"].get("source") == "manifest")
+
+    # --- I14 carry-forward: tool surface unchanged with populated catalog ---
+    tools = _run(mcps._list_tools_impl(cfg))
+    check("Step3 I14: _list_tools_impl with populated catalog still "
+          "returns exactly one tool",
+          isinstance(tools, list) and len(tools) == 1,
+          detail=f"len={len(tools)}")
+    check("Step3 I14: that one tool is still 'generate' (no Step-4 leak)",
+          tools and tools[0].name == "generate")
 
 
 # ════════════════════════════════════════════════════════════════════════

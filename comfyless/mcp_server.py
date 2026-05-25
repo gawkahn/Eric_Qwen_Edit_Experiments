@@ -298,9 +298,20 @@ def _sanitize_error(exc: BaseException, label: str) -> str:
 # ════════════════════════════════════════════════════════════════════════
 
 class _StartupConfig:
-    """Resolved + validated spawn-time configuration."""
+    """Resolved + validated spawn-time configuration.
 
-    __slots__ = ("output_dir", "model_base", "default_model", "mcp_max_iterations")
+    `catalog` is a `comfyless.catalog.CatalogDict` (typed as `dict` here
+    to keep this module's top-level import surface free of catalog.py —
+    `build_catalog` is lazy-imported inside `_validate_startup_args`).
+    """
+
+    __slots__ = (
+        "output_dir",
+        "model_base",
+        "default_model",
+        "mcp_max_iterations",
+        "catalog",
+    )
 
     def __init__(
         self,
@@ -308,11 +319,13 @@ class _StartupConfig:
         model_base: str,
         default_model: Optional[str],
         mcp_max_iterations: int,
+        catalog: dict,
     ) -> None:
         self.output_dir = output_dir
         self.model_base = model_base
         self.default_model = default_model
         self.mcp_max_iterations = mcp_max_iterations
+        self.catalog = catalog
 
 
 def _validate_startup_args(
@@ -320,12 +333,23 @@ def _validate_startup_args(
     model_base: str,
     default_model: Optional[str],
     mcp_max_iterations: int,
+    catalog: Optional[str] = None,
 ) -> _StartupConfig:
     """Resolve + validate spawn-time CLI args. Raises click.BadParameter on bad input.
 
     Invariant 1: fail-closed on missing/non-existent/non-directory for the
     two required roots and (when set) --default-model.
     Invariant 10: --default-model must realpath-resolve under --model-base.
+
+    Slice-2 Step 3: when `catalog` is supplied, the operator-manifest path
+    feeds `comfyless.catalog.build_catalog(model_base, catalog_path)`. Any
+    `CatalogBuildError` (manifest missing, malformed JSON, schema fail,
+    name collision, scan/manifest collision, symlink escape) is wrapped
+    into a `click.BadParameter(param_hint="--catalog")` with the catalog
+    layer's operator-facing message passed through verbatim. Default
+    `None` means "no manifest; scan-only catalog" — existing test call
+    sites that don't pass `catalog` get the scan-only behaviour without
+    edits.
     """
     resolved_out = os.path.realpath(output_dir)
     if not os.path.isdir(resolved_out):
@@ -355,11 +379,38 @@ def _validate_startup_args(
                 param_hint="--default-model",
             )
 
+    # --catalog: explicit NUL-byte pre-check before any os.* / open() so
+    # direct in-process callers (tests, future internal use) get a clean
+    # click.BadParameter instead of the raw `ValueError('embedded null
+    # byte')` that click.Path would raise at parse time. Mirrors the
+    # _handle_generate NUL-handling pattern.
+    if catalog is not None and "\x00" in catalog:
+        raise click.BadParameter(
+            "contains embedded NUL byte",
+            param_hint="--catalog",
+        )
+
+    # Lazy import: keeps mcp_server's module-top surface unchanged for
+    # any future import-time tests, and matches the lazy-import idiom
+    # already used elsewhere in startup validation.
+    from comfyless.catalog import build_catalog, CatalogBuildError
+
+    try:
+        built_catalog = build_catalog(resolved_base, catalog)
+    except CatalogBuildError as e:
+        # `from None` suppresses the CatalogBuildError chain so click's
+        # pretty-printed error stays clean. The catalog layer's message
+        # is operator-facing (names the offending entry / repo ID) and
+        # passes through verbatim — this is stderr, not the agent-facing
+        # uniform-error contract.
+        raise click.BadParameter(str(e), param_hint="--catalog") from None
+
     return _StartupConfig(
         output_dir=resolved_out,
         model_base=resolved_base,
         default_model=resolved_default,
         mcp_max_iterations=mcp_max_iterations,
+        catalog=built_catalog,
     )
 
 
@@ -962,6 +1013,19 @@ async def _run_async(cfg: _StartupConfig) -> None:
     ),
 )
 @click.option(
+    "--catalog",
+    required=False,
+    default=None,
+    type=click.Path(file_okay=True, dir_okay=False, resolve_path=False),
+    help=(
+        "Optional operator manifest (JSON) augmenting the model_base scan "
+        "with named entries (HF repo IDs / explicit local paths). Built "
+        "once at spawn via comfyless.catalog.build_catalog; startup fails "
+        "closed on missing / malformed / schema-invalid / collision / "
+        "symlink-escape (Vision invariants 1, 7 / N1-N7)."
+    ),
+)
+@click.option(
     "--mcp-max-iterations",
     required=False,
     default=100,
@@ -978,6 +1042,7 @@ def main(
     output_dir: str,
     model_base: str,
     default_model: Optional[str],
+    catalog: Optional[str],
     mcp_max_iterations: int,
 ) -> None:
     """Run the comfyless MCP server over stdio.
@@ -996,6 +1061,7 @@ def main(
         model_base=model_base,
         default_model=default_model,
         mcp_max_iterations=mcp_max_iterations,
+        catalog=catalog,
     )
     asyncio.run(_run_async(cfg))
 
