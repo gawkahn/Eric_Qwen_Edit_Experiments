@@ -199,6 +199,14 @@ Queued in Backlog.
 - **Suggested fix:** Pass `max_sequence_length` in the sdxl/sd3/sd1/zimage block (after checking `sig.parameters` like auraflow does).
 - **Priority:** Low
 
+### [Code] `detect_pipeline_class` error message could detect upstream-Tencent (and similar non-diffusers) layouts and suggest the diffusers-converted variant
+- **Location:** `nodes/eric_diffusion_utils.py` `detect_pipeline_class` (the `os.path.exists(index_path)` fail-closed branch).
+- **Observed:** 2026-05-24 during slice `hunyuan-support` Step 5 live smoke. Grant downloaded `tencent/HunyuanImage-2.1` from HF and pointed the loader at it; the loader correctly fail-closed on "No model_index.json found" but the error doesn't tell the operator *why* — Tencent ships their image-gen models in upstream-code format (`dit/`+`vae/`+`config.json`, no `model_index.json`) and the diffusers-format mirror lives at a different repo (`hunyuanvideo-community/HunyuanImage-2.1-Diffusers`). Same shape applies to HunyuanImage-3.0 (deferred to Eric's ComfyUI nodes per Backlog 2026-05-17) and likely future Tencent / Alibaba / Bytedance image-gen releases.
+- **Why not now:** Out of scope for slice `hunyuan-support` (which closed with the workaround "download the community variant" baked into the Vision smoke). Saves ~30 minutes of confusion the next time someone (Grant, a future maintainer, an LLM agent) downloads an upstream Tencent repo and gets a generic "no model_index.json" error.
+- **Suggested fix:** In `detect_pipeline_class`'s missing-`model_index.json` branch, glob for upstream-format markers (`dit/`, `vae/`, `config.json` with `"model_type"` set, or `transformer/` + missing manifest) and on detection append a hint to the ValueError: "Layout looks like a non-diffusers upstream release; the diffusers-format variant is typically at `<huggingface-org>-community/<name>-Diffusers` (e.g. `hunyuanvideo-community/HunyuanImage-2.1-Diffusers`). Try `huggingface-cli download <community-repo> --local-dir <path>` and point the loader at that directory instead." ~20 lines + 2 unit tests (upstream-layout fixture, plain-missing fixture).
+- **Trigger:** Next time the loader's error-message surface is touched, OR a second user report of confusion downloading an upstream Tencent/Alibaba/Bytedance repo, OR if Hunyuan-Image 3.0 work ever revisits this code path. Discussed as part of slice `hunyuan-support` closure (ADR-014 Changelog 2026-05-24).
+- **Priority:** Low
+
 ### [Security] Missing §12 security review for comfyless Unix socket IPC server
 - **Location:** `comfyless/server.py` — full IPC server using Unix sockets
 - **Observed:** 2026-04-23 governance review (§12 trigger: IPC)

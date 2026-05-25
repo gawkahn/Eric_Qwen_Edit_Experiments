@@ -256,8 +256,24 @@ Smoke pass criterion: file written, PNG has comfyless metadata chunk,
 
 - Approved 2026-05-16.
 - Backlog updated (Obsidian `Image_gen/Backlog.md`): 2.1 promoted to
-  Immediate, 3.0 deferred to ai-stack.
+  Immediate, 3.0 deferred to ai-stack (2026-05-16) → 3.0 un-deferred
+  2026-05-17 via Eric's `Comfy_HunyuanImage3` ComfyUI nodes (primary
+  path) and an optional secondary `comfyless/hunyuan3.py` fork (its
+  own ADR, not this slice).
 - Next action: `/change-slice` → ADR-014 draft → implementation.
+- **Implemented and closed 2026-05-24.** Implementation commits on
+  `hunyuan-support` (post-rebase IDs): `085a518` (ADR-014 accepted),
+  `4deeaec` (ADR-014 §3 refiner-slot amendment), `f0d2399` (Step 2
+  pattern + tests), `827c6ed` (Step 2 follow-on TECH_DEBT entry for
+  pre-existing `torch.load` CWE-502 sites), `288137b` (Step 3 CFG
+  branch + tests), `df74b4f` (Step 4 FAMILY_DEFAULTS + tests). Step 5
+  closure commit lands separately (this Status amendment + ADR-014
+  Changelog).
+- Unit gate (10 suites / 1074 tests / 0 failures) and live GPU smoke
+  (24.2s 1024×1024 generation on cuda:0; PNG `comfyless` tEXt chunk
+  carries `model_family="hunyuan-image"`) both PASSED. See ADR-014
+  Changelog entry 2026-05-24 for the full implementation summary +
+  smoke evidence.
 
 ## Changelog
 
