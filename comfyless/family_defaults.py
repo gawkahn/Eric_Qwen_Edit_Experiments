@@ -73,11 +73,27 @@ FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
     # Guidance-distilled. cfg_scale routes to distilled_guidance_scale at
     # call-build time per ADR-014 §2; the family-defaults overlay still
     # operates on the canonical cfg_scale schema key (ADR-014 §4 — same
-    # pattern as the flux family). 3.25 / 50 matches both the
+    # pattern as the flux family). cfg=3.25 / steps=50 match both the
     # HunyuanImagePipeline.__call__ signature defaults and the Tencent
-    # Hunyuan-Image 2.1 model card recommendation.
-    # Source: diffusers 0.37.1 HunyuanImagePipeline + Tencent model card.
-    "hunyuan-image": {"cfg_scale": 3.25, "steps": 50},
+    # Hunyuan-Image 2.1 model card.
+    # **2K-native**: width=2048, height=2048 is mandatory, not optional —
+    # Tencent README (Usage §): "HunyuanImage-2.1 only supports 2K image
+    # generation (e.g. 2048x2048 for 1:1 images, 2560x1536 for 16:9 images,
+    # etc.). Generating images with 1K resolution will result in artifacts."
+    # The 32× spatial compression VAE was trained on 64×64 latents → 2048
+    # decoded images; sub-2K renders are out-of-distribution. Documented
+    # aspect buckets: 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3. cfg_scale and
+    # steps keep their schema-overlay semantics; width/height are this
+    # family's first defaults-overlay entries for dimensions (other
+    # families let the caller choose). ADR-014 Changelog 2026-05-24
+    # amendment carries the empirical evidence + README citation.
+    # Source: HunyuanImage-2.1 README (Usage §); ADR-014 §4 amendment.
+    "hunyuan-image": {
+        "cfg_scale": 3.25,
+        "steps":     50,
+        "width":     2048,
+        "height":    2048,
+    },
 
     # ── qwen-edit (Qwen-Image-Edit-2511) ────────────────────────────────
     # Edit pipeline uses true_cfg path. 30 steps tracks documented sweet

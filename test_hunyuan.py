@@ -371,6 +371,17 @@ check(
     "FAMILY_DEFAULTS['hunyuan-image'] sets steps=50 (model card)",
     FAMILY_DEFAULTS.get("hunyuan-image", {}).get("steps") == 50,
 )
+# 2K-native (ADR-014 Changelog 2026-05-24 amendment): the 32× VAE was
+# trained on 2048-decoded images; sub-2K renders are out-of-distribution
+# per Tencent README ("1K resolution will result in artifacts").
+check(
+    "FAMILY_DEFAULTS['hunyuan-image'] sets width=2048 (2K-native per Tencent README)",
+    FAMILY_DEFAULTS.get("hunyuan-image", {}).get("width") == 2048,
+)
+check(
+    "FAMILY_DEFAULTS['hunyuan-image'] sets height=2048 (2K-native per Tencent README)",
+    FAMILY_DEFAULTS.get("hunyuan-image", {}).get("height") == 2048,
+)
 # Defensive: NOT true_cfg_scale (Hunyuan is distilled, not 2-pass CFG).
 check(
     "FAMILY_DEFAULTS['hunyuan-image'] does NOT set true_cfg_scale",
@@ -401,7 +412,10 @@ with tempfile.TemporaryDirectory() as tmpdir:
 
     # Case A — bare run: explicit_keys empty, iterated_axes empty. Family
     # defaults SHOULD apply, overriding any schema default already in p_cur.
-    p_cur = {"model": tmpdir, "cfg_scale": 3.5, "steps": 28}  # schema defaults
+    p_cur = {
+        "model": tmpdir, "cfg_scale": 3.5, "steps": 28,
+        "width": 1024, "height": 1024,  # schema defaults
+    }
     cg._apply_family_defaults(p_cur, explicit_keys=set(), iterated_axes=set())
     check(
         "bare run: family default overrides schema default (cfg_scale 3.5 → 3.25)",
@@ -411,6 +425,17 @@ with tempfile.TemporaryDirectory() as tmpdir:
     check(
         "bare run: family default overrides schema default (steps 28 → 50)",
         p_cur["steps"] == 50,
+    )
+    # 2K-native dim defaults override 1K schema defaults — the headline fix
+    # of the 2026-05-24 amendment that addresses the artifact issue Grant
+    # surfaced after the original Step 5 smoke.
+    check(
+        "bare run: family default overrides schema default (width 1024 → 2048)",
+        p_cur["width"] == 2048,
+    )
+    check(
+        "bare run: family default overrides schema default (height 1024 → 2048)",
+        p_cur["height"] == 2048,
     )
 
     # Case B — explicit CLI override on cfg_scale. Family default for cfg_scale

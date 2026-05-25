@@ -135,45 +135,77 @@ infixes break the `hunyuanimage` substring after the
 diffusers releases that ship new `Hunyuan*` pipeline classes should
 re-run this audit as a one-line check in an ADR amendment.
 
-**Important caveat on the refiner family slot — it is defensive, not a
-commitment to the end-state for refiner support.** Per the
-HunyuanImageRefinerPipeline `__call__` inspection (signature confirmed
-via `inspect.signature` at decision time): the refiner is structurally
-an **edit / image-to-image pipeline** in the SDXL-refiner sense, not a
-Cascade-style mandatory second stage. Base `HunyuanImagePipeline` produces
-a complete saveable image on its own — the official upstream usage example
-saves `pipe(prompt, ...).images[0]` directly to disk with no refiner pass.
-The refiner is opt-in polish: it consumes a complete image (`image:
-PipelineImageInput | None`), runs ~4 default denoising steps, and outputs
-a refined image; it uses a distinct VAE class (`AutoencoderKLHunyuanImageRefiner`)
-and is distributed as a separate HF model. When refiner support eventually
-lands as its own slice, the natural architectural home is the existing
-**edit-pipeline surface** (where `EricDiffusionEdit` already takes image
-slots and GEN_METADATA), NOT the `GEN_PIPELINE` family system this ADR
-extends — the family-pattern slot reserved here exists only to prevent
-accidental misroute of a refiner-loaded checkpoint through the base CFG
-branch via substring overlap. The future-refiner slice may dissolve the
-`hunyuan-image-refiner` family string entirely in favor of an edit-side
-analog; this is left open.
+**Important caveat on the refiner family slot — it is defensive.** Per
+the `HunyuanImageRefinerPipeline.__call__` inspection (signature confirmed
+via `inspect.signature` at decision time): the refiner is structurally an
+edit / image-to-image pipeline (consumes a complete image via `image:
+PipelineImageInput | None`, runs ~4 default denoising steps, outputs a
+refined image, uses a distinct `AutoencoderKLHunyuanImageRefiner` VAE,
+distributed as a separate HF model). The family-pattern slot reserved
+here exists only to prevent accidental misroute of a refiner-loaded
+checkpoint through the base CFG branch via substring overlap.
+
+**Original framing — partly retracted 2026-05-24 amendment.** This ADR
+initially framed the refiner as "SDXL-style optional polish, edit-pipeline
+home." Empirical evidence from the Step 5 live smoke (Grant's first
+generation at 1024×1024) plus an external diagnosis of the resulting
+artifacts revealed two things: (a) the 1024 default was below the model's
+2K-native operating point (separately addressed by the 2026-05-24 amendment
+to §4), and (b) **even at 2K the base alone produces visibly artifacted
+output for which the refiner is the documented remedy** — making the
+refiner functionally part of "what produces a usable Hunyuan-Image 2.1
+generation," not an optional after-pass. The data exchanged is still
+images (structurally edit-shape), but the *coupling* of base + refiner is
+Cascade-pattern (both stages required for the product). The future-refiner
+work therefore belongs as a **comfyless dispatch fork** analogous to
+`comfyless/cascade.py` (per ADR-010), not on the edit-pipeline surface.
+The fork can either auto-chain base + refiner or expose them as a
+two-step explicit pipeline; that's its own ADR's decision. The
+`hunyuan-image-refiner` family slot reserved here remains defensive (it
+still prevents misroute) but no longer implies the architectural home;
+the refiner Vision + ADR is queued as the immediate next slice after this
+2026-05-24 amendment, per Grant's direction.
 
 ### 4. Family-defaults row in `comfyless/family_defaults.py`
 
-Add one alphabetically-ordered entry:
+Add one alphabetically-ordered entry. **Amended 2026-05-24** to include
+2K-native dimension defaults — see "Original §4 entry was insufficient"
+note below and the 2026-05-24 Changelog amendment:
 
 ```python
 # ── hunyuan-image (Hunyuan-Image 2.1) ───────────────────────────────
-# Distilled-guidance family; cfg_scale routes to distilled_guidance_scale
-# in the call-build layer. Defaults match HunyuanImagePipeline.__call__
-# signature: distilled_guidance_scale=3.25, num_inference_steps=50.
-# Source: diffusers 0.37.1 HunyuanImagePipeline implementation (and the
-# Tencent Hunyuan-Image 2.1 model card recommendation, both 3.25 / 50).
-"hunyuan-image": {"cfg_scale": 3.25, "steps": 50},
+"hunyuan-image": {
+    "cfg_scale": 3.25,
+    "steps":     50,
+    "width":     2048,
+    "height":    2048,
+},
 ```
+
+`cfg_scale`/`steps` match the `HunyuanImagePipeline.__call__` signature
+defaults + the Tencent model card. `width`/`height` are mandatory 2K per
+Tencent README: "HunyuanImage-2.1 only supports 2K image generation …
+Generating images with 1K resolution will result in artifacts." The 32×
+spatial-compression VAE is trained on 64×64 latents → 2048-decoded
+images; sub-2K renders are out-of-distribution. Documented aspect
+buckets: 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3. This row is the first
+FAMILY_DEFAULTS entry to carry `width`/`height` (other families let the
+caller choose); the overlay applier already supports it because the
+applier walks any key that exists in `COMFYLESS_SCHEMA`, and
+`width`/`height` are canonical schema keys.
 
 `true_cfg_scale` is intentionally NOT in this row — Hunyuan does not use
 the double-pass CFG path; setting it would be meaningless. The overlay
 applier silently ignores unknown keys but it would still be a source of
 confusion to readers.
+
+**Original §4 entry was insufficient.** The first version of this row
+shipped with only `{"cfg_scale": 3.25, "steps": 50}` (the 2026-05-17 ADR
+draft). Step 5's live smoke at the schema-default 1024×1024 produced
+visibly artifacted output (sky banding, foil-textured sails, hull
+geometric distortion); external diagnosis identified sub-2K rendering as
+the dominant cause. The 2026-05-24 amendment adds the dimension defaults.
+See the 2026-05-24 Changelog entry.
 
 Per ADR-009's precedence ladder, this row sits **above** `COMFYLESS_SCHEMA`
 defaults (cfg_scale=3.5, steps=28) and **below** explicit CLI flags /
@@ -343,7 +375,8 @@ explicitly preserves consolidation as Queued.
 - 2026-05-17 — proposed (initial draft, Vision-aligned).
 - 2026-05-17 — `code-reviewer` (Opus) round-1 pass: 1 MEDIUM + 3 LOW + 2 INFO findings. All actionable findings folded inline: (a) MEDIUM — Rejected B rewritten to capture the real failure mode (hard `ValueError` from pipeline runtime assertion `pipeline_hunyuanimage.py:727-728`, not silent degradation); (b) LOW — Context docstring/signature default mismatch noted; (c) LOW — Rejected F added (wait for runtime-core consolidation); (d) LOW — §3 Hunyuan class-roster audit appended; (e) INFO — §7 STOP-condition for unexpected caller-supplied component paths appended. Format-compliance INFO and §6 deferral INFO required no change. Status: `proposed` → `accepted`.
 - 2026-05-17 — §3 amended with a "refiner family slot is defensive, not end-state" caveat. Triggered by Grant's prompt asking whether refiner support is Cascade-style mandatory or SDXL-style optional. Confirmed SDXL-style via `HunyuanImageRefinerPipeline.__call__` signature inspection: takes `image: PipelineImageInput | None`, ~4 default steps, distinct refiner VAE, distributed as a separate HF model. Future-refiner slice belongs on the edit-pipeline surface (`EricDiffusionEdit` etc.), not on `GEN_PIPELINE`. The reserved family slot is purely a defensive misroute-blocker. Status remains `accepted` — no decision reversal, only sharpening of the deferral's framing.
-- 2026-05-24 — **Implementation complete.** Code commits (post-rebase IDs on `hunyuan-support`): `f0d2399` (Step 2 — `_FAMILY_PATTERNS` entries for `hunyuan-image` + `hunyuan-image-refiner`, 29 auto-detection/non-regression tests), `288137b` (Step 3 — `_build_call_kwargs` Hunyuan branch in both `nodes/eric_diffusion_generate.py` and `comfyless/generate.py` with `distilled_guidance_scale` routing, 23 CFG-routing tests), `df74b4f` (Step 4 — `FAMILY_DEFAULTS["hunyuan-image"] = {"cfg_scale": 3.25, "steps": 50}` row, 13 precedence-ladder + graceful-degrade tests). Plus `827c6ed` Step 2 follow-on (TECH_DEBT entry for pre-existing `torch.load` CWE-502 sites surfaced by semgrep PostToolUse hook). Unit gate: 10 suites / 1074 tests pass, 0 failures (`test_hunyuan.py` contributed 65 of those; `test_params_schema.py` auto-picked-up the new FAMILY_DEFAULTS row, 135→136). `code-reviewer` (Opus, `model: "opus"` at invocation) ran on each non-trivial step (Steps 1 + 2 + 3 + 4); Step 1 returned `CHANGES REQUIRED` (4 findings folded — see 2026-05-17 entries above); Steps 2 + 3 + 4 returned `CLEAN`. **Live GPU smoke (Vision proof-hook) PASSED 2026-05-24** against `hunyuanvideo-community/HunyuanImage-2.1-Diffusers` (downloaded to `hf-local/HunyuanImage-2.1-Diffusers` after the original `tencent/HunyuanImage-2.1` was found to ship in upstream non-diffusers layout — Tencent ships at `tencent/*`, the diffusers-format repackaging lives at `hunyuanvideo-community/*-Diffusers`; this finding is logged to TECH_DEBT.md as a future-UX improvement for `detect_pipeline_class`'s error message). Smoke command: `./.venv/bin/python3 -m comfyless.generate --model <local-dir> --prompt "..." --width 1024 --height 1024 --output /tmp/hunyuan-smoke.png`. Result: 1024×1024 RGB PNG generated in 24.2s on cuda:0 (RTX PRO 6000 Blackwell, 102 GB VRAM); PNG `comfyless` tEXt chunk carries `model_family="hunyuan-image"`, `steps=50`, `cfg_scale=3.25` — all three slice invariants visible end-to-end. Log line `family=hunyuan-image defaults applied: cfg_scale=3.25, steps=50` proves invariant 3 (overlay); `Detected: HunyuanImagePipeline (family: hunyuan-image)` proves invariant 1 (auto-detection); 50 steps completed without kwarg-routing errors proves invariant 2 (distilled-guidance routing). No `security-auditor` invocation (ADR-013 §8 trailing-note did not trigger — zero ML-stack pin movement). Slice closed.
+- 2026-05-24 — **Implementation complete.** Code commits (post-rebase IDs on `hunyuan-support`): `f0d2399` (Step 2 — `_FAMILY_PATTERNS` entries for `hunyuan-image` + `hunyuan-image-refiner`, 29 auto-detection/non-regression tests), `288137b` (Step 3 — `_build_call_kwargs` Hunyuan branch in both `nodes/eric_diffusion_generate.py` and `comfyless/generate.py` with `distilled_guidance_scale` routing, 23 CFG-routing tests), `df74b4f` (Step 4 — `FAMILY_DEFAULTS["hunyuan-image"] = {"cfg_scale": 3.25, "steps": 50}` row, 13 precedence-ladder + graceful-degrade tests). Plus `827c6ed` Step 2 follow-on (TECH_DEBT entry for pre-existing `torch.load` CWE-502 sites surfaced by semgrep PostToolUse hook).
+- 2026-05-24 — **Amendment.** Step 5's live smoke at the schema-default 1024×1024 produced visibly artifacted output (horizontal embossed banding in sky, foil-textured sails, hull warping, smeared treelines). External quality diagnosis (Claude web) identified four contributors, ranked by impact: (1) sub-native resolution — Tencent README is explicit that "HunyuanImage-2.1 only supports 2K image generation … 1K will result in artifacts" (the 32× compression VAE was trained on 64×64 latents → 2048 images; 1K renders feed a 32×32 latent which is OOD); (2) no refiner pass; (3) possibly distilled checkpoint (verified-not — we're on the undistilled variant); (4) no prompt enhancement. **This amendment addresses #1 only.** Family-defaults row updated to `{cfg_scale: 3.25, steps: 50, width: 2048, height: 2048}`; the original `__call__`-docstring default of 1024 was misleading (consistent with the other docstring bug noted in the 2026-05-17 entry — the diffusers docstring is unreliable; the Tencent README is authoritative). §3 amended to retract the original "edit-pipeline home" framing for the refiner — empirical evidence (base alone produces unusable output even at 2K) shows refiner is functionally part of "what produces a clean Hunyuan generation," Cascade-coupling rather than SDXL-style optional polish; the refiner work belongs as a comfyless dispatch fork (`comfyless/hunyuan_chain.py` shape, separate ADR-016+) per Grant's direction, queued as the immediate next slice. Item #4 (Tencent's bundled reprompt model at upstream `tencent/HunyuanImage-2.1/reprompt/` — `HunYuanDenseV1ForCausalLM`, ~7B params, ~14 GB bf16, `trust_remote_code=True` required) is also in scope for the refiner slice given Grant's "review-and-pin remote code" posture from the abandoned Hunyuan-3 project — making `trust_remote_code` an ADR-governed first-class capability rather than a blocker. Adjacent finding: `pipeline.vae.enable_tiling()` is called unconditionally on every loaded pipeline (`nodes/eric_diffusion_loader.py:179-180`, `comfyless/generate.py:784-785`) — for Hunyuan's 32× VAE on ≥100 GB GPUs this is unnecessary AND may compound the banding (tile seams). Per-family skip queued as the third immediate-next slice. Test count delta: +2 (row-shape) + 2 (bare-run precedence) in `test_hunyuan.py`. Smoke re-run at 2048×2048 captured separately in the slice's commit body. Unit gate: 10 suites / 1074 tests pass, 0 failures (`test_hunyuan.py` contributed 65 of those; `test_params_schema.py` auto-picked-up the new FAMILY_DEFAULTS row, 135→136). `code-reviewer` (Opus, `model: "opus"` at invocation) ran on each non-trivial step (Steps 1 + 2 + 3 + 4); Step 1 returned `CHANGES REQUIRED` (4 findings folded — see 2026-05-17 entries above); Steps 2 + 3 + 4 returned `CLEAN`. **Live GPU smoke (Vision proof-hook) PASSED 2026-05-24** against `hunyuanvideo-community/HunyuanImage-2.1-Diffusers` (downloaded to `hf-local/HunyuanImage-2.1-Diffusers` after the original `tencent/HunyuanImage-2.1` was found to ship in upstream non-diffusers layout — Tencent ships at `tencent/*`, the diffusers-format repackaging lives at `hunyuanvideo-community/*-Diffusers`; this finding is logged to TECH_DEBT.md as a future-UX improvement for `detect_pipeline_class`'s error message). Smoke command: `./.venv/bin/python3 -m comfyless.generate --model <local-dir> --prompt "..." --width 1024 --height 1024 --output /tmp/hunyuan-smoke.png`. Result: 1024×1024 RGB PNG generated in 24.2s on cuda:0 (RTX PRO 6000 Blackwell, 102 GB VRAM); PNG `comfyless` tEXt chunk carries `model_family="hunyuan-image"`, `steps=50`, `cfg_scale=3.25` — all three slice invariants visible end-to-end. Log line `family=hunyuan-image defaults applied: cfg_scale=3.25, steps=50` proves invariant 3 (overlay); `Detected: HunyuanImagePipeline (family: hunyuan-image)` proves invariant 1 (auto-detection); 50 steps completed without kwarg-routing errors proves invariant 2 (distilled-guidance routing). No `security-auditor` invocation (ADR-013 §8 trailing-note did not trigger — zero ML-stack pin movement). Slice closed.
 
 ## AI-Disclosure
 
