@@ -227,6 +227,77 @@ _GENERATE_INPUT_SCHEMA: dict[str, Any] = {
 
 
 # ════════════════════════════════════════════════════════════════════════
+# list_models / list_loras tool surfaces (slice 2 step 4)
+# ════════════════════════════════════════════════════════════════════════
+#
+# These are the agent's discovery channel: read-only enumeration of the
+# spawn-time catalog. Inputs are empty objects (`additionalProperties:
+# false`) — the agent calls without arguments and the server returns the
+# kind-filtered slice of the catalog. Vision invariants 8, 9 govern the
+# response shape: name, kind, source — plus model_family (list_models
+# only, when known from scan-time class detection) and target_family
+# (list_loras only, manifest-declared entries only). NO abs_path / path /
+# any filesystem string under any other key.
+
+_LIST_MODELS_TOOL_DESCRIPTION = """\
+Enumerate the diffusers-pipeline models the server knows about (the
+`kind:"model"` entries in the spawn-time catalog).
+
+Use this to discover what `model` values `generate` will accept once
+slice-3 migrates `generate` to catalog-resolved name references. In
+slice 2 the catalog is built but `generate` still consumes raw paths,
+so calling `list_models` does NOT yet change how you call `generate`;
+it lets you preview the named surface that will become required input.
+
+Returns a JSON array of `{name, kind, source[, model_family]}` objects:
+- `name`: agent-facing identifier (Unicode-NFC catalog key)
+- `kind`: always `"model"` for this tool
+- `source`: `"scan"` (auto-detected under --model-base) or `"manifest"`
+  (declared in the operator's --catalog file)
+- `model_family`: present when known from scan-time class detection
+  (e.g. `"qwen-image"`, `"flux2"`, `"chroma"`); absent for entries the
+  server could not classify
+
+No inputs. No path-typed fields ever appear in the response.
+"""
+
+_LIST_MODELS_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {},
+}
+
+_LIST_LORAS_TOOL_DESCRIPTION = """\
+Enumerate the LoRA adapters the server knows about (the `kind:"lora"`
+entries in the spawn-time catalog).
+
+Use this to discover what LoRA names can be cited once slice-3 migrates
+`generate.loras[].path` to catalog-resolved name references. In slice 2
+the catalog is built but `generate` still consumes raw `.path` strings;
+calling `list_loras` previews the named surface that will become
+canonical input.
+
+Returns a JSON array of `{name, kind, source[, target_family]}` objects:
+- `name`: agent-facing identifier (Unicode-NFC catalog key)
+- `kind`: always `"lora"` for this tool
+- `source`: `"scan"` (file found under --model-base/loras) or
+  `"manifest"` (declared in the operator's --catalog file)
+- `target_family`: present ONLY for manifest entries that explicitly
+  declared a target diffusion family (e.g. `"qwen-image"`). Scan-
+  derived LoRAs omit this field — there is no inference from
+  filesystem layout or weight introspection in this slice.
+
+No inputs. No path-typed fields ever appear in the response.
+"""
+
+_LIST_LORAS_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {},
+}
+
+
+# ════════════════════════════════════════════════════════════════════════
 # Audit-line writer  (invariants 4, 5)
 # ════════════════════════════════════════════════════════════════════════
 
@@ -237,6 +308,7 @@ def _emit_audit_line(
     status: str,
     error_class: Optional[str] = None,
     elapsed_seconds: Optional[float] = None,
+    result_count: Optional[int] = None,
 ) -> None:
     """Write one structured audit line to stderr.
 
@@ -250,6 +322,12 @@ def _emit_audit_line(
     The payload is the raw argument dict passed to the tool (or an empty
     dict if the call failed before argument resolution). Path-typed
     fields are retained verbatim per invariant 5.
+
+    `result_count` is the slice-2 step-4 invariant-19 hook: `list_*`
+    handlers pass the number of entries returned to the agent so the
+    audit line carries tool + count + status + elapsed without exposing
+    the catalog's `abs_path` values. Omit (default `None`) for tools
+    where it does not apply (e.g. `generate`).
     """
     redacted = {k: v for k, v in payload.items() if k not in _AUDIT_DROPPED_FIELDS}
     line: dict[str, Any] = {
@@ -261,6 +339,8 @@ def _emit_audit_line(
         line["error_class"] = error_class
     if elapsed_seconds is not None:
         line["elapsed_seconds"] = round(elapsed_seconds, 3)
+    if result_count is not None:
+        line["count"] = result_count
     try:
         sys.stderr.write(json.dumps(line, default=str) + "\n")
         sys.stderr.flush()
@@ -420,12 +500,33 @@ def _validate_startup_args(
 # ════════════════════════════════════════════════════════════════════════
 
 async def _list_tools_impl(cfg: _StartupConfig) -> list[Tool]:
-    """Invariant 6: advertise exactly ONE tool in slice 1: `generate`."""
-    return [Tool(
-        name="generate",
-        description=_GENERATE_TOOL_DESCRIPTION,
-        inputSchema=_GENERATE_INPUT_SCHEMA,
-    )]
+    """Slice-2 invariant 8 (updates slice-1 invariant 6): advertise exactly
+    THREE tools — `generate` (slice 1, schema and description unchanged
+    per Vision invariant 14), `list_models` (slice 2 step 4, catalog
+    discovery for `kind:"model"` entries), and `list_loras` (slice 2
+    step 4, catalog discovery for `kind:"lora"` entries).
+
+    `kind:"transformer"` catalog entries exist post-spawn but are NOT
+    exposed by either slice-2 tool (Vision invariant 9 / N27); they
+    remain dormant until slice 2b adds `list_transformers`.
+    """
+    return [
+        Tool(
+            name="generate",
+            description=_GENERATE_TOOL_DESCRIPTION,
+            inputSchema=_GENERATE_INPUT_SCHEMA,
+        ),
+        Tool(
+            name="list_models",
+            description=_LIST_MODELS_TOOL_DESCRIPTION,
+            inputSchema=_LIST_MODELS_INPUT_SCHEMA,
+        ),
+        Tool(
+            name="list_loras",
+            description=_LIST_LORAS_TOOL_DESCRIPTION,
+            inputSchema=_LIST_LORAS_INPUT_SCHEMA,
+        ),
+    ]
 
 
 class _MCPHandlerError(Exception):
@@ -462,26 +563,51 @@ async def _call_tool_impl(
     tracebacks) never sees raw exception text (step-1 reviewer F1/F4).
     """
     t0 = time.monotonic()
+    # `result_count` only applies to list_* tools (invariant 19); stays
+    # None for generate and for any error path. _emit_audit_line omits
+    # the field from the audit JSON when None.
+    result_count: Optional[int] = None
+
+    # `list_models` / `list_loras` accept no inputs by schema (empty
+    # `properties` + `additionalProperties: false`). The framework
+    # decorator uses `validate_input=False` so the handler must defend
+    # itself; the list_* handlers ignore `arguments` entirely. To
+    # prevent an agent from flooding the operator's audit stream by
+    # passing arbitrarily large `arguments` to a tool that ignores
+    # them, the audit payload for these two tools is reduced to `{}` —
+    # the audit line still records the call (one line per invocation
+    # per invariant 5) without echoing the unbounded blob. (security-
+    # auditor slice-2 step-4 LOW-1, folded 2026-05-25.)
+    if name in ("list_models", "list_loras"):
+        audit_payload: dict = {}
+    else:
+        audit_payload = arguments
 
     try:
-        if name != "generate":
+        if name == "generate":
+            if "cascade_config" in arguments:
+                result = await _handle_generate_cascade(cfg, arguments)
+            else:
+                result = await _handle_generate(cfg, arguments)
+        elif name == "list_models":
+            result, result_count = await _handle_list_models(cfg)
+        elif name == "list_loras":
+            result, result_count = await _handle_list_loras(cfg)
+        else:
             raise _MCPHandlerError(
                 "UnknownTool",
                 f"Unknown tool: {name!r}",
             )
 
-        if "cascade_config" in arguments:
-            result = await _handle_generate_cascade(cfg, arguments)
-        else:
-            result = await _handle_generate(cfg, arguments)
         _emit_audit_line(
-            name, arguments, status="ok",
+            name, audit_payload, status="ok",
             elapsed_seconds=time.monotonic() - t0,
+            result_count=result_count,
         )
         return result
     except _MCPHandlerError as e:
         _emit_audit_line(
-            name, arguments, status="error",
+            name, audit_payload, status="error",
             error_class=e.error_class,
             elapsed_seconds=time.monotonic() - t0,
         )
@@ -493,7 +619,7 @@ async def _call_tool_impl(
         # stream); category-shaped sanitized string to the agent.
         safe = _sanitize_error(e, "internal_error")
         _emit_audit_line(
-            name, arguments, status="error",
+            name, audit_payload, status="error",
             error_class="InternalError",
             elapsed_seconds=time.monotonic() - t0,
         )
@@ -929,6 +1055,81 @@ def _resolve_mcp_output_path(
             "validation failed: resolved output_path escaped --output-dir",
         )
     return output_path
+
+
+# ════════════════════════════════════════════════════════════════════════
+# list_models / list_loras handlers  (slice 2 step 4)
+# ════════════════════════════════════════════════════════════════════════
+#
+# Vision invariant 9 contract for the response:
+#   - `list_models` returns only `kind:"model"` entries
+#   - `list_loras` returns only `kind:"lora"` entries
+#   - `kind:"transformer"` entries sit in the catalog but are NOT exposed
+#     by either tool (N27 / dormant-until-slice-2b)
+#   - Response entry keys are a strict allowlist:
+#       list_models:  {name, kind, source} + model_family (if known)
+#       list_loras:   {name, kind, source} + target_family (manifest-only)
+#   - NO abs_path / path / any other filesystem-string under any key
+#
+# Each returns `(list[TextContent], int)` where the int is the number of
+# entries the agent received. `_call_tool_impl` reads the count and
+# passes it to `_emit_audit_line(result_count=...)` (invariant 19 — the
+# audit line carries count + tool + status + elapsed without exposing
+# any catalog `abs_path`).
+#
+# Both handlers are pure read-only iteration over `cfg.catalog`; the
+# catalog is built once at spawn and is frozen for the server's
+# lifetime (Vision invariant 1).
+
+async def _handle_list_models(
+    cfg: _StartupConfig,
+) -> tuple[list[TextContent], int]:
+    """Enumerate `kind:"model"` catalog entries for the MCP agent."""
+    entries: list[dict[str, Any]] = []
+    for name, entry in cfg.catalog.items():
+        if entry["kind"] != "model":
+            continue
+        # Strict-allowlist serialization: only the keys named in
+        # Vision invariant 9 are written into the response.
+        out: dict[str, Any] = {
+            "name": name,
+            "kind": "model",
+            "source": entry["source"],
+        }
+        model_family = entry.get("model_family")
+        if model_family is not None:
+            out["model_family"] = model_family
+        entries.append(out)
+    # Deterministic ordering for stable agent UX + reproducible audits.
+    entries.sort(key=lambda e: e["name"])
+    body = json.dumps(entries, ensure_ascii=False, separators=(",", ":"))
+    return [TextContent(type="text", text=body)], len(entries)
+
+
+async def _handle_list_loras(
+    cfg: _StartupConfig,
+) -> tuple[list[TextContent], int]:
+    """Enumerate `kind:"lora"` catalog entries for the MCP agent."""
+    entries: list[dict[str, Any]] = []
+    for name, entry in cfg.catalog.items():
+        if entry["kind"] != "lora":
+            continue
+        out: dict[str, Any] = {
+            "name": name,
+            "kind": "lora",
+            "source": entry["source"],
+        }
+        # `target_family` is manifest-only (Vision invariant 9 / N17 /
+        # OQ2 resolution); scan-derived LoRA entries omit the field
+        # entirely — no inference from filesystem layout or weight
+        # introspection in this slice.
+        target_family = entry.get("target_family")
+        if target_family is not None:
+            out["target_family"] = target_family
+        entries.append(out)
+    entries.sort(key=lambda e: e["name"])
+    body = json.dumps(entries, ensure_ascii=False, separators=(",", ":"))
+    return [TextContent(type="text", text=body)], len(entries)
 
 
 # ════════════════════════════════════════════════════════════════════════

@@ -126,6 +126,24 @@ Trigger: first report of the ceiling tripping, OR first commit that adds a model
 family with known-longer generation times. See
 `docs/security/review-server-timeout-brokenpipe-2026-04-24.md` (LOW finding).
 
+**Catalog-name allowlist intentionally narrow** *(2026-05-25)*
+`comfyless/catalog.py:_FORBIDDEN_NAME_CHARS` rejects C0/C1 controls,
+zero-width chars + LRM/RLM (U+200B-200F), bidi overrides (U+202A-202E),
+LINE/PARAGRAPH SEPARATOR (U+2028-2029), and bidi isolates (U+2066-2069)
+at catalog-build time. Codepoints NOT in the set that are plausible
+agent-UX confusables: BOM / ZWNBSP (U+FEFF), SOFT HYPHEN (U+00AD),
+MONGOLIAN VOWEL SEPARATOR (U+180E), INTERLINEAR ANNOTATION (U+FFF9-
+U+FFFB). Under the same-uid stdio trust model, the omission is
+aesthetic/UX (two visually-identical names mapping to distinct entries),
+not an exploit surface — an adversary at the same uid can already plant
+anything. Trigger to revisit: first slice-3 agent UX report of "two
+catalog entries look identical to me but resolve differently"; or any
+threat-model change to multi-tenant MCP transport. Fix shape: extend
+the regex one-liner with `\ufeff\u00ad\u180e\ufff9-\ufffb` (no behaviour
+on existing valid names). Surfaced by slice-2 step-4 security-auditor
+INFO (2026-05-25). See
+`docs/security/review-slice-2-step4-2026-05-25.md`.
+
 ---
 
 ## Dependencies

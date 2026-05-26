@@ -15,7 +15,8 @@ Coverage (slice-1 Vision negative cases):
             a legacy-marker referencing ADR-011 §5
 
 Plus step-1 positive-path / structural coverage:
-  - tools/list advertises exactly ["generate"]    (invariant 6)
+  - tools/list advertises ["generate", "list_models", "list_loras"]
+    (slice-2 step-4 updates slice-1 invariant 6's count from 1 → 3)
   - audit line on tool rejection drops prompt + negative_prompt
                                                    (invariant 5)
   - audit line written to stderr (not stdout)      (invariant 5)
@@ -230,8 +231,11 @@ check("schema: `cascade_config` IS in properties (slot reserved for step 3)",
 
 
 # ════════════════════════════════════════════════════════════════════════
-print("\n== Invariant 6: tools/list returns exactly ['generate'] ==")
+print("\n== Invariant 8 (was slice-1 inv 6): tools/list returns 3 tools ==")
 # ════════════════════════════════════════════════════════════════════════
+# Slice 2 step 4 updates the slice-1 invariant 6 count from 1 → 3:
+# `generate` (slice 1 — schema + description unchanged per Vision
+# invariant 14), `list_models`, `list_loras` (this slice).
 
 with tempfile.TemporaryDirectory() as tmp_out, \
      tempfile.TemporaryDirectory() as tmp_base:
@@ -240,16 +244,26 @@ with tempfile.TemporaryDirectory() as tmp_out, \
         default_model=None, mcp_max_iterations=100,
     )
     tools = _run(mcps._list_tools_impl(cfg))
-    check("list_tools returns one element",
-          isinstance(tools, list) and len(tools) == 1,
+    check("Invariant 8: list_tools returns 3 elements",
+          isinstance(tools, list) and len(tools) == 3,
           detail=f"len={len(tools)}")
-    check("list_tools[0] is a Tool",
-          isinstance(tools[0], Tool))
-    check("list_tools[0].name == 'generate' (invariant 6)",
-          tools[0].name == "generate")
-    check("list_tools[0] has tool-description steering text",
-          tools[0].description and "qwen-image" in tools[0].description.lower(),
-          detail="description should name model families per ADR-011 §2 amendment")
+    check("Invariant 8: every element is a Tool",
+          all(isinstance(t, Tool) for t in tools))
+    _tool_names = sorted(t.name for t in tools)
+    check("Invariant 8: tool names are exactly {generate, list_models, list_loras}",
+          _tool_names == ["generate", "list_loras", "list_models"],
+          detail=f"names={_tool_names}")
+    _tools_by_name = {t.name: t for t in tools}
+    check("Invariant 8: 'generate' tool description still names qwen-image "
+          "(slice-1 description preserved per invariant 14)",
+          _tools_by_name["generate"].description
+          and "qwen-image" in _tools_by_name["generate"].description.lower())
+    check("Invariant 8: 'list_models' tool description names model_family",
+          _tools_by_name["list_models"].description
+          and "model_family" in _tools_by_name["list_models"].description)
+    check("Invariant 8: 'list_loras' tool description names target_family",
+          _tools_by_name["list_loras"].description
+          and "target_family" in _tools_by_name["list_loras"].description)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -2068,8 +2082,8 @@ print("\n== Slice 2 Step 3: --catalog flag + spawn-time wire-up ==")
 #   - I7  startup fails closed on missing / malformed / schema-invalid /
 #         collision / symlink-escape (--catalog channel)
 #   - I13 --catalog declared as click option on main()
-#   - I14 _list_tools_impl still returns exactly ["generate"] (tool growth
-#         lands in Step 4)
+#   - I14 _list_tools_impl tool count is unchanged by catalog content
+#         (post-Step 4: returns the static 3 tools regardless of catalog)
 #   - N1–N7 the catalog-layer fail-closed cases (most are unit-tested in
 #         test_mcp_server's catalog section already; CLI-surface parity
 #         lives here so wiring regressions are caught)
@@ -2271,14 +2285,600 @@ with tempfile.TemporaryDirectory() as tmp_out, \
         check("Step3 S2: manifest entry has source='manifest'",
               cfg.catalog["from-manifest"].get("source") == "manifest")
 
-    # --- I14 carry-forward: tool surface unchanged with populated catalog ---
+    # --- Step-3 wiring carry: tool surface count is the same regardless
+    # of catalog content (Step 3 wires the catalog onto cfg; Step 4 grew
+    # the surface to 3 tools statically — catalog content never changes
+    # the tool LIST, only the responses inside list_models/list_loras).
     tools = _run(mcps._list_tools_impl(cfg))
-    check("Step3 I14: _list_tools_impl with populated catalog still "
-          "returns exactly one tool",
-          isinstance(tools, list) and len(tools) == 1,
+    check("Step3 carry: _list_tools_impl with populated catalog still "
+          "returns the static three tools",
+          isinstance(tools, list) and len(tools) == 3,
           detail=f"len={len(tools)}")
-    check("Step3 I14: that one tool is still 'generate' (no Step-4 leak)",
-          tools and tools[0].name == "generate")
+    _names = sorted(t.name for t in tools)
+    check("Step3 carry: tool names unchanged by catalog content",
+          _names == ["generate", "list_loras", "list_models"],
+          detail=f"names={_names}")
+
+
+# ════════════════════════════════════════════════════════════════════════
+print("\n== Slice 2 Step 4: list_models / list_loras + name sanitization ==")
+# ════════════════════════════════════════════════════════════════════════
+#
+# Invariants exercised here (see docs/vision/slice-2-mcp-catalog.md):
+#   - I8  _list_tools_impl advertises 3 tools (covered by the Inv-8 section
+#         near the top of this file; not duplicated here)
+#   - I9  list_*  response shape: strict-allowlist keys; no abs_path
+#   - I10 audit line on every list_* call (count + status + elapsed)
+#   - I11 traceback strip on list_* internal exceptions
+#   - I14 generate's schema + description byte-identical to slice 1
+#   - N16-N20, N22-N23, N27 + Step-2 INFO-2 fold (name-char sanitization)
+
+
+# --- Step-4 fixture builder: multi-kind catalog used by several cases ---
+
+def _build_step4_catalog(mb: str) -> tuple[str, dict]:
+    """Plant a multi-kind catalog under `mb`. Returns (manifest_path, info)
+    where `info` documents the expected catalog membership.
+
+    Plants:
+      scan side:
+        - fixture-model/model_index.json         -> kind:"model"
+        - loras/scan-lora.safetensors            -> kind:"lora"
+        - checkpoints/scan-transformer.safetensors -> kind:"transformer"
+      manifest side:
+        - "Manifest-LoRA"  -> manifest-lora.safetensors with target_family
+        - "Manifest-Model" -> manifest-model/ (no model_index.json)
+    """
+    # Scan: model
+    model_dir = os.path.join(mb, "fixture-model")
+    os.makedirs(model_dir)
+    with open(os.path.join(model_dir, "model_index.json"), "w",
+              encoding="utf-8") as f:
+        json.dump({"_class_name": "QwenImagePipeline"}, f)
+
+    # Scan: lora
+    loras_dir = os.path.join(mb, "loras")
+    os.makedirs(loras_dir)
+    open(os.path.join(loras_dir, "scan-lora.safetensors"), "wb").close()
+
+    # Scan: transformer (single-file safetensors under checkpoints/)
+    checkpoints_dir = os.path.join(mb, "checkpoints")
+    os.makedirs(checkpoints_dir)
+    open(os.path.join(checkpoints_dir, "scan-transformer.safetensors"),
+         "wb").close()
+
+    # Manifest entries — both under mb but NOT in a scan-dispatched dir
+    manifest_lora_path = os.path.join(mb, "manifest-lora.safetensors")
+    open(manifest_lora_path, "wb").close()
+    manifest_model_dir = os.path.join(mb, "manifest-model")
+    os.makedirs(manifest_model_dir)  # no model_index.json -> scan skips
+
+    manifest_path = os.path.join(mb, "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "Manifest-LoRA": {
+                "target": manifest_lora_path,
+                "kind": "lora",
+                "target_family": "qwen-image",
+            },
+            "Manifest-Model": {
+                "target": manifest_model_dir,
+                "kind": "model",
+                "model_family": "flux2",
+            },
+        }, f)
+    return manifest_path, {
+        "expected_models": {"fixture-model", "Manifest-Model"},
+        "expected_loras": {"scan-lora", "Manifest-LoRA"},
+        "expected_transformers": {"scan-transformer"},
+    }
+
+
+# --- N16: list_models response shape ---
+
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    manifest, info = _build_step4_catalog(tmp_base)
+    cfg = mcps._validate_startup_args(
+        output_dir=tmp_out, model_base=tmp_base,
+        default_model=None, mcp_max_iterations=100,
+        catalog=manifest,
+    )
+    result, count = _run(mcps._handle_list_models(cfg))
+    check("N16: _handle_list_models returns (list[TextContent], int)",
+          isinstance(result, list) and len(result) == 1
+          and result[0].type == "text" and isinstance(count, int))
+    entries = json.loads(result[0].text)
+    check("N16: list_models returns a JSON array",
+          isinstance(entries, list))
+    check("N16: list_models entry count matches expected_models",
+          {e["name"] for e in entries} == info["expected_models"],
+          detail=f"got={sorted(e['name'] for e in entries)}")
+    check("N16: count from handler matches len(entries)",
+          count == len(entries), detail=f"count={count} len={len(entries)}")
+    _allowed_keys = {"name", "kind", "source", "model_family"}
+    _bad_entries = [e for e in entries if not set(e.keys()).issubset(_allowed_keys)]
+    check("N16: every entry's keys subset of {name, kind, source, model_family}",
+          not _bad_entries,
+          detail=f"bad={_bad_entries!r}")
+    check("N16: NO entry contains 'abs_path' or 'path' key",
+          not any("abs_path" in e or "path" in e for e in entries))
+    check("N16: every entry has kind='model'",
+          all(e["kind"] == "model" for e in entries))
+    # The Manifest-Model fixture declared model_family='flux2' explicitly
+    _manifest_model = next((e for e in entries if e["name"] == "Manifest-Model"), None)
+    if _manifest_model is not None:
+        check("N16: manifest-declared model_family surfaces",
+              _manifest_model.get("model_family") == "flux2",
+              detail=f"got={_manifest_model!r}")
+
+
+# --- N17: list_loras response shape + target_family manifest-only ---
+
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    manifest, info = _build_step4_catalog(tmp_base)
+    cfg = mcps._validate_startup_args(
+        output_dir=tmp_out, model_base=tmp_base,
+        default_model=None, mcp_max_iterations=100,
+        catalog=manifest,
+    )
+    result, count = _run(mcps._handle_list_loras(cfg))
+    entries = json.loads(result[0].text)
+    check("N17: list_loras entry names match expected_loras",
+          {e["name"] for e in entries} == info["expected_loras"],
+          detail=f"got={sorted(e['name'] for e in entries)}")
+    _allowed_keys = {"name", "kind", "source", "target_family"}
+    _bad = [e for e in entries if not set(e.keys()).issubset(_allowed_keys)]
+    check("N17: every entry's keys subset of {name, kind, source, target_family}",
+          not _bad, detail=f"bad={_bad!r}")
+    check("N17: NO entry contains 'abs_path' or 'path'",
+          not any("abs_path" in e or "path" in e for e in entries))
+    check("N17: every entry has kind='lora'",
+          all(e["kind"] == "lora" for e in entries))
+    _scan_lora = next((e for e in entries if e["name"] == "scan-lora"), None)
+    _manifest_lora = next((e for e in entries if e["name"] == "Manifest-LoRA"), None)
+    check("N17: scan-derived LoRA omits target_family entirely (no inference)",
+          _scan_lora is not None and "target_family" not in _scan_lora,
+          detail=f"got={_scan_lora!r}")
+    check("N17: manifest-declared target_family surfaces",
+          _manifest_lora is not None
+          and _manifest_lora.get("target_family") == "qwen-image",
+          detail=f"got={_manifest_lora!r}")
+
+
+# --- N18: HF + local entries both surface only names ---
+#
+# We don't have a guaranteed-local HF cache hit in CI; emulate by
+# constructing the catalog DIRECTLY (bypass build_catalog) with one
+# entry whose abs_path is an HF-cache-shaped string and another with a
+# local filesystem-style abs_path. Asserts that the response serializer
+# never echoes either path under any key.
+
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    cfg = mcps._validate_startup_args(
+        output_dir=tmp_out, model_base=tmp_base,
+        default_model=None, mcp_max_iterations=100,
+    )
+    # Inject directly — bypasses normalize_name / _add_entry validation
+    # for the sake of the no-abs_path-leak property.
+    cfg.catalog["hf-repo-style"] = {
+        "abs_path": "/var/cache/hf/Qwen/Qwen-Image-2512/snapshots/abcd1234",
+        "kind": "model", "source": "manifest",
+        "model_family": "qwen-image", "target_family": None,
+    }
+    cfg.catalog["local-style"] = {
+        "abs_path": "/mnt/nvme-8tb/comfyui/checkpoints/local-model",
+        "kind": "model", "source": "scan",
+        "model_family": None, "target_family": None,
+    }
+    result, _ = _run(mcps._handle_list_models(cfg))
+    body = result[0].text
+    check("N18: HF-style abs_path does NOT appear in list_models text",
+          "/var/cache/hf/Qwen" not in body and "snapshots/abcd1234" not in body,
+          detail=f"body={body!r}")
+    check("N18: local-style abs_path does NOT appear in list_models text",
+          "/mnt/nvme-8tb" not in body
+          and "comfyui/checkpoints/local-model" not in body,
+          detail=f"body={body!r}")
+    entries = json.loads(body)
+    _by_name = {e["name"]: e for e in entries}
+    check("N18: hf-repo-style entry surfaces its name only (no path)",
+          "hf-repo-style" in _by_name
+          and _by_name["hf-repo-style"].get("model_family") == "qwen-image"
+          and "abs_path" not in _by_name["hf-repo-style"])
+    check("N18: local-style entry surfaces its name only (no path)",
+          "local-style" in _by_name
+          and "abs_path" not in _by_name["local-style"])
+
+
+# --- N19: list_models audit line carries count + tool + status + elapsed
+# but does NOT carry any catalog abs_path or repo ID ---
+
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    manifest, _ = _build_step4_catalog(tmp_base)
+    cfg = mcps._validate_startup_args(
+        output_dir=tmp_out, model_base=tmp_base,
+        default_model=None, mcp_max_iterations=100,
+        catalog=manifest,
+    )
+    captured_err = io.StringIO()
+    with unittest.mock.patch.object(sys, "stderr", captured_err):
+        _run(mcps._call_tool_impl(cfg, "list_models", {}))
+    audit_text = captured_err.getvalue().strip()
+    # Should be exactly one JSON line
+    _audit_lines = [ln for ln in audit_text.splitlines() if ln.startswith("{")]
+    check("N19: exactly one audit line emitted for list_models",
+          len(_audit_lines) == 1,
+          detail=f"lines={_audit_lines!r}")
+    if len(_audit_lines) == 1:
+        line = json.loads(_audit_lines[0])
+        check("N19: audit line tool=list_models",
+              line.get("tool") == "list_models")
+        check("N19: audit line status=ok",
+              line.get("status") == "ok")
+        check("N19: audit line carries 'count' field",
+              "count" in line and isinstance(line["count"], int))
+        check("N19: audit line carries 'elapsed_seconds' field",
+              "elapsed_seconds" in line)
+        check("N19: audit line does NOT contain any catalog abs_path",
+              tmp_base not in _audit_lines[0],
+              detail=f"line={_audit_lines[0]!r}")
+        # The manifest target is an HF-repo-shaped string in some Step-4
+        # cases. For this fixture it's a local path; assert no path
+        # fragment leaks.
+        check("N19: audit line does NOT contain 'manifest-lora.safetensors'",
+              "manifest-lora.safetensors" not in _audit_lines[0])
+
+
+# --- N19b: list_* audit-payload bound (security-auditor LOW-1 fold) ---
+# list_models / list_loras accept no inputs by schema. The framework
+# decorator uses validate_input=False, so an agent CAN send arbitrary
+# `arguments` to a list_* call. The handlers ignore them by signature
+# (they take only `cfg`). To prevent the audit stream from being
+# flooded with arbitrarily large agent payloads to a tool that ignores
+# them, _call_tool_impl reduces the audit-line `input` to {} for these
+# two tools — the call is still audited (one line, invariant 5), the
+# blob is not echoed.
+
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    cfg = mcps._validate_startup_args(
+        output_dir=tmp_out, model_base=tmp_base,
+        default_model=None, mcp_max_iterations=100,
+    )
+    flood_blob = "A" * 10_000
+    flood_args = {"unexpected_key": flood_blob, "nested": {"deep": flood_blob}}
+    captured_err = io.StringIO()
+    with unittest.mock.patch.object(sys, "stderr", captured_err):
+        # Both list_* tools — handlers ignore args, audit emits {}
+        _run(mcps._call_tool_impl(cfg, "list_models", flood_args))
+        _run(mcps._call_tool_impl(cfg, "list_loras", flood_args))
+    _stderr = captured_err.getvalue()
+    check("N19b: list_models audit line does NOT echo the flood blob",
+          flood_blob not in _stderr,
+          detail=f"first 200 chars of stderr: {_stderr[:200]!r}")
+    check("N19b: list_models audit line does NOT echo 'unexpected_key'",
+          "unexpected_key" not in _stderr)
+    _audit_lines = [json.loads(ln) for ln in _stderr.splitlines()
+                    if ln.startswith("{")]
+    check("N19b: both list_* audit lines emitted",
+          len(_audit_lines) == 2,
+          detail=f"got={len(_audit_lines)} lines")
+    if len(_audit_lines) == 2:
+        check("N19b: every list_* audit line has input={} (no payload echo)",
+              all(line.get("input") == {} for line in _audit_lines),
+              detail=f"inputs={[line.get('input') for line in _audit_lines]!r}")
+        check("N19b: every list_* audit line still carries status=ok + count",
+              all(line.get("status") == "ok" and "count" in line
+                  for line in _audit_lines))
+
+# Sanity carry: `generate`-tool audit payload still echoes agent args
+# (that surface accepts inputs by schema; bounding it would lose
+# operator-visible signal for legitimate calls). This guards against a
+# regression where the audit_payload bound accidentally widens to
+# generate.
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    cfg = mcps._validate_startup_args(
+        output_dir=tmp_out, model_base=tmp_base,
+        default_model=None, mcp_max_iterations=100,
+    )
+    captured_err = io.StringIO()
+    raised = None
+    with unittest.mock.patch.object(sys, "stderr", captured_err):
+        try:
+            _run(mcps._call_tool_impl(cfg, "generate",
+                                     {"prompt": "p", "model": "/etc/passwd"}))
+        except ValueError as e:
+            raised = str(e)
+    _stderr = captured_err.getvalue()
+    check("N19b carry: 'generate' audit line DOES echo agent arguments "
+          "(only list_* are bounded)",
+          "/etc/passwd" in _stderr,
+          detail=f"stderr[:300]={_stderr[:300]!r}")
+
+
+# --- N20: tools/list returns 3 tools; generate's schema + description
+# byte-identical to slice 1 (compared against the unchanged constant) ---
+
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    cfg = mcps._validate_startup_args(
+        output_dir=tmp_out, model_base=tmp_base,
+        default_model=None, mcp_max_iterations=100,
+    )
+    tools = _run(mcps._list_tools_impl(cfg))
+    by_name = {t.name: t for t in tools}
+    check("N20: tools/list advertises exactly 3 tools",
+          set(by_name) == {"generate", "list_models", "list_loras"})
+    check("N20: 'generate' inputSchema is byte-identical to _GENERATE_INPUT_SCHEMA "
+          "(slice-1 invariant 14)",
+          by_name["generate"].inputSchema == mcps._GENERATE_INPUT_SCHEMA)
+    check("N20: 'generate' description is byte-identical to _GENERATE_TOOL_DESCRIPTION",
+          by_name["generate"].description == mcps._GENERATE_TOOL_DESCRIPTION)
+    check("N20: 'list_models' inputSchema accepts no inputs "
+          "(empty properties + additionalProperties=False)",
+          by_name["list_models"].inputSchema.get("properties") == {}
+          and by_name["list_models"].inputSchema.get("additionalProperties") is False)
+    check("N20: 'list_loras' inputSchema accepts no inputs",
+          by_name["list_loras"].inputSchema.get("properties") == {}
+          and by_name["list_loras"].inputSchema.get("additionalProperties") is False)
+
+
+# --- N22: traceback strip on list_* internal exceptions ---
+
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    cfg = mcps._validate_startup_args(
+        output_dir=tmp_out, model_base=tmp_base,
+        default_model=None, mcp_max_iterations=100,
+    )
+
+    def _boom_with_secret(*_a, **_kw):
+        raise RuntimeError(
+            "/home/gawkahn/private/should-not-leak.txt: synthetic failure"
+        )
+
+    captured_err = io.StringIO()
+    agent_facing_msg = None
+    with unittest.mock.patch.object(sys, "stderr", captured_err), \
+         unittest.mock.patch.object(mcps, "_handle_list_models",
+                                    _boom_with_secret):
+        try:
+            _run(mcps._call_tool_impl(cfg, "list_models", {}))
+        except ValueError as e:
+            agent_facing_msg = str(e)
+    check("N22: list_models internal exception surfaces as ValueError "
+          "(framework-level sanitized shape)",
+          agent_facing_msg is not None,
+          detail=f"msg={agent_facing_msg!r}")
+    if agent_facing_msg is not None:
+        check("N22: agent-facing message does NOT contain 'Traceback'",
+              "Traceback" not in agent_facing_msg)
+        check("N22: agent-facing message does NOT contain '.py:' patterns",
+              not re.search(r"\.py:\d+", agent_facing_msg))
+        check("N22: agent-facing message does NOT contain absolute /home/ path",
+              "/home/" not in agent_facing_msg)
+        check("N22: agent-facing message does NOT leak the secret-path string",
+              "should-not-leak" not in agent_facing_msg)
+        check("N22: agent-facing message has 'internal_error: RuntimeError' shape",
+              "internal_error" in agent_facing_msg
+              and "RuntimeError" in agent_facing_msg)
+    # Stderr SHOULD have the full traceback (operator visibility)
+    stderr_text = captured_err.getvalue()
+    check("N22: stderr captures the full traceback for operator audit",
+          "Traceback" in stderr_text and "should-not-leak.txt" in stderr_text)
+    # Audit line should be on stderr too, with error status
+    _audit_lines = [ln for ln in stderr_text.splitlines()
+                    if ln.startswith('{"tool":')]
+    check("N22: audit line emitted with status=error + error_class=InternalError",
+          any(json.loads(ln).get("status") == "error"
+              and json.loads(ln).get("error_class") == "InternalError"
+              for ln in _audit_lines))
+
+
+# --- N23: static-source check — no argparse in mcp_server.py or catalog.py ---
+
+_mcps_src = inspect.getsource(mcps)
+_cat_src = inspect.getsource(cat_mod)
+# Use a line-anchored regex (not a bare substring): docstrings and
+# comments legitimately mention "import argparse" in prose ("this module
+# does NOT import argparse"); the violation is a real import statement.
+_argparse_import_re = re.compile(
+    r"^\s*(?:import argparse\b|from argparse\b)", re.MULTILINE
+)
+check("N23: comfyless/mcp_server.py contains NO 'import argparse' statement",
+      not _argparse_import_re.search(_mcps_src))
+check("N23: comfyless/catalog.py contains NO 'import argparse' statement",
+      not _argparse_import_re.search(_cat_src))
+# AST-level sanity: parse the modules and verify there is no Import
+# node for argparse anywhere.
+for label, src in (("mcp_server", _mcps_src), ("catalog", _cat_src)):
+    _tree = ast.parse(src)
+    _argparse_imports = [
+        n for n in ast.walk(_tree)
+        if (isinstance(n, ast.Import)
+            and any(a.name == "argparse" for a in n.names))
+        or (isinstance(n, ast.ImportFrom) and n.module == "argparse")
+    ]
+    check(f"N23: AST of {label} has no argparse imports",
+          not _argparse_imports)
+
+
+# --- N27: kind:"transformer" entries present in catalog but hidden
+# from both list_models and list_loras ---
+
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    manifest, info = _build_step4_catalog(tmp_base)
+    cfg = mcps._validate_startup_args(
+        output_dir=tmp_out, model_base=tmp_base,
+        default_model=None, mcp_max_iterations=100,
+        catalog=manifest,
+    )
+    # Catalog contains the transformer entry
+    check("N27: catalog contains kind:'transformer' entries (dormant slot)",
+          any(e["kind"] == "transformer" for e in cfg.catalog.values()))
+    _models, _ = _run(mcps._handle_list_models(cfg))
+    _loras, _ = _run(mcps._handle_list_loras(cfg))
+    _models_entries = json.loads(_models[0].text)
+    _loras_entries = json.loads(_loras[0].text)
+    check("N27: list_models response has NO transformer entries",
+          not any(e["kind"] == "transformer" for e in _models_entries))
+    check("N27: list_loras response has NO transformer entries",
+          not any(e["kind"] == "transformer" for e in _loras_entries))
+    check("N27: scan-transformer NOT in list_models response",
+          "scan-transformer" not in {e["name"] for e in _models_entries})
+    check("N27: scan-transformer NOT in list_loras response",
+          "scan-transformer" not in {e["name"] for e in _loras_entries})
+
+
+# --- Empty-catalog edge case (N13 from Vision, list_* shape) ---
+
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    cfg = mcps._validate_startup_args(
+        output_dir=tmp_out, model_base=tmp_base,
+        default_model=None, mcp_max_iterations=100,
+    )
+    _m_result, _m_count = _run(mcps._handle_list_models(cfg))
+    _l_result, _l_count = _run(mcps._handle_list_loras(cfg))
+    check("Empty catalog: list_models returns empty JSON array, count=0",
+          json.loads(_m_result[0].text) == [] and _m_count == 0)
+    check("Empty catalog: list_loras returns empty JSON array, count=0",
+          json.loads(_l_result[0].text) == [] and _l_count == 0)
+
+
+# --- list_* through full _call_tool_impl dispatch (success path) ---
+
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    manifest, info = _build_step4_catalog(tmp_base)
+    cfg = mcps._validate_startup_args(
+        output_dir=tmp_out, model_base=tmp_base,
+        default_model=None, mcp_max_iterations=100,
+        catalog=manifest,
+    )
+    captured_err = io.StringIO()
+    with unittest.mock.patch.object(sys, "stderr", captured_err):
+        models_response = _run(mcps._call_tool_impl(cfg, "list_models", {}))
+        loras_response = _run(mcps._call_tool_impl(cfg, "list_loras", {}))
+    check("Dispatch: _call_tool_impl('list_models') returns list[TextContent]",
+          isinstance(models_response, list) and len(models_response) == 1
+          and models_response[0].type == "text")
+    check("Dispatch: _call_tool_impl('list_loras') returns list[TextContent]",
+          isinstance(loras_response, list) and len(loras_response) == 1
+          and loras_response[0].type == "text")
+    # Sanity: both response bodies are valid JSON arrays
+    check("Dispatch: list_models response body is a JSON array",
+          isinstance(json.loads(models_response[0].text), list))
+    check("Dispatch: list_loras response body is a JSON array",
+          isinstance(json.loads(loras_response[0].text), list))
+
+
+# --- Step-2 INFO-2 fold: catalog-name sanitization at build time ---
+#
+# Rejects C0/C1 controls, zero-width chars, bidi overrides/isolates,
+# and LINE/PARAGRAPH SEPARATOR in catalog names (manifest keys here;
+# scan-derived names cannot easily plant most of these via tempfile).
+#
+# Test inputs use \uXXXX escapes (NOT literal bidi/zw characters in
+# source) so semgrep's bidi-detection rule does not flag this file on
+# every edit. Python decodes the escapes at parse time, so the runtime
+# strings DO contain the hostile codepoints that the catalog rejects.
+
+def _build_with_manifest_key(mb: str, bad_name: str) -> None:
+    """Helper: write a manifest with one entry keyed by `bad_name`, then
+    call build_catalog. Should raise CatalogBuildError."""
+    target = os.path.join(mb, "manifest-lora.safetensors")
+    open(target, "wb").close()
+    manifest_path = os.path.join(mb, "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump({bad_name: {"target": target, "kind": "lora"}}, f)
+    cat_mod.build_catalog(mb, manifest_path)
+
+# Sanity: a clean manifest key succeeds
+with tempfile.TemporaryDirectory() as tmp_base:
+    _ok = False
+    try:
+        _build_with_manifest_key(tmp_base, "clean-name_123")
+        _ok = True
+    except cat_mod.CatalogBuildError:
+        pass
+    check("Sanitize: clean manifest key 'clean-name_123' is accepted",
+          _ok)
+
+# Helper for sanitize cases: assert both exception type AND that the
+# error message names the `_add_entry` gate. A future refactor that
+# reorders gates (e.g., adding an earlier NUL-pre-check inside
+# _parse_manifest_entry) could change WHICH gate caught the bad name,
+# and the resulting message would no longer mention "forbidden
+# character" \u2014 surfacing the regression here rather than silently. See
+# code-reviewer slice-2 step-4 LOW-2 (2026-05-25).
+def _check_sanitize_reject(name: str, bad_name: str, mb: str) -> None:
+    raised = None
+    try:
+        _build_with_manifest_key(mb, bad_name)
+    except cat_mod.CatalogBuildError as e:
+        raised = e
+    except BaseException as e:
+        raised = f"UNEXPECTED-{type(e).__name__}: {e}"
+    check(f"{name} -> CatalogBuildError",
+          isinstance(raised, cat_mod.CatalogBuildError),
+          detail=f"raised={raised!r}")
+    check(f"{name} -> error message names 'forbidden character' "
+          f"(proves the _add_entry gate fired, not some other reject)",
+          isinstance(raised, cat_mod.CatalogBuildError)
+          and "forbidden character" in str(raised),
+          detail=f"raised={raised!r}")
+
+# Reject NUL byte (C0)
+with tempfile.TemporaryDirectory() as tmp_base:
+    _check_sanitize_reject(
+        "Sanitize: manifest key with NUL byte", "foo\x00bar", tmp_base
+    )
+
+# Reject DEL / C1 controls
+with tempfile.TemporaryDirectory() as tmp_base:
+    _check_sanitize_reject(
+        "Sanitize: manifest key with C1 control", "foo\x9fbar", tmp_base
+    )
+
+# Reject zero-width chars (U+200B..U+200F)
+with tempfile.TemporaryDirectory() as tmp_base:
+    _check_sanitize_reject(
+        "Sanitize: manifest key with zero-width space",
+        "foo\u200bbar", tmp_base,
+    )
+
+# Reject bidi override formatting (U+202A..U+202E)
+with tempfile.TemporaryDirectory() as tmp_base:
+    _check_sanitize_reject(
+        "Sanitize: manifest key with RLO bidi override",
+        "foo\u202ebar", tmp_base,
+    )
+
+# Reject LINE SEPARATOR (U+2028)
+with tempfile.TemporaryDirectory() as tmp_base:
+    _check_sanitize_reject(
+        "Sanitize: manifest key with LINE SEPARATOR",
+        "foo\u2028bar", tmp_base,
+    )
+
+# Reject bidi isolate (U+2066..U+2069)
+with tempfile.TemporaryDirectory() as tmp_base:
+    _check_sanitize_reject(
+        "Sanitize: manifest key with LRI bidi isolate",
+        "foo\u2066bar", tmp_base,
+    )
+
+# Module-level: _FORBIDDEN_NAME_CHARS is a compiled regex
+check("Sanitize: _FORBIDDEN_NAME_CHARS is a compiled regex",
+      hasattr(cat_mod, "_FORBIDDEN_NAME_CHARS")
+      and hasattr(cat_mod._FORBIDDEN_NAME_CHARS, "search"))
 
 
 # ════════════════════════════════════════════════════════════════════════

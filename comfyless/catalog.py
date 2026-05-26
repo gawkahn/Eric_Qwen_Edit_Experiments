@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import unicodedata
 from typing import Dict, Iterator, Literal, Optional, Tuple, TypedDict
 
@@ -189,6 +190,47 @@ class CatalogBuildError(ValueError):
     """
 
 
+# Forbidden characters in catalog names. Step-2 INFO-2 forward-pointer
+# resolution (slice 2 step 4 / 2026-05-25): catalog names flow into the
+# agent-facing `list_*` JSON responses AND form the round-trip key the
+# slice-3 reference resolution will look up. Rejecting these classes at
+# build time means every consumer downstream is safe by construction
+# (no per-tool output sanitizer; the catalog key, error messages, audit
+# lines, and MCP-frame `name` field all agree on the same value).
+#
+# Rejected codepoint ranges (codepoints listed by hex only -- no literal
+# bidi/zw characters appear in this source file, so bidi-detection
+# scanners do not need to flag this module):
+#   - U+0000..U+001F  C0 controls (NUL, TAB, LF, CR, ...)
+#   - U+007F..U+009F  DEL + C1 controls
+#   - U+200B..U+200F  zero-width chars + LRM/RLM
+#   - U+202A..U+202E  bidi override formatting (LRE/RLE/PDF/LRO/RLO)
+#   - U+2028..U+2029  LINE / PARAGRAPH SEPARATOR
+#   - U+2066..U+2069  bidi isolate formatting (LRI/RLI/FSI/PDI)
+#
+# Pattern is a raw string so Python does not pre-decode the \uXXXX
+# escapes; the `re` engine parses them itself. This keeps the source
+# free of literal hostile characters that would trip bidi-detection
+# tools (semgrep CWE-94 rule) on every edit.
+#
+# Threat model (same-uid trust): the operator can already plant arbitrary
+# filenames under `--model-base` and arbitrary keys in the manifest. The
+# reject-at-build-time policy is not an escalation defense; it is an
+# agent-UX / round-trip-property contract. A scan-derived name whose
+# filesystem basename contains a forbidden char fails startup naming the
+# file (operator self-harm channel); a manifest entry with such a key
+# fails likewise.
+_FORBIDDEN_NAME_CHARS = re.compile(
+    r"["
+    r"\x00-\x1f\x7f-\x9f"
+    r"\u200b-\u200f"
+    r"\u202a-\u202e"
+    r"\u2028-\u2029"
+    r"\u2066-\u2069"
+    r"]"
+)
+
+
 def normalize_name(s: str) -> str:
     """Unicode NFC-normalize a catalog name (Vision invariant 3).
 
@@ -198,6 +240,11 @@ def normalize_name(s: str) -> str:
     future slice-3 request-side resolution will call on agent-supplied
     reference names, so catalog keys and request candidates cannot
     disagree on normalization.
+
+    Pure normalizer: does NOT enforce the catalog-name character allowlist
+    (`_FORBIDDEN_NAME_CHARS`). That gate lives in `_add_entry` so it can
+    raise `CatalogBuildError` naming the offending original name; slice-3
+    caller-supplied names will get their own request-time gate.
     """
     return unicodedata.normalize("NFC", s)
 
@@ -226,7 +273,35 @@ def _add_entry(
 
     On collision, raises `CatalogBuildError` with a message naming the
     offending name (operator-visible debugging info).
+
+    Catalog-name character allowlist: any `original_name` containing a
+    forbidden character (C0/C1 controls, zero-width chars, bidi
+    overrides/isolates, LINE/PARAGRAPH SEPARATOR — see
+    `_FORBIDDEN_NAME_CHARS`) raises `CatalogBuildError` at insert time.
+    Centralizing the check here means scan-derived and manifest-derived
+    names both go through the same gate, and downstream consumers
+    (`list_models` / `list_loras` JSON, slice-3 reference lookup) can
+    rely on every catalog key being agent-presentable plain text. Step-2
+    INFO-2 forward-pointer resolution, slice 2 step 4 / 2026-05-25.
     """
+    # Gate runs BEFORE normalize_name (i.e., on the original byte form
+    # the operator supplied). This is safe because every codepoint in
+    # `_FORBIDDEN_NAME_CHARS` is NFC-stable: a format/control character
+    # with no canonical decomposition, and no other BMP codepoint
+    # NFC-decomposes INTO one of these ranges. If a future addition to
+    # `_FORBIDDEN_NAME_CHARS` is NOT NFC-stable (e.g. a precomposed
+    # character that decomposes to a forbidden-range component), this
+    # check must move to AFTER `normalize_name` or be applied to both
+    # forms — otherwise the gate would silently allow the decomposed
+    # form. (code-reviewer slice-2 step-4 LOW-1, folded 2026-05-25.)
+    if _FORBIDDEN_NAME_CHARS.search(original_name):
+        raise CatalogBuildError(
+            f"catalog name {original_name!r} contains a forbidden "
+            f"character (control / bidi-override / zero-width / "
+            f"line-separator); names must be agent-presentable plain "
+            f"text"
+        )
+
     name_norm = normalize_name(original_name)
 
     if name_norm in catalog:
