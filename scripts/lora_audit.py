@@ -77,6 +77,8 @@ _read_safetensors_header = _check_mod._read_safetensors_header
 find_matching_plan = _convert_mod.find_matching_plan
 detect_lora_format = _convert_base_mod.detect_lora_format
 _load_state_dict = _qwen_mod._load_state_dict
+load_lora_with_key_fix = _qwen_mod.load_lora_with_key_fix
+unload_adapters = _qwen_mod.unload_adapters
 
 # ── Tool contract constants ────────────────────────────────────────────
 _TOOL_VERSION = "0.1.0"
@@ -127,6 +129,9 @@ W_EXCLUDED_SYMLINK_ESCAPE = "excluded_symlink_escape"
 W_DANGLING_SYMLINK = "dangling_symlink"
 W_UNREADABLE = "unreadable"
 W_STALE_TMP_FILE = "stale_tmp_file"  # ADR §10 F-2 Option A
+W_DRY_LOAD_BASE_FAILED = "dry_load_base_failed"  # ADR §7
+W_DRY_LOAD_VRAM_CASCADE = "dry_load_vram_cascade_possible"  # ADR §7 F-3
+W_DRY_LOAD_UNLOAD_FAILED = "dry_load_unload_failed"  # ADR §7
 
 _DEFAULT_CONFIG_PATH = Path.home() / ".config" / "lora_audit.toml"
 
@@ -156,6 +161,7 @@ class BaseSpec:
     param_count: int = 0
     param_dict: Optional[dict] = None  # populated lazily by _prepare_bases
     param_names: tuple = ()
+    dry_load_attempted: bool = False  # flipped per-base by _dry_load_per_base (S2)
 
 
 @dataclass
@@ -202,8 +208,8 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="lora_audit",
         description=(
             f"LoRA audit / classify / manifest tool (v{_TOOL_VERSION}). "
-            "S1 of ADR-014 — shape-match classification only; "
-            "--dry-load, --convert, --delete reject at runtime."
+            "S1+S2 of ADR-014 — shape-match classification and optional "
+            "dry-load; --convert, --delete reject at runtime."
         ),
     )
     p.add_argument(
@@ -257,14 +263,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "--output-dir", type=Path, default=None,
         help="Convert output directory (for --convert; S3, not S1).",
     )
-    # S2/S3/S4 flags — parse but reject in S1
+    # S3/S4 flags — parse but reject at runtime
     p.add_argument(
         "--dry-load", action="store_true",
-        help="(S2 of ADR-014; not implemented in S1.)",
+        help="Sequentially load each base pipeline (diffusers, "
+             "local_files_only) and attempt to load every non-WRONG_ARCH "
+             "LoRA against it. Records loaded/applied_modules per base in "
+             "the manifest. Default off; [defaults] dry_load = true in "
+             "config flips the default.",
     )
     p.add_argument(
         "--convert", action="store_true",
-        help="(S3 of ADR-014; not implemented in S1.)",
+        help="(S3 of ADR-014; not implemented in S2.)",
     )
     p.add_argument(
         "--delete", action="store_true",
@@ -504,7 +514,7 @@ def _build_manifest(
         "audited_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "bases": {
             b.name: {
-                "dry_load_attempted": False,
+                "dry_load_attempted": b.dry_load_attempted,
                 "param_count": b.param_count,
                 "path": str(b.path),
             }
@@ -817,6 +827,220 @@ def _prepare_bases(bases: list[BaseSpec], warnings: list[Warning_]) -> None:
         base.param_count = len(names)
 
 
+# ── Dry-load loop (ADR §7) ─────────────────────────────────────────────
+# The `applied=` token format matches the loader's three direct-merge log
+# lines (lora_direct, lokr_direct, loha_direct in eric_qwen_edit_lora.py
+# at lines 1034, 438, 605 — search 'direct merge .weight='). PEFT and
+# pipeline fast-paths don't emit a count; `applied_modules` is None in
+# those cases. If the loader's print format changes, this regex is the
+# single failure point — re-validate against the loader on each upgrade.
+_APPLIED_RE = re.compile(r"applied=(\d+)")
+_ADAPTER_NAME_SAFE_RE = re.compile(r"[^A-Za-z0-9_]")
+
+
+def _parse_applied_modules(captured: str) -> Optional[int]:
+    matches = _APPLIED_RE.findall(captured)
+    if not matches:
+        return None
+    try:
+        return int(matches[-1])
+    except ValueError:
+        return None
+
+
+def _safe_adapter_name(rel_path: str) -> str:
+    stem = Path(rel_path).stem
+    safe = _ADAPTER_NAME_SAFE_RE.sub("_", stem)
+    return safe or "lora"
+
+
+def _load_dry_load_pipeline(base_dir: Path):
+    """Lazy-import diffusers + torch and load the full base pipeline.
+
+    Imports are deferred so non-dry-load runs do not pay the diffusers
+    import cost and so tests can monkey-patch this function. Per ADR §7
+    + project CLAUDE.md `Important Constraints`, `local_files_only=True`
+    is non-negotiable — the audit tool must never phone home.
+
+    DO NOT add a `**kwargs` passthrough or accept a caller-supplied
+    `local_files_only` argument — a future regression that lets a caller
+    shadow this kwarg silently re-opens the network surface.
+    """
+    import torch  # noqa: F401  — used via torch.bfloat16
+    from diffusers import AutoPipelineForText2Image
+    return AutoPipelineForText2Image.from_pretrained(
+        str(base_dir),
+        local_files_only=True,
+        torch_dtype=torch.bfloat16,
+    )
+
+
+def _empty_cuda_cache() -> None:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _dry_load_per_base(
+    audit_root: Path,
+    base: BaseSpec,
+    files: list[FileEntry],
+    warnings: list[Warning_],
+) -> bool:
+    """Sequentially dry-load every applicable LoRA against *base*.
+
+    Returns True iff the base pipeline loaded. On success, mutates
+    each candidate's `verdicts_by_base[base.name]` to include a
+    `dry_load` sub-object `{loaded, applied_modules, reason}` and sets
+    `base.dry_load_attempted = True`. On base-load failure, emits a
+    WARN and returns False without mutating any file's verdict.
+
+    Per-LoRA fault isolation (Vision invariant 9): any exception from
+    `load_lora_with_key_fix` for an individual file is caught and
+    recorded as `loaded=false, reason=<summary>` for that file only;
+    the per-base loop continues.
+    """
+    base_pipeline_root = base.path.parent
+    try:
+        pipe = _load_dry_load_pipeline(base_pipeline_root)
+    except Exception as e:
+        detail = f"{type(e).__name__}: {str(e)[:200]}"
+        warnings.append(Warning_(None, W_DRY_LOAD_BASE_FAILED,
+                                 f"base {base.name!r}: {detail}"))
+        _emit_warn(
+            f"dry-load skipped for base {base.name!r}: {detail}. "
+            f"Falling back to shape-match."
+        )
+        return False
+
+    candidates: list[FileEntry] = []
+    for entry in files:
+        if entry.kind != KIND_LORA:
+            continue
+        if entry.classification in (CLASS_DELETABLE, CLASS_ERROR):
+            continue
+        v = entry.verdicts_by_base.get(base.name) or {}
+        verdict = v.get("verdict")
+        if verdict in ("WRONG_ARCH", "BASE_UNAVAILABLE", "ERROR", None):
+            continue
+        candidates.append(entry)
+
+    _emit_info(
+        f"base {base.name!r}: pipeline loaded; dry-loading "
+        f"{len(candidates)} candidates"
+    )
+
+    used_names: set[str] = set()
+    loaded_adapter_names: list[str] = []
+    for entry in candidates:
+        base_name_safe = _safe_adapter_name(entry.relative_path)
+        adapter_name = base_name_safe
+        suffix = 1
+        while adapter_name in used_names:
+            suffix += 1
+            adapter_name = f"{base_name_safe}_{suffix}"
+        used_names.add(adapter_name)
+
+        abs_path_p = audit_root / entry.relative_path
+        # Re-run scan-time containment per security-auditor M-1: the
+        # symlink target may have changed between scan and dry-load.
+        # `_passes_scan_containment` is realpath + relative_to(audit_root);
+        # the inner TOCTOU between this check and the loader's open is
+        # the same same-uid residual ADR §6 already accepts.
+        recheck_warnings: list[Warning_] = []
+        if not _passes_scan_containment(abs_path_p, audit_root, recheck_warnings):
+            entry.verdicts_by_base[base.name]["dry_load"] = {
+                "applied_modules": None,
+                "loaded": False,
+                "reason": "containment_changed",
+            }
+            continue
+
+        captured = io.StringIO()
+        loaded = False
+        applied_raw: Optional[int] = None
+        reason: Optional[str] = None
+        try:
+            with contextlib.redirect_stdout(captured):
+                loaded = bool(load_lora_with_key_fix(
+                    pipe, str(abs_path_p), adapter_name=adapter_name,
+                ))
+            applied_raw = _parse_applied_modules(captured.getvalue())
+        except Exception as e:
+            # Broad except (not BaseException) preserves KeyboardInterrupt
+            # and SystemExit pass-through while isolating per-file faults
+            # per Vision invariant 9.
+            loaded = False
+            reason = f"{type(e).__name__}: {str(e)[:200]}"
+
+        # `applied_modules` is the merged-module count *on success*. The
+        # direct-merge loader paths print `applied=0, skipped=N` when no
+        # module matched AND return False; folding code-reviewer H-1, we
+        # null out the count whenever `loaded` is False so the downstream
+        # catalog reads `applied_modules` as "what got merged" only.
+        applied = applied_raw if loaded else None
+
+        entry.verdicts_by_base[base.name]["dry_load"] = {
+            "applied_modules": applied,
+            "loaded": loaded,
+            "reason": reason,
+        }
+        if loaded:
+            loaded_adapter_names.append(adapter_name)
+
+    # Unload is logically redundant (the immediately-following `del pipe`
+    # discards the transformer anyway) but kept for loader-faithfulness
+    # per Vision invariant 7 — the unload path is what production code
+    # runs after every LoRA stack swap.
+    if loaded_adapter_names:
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                unload_adapters(pipe, loaded_adapter_names)
+        except Exception as e:
+            warnings.append(Warning_(
+                None, W_DRY_LOAD_UNLOAD_FAILED,
+                f"base {base.name!r}: {type(e).__name__}: {str(e)[:200]}",
+            ))
+
+    del pipe
+    _empty_cuda_cache()
+    base.dry_load_attempted = True
+    return True
+
+
+def _run_dry_load(
+    audit_root: Path,
+    bases: list[BaseSpec],
+    files: list[FileEntry],
+    warnings: list[Warning_],
+) -> None:
+    """Iterate bases and run dry-load per-base. Emits VRAM-cascade warning
+    (ADR §7 F-3) on any base failure that follows an earlier base failure.
+    """
+    runnable = [b for b in bases if b.param_dict is not None]
+    total = len(runnable)
+    any_base_failed = False
+    for idx, base in enumerate(runnable, start=1):
+        _emit_info(f"base {base.name!r} ({idx}/{total}): loading pipeline...")
+        ok = _dry_load_per_base(audit_root, base, files, warnings)
+        if not ok:
+            if any_base_failed:
+                warnings.append(Warning_(
+                    None, W_DRY_LOAD_VRAM_CASCADE,
+                    f"prior base load failed; base {base.name!r} failure "
+                    f"may be a downstream effect, not the base's own problem",
+                ))
+                _emit_warn(
+                    "vram_cascade_possible: prior base load failed; "
+                    "subsequent base failures may be downstream effects, "
+                    "not the base's own problem"
+                )
+            any_base_failed = True
+
+
 # ── Scan loop (Vision invariant 9: per-file fault isolation) ───────────
 def _scan(
     audit_root: Path, bases: list[BaseSpec], warnings: list[Warning_]
@@ -918,14 +1142,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             raise
         return EXIT_STARTUP_FAIL
 
-    if args.dry_load:
-        _emit_error("--dry-load not implemented in S1 — see ADR-014 §15")
-        return EXIT_STARTUP_FAIL
     if args.convert:
-        _emit_error("--convert not implemented in S1 — see ADR-014 §15")
+        _emit_error("--convert not implemented in S2 — see ADR-014 §15")
         return EXIT_STARTUP_FAIL
     if args.delete or args.yes:
-        _emit_error("--delete / --yes not implemented in S1 — see ADR-014 §15")
+        _emit_error("--delete / --yes not implemented in S2 — see ADR-014 §15")
         return EXIT_STARTUP_FAIL
 
     try:
@@ -945,6 +1166,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             config_path = _DEFAULT_CONFIG_PATH
         if config_path is not None:
             config = _load_config(config_path)
+
+    # [defaults] dry_load = true flips the default when CLI didn't pass
+    # --dry-load (per ADR §7). CLI presence always wins; config only
+    # promotes, never demotes.
+    if not args.dry_load and bool(
+        (config.get("defaults") or {}).get("dry_load", False)
+    ):
+        args.dry_load = True
 
     bases = _resolve_bases(config, args.base, args.override_base)
 
@@ -982,6 +1211,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     with contextlib.redirect_stdout(io.StringIO()):
         _prepare_bases(bases, warnings)
         files, error_exit = _scan(audit_root, bases, warnings)
+
+    if args.dry_load:
+        # `_load_dry_load_pipeline` invokes diffusers' from_pretrained
+        # which prints warnings/info to stdout. Wrap the whole loop in
+        # redirect_stdout so the machine-caller stdout contract (Vision
+        # §13 — empty unless --print-manifest, JSON-only otherwise) is
+        # preserved. Per-call loader output is captured separately by
+        # `_dry_load_per_base` for `_applied_modules` parsing.
+        with contextlib.redirect_stdout(io.StringIO()):
+            _run_dry_load(audit_root, bases, files, warnings)
 
     manifest = _build_manifest(
         audit_root=audit_root,

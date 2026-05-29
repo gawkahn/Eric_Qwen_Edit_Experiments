@@ -145,6 +145,29 @@ on existing valid names). Surfaced by slice-2 step-4 security-auditor
 INFO (2026-05-25). See
 `docs/security/review-slice-2-step4-2026-05-25.md`.
 
+**LoRA audit: unbounded captured stdout per dry-load file** *(2026-05-28)*
+`scripts/lora_audit.py:_dry_load_per_base` wraps each `load_lora_with_key_fix`
+call in `contextlib.redirect_stdout(io.StringIO())` and parses the buffer for
+`applied=(\d+)`. The `StringIO` is GC'd after the iteration, but during a
+single file's load it grows unbounded — a pathological loader that prints in a
+loop would consume RAM until OOM. Today's loader does not print in a loop and
+there is no caller-controlled path into the loader's print behavior, so the
+risk is residual. Surfaced by security-auditor S2 review L-2.
+Trigger: any commit that adds caller-controlled formatting strings into the
+loader's logging path, OR any reproducible loader regression that prints
+unbounded output. Fix shape: cap StringIO writes via a custom file-like wrapper
+that raises after N bytes; record `dry_load.reason = "loader_log_overflow"`.
+
+**LoRA audit: `test_dry_load_integration.py` SKIP exits 0** *(2026-05-28)*
+The gated E2E test returns exit code 0 on SKIP. There is no CI today, so a
+"silently skipped" outcome is not detectable, but the moment CI lands the SKIP
+path will report green for runs that should have been gated as "not exercised."
+Fix shape: switch SKIP exits to 77 (autoconf convention) and have the CI
+runner treat 77 as a distinct status. Surfaced by code-reviewer S2 review L-3.
+Trigger: any CI being wired for this repo, OR any sibling test gaining the
+same gating pattern. Fix is a 2-line change in `test_dry_load_integration.py`
+plus a CI runner update.
+
 ---
 
 ## Dependencies
