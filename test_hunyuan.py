@@ -721,6 +721,65 @@ check(
 
 
 # ──────────────────────────────────────────────────────────────────────
+print("── Invariant 4 — comfyless daemon wires vae_tiling through IPC (structural)")
+
+# Structural co-locking for the comfyless daemon path. _handle_generate is
+# hard to unit-instrument cheaply (it reaches into pipe.delete_adapters,
+# LoRA load, savepath resolution); the contract that matters for the
+# tile-VAE-skip slice is "the daemon passes vae_tiling through with the same
+# shape as the one-shot CLI path." These string assertions lock the wire-
+# protocol field, the cache_key membership, and both _load_pipeline call
+# sites against silent regression. Behavior coverage of resolver application
+# lives in the FakePipe test above (which exercises the same _load_pipeline
+# the daemon calls).
+with open("comfyless/server.py") as f:
+    server_src = f.read()
+
+check(
+    "server.py cache_key tuple includes vae_tiling entry",
+    "req.get(\"vae_tiling\")" in server_src,
+)
+# Two _load_pipeline call sites exist in _handle_generate (initial load and
+# LoRA-removal-failure reload path); both must thread vae_tiling.
+check(
+    "server.py threads vae_tiling to BOTH _load_pipeline call sites",
+    server_src.count("vae_tiling=req.get(\"vae_tiling\") or \"auto\"") == 2,
+    f"got {server_src.count('vae_tiling=req.get(\"vae_tiling\") or \"auto\"')} occurrence(s)",
+)
+
+# Client side — _delegate_to_server must include the field in the outbound
+# request dict. Without this, daemon-mode clients silently lose the flag
+# (the request omits it, server sees None → "auto" via the `or "auto"`
+# fallback, which loses any explicit override the operator typed).
+# Reuses cg_src loaded in the I4-structural section above; regex form is
+# whitespace-insensitive so column-alignment changes in the request dict
+# do not silently invalidate the lock (Step 3 code-reviewer minor).
+import re
+check(
+    "comfyless/generate.py _delegate_to_server request dict includes vae_tiling",
+    re.search(r'"vae_tiling"\s*:\s*args\.vae_tiling', cg_src) is not None,
+)
+
+# Lock the deliberate MCP-server omission. comfyless/mcp_server.py L600-606
+# explicitly states that operator-tuning knobs (precision, offload_vae,
+# attention_slicing, sequential_offload, vae_tiling) are NOT exposed on the
+# MCP schema — the LLM agent should not be tuning these per-call. The MCP
+# _load_pipeline call inherits the family-aware "auto" default via the
+# signature default. This assertion catches a future engineer either (a)
+# adding vae_tiling to the MCP schema without acknowledging the design
+# intent, or (b) silently threading args through without updating the
+# comment block. Forces the change to surface here. (Step 3 code-reviewer
+# MEDIUM, security-auditor confirmed: out of scope for this slice; locked.)
+with open("comfyless/mcp_server.py") as f:
+    mcp_src = f.read()
+check(
+    "mcp_server.py does NOT thread vae_tiling (deliberate omission per "
+    "operator-tuning-knob comment at L600-606)",
+    "vae_tiling" not in mcp_src,
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
 print(f"\n────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print(f"────────────────────────────────────────────────")

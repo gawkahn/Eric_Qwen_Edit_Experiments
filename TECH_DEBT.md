@@ -146,6 +146,55 @@ Trigger to revisit: next deliberate change touching `_load_single_weights`,
 4 functions containing these 5 lines), OR any commit that adds support for a new
 checkpoint format that would land in the same helpers.
 
+**vae_tiling value-error reclassification → ValidationError** *(2026-05-28)*
+A client sending `vae_tiling="garbage"` (a string that passes the
+`_RUNTIME_KIND` type validator but fails the enum check inside
+`resolve_vae_tiling`) currently surfaces as `LoadError` rather than the
+correct `ValidationError`. Conflating "model load failed, retry might help"
+with "your request is malformed, stop" is a forward-LLM-safety concern: when
+the MCP/LLM-agent surface exposes `vae_tiling`, an agent's retry-loop
+arithmetic depends on this category distinction. For today's same-uid IPC
+threat model (no LLM agent on this surface), `LoadError` is operationally
+indistinguishable from `ValidationError`. Surfaced by `security-auditor`
+(Opus) on Step 3 of slice `hunyuan-support` (2026-05-28). See
+`docs/security/review-hunyuan-vae-tiling-server-2026-05-28.md` Finding
+MEDIUM #2. Fix shape (when triggered): short-circuit invalid enum values at
+the top of `comfyless/server.py:_handle_generate` with an explicit
+`ValidationError` return, OR introduce a `_KIND_ENUM` validator kind in
+`comfyless/params_validation.py` so the allowed-set check happens at the
+IPC boundary. Trigger to revisit: MCP surface exposes `vae_tiling`, OR any
+slice that adds a second enum-typed wire field that would copy the same
+shape.
+
+**vae_tiling resolver echoes caller-supplied data in ValueError message** *(2026-05-28)*
+`nodes/eric_diffusion_utils.py:89` raises `ValueError(f"vae_tiling must be
+one of {VAE_TILING_CHOICES}, got {flag!r}")` — the `!r` echoes the
+caller-supplied value verbatim into the error string, which IPC returns to
+the client. Today the echo target is a same-uid client; the round-trip is
+local. **Becomes MEDIUM the moment `vae_tiling` is exposed through
+`mcp_server.py`** (project CLAUDE.md "Surfaces that become Red Zone on
+scope change") — an attacker-controlled prompt could attempt indirect
+injection via the echoed value if the MCP error frame flows back into a
+downstream LLM's context. Surfaced by `security-auditor` (Opus) on Step 3
+of slice `hunyuan-support` (2026-05-28). See
+`docs/security/review-hunyuan-vae-tiling-server-2026-05-28.md` Finding LOW.
+Fix shape (when triggered): drop the offending value from the resolver's
+message (the allowed-set message is sufficient), OR redact caller-supplied
+field values at the MCP error-frame surface (match the existing
+`redact_metadata_for_png` pattern in `comfyless/mcp_server.py`). Trigger to
+revisit: MCP surface exposes `vae_tiling` to LLM agents.
+
+**CLAUDE.md "Review bar" debt note for comfyless/server.py is stale** *(2026-05-28)*
+Project `CLAUDE.md` "Review bar" → "Debt" lists no ADR or security review
+exists for `comfyless/server.py` or `resolve_hf_path`, but both surfaces
+have existing 2026-04-23 review artifacts in `docs/security/` (plus
+ADR-001). The 2026-05-28 vae-tiling review explicitly does NOT close the
+prior debt — it covered only the additive `vae_tiling` field. Wording fix:
+"the 2026-04-23 reviews exist; further review required on next material
+change to the surface." Surfaced by `security-auditor` on Step 3 of slice
+`hunyuan-support` (2026-05-28). Out of scope for this slice. Trigger to
+revisit: next CLAUDE.md edit pass.
+
 ---
 
 ## Dependencies

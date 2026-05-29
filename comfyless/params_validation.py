@@ -72,6 +72,7 @@ _RUNTIME_KIND = types.MappingProxyType({
     "offload_vae":        _KIND_BOOL,
     "attention_slicing":  _KIND_BOOL,
     "sequential_offload": _KIND_BOOL,
+    "vae_tiling":         _KIND_STR,
     "savepath":           _KIND_STR,
 })
 

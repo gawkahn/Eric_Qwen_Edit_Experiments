@@ -338,7 +338,16 @@ def _handle_generate(
     req_device    = req.get("device")    or device
 
     # Cache key covers everything that affects pipeline shape; LoRAs are tracked
-    # separately so they can be diffed incrementally.
+    # separately so they can be diffed incrementally. vae_tiling is included so a
+    # client switching the flag mid-session invalidates the cached pipeline
+    # (a `enable_tiling`/`disable_tiling` toggle is cheap but the cache key has
+    # to see the change). Non-string vae_tiling values are rejected at the IPC
+    # boundary by _RUNTIME_KIND ("vae_tiling": _KIND_STR) and never reach here;
+    # empty-string and None collapse to "auto" via the `or` fallback; invalid
+    # non-empty strings (e.g. "garbage") pass through and raise ValueError at
+    # resolve_vae_tiling inside _load_pipeline → caught as LoadError on the wire
+    # below. Value-error → ValidationError reclassification is tracked in
+    # TECH_DEBT.md (deferred to the MCP-rollout slice).
     cache_key = (
         req["model"],
         req_precision,
@@ -351,6 +360,7 @@ def _handle_generate(
         bool(req.get("offload_vae")),
         bool(req.get("attention_slicing")),
         bool(req.get("sequential_offload")),
+        req.get("vae_tiling") or "auto",
     )
 
     # ── Evict on config change ────────────────────────────────────────
@@ -375,6 +385,7 @@ def _handle_generate(
                 vae_from_transformer=bool(req.get("vae_from_transformer")),
                 attention_slicing=bool(req.get("attention_slicing")),
                 sequential_offload=bool(req.get("sequential_offload")),
+                vae_tiling=req.get("vae_tiling") or "auto",
             )
         except Exception as e:
             return {"status": "error", "error_type": "LoadError", "error": str(e)}
@@ -420,6 +431,7 @@ def _handle_generate(
                     vae_from_transformer=bool(req.get("vae_from_transformer")),
                     attention_slicing=bool(req.get("attention_slicing")),
                     sequential_offload=bool(req.get("sequential_offload")),
+                    vae_tiling=req.get("vae_tiling") or "auto",
                 )
             except Exception as e2:
                 return {"status": "error", "error_type": "LoadError", "error": str(e2)}

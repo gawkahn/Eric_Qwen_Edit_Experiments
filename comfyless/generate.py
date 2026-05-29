@@ -1344,6 +1344,7 @@ def _delegate_to_server(
         "offload_vae":         args.offload_vae,
         "attention_slicing":   args.attention_slicing,
         "sequential_offload":  args.sequential_offload,
+        "vae_tiling":          args.vae_tiling,
         "transformer_path":    _abspath(p.get("transformer_path", "")),
         "vae_path":            _abspath(p.get("vae_path", "")),
         "text_encoder_path":   _abspath(p.get("text_encoder_path", "")),

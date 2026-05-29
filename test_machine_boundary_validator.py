@@ -234,6 +234,14 @@ _GRID = [
     ("reject-int-prompt",          base_payload(prompt=42),                               False),
     ("reject-non-dict-payload",    "not a dict",                                          False),
     ("reject-list-payload",        ["not", "a", "dict"],                                  False),
+    # vae_tiling: _KIND_STR — locks the Step 3 security-auditor MEDIUM #1
+    # fix (validator catches non-string at IPC boundary as ValidationError
+    # rather than passing through to LoadError downstream).
+    ("valid-vae-tiling-auto",      base_payload(vae_tiling="auto"),                       True),
+    ("valid-vae-tiling-on",        base_payload(vae_tiling="on"),                         True),
+    ("reject-int-vae-tiling",      base_payload(vae_tiling=42),                           False),
+    ("reject-bool-vae-tiling",     base_payload(vae_tiling=True),                         False),
+    ("reject-dict-vae-tiling",     base_payload(vae_tiling={"x": 1}),                     False),
 ]
 
 for name, payload, expected_ok in _GRID:
