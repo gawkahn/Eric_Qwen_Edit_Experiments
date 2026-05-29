@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test suite for scripts/lora_audit.py (S1 of ADR-014).
+"""Test suite for scripts/lora_audit.py (S1+S2 of ADR-014).
 
 Covers the S1-applicable Vision negative cases:
   #1  path-traversal-audit-root        test_path_traversal_audit_root
@@ -15,18 +15,31 @@ plus S1 review-fold coverage:
       F-8 argv redaction negative      test_redact_argv_no_path_leak
       F-17 output-dir mutex            test_output_dir_mutex_rejected
       --allow-output-outside-root use  test_allow_output_outside_root_usable
+plus S2 dry-load coverage (ADR §7):
+      default-off no pipeline import   test_dry_load_disabled_default_no_pipe_import
+      per-file fault isolation         test_dry_load_per_file_fault_isolation
+      base-load failure fallback       test_dry_load_base_load_failure_falls_back
+      VRAM-cascade warning             test_dry_load_vram_cascade_warning
+      manifest schema sub-object       test_manifest_schema_dry_load_subobject
+plus S2 review-fold coverage:
+      print-manifest stdout contract   test_dry_load_print_manifest_stdout_clean
+      loaded=False nulls applied       test_dry_load_loaded_false_nulls_applied_modules
+      pre-load containment recheck     test_dry_load_containment_recheck
 
 Run with the worktree's uv-managed venv per ADR-013:
   ./.venv/bin/python3 test_lora_audit.py
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -466,10 +479,496 @@ def test_allow_output_outside_root_usable() -> None:
               detail=f"output_dir={manifest.get('output_dir')!r}")
 
 
+# ── S2 dry-load helpers and tests ──────────────────────────────────────
+def _build_dry_load_fixture(root: Path) -> tuple[Path, Path]:
+    """Build a 2-LoRA tree + synthetic base under *root*.
+
+    Both LoRAs target keys present in the synthetic base so each one is a
+    non-WRONG_ARCH dry-load candidate. Returns (tree_dir, base_dir).
+    """
+    tree = root / "tree"
+    base = root / "synth" / "transformer"
+    _build_synth_base(base)
+    tree.mkdir(parents=True, exist_ok=True)
+    safetensors.torch.save_file({
+        "transformer_blocks.0.attn.to_q.lora_A.weight": torch.zeros(8, 64),
+        "transformer_blocks.0.attn.to_q.lora_B.weight": torch.zeros(64, 8),
+    }, str(tree / "first.safetensors"))
+    safetensors.torch.save_file({
+        "transformer_blocks.0.attn.to_k.lora_A.weight": torch.zeros(8, 64),
+        "transformer_blocks.0.attn.to_k.lora_B.weight": torch.zeros(64, 8),
+    }, str(tree / "second.safetensors"))
+    return tree, base
+
+
+class _DryLoadPatch:
+    """Context manager that swaps mod's dry-load surface for fakes
+    and restores the originals on exit."""
+
+    def __init__(self, mod, *,
+                 pipeline_factory=None,
+                 loader=None,
+                 unloader=None):
+        self.mod = mod
+        self.pipeline_factory = pipeline_factory
+        self.loader = loader
+        self.unloader = unloader
+        self._saved: dict = {}
+
+    def __enter__(self):
+        self._saved["pipe"] = self.mod._load_dry_load_pipeline
+        self._saved["loader"] = self.mod.load_lora_with_key_fix
+        self._saved["unloader"] = self.mod.unload_adapters
+        if self.pipeline_factory is not None:
+            self.mod._load_dry_load_pipeline = self.pipeline_factory
+        if self.loader is not None:
+            self.mod.load_lora_with_key_fix = self.loader
+        if self.unloader is not None:
+            self.mod.unload_adapters = self.unloader
+        return self
+
+    def __exit__(self, *exc):
+        self.mod._load_dry_load_pipeline = self._saved["pipe"]
+        self.mod.load_lora_with_key_fix = self._saved["loader"]
+        self.mod.unload_adapters = self._saved["unloader"]
+
+
+def test_dry_load_disabled_default_no_pipe_import() -> None:
+    print("\n[12] test_dry_load_disabled_default_no_pipe_import (S2 ADR §7)")
+    mod = _import_script()
+    with tempfile.TemporaryDirectory(prefix="dryload_off_") as tmp:
+        tree, base = _build_dry_load_fixture(Path(tmp))
+
+        def boom(_dir):
+            raise AssertionError(
+                "_load_dry_load_pipeline must not be invoked when "
+                "--dry-load is off"
+            )
+
+        with _DryLoadPatch(mod, pipeline_factory=boom):
+            exit_code = mod.main([
+                "--audit-root", str(tree), "--no-config",
+                "--base", f"klein={base}",
+                "-o", str(tree / "manifest.json"),
+            ])
+        check("exits cleanly without --dry-load",
+              exit_code in (0, 2),
+              detail=f"got {exit_code}")
+        manifest = json.loads((tree / "manifest.json").read_text())
+        check("bases[klein].dry_load_attempted is False",
+              manifest["bases"]["klein"]["dry_load_attempted"] is False)
+        no_subobj = all(
+            "dry_load" not in v
+            for f in manifest["files"]
+            for v in (f.get("verdicts_by_base") or {}).values()
+        )
+        check("no dry_load sub-object on any per-base verdict", no_subobj)
+
+
+def test_dry_load_per_file_fault_isolation() -> None:
+    print("\n[13] test_dry_load_per_file_fault_isolation (Vision invariant 9)")
+    mod = _import_script()
+    with tempfile.TemporaryDirectory(prefix="dryload_iso_") as tmp:
+        tree, base = _build_dry_load_fixture(Path(tmp))
+
+        def fake_loader(_pipe, lora_path, adapter_name=None, **kw):
+            if "first.safetensors" in lora_path:
+                print("[LoRA] LoRA direct merge (weight=1.0): "
+                      "applied=4, skipped=0")
+                return True
+            raise RuntimeError("synthetic per-file fault")
+
+        with _DryLoadPatch(
+            mod,
+            pipeline_factory=lambda _d: object(),
+            loader=fake_loader,
+            unloader=lambda _p, _names, **kw: None,
+        ):
+            exit_code = mod.main([
+                "--audit-root", str(tree), "--no-config",
+                "--base", f"klein={base}",
+                "--dry-load",
+                "-o", str(tree / "manifest.json"),
+            ])
+
+        check("dry-load run completes despite per-file fault",
+              exit_code in (0, 2),
+              detail=f"got {exit_code}")
+        manifest = json.loads((tree / "manifest.json").read_text())
+        files_by_rel = {f["relative_path"]: f for f in manifest["files"]}
+        first = files_by_rel.get("first.safetensors")
+        second = files_by_rel.get("second.safetensors")
+        check("first.safetensors present", first is not None)
+        check("second.safetensors present", second is not None)
+        if first and second:
+            f_dl = first["verdicts_by_base"]["klein"].get("dry_load")
+            s_dl = second["verdicts_by_base"]["klein"].get("dry_load")
+            check("first.safetensors dry_load.loaded is True",
+                  f_dl is not None and f_dl.get("loaded") is True,
+                  detail=f"dry_load={f_dl}")
+            check("first.safetensors dry_load.applied_modules == 4",
+                  f_dl is not None and f_dl.get("applied_modules") == 4,
+                  detail=f"dry_load={f_dl}")
+            check("second.safetensors dry_load.loaded is False",
+                  s_dl is not None and s_dl.get("loaded") is False,
+                  detail=f"dry_load={s_dl}")
+            check("second.safetensors dry_load.reason names the exception",
+                  s_dl is not None
+                  and "RuntimeError" in (s_dl.get("reason") or ""),
+                  detail=f"dry_load={s_dl}")
+        check("bases[klein].dry_load_attempted is True",
+              manifest["bases"]["klein"]["dry_load_attempted"] is True)
+
+
+def test_dry_load_base_load_failure_falls_back() -> None:
+    print("\n[14] test_dry_load_base_load_failure_falls_back (ADR §7)")
+    mod = _import_script()
+    with tempfile.TemporaryDirectory(prefix="dryload_bf_") as tmp:
+        tree, base = _build_dry_load_fixture(Path(tmp))
+
+        def fail_pipe(_dir):
+            raise RuntimeError("synthetic OOM")
+
+        def must_not_call_loader(*a, **kw):
+            raise AssertionError(
+                "load_lora_with_key_fix must not be invoked if base load "
+                "failed"
+            )
+
+        with _DryLoadPatch(
+            mod,
+            pipeline_factory=fail_pipe,
+            loader=must_not_call_loader,
+        ):
+            exit_code = mod.main([
+                "--audit-root", str(tree), "--no-config",
+                "--base", f"klein={base}",
+                "--dry-load",
+                "-o", str(tree / "manifest.json"),
+            ])
+
+        check("run completes despite base-load failure",
+              exit_code in (0, 2),
+              detail=f"got {exit_code}")
+        manifest = json.loads((tree / "manifest.json").read_text())
+        check("bases[klein].dry_load_attempted is False",
+              manifest["bases"]["klein"]["dry_load_attempted"] is False,
+              detail=f"bases={manifest['bases']}")
+        no_subobj = all(
+            "dry_load" not in v
+            for f in manifest["files"]
+            for v in (f.get("verdicts_by_base") or {}).values()
+        )
+        check("no dry_load sub-object on any file's per-base verdict",
+              no_subobj)
+        codes = [w["code"] for w in manifest["warnings"]]
+        check("dry_load_base_failed warning recorded",
+              "dry_load_base_failed" in codes,
+              detail=f"codes={codes}")
+        check("no vram_cascade_possible (only one base)",
+              "dry_load_vram_cascade_possible" not in codes,
+              detail=f"codes={codes}")
+
+
+def test_dry_load_vram_cascade_warning() -> None:
+    print("\n[15] test_dry_load_vram_cascade_warning (ADR §7 F-3)")
+    mod = _import_script()
+    with tempfile.TemporaryDirectory(prefix="dryload_casc_") as tmp:
+        tree, base = _build_dry_load_fixture(Path(tmp))
+
+        def fail_pipe(_dir):
+            raise RuntimeError("synthetic OOM")
+
+        with _DryLoadPatch(mod, pipeline_factory=fail_pipe):
+            exit_code = mod.main([
+                "--audit-root", str(tree), "--no-config",
+                "--base", f"klein={base}",
+                "--base", f"sibling={base}",
+                "--dry-load",
+                "-o", str(tree / "manifest.json"),
+            ])
+
+        check("run completes despite both bases failing",
+              exit_code in (0, 2),
+              detail=f"got {exit_code}")
+        manifest = json.loads((tree / "manifest.json").read_text())
+        codes = [w["code"] for w in manifest["warnings"]]
+        n_failed = sum(1 for c in codes if c == "dry_load_base_failed")
+        n_cascade = sum(1 for c in codes if c == "dry_load_vram_cascade_possible")
+        check("two dry_load_base_failed warnings (one per base)",
+              n_failed == 2,
+              detail=f"codes={codes}")
+        check("exactly one vram_cascade_possible warning (fires on 2nd failure only)",
+              n_cascade == 1,
+              detail=f"codes={codes}")
+
+
+def test_manifest_schema_dry_load_subobject() -> None:
+    print("\n[16] test_manifest_schema_dry_load_subobject (ADR §5/§7)")
+    mod = _import_script()
+    with tempfile.TemporaryDirectory(prefix="dryload_schema_") as tmp:
+        tree, base = _build_dry_load_fixture(Path(tmp))
+
+        def fake_loader(_pipe, lora_path, adapter_name=None, **kw):
+            print("[LoRA] LoRA direct merge (weight=1.0): "
+                  "applied=7, skipped=0")
+            return True
+
+        with _DryLoadPatch(
+            mod,
+            pipeline_factory=lambda _d: object(),
+            loader=fake_loader,
+            unloader=lambda _p, _names, **kw: None,
+        ):
+            exit_code = mod.main([
+                "--audit-root", str(tree), "--no-config",
+                "--base", f"klein={base}",
+                "--dry-load",
+                "-o", str(tree / "manifest.json"),
+            ])
+
+        check("happy-path run exits 0/2",
+              exit_code in (0, 2),
+              detail=f"got {exit_code}")
+        manifest = json.loads((tree / "manifest.json").read_text())
+        check("bases[klein].dry_load_attempted is True",
+              manifest["bases"]["klein"]["dry_load_attempted"] is True)
+        lora_files = [
+            f for f in manifest["files"]
+            if f["kind"] == "lora" and f["classification"] == "usable"
+        ]
+        check("≥1 usable LoRA was dry-loaded",
+              len(lora_files) >= 1)
+        for f in lora_files:
+            dl = (f.get("verdicts_by_base") or {}).get("klein", {}).get("dry_load")
+            check(f"{f['relative_path']}: dry_load is a dict",
+                  isinstance(dl, dict),
+                  detail=f"dry_load={dl}")
+            if isinstance(dl, dict):
+                check(f"{f['relative_path']}: dry_load has exact keys "
+                      f"{{loaded, applied_modules, reason}}",
+                      set(dl.keys()) == {"loaded", "applied_modules", "reason"},
+                      detail=f"keys={sorted(dl.keys())}")
+                check(f"{f['relative_path']}: loaded is True",
+                      dl.get("loaded") is True)
+                check(f"{f['relative_path']}: applied_modules == 7",
+                      dl.get("applied_modules") == 7,
+                      detail=f"dl={dl}")
+                check(f"{f['relative_path']}: reason is None on success",
+                      dl.get("reason") is None,
+                      detail=f"dl={dl}")
+
+
+def test_dry_load_print_manifest_stdout_clean() -> None:
+    print("\n[17] test_dry_load_print_manifest_stdout_clean "
+          "(S2 security H-1 fold)")
+    mod = _import_script()
+    with tempfile.TemporaryDirectory(prefix="dryload_pm_") as tmp:
+        tree, base = _build_dry_load_fixture(Path(tmp))
+
+        def noisy_pipe(_dir):
+            # Simulate diffusers' from_pretrained banner output.
+            print("Some weights of the model checkpoint at ... were not "
+                  "used when initializing FluxTransformer2DModel: ...")
+            print("- This IS expected if you are initializing FluxModel ...")
+            return object()
+
+        def fake_loader(_pipe, lora_path, adapter_name=None, **kw):
+            print("[LoRA] LoRA direct merge (weight=1.0): "
+                  "applied=3, skipped=0")
+            return True
+
+        original_pipe = mod._load_dry_load_pipeline
+        original_loader = mod.load_lora_with_key_fix
+        original_unloader = mod.unload_adapters
+        mod._load_dry_load_pipeline = noisy_pipe
+        mod.load_lora_with_key_fix = fake_loader
+        mod.unload_adapters = lambda _p, _names, **kw: None
+        try:
+            captured_stdout = io.StringIO()
+            with contextlib.redirect_stdout(captured_stdout):
+                exit_code = mod.main([
+                    "--audit-root", str(tree), "--no-config",
+                    "--base", f"klein={base}",
+                    "--dry-load",
+                    "--print-manifest",
+                ])
+        finally:
+            mod._load_dry_load_pipeline = original_pipe
+            mod.load_lora_with_key_fix = original_loader
+            mod.unload_adapters = original_unloader
+
+        check("--dry-load --print-manifest exits 0/2",
+              exit_code in (0, 2),
+              detail=f"got {exit_code}")
+        stdout_text = captured_stdout.getvalue().strip()
+        check("stdout is non-empty (manifest present)",
+              bool(stdout_text))
+        try:
+            parsed = json.loads(stdout_text)
+            check("stdout parses as JSON (no from_pretrained chatter mixed in)",
+                  True)
+            check("parsed JSON has bases.klein.dry_load_attempted=True",
+                  parsed["bases"]["klein"]["dry_load_attempted"] is True)
+        except json.JSONDecodeError as e:
+            check("stdout parses as JSON (no from_pretrained chatter mixed in)",
+                  False, detail=f"JSONDecodeError: {e}; head={stdout_text[:200]}")
+
+
+def test_dry_load_loaded_false_nulls_applied_modules() -> None:
+    print("\n[18] test_dry_load_loaded_false_nulls_applied_modules "
+          "(code-review H-1 fold)")
+    mod = _import_script()
+    with tempfile.TemporaryDirectory(prefix="dryload_nulls_") as tmp:
+        tree, base = _build_dry_load_fixture(Path(tmp))
+
+        def zero_applied_loader(_pipe, lora_path, adapter_name=None, **kw):
+            # Matches the direct-merge loader's "applied=0" log line on
+            # zero-match. Return False to simulate the loader's
+            # `return applied > 0` exit at lines 446 / 613 / 1042 in
+            # nodes/eric_qwen_edit_lora.py.
+            print("[LoRA] LoRA direct merge (weight=1.0): "
+                  "applied=0, skipped=4")
+            return False
+
+        with _DryLoadPatch(
+            mod,
+            pipeline_factory=lambda _d: object(),
+            loader=zero_applied_loader,
+            unloader=lambda _p, _names, **kw: None,
+        ):
+            exit_code = mod.main([
+                "--audit-root", str(tree), "--no-config",
+                "--base", f"klein={base}",
+                "--dry-load",
+                "-o", str(tree / "manifest.json"),
+            ])
+
+        check("run exits 0/2", exit_code in (0, 2),
+              detail=f"got {exit_code}")
+        manifest = json.loads((tree / "manifest.json").read_text())
+        for f in manifest["files"]:
+            if f["classification"] != "usable":
+                continue
+            dl = (f.get("verdicts_by_base") or {}).get("klein", {}).get("dry_load")
+            if dl is None:
+                continue
+            check(f"{f['relative_path']}: loaded is False",
+                  dl.get("loaded") is False,
+                  detail=f"dl={dl}")
+            check(f"{f['relative_path']}: applied_modules is None when "
+                  f"loaded=False (not 0)",
+                  dl.get("applied_modules") is None,
+                  detail=f"dl={dl}")
+            check(f"{f['relative_path']}: reason is None (no exception)",
+                  dl.get("reason") is None,
+                  detail=f"dl={dl}")
+
+
+def test_dry_load_containment_recheck() -> None:
+    print("\n[19] test_dry_load_containment_recheck "
+          "(security M-1 fold — symlink TOCTOU)")
+    mod = _import_script()
+    with tempfile.TemporaryDirectory(prefix="dryload_toctou_") as tmp:
+        tree, base = _build_dry_load_fixture(Path(tmp))
+        # `outside` exists outside the audit-root and outside the tmpdir
+        # so the symlink target unambiguously escapes.
+        outside = Path(tmp).parent / f"escape_target_{os.getpid()}.safetensors"
+        # Copy a valid LoRA file there so the recheck (not the open) is
+        # the failure point — this isolates the TOCTOU narrowing.
+        outside.write_bytes((tree / "first.safetensors").read_bytes())
+
+        def swapping_loader(_pipe, lora_path, adapter_name=None, **kw):
+            # If recheck were absent, this loader would happily see the
+            # swapped symlink target. The recheck must short-circuit
+            # before we ever reach this point — assert as much.
+            real = os.path.realpath(lora_path)
+            if str(outside.resolve()) == real:
+                raise AssertionError(
+                    "containment recheck must reject this load — got "
+                    f"realpath {real}"
+                )
+            print("[LoRA] LoRA direct merge (weight=1.0): "
+                  "applied=2, skipped=0")
+            return True
+
+        original_loader = mod.load_lora_with_key_fix
+        original_pipe = mod._load_dry_load_pipeline
+        original_unloader = mod.unload_adapters
+
+        # Hook between scan and dry-load: monkey-patch _scan to do the
+        # swap *after* it returns (i.e., simulate the attacker swapping
+        # the file between scan and dry-load reopen).
+        original_scan = mod._scan
+
+        def scan_then_swap(audit_root, bases, warnings):
+            files, exit_code = original_scan(audit_root, bases, warnings)
+            # Replace second.safetensors with a symlink to `outside`.
+            second = tree / "second.safetensors"
+            second.unlink()
+            second.symlink_to(outside)
+            return files, exit_code
+
+        mod._scan = scan_then_swap
+        mod._load_dry_load_pipeline = lambda _d: object()
+        mod.load_lora_with_key_fix = swapping_loader
+        mod.unload_adapters = lambda _p, _names, **kw: None
+        try:
+            exit_code = mod.main([
+                "--audit-root", str(tree), "--no-config",
+                "--base", f"klein={base}",
+                "--dry-load",
+                "-o", str(tree / "manifest.json"),
+            ])
+        finally:
+            mod._scan = original_scan
+            mod._load_dry_load_pipeline = original_pipe
+            mod.load_lora_with_key_fix = original_loader
+            mod.unload_adapters = original_unloader
+            outside.unlink(missing_ok=True)
+
+        check("run completes despite mid-flight symlink swap",
+              exit_code in (0, 2),
+              detail=f"got {exit_code}")
+        manifest = json.loads((tree / "manifest.json").read_text())
+        swapped = next(
+            (f for f in manifest["files"]
+             if f["relative_path"] == "second.safetensors"),
+            None,
+        )
+        check("swapped file present in manifest", swapped is not None)
+        if swapped is not None:
+            dl = (swapped.get("verdicts_by_base") or {}).get("klein", {}).get("dry_load")
+            check("swapped file dry_load is recorded",
+                  isinstance(dl, dict),
+                  detail=f"dl={dl}")
+            if isinstance(dl, dict):
+                check("swapped file dry_load.loaded is False",
+                      dl.get("loaded") is False,
+                      detail=f"dl={dl}")
+                check("swapped file dry_load.reason == 'containment_changed'",
+                      dl.get("reason") == "containment_changed",
+                      detail=f"dl={dl}")
+                check("swapped file applied_modules is None",
+                      dl.get("applied_modules") is None,
+                      detail=f"dl={dl}")
+        # Non-swapped file should still have dry-loaded normally.
+        first = next(
+            (f for f in manifest["files"]
+             if f["relative_path"] == "first.safetensors"),
+            None,
+        )
+        if first is not None:
+            dl = (first.get("verdicts_by_base") or {}).get("klein", {}).get("dry_load")
+            check("non-swapped first.safetensors loaded normally",
+                  isinstance(dl, dict) and dl.get("loaded") is True,
+                  detail=f"dl={dl}")
+
+
 # ── Driver ─────────────────────────────────────────────────────────────
 def main() -> int:
     print("=" * 70)
-    print(f"  test_lora_audit.py — S1 of ADR-014")
+    print(f"  test_lora_audit.py — S1+S2 of ADR-014")
     print(f"  script: {_SCRIPT_PATH}")
     print(f"  fixtures: {_FIX_ROOT}")
     print("=" * 70)
@@ -486,6 +985,14 @@ def main() -> int:
         test_redact_argv_no_path_leak()
         test_output_dir_mutex_rejected()
         test_allow_output_outside_root_usable()
+        test_dry_load_disabled_default_no_pipe_import()
+        test_dry_load_per_file_fault_isolation()
+        test_dry_load_base_load_failure_falls_back()
+        test_dry_load_vram_cascade_warning()
+        test_manifest_schema_dry_load_subobject()
+        test_dry_load_print_manifest_stdout_clean()
+        test_dry_load_loaded_false_nulls_applied_modules()
+        test_dry_load_containment_recheck()
     finally:
         teardown_fixtures()
     print("\n" + "─" * 70)
