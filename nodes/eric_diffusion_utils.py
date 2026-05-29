@@ -56,6 +56,45 @@ def infer_model_family(class_name: str) -> str:
     return lower  # best-effort fallback for unrecognised models
 
 
+#: Valid values for the --vae-tiling CLI flag and the EricDiffusionLoader
+#: "vae_tiling" ComfyUI input. Exported so the argparse choices= list and the
+#: node-side dropdown share one source of truth.
+VAE_TILING_CHOICES = ("auto", "on", "off")
+
+#: Families whose VAE should NOT have tiling enabled under "auto". The 32×
+#: compression Hunyuan-Image VAE produces a 64×64 latent for a 2K 2048×2048
+#: render — smaller than the SDXL VAE handles untiled — so tiling adds seam
+#: artifacts without any memory headroom benefit (ADR-014 Changelog
+#: 2026-05-27). Other families default to tiled (preserves the pre-existing
+#: behavior on 8×/16× VAEs). The Hunyuan-Image refiner is intentionally NOT
+#: in this set in v1 — handled in the refiner slice.
+_VAE_TILING_FAMILIES_DEFAULT_OFF = frozenset({"hunyuan-image"})
+
+
+def resolve_vae_tiling(model_family: str, flag: str = "auto") -> bool:
+    """Resolve the per-pipeline VAE tiling decision at load time.
+
+      - "on"  → True  (force-on, ignores family).
+      - "off" → False (force-off, ignores family).
+      - "auto" (default) → False for families in
+        _VAE_TILING_FAMILIES_DEFAULT_OFF; True otherwise. Unknown family
+        strings tile by default (memory-safe fallback).
+
+    Raises ValueError on any other flag value. Argparse rejects bad values
+    upstream in the CLI path; the in-process check defends the ComfyUI node
+    input and any future programmatic caller.
+    """
+    if flag not in VAE_TILING_CHOICES:
+        raise ValueError(
+            f"vae_tiling must be one of {VAE_TILING_CHOICES}, got {flag!r}"
+        )
+    if flag == "on":
+        return True
+    if flag == "off":
+        return False
+    return model_family not in _VAE_TILING_FAMILIES_DEFAULT_OFF
+
+
 def detect_pipeline_class(model_path: str):
     """Read model_index.json and return (pipeline_class, class_name, model_family).
 

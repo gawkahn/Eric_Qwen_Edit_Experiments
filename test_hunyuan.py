@@ -492,6 +492,80 @@ with tempfile.TemporaryDirectory() as tmpdir:
 
 
 # ──────────────────────────────────────────────────────────────────────
+print("── resolve_vae_tiling: family-conditional default + explicit overrides")
+
+# Invariant 1 — hunyuan-image under auto resolves to "no tiling". Locks the
+# headline behavior of the tile-VAE-skip slice: the 32× Hunyuan VAE does
+# not benefit from tiling and the seams compound the artifacts diagnosed
+# in the ADR-014 2026-05-24 amendment.
+check(
+    "hunyuan-image + auto → tiling False (32× VAE; ADR-014 Changelog 2026-05-27)",
+    utils_mod.resolve_vae_tiling("hunyuan-image", "auto") is False,
+)
+
+# Invariant 2 — every other family under auto stays tiled (preserves the
+# pre-existing behavior on 8×/16× VAEs). Sweeps the full family roster the
+# slice's Vision §"Invariants 2" enumerates, plus the Hunyuan-Image refiner
+# (intentionally NOT in the default-off set in v1; the refiner slice owns
+# the call about extending the no-tile default there).
+AUTO_TILED_FAMILIES = [
+    "qwen-edit", "qwen-image",
+    "flux", "flux2", "flux2klein",
+    "chroma", "auraflow",
+    "sd1", "sd3", "sdxl",
+    "zimage",
+    "stablecascade",
+    "hunyuan-image-refiner",
+]
+for fam in AUTO_TILED_FAMILIES:
+    check(
+        f"{fam} + auto → tiling True (preserves current behavior)",
+        utils_mod.resolve_vae_tiling(fam, "auto") is True,
+    )
+
+# Invariant 3a — explicit "on" forces tiling even on a default-off family.
+check(
+    "hunyuan-image + on → tiling True (force-on wins over family default)",
+    utils_mod.resolve_vae_tiling("hunyuan-image", "on") is True,
+)
+
+# Invariant 3b — explicit "off" forces no-tiling even on a default-on family.
+check(
+    "qwen-image + off → tiling False (force-off wins over family default)",
+    utils_mod.resolve_vae_tiling("qwen-image", "off") is False,
+)
+
+# Unknown family falls into the safe (memory-safe) tiled path under auto.
+# Locks the closed-world contract on _VAE_TILING_FAMILIES_DEFAULT_OFF: a new
+# 32× family that needs default-off must be explicitly added — the resolver
+# does not silently extrapolate from name shape.
+check(
+    "foobar (unknown family) + auto → tiling True (memory-safe fallback)",
+    utils_mod.resolve_vae_tiling("foobar", "auto") is True,
+)
+
+# Default arg (flag omitted) matches explicit "auto" — pins the in-process
+# convention used by _load_pipeline()'s `vae_tiling: str = "auto"` signature.
+check(
+    "flag omitted matches explicit 'auto' for hunyuan-image",
+    utils_mod.resolve_vae_tiling("hunyuan-image") is False,
+)
+check(
+    "flag omitted matches explicit 'auto' for qwen-image",
+    utils_mod.resolve_vae_tiling("qwen-image") is True,
+)
+
+# Defense-in-depth — invalid flag raises ValueError. Argparse rejects bad
+# values upstream in the CLI path; the in-process raise defends the ComfyUI
+# node dropdown and any future programmatic caller from silent fallthrough.
+expect_raises(
+    "resolve_vae_tiling raises ValueError on invalid flag",
+    lambda: utils_mod.resolve_vae_tiling("hunyuan-image", "garbage"),
+    ValueError,
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
 print(f"\n────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print(f"────────────────────────────────────────────────")
