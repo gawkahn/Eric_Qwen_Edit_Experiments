@@ -53,6 +53,8 @@ from nodes.eric_diffusion_utils import (
     detect_component_format,
     load_component,
     resolve_hf_path,
+    resolve_vae_tiling,
+    VAE_TILING_CHOICES,
     _is_hf_repo_id,
 )
 from nodes.eric_diffusion_samplers import sampler_choices, swap_sampler
@@ -665,6 +667,7 @@ def _load_pipeline(
     vae_from_transformer: bool = False,
     attention_slicing: bool = False,
     sequential_offload: bool = False,
+    vae_tiling: str = "auto",
     allow_hf_download: bool = False,
 ):
     """Load, place, and configure a diffusers pipeline.
@@ -782,7 +785,15 @@ def _load_pipeline(
             _log("[comfyless] VAE offloaded to CPU")
 
     if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
-        pipe.vae.enable_tiling()
+        if resolve_vae_tiling(model_family, vae_tiling):
+            pipe.vae.enable_tiling()
+            _log(f"[comfyless] VAE tiling enabled (vae_tiling={vae_tiling})")
+        else:
+            # Defensive disable in case a future diffusers default flips
+            # use_tiling=True at construct time.
+            if hasattr(pipe.vae, "disable_tiling"):
+                pipe.vae.disable_tiling()
+            _log(f"[comfyless] VAE tiling disabled (vae_tiling={vae_tiling})")
 
     if attention_slicing:
         try:
@@ -826,6 +837,7 @@ def generate(
     vae_from_transformer: bool = False,
     attention_slicing: bool = False,
     sequential_offload: bool = False,
+    vae_tiling: str = "auto",
     allow_hf_download: bool = False,
     _cached_pipeline: Optional[Dict[str, Any]] = None,
     mcp_caller: bool = False,
@@ -875,7 +887,8 @@ def generate(
             transformer_path=transformer_path, vae_path=vae_path,
             text_encoder_path=text_encoder_path, text_encoder_2_path=text_encoder_2_path,
             vae_from_transformer=vae_from_transformer, attention_slicing=attention_slicing,
-            sequential_offload=sequential_offload, allow_hf_download=allow_hf_download,
+            sequential_offload=sequential_offload, vae_tiling=vae_tiling,
+            allow_hf_download=allow_hf_download,
         )
 
     # ── Load LoRAs ────────────────────────────────────────────────────
@@ -1050,6 +1063,12 @@ def _parse_args() -> argparse.Namespace:
                    help="Trade speed for lower peak VRAM")
     p.add_argument("--sequential-offload", action="store_true",
                    help="Extreme VRAM savings via sequential CPU offload — very slow")
+    p.add_argument("--vae-tiling", choices=list(VAE_TILING_CHOICES), default="auto",
+                   help="VAE tiling policy at decode time. 'auto' (default) is "
+                        "family-aware: off for Hunyuan-Image (32× VAE, tiling adds "
+                        "seam artifacts without memory benefit), on for every other "
+                        "family (preserves prior behavior). 'on'/'off' force the "
+                        "choice regardless of family.")
     p.add_argument("--allow-hf-download", action="store_true", default=False,
                    help="Allow downloading models from HuggingFace if not in local cache. "
                         "By default only the local cache is used (no network access)")
@@ -1172,6 +1191,7 @@ def _run_json_mode() -> int:
             offload_vae=params.get("offload_vae", False),
             attention_slicing=params.get("attention_slicing", False),
             sequential_offload=params.get("sequential_offload", False),
+            vae_tiling=params.get("vae_tiling", "auto"),
             transformer_path=params.get("transformer_path", ""),
             vae_path=params.get("vae_path", ""),
             text_encoder_path=params.get("text_encoder_path", ""),
@@ -1811,6 +1831,7 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                 offload_vae=args.offload_vae,
                 attention_slicing=args.attention_slicing,
                 sequential_offload=args.sequential_offload,
+                vae_tiling=args.vae_tiling,
                 allow_hf_download=args.allow_hf_download,
                 transformer_path=p_cur.get("transformer_path", ""),
                 vae_path=p_cur.get("vae_path", ""),

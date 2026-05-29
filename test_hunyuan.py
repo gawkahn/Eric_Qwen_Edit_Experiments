@@ -566,6 +566,161 @@ expect_raises(
 
 
 # ──────────────────────────────────────────────────────────────────────
+print("── Invariant 4 — comfyless _load_pipeline applies resolver decision")
+
+# Behavior test: drive comfyless._load_pipeline against a FakePipe whose VAE
+# tracks use_tiling state via enable_tiling()/disable_tiling(). Asserts that
+# for every (family, flag) combination, the loader's post-load
+# pipe.vae.use_tiling matches resolve_vae_tiling(family, flag) — i.e. the
+# loader actually calls the resolver and applies its result, not a duplicated
+# inline family check (per code-reviewer's Step 1 forward-watch).
+class _FakeVAE:
+    def __init__(self):
+        self.use_tiling = False
+    def enable_tiling(self):
+        self.use_tiling = True
+    def disable_tiling(self):
+        self.use_tiling = False
+
+class _FakePipe:
+    def __init__(self):
+        self.vae = _FakeVAE()
+    def to(self, device):
+        return self
+
+class _FakePipeClass:
+    @classmethod
+    def from_pretrained(cls, model_path, **kwargs):
+        return _FakePipe()
+
+def _drive_comfyless_load(model_family, vae_tiling, tmp_path):
+    """Drive cg._load_pipeline with stubbed disk/diffusers boundary."""
+    orig = {
+        "resolve_hf_path":      cg.resolve_hf_path,
+        "detect_pipeline_class": cg.detect_pipeline_class,
+        "detect_load_variant":   cg.detect_load_variant,
+        "read_guidance_embeds":  cg.read_guidance_embeds,
+    }
+    cg.resolve_hf_path      = lambda p, **kw: p
+    cg.detect_pipeline_class = lambda p: (_FakePipeClass, "FakePipeline", model_family)
+    cg.detect_load_variant   = lambda p: None
+    cg.read_guidance_embeds  = lambda p: False
+    try:
+        pipe, _fam, _emb = cg._load_pipeline(
+            tmp_path,
+            precision="bf16",
+            device="cpu",
+            offload_vae=False,
+            attention_slicing=False,
+            sequential_offload=False,
+            vae_tiling=vae_tiling,
+        )
+        return pipe.vae.use_tiling
+    finally:
+        for k, v in orig.items():
+            setattr(cg, k, v)
+
+with tempfile.TemporaryDirectory() as _tmp:
+    PARITY_CASES = [
+        ("hunyuan-image", "auto", False),
+        ("hunyuan-image", "on",   True),
+        ("hunyuan-image", "off",  False),
+        ("qwen-image",    "auto", True),
+        ("qwen-image",    "off",  False),
+        ("flux2",         "on",   True),
+        ("foobar",        "auto", True),  # unknown family → memory-safe default
+    ]
+    for family, flag, expected in PARITY_CASES:
+        actual = _drive_comfyless_load(family, flag, _tmp)
+        check(
+            f"comfyless _load_pipeline: ({family!r},{flag!r}) → use_tiling={expected}",
+            actual is expected,
+            f"got {actual!r}",
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── Invariant 4 — both loader call sites wire the resolver identically")
+
+# Structural co-locking: the ComfyUI loader path runs inside ComfyUI so it
+# can't be cheaply unit-instrumented (relative imports drag the whole node
+# pack), but the parity contract is that BOTH loaders call resolve_vae_tiling
+# with the same (family, flag) shape and apply both branches. These string
+# checks lock the "Step 2 wired one side, forgot the other" failure mode
+# and the "duplicated the family check inline instead of calling the
+# resolver" failure mode the Step 1 reviewer flagged as the watch-item.
+with open("nodes/eric_diffusion_loader.py") as f:
+    nodes_loader_src = f.read()
+
+check(
+    "nodes loader imports resolve_vae_tiling from eric_diffusion_utils",
+    "resolve_vae_tiling" in nodes_loader_src
+    and "from .eric_diffusion_utils import" in nodes_loader_src,
+)
+check(
+    "nodes loader calls resolve_vae_tiling(model_family, vae_tiling)",
+    "resolve_vae_tiling(model_family, vae_tiling)" in nodes_loader_src,
+)
+check(
+    "nodes loader applies both enable_tiling() AND disable_tiling()",
+    "pipeline.vae.enable_tiling()" in nodes_loader_src
+    and "pipeline.vae.disable_tiling()" in nodes_loader_src,
+)
+
+with open("comfyless/generate.py") as f:
+    cg_src = f.read()
+
+check(
+    "comfyless _load_pipeline imports resolve_vae_tiling",
+    "resolve_vae_tiling" in cg_src,
+)
+check(
+    "comfyless _load_pipeline calls resolve_vae_tiling(model_family, vae_tiling)",
+    "resolve_vae_tiling(model_family, vae_tiling)" in cg_src,
+)
+check(
+    "comfyless _load_pipeline applies both enable_tiling() AND disable_tiling()",
+    "pipe.vae.enable_tiling()" in cg_src
+    and "pipe.vae.disable_tiling()" in cg_src,
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── Invariant 5 — argparse rejects invalid --vae-tiling value ─────────")
+
+# Subprocess invocation so we hit the real argparse layer, not a mock.
+# Uses the same .venv interpreter the rest of the suite runs under.
+import subprocess
+_repo_root = os.path.dirname(os.path.abspath(__file__))
+_proc = subprocess.run(
+    [sys.executable, "-m", "comfyless.generate",
+     "--vae-tiling", "garbage",
+     "--model", "/tmp/__vae_tiling_test_nonexistent__",
+     "--prompt", "x",
+     "--output", "/tmp/__vae_tiling_test_nonexistent__.png"],
+    capture_output=True,
+    text=True,
+    timeout=60,
+    cwd=_repo_root,
+)
+check(
+    "--vae-tiling garbage exits non-zero",
+    _proc.returncode != 0,
+    f"returncode={_proc.returncode}",
+)
+check(
+    "--vae-tiling garbage rejection lists valid choices on stderr",
+    "'auto'" in _proc.stderr and "'on'" in _proc.stderr and "'off'" in _proc.stderr,
+    f"stderr tail={_proc.stderr[-300:]!r}",
+)
+check(
+    "--vae-tiling garbage never attempts to load the model",
+    "Loading model" not in _proc.stderr,
+    "argparse must reject before any disk I/O",
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
 print(f"\n────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print(f"────────────────────────────────────────────────")
