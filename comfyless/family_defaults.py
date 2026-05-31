@@ -89,10 +89,17 @@ FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
     # amendment carries the empirical evidence + README citation.
     # Source: HunyuanImage-2.1 README (Usage §); ADR-014 §4 amendment.
     "hunyuan-image": {
-        "cfg_scale": 3.25,
-        "steps":     50,
-        "width":     2048,
-        "height":    2048,
+        "cfg_scale":     3.25,
+        "steps":         50,
+        "width":         2048,
+        "height":        2048,
+        # Refiner-stage defaults per ADR-016 §(d): Tencent refiner README
+        # is authoritative (cfg=3.5, steps=4); diffusers signature default
+        # for refiner cfg is 3.25 but the README wins, same lesson as the
+        # 2K-mandatory amendment. Both keys are no-ops when --refiner is
+        # unset (chained dispatch path skipped → these never read).
+        "refiner_steps": 4,
+        "refiner_cfg":   3.5,
     },
 
     # ── qwen-edit (Qwen-Image-Edit-2511) ────────────────────────────────

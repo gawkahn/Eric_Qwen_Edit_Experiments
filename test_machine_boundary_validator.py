@@ -242,6 +242,20 @@ _GRID = [
     ("reject-int-vae-tiling",      base_payload(vae_tiling=42),                           False),
     ("reject-bool-vae-tiling",     base_payload(vae_tiling=True),                         False),
     ("reject-dict-vae-tiling",     base_payload(vae_tiling={"x": 1}),                     False),
+    # Refiner schema keys per ADR-016 §(d). refiner_path is a string
+    # (sidecar-replayable component path); refiner_steps is canonical int;
+    # refiner_cfg is canonical float (int→float safe-cast per ADR-012 §3).
+    # The parametric bool-reject loop above auto-covers bool-rejection for
+    # the two numeric kinds; these entries lock the happy-path acceptance
+    # and the cast behavior.
+    ("valid-refiner-path",         base_payload(refiner_path="/m/refiner"),               True),
+    ("valid-refiner-path-empty",   base_payload(refiner_path=""),                         True),
+    ("valid-refiner-steps-int",    base_payload(refiner_steps=4),                         True),
+    ("valid-refiner-cfg-float",    base_payload(refiner_cfg=3.5),                         True),
+    ("valid-refiner-cfg-int-cast", base_payload(refiner_cfg=4),                           True),
+    ("reject-int-refiner-path",    base_payload(refiner_path=42),                         False),
+    ("reject-float-refiner-steps", base_payload(refiner_steps=4.0),                       False),
+    ("reject-str-refiner-cfg",     base_payload(refiner_cfg="heavy"),                     False),
 ]
 
 for name, payload, expected_ok in _GRID:

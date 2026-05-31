@@ -838,6 +838,15 @@ def generate(
     attention_slicing: bool = False,
     sequential_offload: bool = False,
     vae_tiling: str = "auto",
+    # Refiner schema keys per ADR-016 §(d). v1 plumbing only — Step 2 of
+    # the refiner slice wires the `--refiner` argparse flag, the chain
+    # activation (when family == "hunyuan-image" AND refiner_path is set),
+    # and the comfyless/hunyuan_chain.py dispatch. Until then these flow
+    # through generate() as no-op params, present in the signature so the
+    # sidecar-replay path and family-defaults overlay can address them.
+    refiner_path: str = "",
+    refiner_steps: int = 4,
+    refiner_cfg: float = 3.5,
     allow_hf_download: bool = False,
     _cached_pipeline: Optional[Dict[str, Any]] = None,
     mcp_caller: bool = False,
@@ -1192,6 +1201,10 @@ def _run_json_mode() -> int:
             attention_slicing=params.get("attention_slicing", False),
             sequential_offload=params.get("sequential_offload", False),
             vae_tiling=params.get("vae_tiling", "auto"),
+            # Refiner schema keys per ADR-016 §(d) — Step 1 plumbing.
+            refiner_path=params.get("refiner_path", ""),
+            refiner_steps=params.get("refiner_steps", 4),
+            refiner_cfg=params.get("refiner_cfg", 3.5),
             transformer_path=params.get("transformer_path", ""),
             vae_path=params.get("vae_path", ""),
             text_encoder_path=params.get("text_encoder_path", ""),
@@ -1345,6 +1358,18 @@ def _delegate_to_server(
         "attention_slicing":   args.attention_slicing,
         "sequential_offload":  args.sequential_offload,
         "vae_tiling":          args.vae_tiling,
+        # Refiner schema keys per ADR-016 §(d) — Step 1 plumbing. The
+        # daemon-side handler (server.py:_handle_generate) gains its own
+        # refiner field threading in Step 4 alongside the security-auditor
+        # pass. Between Step 1 and Step 4 these keys reach the daemon
+        # request but are silently ignored on the server side (the daemon's
+        # cache_key tuple does not yet include them, and its _load_pipeline
+        # call site does not yet receive them). Threading them client-side
+        # now keeps the in-process and daemon paths in lockstep so a
+        # sidecar replay does not silently drop them at the wire boundary.
+        "refiner_path":        _abspath(p.get("refiner_path", "")),
+        "refiner_steps":       p.get("refiner_steps", 4),
+        "refiner_cfg":         p.get("refiner_cfg", 3.5),
         "transformer_path":    _abspath(p.get("transformer_path", "")),
         "vae_path":            _abspath(p.get("vae_path", "")),
         "text_encoder_path":   _abspath(p.get("text_encoder_path", "")),
@@ -1833,6 +1858,13 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                 attention_slicing=args.attention_slicing,
                 sequential_offload=args.sequential_offload,
                 vae_tiling=args.vae_tiling,
+                # Refiner schema keys per ADR-016 §(d) — Step 1 plumbing.
+                # The argparse --refiner flag + chain activation land in
+                # Step 2; for now the values flow through from sidecar
+                # / family-defaults overlay only.
+                refiner_path=p_cur.get("refiner_path", ""),
+                refiner_steps=p_cur.get("refiner_steps", 4),
+                refiner_cfg=p_cur.get("refiner_cfg", 3.5),
                 allow_hf_download=args.allow_hf_download,
                 transformer_path=p_cur.get("transformer_path", ""),
                 vae_path=p_cur.get("vae_path", ""),

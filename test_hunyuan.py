@@ -398,6 +398,79 @@ check(
 
 
 # ──────────────────────────────────────────────────────────────────────
+print("── family_defaults: hunyuan-image refiner-stage row (ADR-016 §(d))")
+
+# ADR-016 §(d): Tencent refiner README is authoritative — refiner_cfg=3.5,
+# refiner_steps=4. Diffusers HunyuanImageRefinerPipeline.__call__ signature
+# default for distilled_guidance_scale is 3.25, but the README wins
+# (same lesson as the 2K-mandatory amendment in ADR-014's 2026-05-24
+# Changelog: signature docstrings are unreliable; the Tencent README is
+# the source of truth for operating points). Both keys are no-ops when
+# the chained dispatch path isn't activated — they flow through the
+# ADR-009 precedence ladder same as cfg_scale/steps, just only consumed
+# by the refiner stage when it runs.
+check(
+    "FAMILY_DEFAULTS['hunyuan-image'] sets refiner_steps=4 (Tencent refiner README)",
+    FAMILY_DEFAULTS.get("hunyuan-image", {}).get("refiner_steps") == 4,
+)
+check(
+    "FAMILY_DEFAULTS['hunyuan-image'] sets refiner_cfg=3.5 (Tencent refiner README)",
+    FAMILY_DEFAULTS.get("hunyuan-image", {}).get("refiner_cfg") == 3.5,
+)
+# Defensive: NOT refiner_path — there is no family-wide default refiner
+# location. The ADR-016 §(a) "no filesystem auto-discovery" invariant
+# requires the operator to point at the refiner explicitly. Family-
+# defaulting refiner_path would either re-introduce path derivation
+# (Alternative A — rejected for the security-surface widening reason)
+# or hardcode a single path that doesn't match every operator's layout.
+check(
+    "FAMILY_DEFAULTS['hunyuan-image'] does NOT set refiner_path "
+    "(ADR-016 §(a) — no auto-discovery; operator opts in explicitly)",
+    "refiner_path" not in FAMILY_DEFAULTS.get("hunyuan-image", {}),
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── COMFYLESS_SCHEMA: refiner-stage canonical keys (ADR-016 §(d), (h))")
+
+# Schema-replayable. refiner_path parallels transformer_path/vae_path etc.
+# (sidecar-replayable component path; empty string = unset). refiner_steps
+# / refiner_cfg parallel steps / cfg_scale (typed numeric, ADR-009 overlay).
+# All three are no-ops when the chained dispatch path doesn't run; sidecar
+# replay of a base+refiner generation against a pre-refiner build silently
+# ignores unknown keys (existing schema-validator pass-through behavior).
+from comfyless.params_schema import COMFYLESS_SCHEMA
+
+check(
+    "COMFYLESS_SCHEMA contains refiner_path (sidecar-replayable path)",
+    "refiner_path" in COMFYLESS_SCHEMA,
+)
+check(
+    "COMFYLESS_SCHEMA contains refiner_steps (sidecar-replayable int)",
+    "refiner_steps" in COMFYLESS_SCHEMA,
+)
+check(
+    "COMFYLESS_SCHEMA contains refiner_cfg (sidecar-replayable float)",
+    "refiner_cfg" in COMFYLESS_SCHEMA,
+)
+# Schema default values match Tencent refiner README (locks defaults
+# even if a future engineer changes _FIELD_DEFAULTS without acknowledging
+# the README citation).
+check(
+    "COMFYLESS_SCHEMA['refiner_steps'] default is 4",
+    COMFYLESS_SCHEMA["refiner_steps"][1] == 4,
+)
+check(
+    "COMFYLESS_SCHEMA['refiner_cfg'] default is 3.5",
+    COMFYLESS_SCHEMA["refiner_cfg"][1] == 3.5,
+)
+check(
+    "COMFYLESS_SCHEMA['refiner_path'] default is '' (unset → base-only)",
+    COMFYLESS_SCHEMA["refiner_path"][1] == "",
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
 print("── family_defaults: precedence ladder (ADR-009 + ADR-014 §4) ──")
 
 # End-to-end: _apply_family_defaults reads detect_pipeline_class to derive

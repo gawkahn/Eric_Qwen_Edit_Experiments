@@ -69,8 +69,16 @@ _FIELD_DEFAULTS: Dict[str, object] = {
     "vae_path":             "",
     "text_encoder_path":    "",
     "text_encoder_2_path":  "",
+    "refiner_path":         "",
     "vae_from_transformer": False,
     "loras":                [],
+    # Refiner schema keys per ADR-016 §(d) defaults (Tencent refiner
+    # README authoritative — diffusers signature default for cfg is 3.25,
+    # README wins; same lesson as the 2K-mandatory amendment in ADR-014).
+    # Both are no-ops when --refiner is unset; activated only when the
+    # chained dispatch path runs.
+    "refiner_steps":        4,
+    "refiner_cfg":          3.5,
 }
 
 
