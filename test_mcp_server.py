@@ -233,9 +233,10 @@ check("schema: `cascade_config` IS in properties (slot reserved for step 3)",
 # ════════════════════════════════════════════════════════════════════════
 print("\n== Invariant 8 (was slice-1 inv 6): tools/list returns 3 tools ==")
 # ════════════════════════════════════════════════════════════════════════
-# Slice 2 step 4 updates the slice-1 invariant 6 count from 1 → 3:
-# `generate` (slice 1 — schema + description unchanged per Vision
-# invariant 14), `list_models`, `list_loras` (this slice).
+# Slice 2 step 4 updated the slice-1 invariant 6 count from 1 → 3.
+# Slice 2b invariant 1 updates it again 3 → 4: `generate` (slice 1 —
+# schema + description unchanged per slice-2 Vision invariant 14),
+# `list_models`, `list_loras` (slice 2), `list_transformers` (slice 2b).
 
 with tempfile.TemporaryDirectory() as tmp_out, \
      tempfile.TemporaryDirectory() as tmp_base:
@@ -244,14 +245,16 @@ with tempfile.TemporaryDirectory() as tmp_out, \
         default_model=None, mcp_max_iterations=100,
     )
     tools = _run(mcps._list_tools_impl(cfg))
-    check("Invariant 8: list_tools returns 3 elements",
-          isinstance(tools, list) and len(tools) == 3,
+    check("Slice-2b invariant 1: list_tools returns 4 elements",
+          isinstance(tools, list) and len(tools) == 4,
           detail=f"len={len(tools)}")
-    check("Invariant 8: every element is a Tool",
+    check("Slice-2b invariant 1: every element is a Tool",
           all(isinstance(t, Tool) for t in tools))
     _tool_names = sorted(t.name for t in tools)
-    check("Invariant 8: tool names are exactly {generate, list_models, list_loras}",
-          _tool_names == ["generate", "list_loras", "list_models"],
+    check("Slice-2b invariant 1: tool names are exactly "
+          "{generate, list_models, list_loras, list_transformers}",
+          _tool_names == ["generate", "list_loras", "list_models",
+                          "list_transformers"],
           detail=f"names={_tool_names}")
     _tools_by_name = {t.name: t for t in tools}
     check("Invariant 8: 'generate' tool description still names qwen-image "
@@ -264,6 +267,13 @@ with tempfile.TemporaryDirectory() as tmp_out, \
     check("Invariant 8: 'list_loras' tool description names target_family",
           _tools_by_name["list_loras"].description
           and "target_family" in _tools_by_name["list_loras"].description)
+    check("Slice-2b invariant 1: 'list_transformers' tool description names "
+          "transformer + empty inputSchema",
+          _tools_by_name["list_transformers"].description
+          and "transformer" in _tools_by_name["list_transformers"].description
+          and _tools_by_name["list_transformers"].inputSchema.get("properties") == {}
+          and _tools_by_name["list_transformers"].inputSchema.get(
+              "additionalProperties") is False)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -2287,16 +2297,18 @@ with tempfile.TemporaryDirectory() as tmp_out, \
 
     # --- Step-3 wiring carry: tool surface count is the same regardless
     # of catalog content (Step 3 wires the catalog onto cfg; Step 4 grew
-    # the surface to 3 tools statically — catalog content never changes
-    # the tool LIST, only the responses inside list_models/list_loras).
+    # the surface to 3 tools statically; slice 2b adds a 4th — catalog
+    # content never changes the tool LIST, only the responses inside the
+    # list_* handlers).
     tools = _run(mcps._list_tools_impl(cfg))
     check("Step3 carry: _list_tools_impl with populated catalog still "
-          "returns the static three tools",
-          isinstance(tools, list) and len(tools) == 3,
+          "returns the static four tools (slice-2b)",
+          isinstance(tools, list) and len(tools) == 4,
           detail=f"len={len(tools)}")
     _names = sorted(t.name for t in tools)
     check("Step3 carry: tool names unchanged by catalog content",
-          _names == ["generate", "list_loras", "list_models"],
+          _names == ["generate", "list_loras", "list_models",
+                     "list_transformers"],
           detail=f"names={_names}")
 
 
@@ -2612,8 +2624,9 @@ with tempfile.TemporaryDirectory() as tmp_out, \
     )
     tools = _run(mcps._list_tools_impl(cfg))
     by_name = {t.name: t for t in tools}
-    check("N20: tools/list advertises exactly 3 tools",
-          set(by_name) == {"generate", "list_models", "list_loras"})
+    check("N20: tools/list advertises exactly 4 tools (slice-2b)",
+          set(by_name) == {"generate", "list_models", "list_loras",
+                           "list_transformers"})
     check("N20: 'generate' inputSchema is byte-identical to _GENERATE_INPUT_SCHEMA "
           "(slice-1 invariant 14)",
           by_name["generate"].inputSchema == mcps._GENERATE_INPUT_SCHEMA)
@@ -2626,6 +2639,14 @@ with tempfile.TemporaryDirectory() as tmp_out, \
     check("N20: 'list_loras' inputSchema accepts no inputs",
           by_name["list_loras"].inputSchema.get("properties") == {}
           and by_name["list_loras"].inputSchema.get("additionalProperties") is False)
+    check("N20: 'list_transformers' inputSchema accepts no inputs (slice-2b)",
+          by_name["list_transformers"].inputSchema.get("properties") == {}
+          and by_name["list_transformers"].inputSchema.get(
+              "additionalProperties") is False)
+    check("N20: 'list_loras'/'list_models' descriptions are byte-identical to "
+          "their slice-2 constants (slice 2b does not touch them)",
+          by_name["list_models"].description == mcps._LIST_MODELS_TOOL_DESCRIPTION
+          and by_name["list_loras"].description == mcps._LIST_LORAS_TOOL_DESCRIPTION)
 
 
 # --- N22: traceback strip on list_* internal exceptions ---
@@ -2708,8 +2729,9 @@ for label, src in (("mcp_server", _mcps_src), ("catalog", _cat_src)):
           not _argparse_imports)
 
 
-# --- N27: kind:"transformer" entries present in catalog but hidden
-# from both list_models and list_loras ---
+# --- N27: kind:"transformer" entries present in catalog, exposed ONLY
+# through list_transformers (slice 2b) and excluded from list_models /
+# list_loras (slice 2 carry-forward) ---
 
 with tempfile.TemporaryDirectory() as tmp_out, \
      tempfile.TemporaryDirectory() as tmp_base:
@@ -2720,7 +2742,7 @@ with tempfile.TemporaryDirectory() as tmp_out, \
         catalog=manifest,
     )
     # Catalog contains the transformer entry
-    check("N27: catalog contains kind:'transformer' entries (dormant slot)",
+    check("N27: catalog contains kind:'transformer' entries",
           any(e["kind"] == "transformer" for e in cfg.catalog.values()))
     _models, _ = _run(mcps._handle_list_models(cfg))
     _loras, _ = _run(mcps._handle_list_loras(cfg))
@@ -2734,6 +2756,140 @@ with tempfile.TemporaryDirectory() as tmp_out, \
           "scan-transformer" not in {e["name"] for e in _models_entries})
     check("N27: scan-transformer NOT in list_loras response",
           "scan-transformer" not in {e["name"] for e in _loras_entries})
+    # Slice-2b: the transformer IS surfaced by list_transformers, and
+    # ONLY transformers are (no model/lora bleed-through).
+    _tf, _tf_count = _run(mcps._handle_list_transformers(cfg))
+    _tf_entries = json.loads(_tf[0].text)
+    check("N27(2b): scan-transformer IS in list_transformers response",
+          "scan-transformer" in {e["name"] for e in _tf_entries})
+    check("N27(2b): list_transformers returns ONLY kind:'transformer' entries",
+          _tf_entries
+          and all(e["kind"] == "transformer" for e in _tf_entries))
+    check("N27(2b): no model/lora names bleed into list_transformers",
+          info["expected_models"].isdisjoint({e["name"] for e in _tf_entries})
+          and info["expected_loras"].isdisjoint(
+              {e["name"] for e in _tf_entries}))
+    check("N27(2b): list_transformers count matches len(entries)",
+          _tf_count == len(_tf_entries))
+
+
+# ════════════════════════════════════════════════════════════════════════
+print("\n== Slice 2b: list_transformers tool ==")
+# ════════════════════════════════════════════════════════════════════════
+#
+# Invariants (docs/vision/slice-2b-mcp-list-transformers.md):
+#   - Inv 2  response shape: strict-allowlist {name, kind, source[, model_family]};
+#            NO abs_path / path / any filesystem string
+#   - Inv 4  empty-input schema; audit-payload bounded to {} like the other
+#            list_* tools; one audit line per invocation
+#   - Inv 5  traceback strip carries forward (covered by the generic
+#            _call_tool_impl outer-except; N22 pattern already exercises it)
+
+# --- Tb1: list_transformers response shape (scan-derived omits model_family) ---
+
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    manifest, info = _build_step4_catalog(tmp_base)
+    cfg = mcps._validate_startup_args(
+        output_dir=tmp_out, model_base=tmp_base,
+        default_model=None, mcp_max_iterations=100,
+        catalog=manifest,
+    )
+    result, count = _run(mcps._handle_list_transformers(cfg))
+    check("Tb1: _handle_list_transformers returns (list[TextContent], int)",
+          isinstance(result, list) and len(result) == 1
+          and result[0].type == "text" and isinstance(count, int))
+    entries = json.loads(result[0].text)
+    check("Tb1: entry names match expected_transformers",
+          {e["name"] for e in entries} == info["expected_transformers"],
+          detail=f"got={sorted(e['name'] for e in entries)}")
+    _allowed_keys = {"name", "kind", "source", "model_family"}
+    _bad = [e for e in entries if not set(e.keys()).issubset(_allowed_keys)]
+    check("Tb1: every entry's keys subset of {name, kind, source, model_family}",
+          not _bad, detail=f"bad={_bad!r}")
+    check("Tb1: NO entry contains 'abs_path' or 'path' key",
+          not any("abs_path" in e or "path" in e for e in entries))
+    check("Tb1: every entry has kind='transformer'",
+          all(e["kind"] == "transformer" for e in entries))
+    _scan_tf = next((e for e in entries if e["name"] == "scan-transformer"), None)
+    check("Tb1: scan-derived transformer omits model_family (no inference)",
+          _scan_tf is not None and "model_family" not in _scan_tf,
+          detail=f"got={_scan_tf!r}")
+
+
+# --- Tb2: manifest-declared model_family surfaces; abs_path never leaks ---
+# Inject directly (mirror of N18) to prove the serializer's allowlist
+# holds for a transformer entry carrying both a path and a family.
+
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    cfg = mcps._validate_startup_args(
+        output_dir=tmp_out, model_base=tmp_base,
+        default_model=None, mcp_max_iterations=100,
+    )
+    cfg.catalog["flux2-dit"] = {
+        "abs_path": "/mnt/nvme-8tb/comfyui/diffusion_models/flux2-dit.safetensors",
+        "kind": "transformer", "source": "manifest",
+        "model_family": "flux2", "target_family": None,
+    }
+    result, _ = _run(mcps._handle_list_transformers(cfg))
+    body = result[0].text
+    check("Tb2: abs_path does NOT appear anywhere in list_transformers text",
+          "/mnt/nvme-8tb" not in body
+          and "flux2-dit.safetensors" not in body,
+          detail=f"body={body!r}")
+    _by_name = {e["name"]: e for e in json.loads(body)}
+    check("Tb2: manifest-declared model_family surfaces on transformer",
+          _by_name.get("flux2-dit", {}).get("model_family") == "flux2"
+          and "abs_path" not in _by_name.get("flux2-dit", {}),
+          detail=f"got={_by_name.get('flux2-dit')!r}")
+
+
+# --- Tb3: empty catalog -> empty array, count 0 ---
+
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    cfg = mcps._validate_startup_args(
+        output_dir=tmp_out, model_base=tmp_base,
+        default_model=None, mcp_max_iterations=100,
+    )
+    _t_result, _t_count = _run(mcps._handle_list_transformers(cfg))
+    check("Tb3: empty catalog -> list_transformers returns [] with count=0",
+          json.loads(_t_result[0].text) == [] and _t_count == 0)
+
+
+# --- Tb4: dispatch through _call_tool_impl + audit-payload bound to {} ---
+
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    manifest, info = _build_step4_catalog(tmp_base)
+    cfg = mcps._validate_startup_args(
+        output_dir=tmp_out, model_base=tmp_base,
+        default_model=None, mcp_max_iterations=100,
+        catalog=manifest,
+    )
+    flood_blob = "Z" * 10_000
+    captured_err = io.StringIO()
+    with unittest.mock.patch.object(sys, "stderr", captured_err):
+        tf_response = _run(mcps._call_tool_impl(
+            cfg, "list_transformers", {"junk": flood_blob}))
+    check("Tb4: _call_tool_impl('list_transformers') returns list[TextContent]",
+          isinstance(tf_response, list) and len(tf_response) == 1
+          and tf_response[0].type == "text"
+          and isinstance(json.loads(tf_response[0].text), list))
+    _stderr = captured_err.getvalue()
+    check("Tb4: list_transformers audit line does NOT echo the flood blob",
+          flood_blob not in _stderr and "junk" not in _stderr,
+          detail=f"stderr[:200]={_stderr[:200]!r}")
+    _audit_lines = [json.loads(ln) for ln in _stderr.splitlines()
+                    if ln.startswith("{")]
+    check("Tb4: exactly one list_transformers audit line, input={}, status=ok",
+          len(_audit_lines) == 1
+          and _audit_lines[0].get("tool") == "list_transformers"
+          and _audit_lines[0].get("input") == {}
+          and _audit_lines[0].get("status") == "ok"
+          and "count" in _audit_lines[0],
+          detail=f"lines={_audit_lines!r}")
 
 
 # --- Empty-catalog edge case (N13 from Vision, list_* shape) ---

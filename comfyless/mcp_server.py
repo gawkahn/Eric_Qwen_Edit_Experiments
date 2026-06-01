@@ -227,7 +227,7 @@ _GENERATE_INPUT_SCHEMA: dict[str, Any] = {
 
 
 # ════════════════════════════════════════════════════════════════════════
-# list_models / list_loras tool surfaces (slice 2 step 4)
+# list_models / list_loras tool surfaces (slice 2 step 4) + list_transformers (slice 2b)
 # ════════════════════════════════════════════════════════════════════════
 #
 # These are the agent's discovery channel: read-only enumeration of the
@@ -291,6 +291,38 @@ No inputs. No path-typed fields ever appear in the response.
 """
 
 _LIST_LORAS_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {},
+}
+
+_LIST_TRANSFORMERS_TOOL_DESCRIPTION = """\
+Enumerate the single-file diffusion-transformer (DiT) weights the server
+knows about (the `kind:"transformer"` entries in the spawn-time catalog).
+
+These are the standalone `.safetensors` transformer checkpoints (scanned
+from `--model-base/checkpoints` and `--model-base/diffusion_models`, or
+declared in the operator's --catalog file) that `generate` will accept as
+`transformer_path` values once slice-3 migrates `generate` to catalog-
+resolved name references. In slice 2/2b the catalog is built but `generate`
+still consumes raw paths, so calling `list_transformers` does NOT yet change
+how you call `generate`; it previews the named surface that will become
+required input.
+
+Returns a JSON array of `{name, kind, source[, model_family]}` objects:
+- `name`: agent-facing identifier (Unicode-NFC catalog key)
+- `kind`: always `"transformer"` for this tool
+- `source`: `"scan"` (auto-detected under --model-base/checkpoints or
+  /diffusion_models) or `"manifest"` (declared in the --catalog file)
+- `model_family`: present ONLY for manifest entries that explicitly
+  declared one (e.g. `"flux2"`). Scan-derived transformers omit this
+  field — a single-file DiT weight carries no model_index.json, so there
+  is no scan-time family classification.
+
+No inputs. No path-typed fields ever appear in the response.
+"""
+
+_LIST_TRANSFORMERS_INPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "properties": {},
@@ -500,15 +532,17 @@ def _validate_startup_args(
 # ════════════════════════════════════════════════════════════════════════
 
 async def _list_tools_impl(cfg: _StartupConfig) -> list[Tool]:
-    """Slice-2 invariant 8 (updates slice-1 invariant 6): advertise exactly
-    THREE tools — `generate` (slice 1, schema and description unchanged
-    per Vision invariant 14), `list_models` (slice 2 step 4, catalog
-    discovery for `kind:"model"` entries), and `list_loras` (slice 2
-    step 4, catalog discovery for `kind:"lora"` entries).
+    """Slice-2b invariant 1 (updates slice-2 invariant 8's count 3→4):
+    advertise exactly FOUR tools — `generate` (slice 1, schema and
+    description unchanged per slice-2 Vision invariant 14), `list_models`
+    (slice 2 step 4, `kind:"model"` discovery), `list_loras` (slice 2
+    step 4, `kind:"lora"` discovery), and `list_transformers` (slice 2b,
+    `kind:"transformer"` discovery).
 
-    `kind:"transformer"` catalog entries exist post-spawn but are NOT
-    exposed by either slice-2 tool (Vision invariant 9 / N27); they
-    remain dormant until slice 2b adds `list_transformers`.
+    `kind:"transformer"` entries were built and held dormant by slice 2
+    (slice-2 Vision invariant 9 / N27); slice 2b surfaces them through
+    `list_transformers` ONLY — they continue to be excluded from
+    `list_models` and `list_loras`.
     """
     return [
         Tool(
@@ -525,6 +559,11 @@ async def _list_tools_impl(cfg: _StartupConfig) -> list[Tool]:
             name="list_loras",
             description=_LIST_LORAS_TOOL_DESCRIPTION,
             inputSchema=_LIST_LORAS_INPUT_SCHEMA,
+        ),
+        Tool(
+            name="list_transformers",
+            description=_LIST_TRANSFORMERS_TOOL_DESCRIPTION,
+            inputSchema=_LIST_TRANSFORMERS_INPUT_SCHEMA,
         ),
     ]
 
@@ -578,7 +617,7 @@ async def _call_tool_impl(
     # the audit line still records the call (one line per invocation
     # per invariant 5) without echoing the unbounded blob. (security-
     # auditor slice-2 step-4 LOW-1, folded 2026-05-25.)
-    if name in ("list_models", "list_loras"):
+    if name in ("list_models", "list_loras", "list_transformers"):
         audit_payload: dict = {}
     else:
         audit_payload = arguments
@@ -593,6 +632,8 @@ async def _call_tool_impl(
             result, result_count = await _handle_list_models(cfg)
         elif name == "list_loras":
             result, result_count = await _handle_list_loras(cfg)
+        elif name == "list_transformers":
+            result, result_count = await _handle_list_transformers(cfg)
         else:
             raise _MCPHandlerError(
                 "UnknownTool",
@@ -1058,7 +1099,7 @@ def _resolve_mcp_output_path(
 
 
 # ════════════════════════════════════════════════════════════════════════
-# list_models / list_loras handlers  (slice 2 step 4)
+# list_models / list_loras handlers (slice 2 step 4) + list_transformers (slice 2b)
 # ════════════════════════════════════════════════════════════════════════
 #
 # Vision invariant 9 contract for the response:
@@ -1126,6 +1167,37 @@ async def _handle_list_loras(
         target_family = entry.get("target_family")
         if target_family is not None:
             out["target_family"] = target_family
+        entries.append(out)
+    entries.sort(key=lambda e: e["name"])
+    body = json.dumps(entries, ensure_ascii=False, separators=(",", ":"))
+    return [TextContent(type="text", text=body)], len(entries)
+
+
+async def _handle_list_transformers(
+    cfg: _StartupConfig,
+) -> tuple[list[TextContent], int]:
+    """Enumerate `kind:"transformer"` catalog entries for the MCP agent.
+
+    Mirror of `_handle_list_models` over the transformer kind (slice 2b
+    invariant 2): strict-allowlist serialization of `{name, kind, source}`
+    plus `model_family` when present. `model_family` is manifest-declared
+    only for transformers — scan-derived single-file DiT weights carry no
+    model_index.json, so the field is normally absent. NO `abs_path` /
+    `path` / any filesystem string ever enters the response (the slice-2
+    keystone guarantee, extended verbatim to this handler).
+    """
+    entries: list[dict[str, Any]] = []
+    for name, entry in cfg.catalog.items():
+        if entry["kind"] != "transformer":
+            continue
+        out: dict[str, Any] = {
+            "name": name,
+            "kind": "transformer",
+            "source": entry["source"],
+        }
+        model_family = entry.get("model_family")
+        if model_family is not None:
+            out["model_family"] = model_family
         entries.append(out)
     entries.sort(key=lambda e: e["name"])
     body = json.dumps(entries, ensure_ascii=False, separators=(",", ":"))
