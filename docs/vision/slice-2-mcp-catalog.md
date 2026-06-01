@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-23
 **ADR:** [ADR-015](../decisions/ADR-015-mcp-catalog-reference-resolution.md) (Status: accepted; rounds 1+2 CLEAN). Slice-2 row of the [ADR-015 §5](../decisions/ADR-015-mcp-catalog-reference-resolution.md) revised plan. Parent: [ADR-011](../decisions/ADR-011-comfyless-mcp-server.md) (2026-05-23 Changelog).
-**Status:** approved by Grant 2026-05-23 (open questions resolved: OQ1 new `comfyless/catalog.py` module; OQ2 manifest-only `target_family`; OQ3 shape-detection extraction in slice 2; OQ4 no `abs_path` in `list_*` audit). **Amended 2026-05-23 to add `kind:"transformer"` to the slice-2 catalog scope** (single-file safetensors DiT weights from `checkpoints/` and `diffusion_models/`); `list_transformers` becomes new slice 2b; VAE / `text_encoder` catalog kinds and cascade `scaffolding_repo` modeling deferred. Ready for `/change-slice`.
+**Status:** approved by Grant 2026-05-23 (open questions resolved: OQ1 new `comfyless/catalog.py` module; OQ2 manifest-only `target_family`; OQ3 shape-detection extraction in slice 2; OQ4 no `abs_path` in `list_*` audit). **Amended 2026-05-23 to add `kind:"transformer"` to the slice-2 catalog scope** (single-file safetensors DiT weights from `checkpoints/` and `diffusion_models/`); `list_transformers` becomes new slice 2b; VAE / `text_encoder` catalog kinds and cascade `scaffolding_repo` modeling deferred. **IMPLEMENTED 2026-05-30** (steps 1–4, commits `049f7f7`→`bb11a0f`; new `comfyless/catalog.py`; per-step `security-auditor` reviews on file; `test_mcp_server.py` 158→375, full suite 1225/1225; closure in ADR-015 Changelog 2026-05-30 entry). Next: slice 2b `list_transformers`.
 **AI-Disclosure:** Claude (Opus 4.7, 1M context) authored; Grant to review and approve.
 
 ---

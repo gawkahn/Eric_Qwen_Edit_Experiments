@@ -863,6 +863,22 @@ This sends a shutdown command over the socket. The server unloads the pipeline f
 - LoRA adapter names are sanitized to `[a-zA-Z0-9_-]` before being passed to diffusers.
 - Full design rationale: `docs/decisions/ADR-001-daemon-socket-security.md`.
 
+### MCP server (stdio) — for LLM agents
+
+Separate from the `--serve` IPC daemon above, `comfyless.mcp_server` exposes comfyless to an LLM agent over the Model Context Protocol (stdio transport). It is launched by the agent host, not run interactively:
+
+```bash
+$PY -m comfyless.mcp_server \
+    --model-base /home/gawkahn/projects/ai-lab/ai-base/models \
+    --output-dir /home/gawkahn/gen-output \
+    --default-model Qwen-Image-2512 \
+    --catalog /home/gawkahn/comfyless-catalog.json   # optional operator manifest
+```
+
+Advertised tools: **`generate`** (all non-cascade families + Stable Cascade via inline `cascade_config`), **`list_models`**, and **`list_loras`**. The agent never sees or supplies absolute paths — it references models and LoRAs by **opaque catalog names** only. The catalog is built once at spawn from a no-follow-symlinks scan of `--model-base` (directories with `model_index.json` → models; `loras/` → LoRAs) plus the optional `--catalog` manifest, and `list_models` / `list_loras` return `name` + `kind` + `model_family` + `source` only — never a filesystem path. Design source of truth: `docs/decisions/ADR-015-mcp-catalog-reference-resolution.md`.
+
+**Name portability — case matters.** Catalog names are compared case-sensitively but the catalog **refuses to start** if two entries collide under case-insensitive comparison (e.g. `MyLora` and `mylora`). This defends against case-folding hosts where the two could silently alias. Practical guidance: on a case-insensitive filesystem (macOS default, some network mounts) two weights whose names differ only by case can't coexist on disk anyway, and the catalog enforces the same rule everywhere for portability — **name your weights so they remain distinct without relying on case**, and a packaged distribution's manifest will then load identically across hosts.
+
 ---
 
 ## Troubleshooting
