@@ -900,6 +900,49 @@ def generate(
             allow_hf_download=allow_hf_download,
         )
 
+    # ── Hunyuan-Image refiner gate + load (ADR-016) ───────────────────
+    # The chain activates when family is hunyuan-image AND refiner_path
+    # is non-empty. Three other cases are handled here too:
+    #   - refiner_path set on a non-hunyuan family → clean error
+    #     (Vision Inv 10 negative; failure-semantics §5)
+    #   - hunyuan-image + refiner_path unset → loud stderr warning +
+    #     base-only run (Vision Inv 2; failure-semantics §1)
+    #   - any other family with refiner_path unset → no-op
+    # Empty string is the unset state per ADR-016 §(c) — sidecar replay
+    # of an empty string lands here as falsy.
+    refiner_pipe = None
+    if refiner_path:
+        if model_family != "hunyuan-image":
+            raise ValueError(
+                f"--refiner is only supported for the hunyuan-image family; "
+                f"--model resolved to family {model_family!r}. Drop --refiner "
+                f"or point --model at a HunyuanImage-2.1-Diffusers checkpoint."
+            )
+        from comfyless import hunyuan_chain
+        # Daemon path may pre-load both base and refiner (Step 4 of the
+        # refiner slice); accept a pre-loaded refiner from the cache when
+        # the server provides one, otherwise load fresh.
+        if _cached_pipeline is not None and _cached_pipeline.get("refiner_pipeline") is not None:
+            refiner_pipe = _cached_pipeline["refiner_pipeline"]
+            _log("[comfyless] Reusing cached refiner pipeline")
+        else:
+            refiner_pipe = hunyuan_chain.load_refiner_pipeline(
+                refiner_path, base_pipe=pipe,
+                precision=precision, device=device,
+                vae_tiling=vae_tiling,
+                allow_hf_download=allow_hf_download,
+            )
+    elif model_family == "hunyuan-image":
+        # Warn-don't-block per `feedback_warn_dont_block` + Vision Inv 2.
+        # The exact warning text is locked at runtime by test_hunyuan.py
+        # Inv 2; changing it requires a paired test edit.
+        print(
+            "WARNING: hunyuan-image quality requires a refiner; pass "
+            "--refiner <path>; download with huggingface-cli download "
+            "hunyuanvideo-community/HunyuanImage-2.1-Refiner-Diffusers",
+            file=sys.stderr,
+        )
+
     # ── Load LoRAs ────────────────────────────────────────────────────
     lora_warnings: List[str] = []
     loras = loras or []
@@ -963,9 +1006,24 @@ def generate(
         effective_sampler = "default"
 
     # ── Inference (with optional sampler swap) ────────────────────────
+    # When the Hunyuan-Image refiner chain is active, run_chain handles
+    # both pipeline calls under a single swap_sampler context. The swap
+    # is per-pipe (swap_sampler operates on base only), so refiner's
+    # scheduler is untouched — pinned per ADR-016 §(g) / Vision Inv 8.
     t0 = time.monotonic()
-    with swap_sampler(pipe, effective_sampler, log_prefix="[comfyless]"):
-        result = pipe(**call_kwargs)
+    if refiner_pipe is not None:
+        from comfyless import hunyuan_chain
+        with swap_sampler(pipe, effective_sampler, log_prefix="[comfyless]"):
+            final_pil = hunyuan_chain.run_chain(
+                pipe, refiner_pipe, call_kwargs,
+                prompt=prompt, negative_prompt=neg,
+                refiner_steps=refiner_steps, refiner_cfg=refiner_cfg,
+                generator=generator,
+            )
+    else:
+        with swap_sampler(pipe, effective_sampler, log_prefix="[comfyless]"):
+            result = pipe(**call_kwargs)
+        final_pil = result.images[0]
     elapsed = time.monotonic() - t0
     _log(f"[comfyless] Generated in {elapsed:.1f}s")
 
@@ -996,10 +1054,18 @@ def generate(
     }
     if lora_warnings:
         metadata["lora_warnings"] = lora_warnings
+    if refiner_pipe is not None:
+        # Two-stage metadata extension per ADR-016 §(h). The four keys
+        # are absent (not present-and-empty) on base-only runs — Vision
+        # Inv 4. Sidecar replay of a pre-refiner image carries no
+        # `pipeline` key → base-only branch reactivates correctly.
+        metadata["pipeline"]      = "base+refiner"
+        metadata["refiner_path"]  = refiner_path
+        metadata["refiner_steps"] = refiner_steps
+        metadata["refiner_cfg"]   = refiner_cfg
 
     # ── Save PNG with embedded metadata ──────────────────────────────
-    pil_image = result.images[0]
-    _save_with_metadata(pil_image, output_path, metadata, mcp_caller=mcp_caller)
+    _save_with_metadata(final_pil, output_path, metadata, mcp_caller=mcp_caller)
     _log(f"[comfyless] Saved: {output_path}")
 
     # ── Clean up VAE ──────────────────────────────────────────────────
@@ -1063,6 +1129,16 @@ def _parse_args() -> argparse.Namespace:
                    help="Custom text encoder slot 1 (CLIP-L for Flux; Qwen2.5-VL for Qwen)")
     p.add_argument("--te2", type=str, default=None, metavar="PATH",
                    help="Custom text encoder slot 2 (T5-XXL for Flux/Chroma)")
+    p.add_argument("--refiner", type=str, default=None, metavar="PATH",
+                   help="Hunyuan-Image 2.1 refiner pipeline path (opt-in two-stage "
+                        "chained generation). When set on a hunyuan-image --model, "
+                        "the base output is passed through "
+                        "HunyuanImageRefinerPipeline for the documented quality "
+                        "pass (Tencent README, ADR-016). Unset on hunyuan-image: "
+                        "loud stderr warning + base-only run. Unset on other "
+                        "families: no-op. Set on a non-hunyuan family: clean "
+                        "error. Download with: huggingface-cli download "
+                        "hunyuanvideo-community/HunyuanImage-2.1-Refiner-Diffusers")
     p.add_argument("--vae-from-transformer", action="store_true", default=None,
                    help="Extract VAE from the --transformer AIO checkpoint")
     p.add_argument("--precision", choices=["bf16", "fp16", "fp32"], default="bf16")

@@ -124,4 +124,5 @@ _CLI_TO_CANONICAL: Dict[str, str] = {
     "te1":         "text_encoder_path",
     "te2":         "text_encoder_2_path",
     "lora":        "loras",
+    "refiner":     "refiner_path",
 }

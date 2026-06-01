@@ -852,6 +852,617 @@ check(
 )
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  Refiner slice — Step 2 (ADR-016, slice-hunyuan-image-2-1-refiner.md)
+# ══════════════════════════════════════════════════════════════════════
+#
+# Invariants tested below (cross-reference Vision §"Invariants"):
+#   Inv 1  no-fs-search       — structural + runtime
+#   Inv 2  warn-don't-block   — runtime stderr capture + PIL write
+#   Inv 3  opt-in via path    — runtime activation gating
+#   Inv 4  output identity    — PNG tEXt chunk shape
+#   Inv 6  CFG routing parity — build_refiner_call_kwargs direct call
+#   Inv 7  LoRAs base-only    — structural + runtime adapter-count proxy
+#   Inv 8  scheduler pinned   — structural source check
+#   Inv 9  shared text enc    — structural source check + runtime
+#   Inv 10 no regressions     — negative case (non-hunyuan + refiner_path)
+#
+# Inv 5 is locked by the Step-1 schema/defaults tests above. Inv 11 is
+# the Step-4 daemon scope. Inv 12 is the Step-3 ComfyUI-node scope.
+# Inv 13 is the live-smoke memory ceiling (no CPU coverage).
+
+import comfyless.hunyuan_chain as hc
+import contextlib
+import io
+from PIL import Image as _PILImage
+from PIL.PngImagePlugin import PngInfo
+
+
+class _FakeBaseResult:
+    """diffusers-shaped result: .images is a list of PIL images."""
+    def __init__(self, pil):
+        self.images = [pil]
+
+
+class _FakeBasePipe:
+    """Fake base pipeline. Tracks call count and last kwargs."""
+    def __init__(self, family="hunyuan-image"):
+        self.call_count = 0
+        self.last_kwargs = None
+        self.family = family
+        # text_encoder + tokenizer present so shared-encoder injection
+        # has identity-trackable objects to assert on.
+        self.text_encoder = object()
+        self.tokenizer = object()
+        self.vae = None  # offload_vae=False in tests → never accessed
+
+    def __call__(self, **kwargs):
+        self.call_count += 1
+        self.last_kwargs = kwargs
+        pil = _PILImage.new("RGB", (16, 16), color=(10, 20, 30))
+        return _FakeBaseResult(pil)
+
+
+class _FakeRefinerPipe:
+    """Fake refiner pipeline. Tracks call count and last kwargs."""
+    def __init__(self):
+        self.call_count = 0
+        self.last_kwargs = None
+
+    def __call__(self, **kwargs):
+        self.call_count += 1
+        self.last_kwargs = kwargs
+        pil = _PILImage.new("RGB", (16, 16), color=(200, 100, 50))
+        return _FakeBaseResult(pil)
+
+    def to(self, device):
+        # diffusers pipelines return self from .to() — load_refiner_pipeline
+        # rebinds the returned value, so this fake must follow the same shape.
+        return self
+
+
+def _cached(family="hunyuan-image", refiner_pipe=None):
+    """Build a _cached_pipeline dict shape that bypasses _load_pipeline."""
+    base = _FakeBasePipe(family=family)
+    cd = {
+        "pipeline": base,
+        "model_family": family,
+        "guidance_embeds": False,
+    }
+    if refiner_pipe is not None:
+        cd["refiner_pipeline"] = refiner_pipe
+    return cd, base
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── Inv 1 — no filesystem search (structural + runtime) ────────")
+
+# Structural: hunyuan_chain.py must not contain any directory-traversal
+# primitives. If it has none, the runtime can't search — locks the
+# "no path-derivation" posture at the source level. Defends against a
+# future engineer adding sibling-glob logic without re-reading ADR-016
+# Alternative A's rationale.
+with open("comfyless/hunyuan_chain.py") as f:
+    chain_src = f.read()
+for forbidden in ("os.listdir", "Path.glob", ".iterdir(", ".scandir(", "os.scandir"):
+    check(
+        f"hunyuan_chain.py does NOT contain {forbidden!r} (no auto-discovery)",
+        forbidden not in chain_src,
+    )
+
+# Runtime: a bare hunyuan-image generate() with refiner_path="" must
+# never reach load_refiner_pipeline — the only code path that could
+# derive any refiner path. Tracks invocation by replacing the loader
+# with a recording spy.
+_load_calls = []
+_orig_loader = hc.load_refiner_pipeline
+hc.load_refiner_pipeline = lambda *a, **kw: (_load_calls.append((a, kw)),
+                                             _FakeRefinerPipe())[1]
+try:
+    cached, base = _cached(family="hunyuan-image", refiner_pipe=None)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Use the real fixture dir as --model so output dir validation passes.
+        fixture = os.path.join(tmpdir, "model_index.json")
+        with open(fixture, "w") as f:
+            json.dump({"_class_name": "HunyuanImagePipeline"}, f)
+        out = os.path.join(tmpdir, "out.png")
+        # Silence the expected warn-don't-block stderr line.
+        with contextlib.redirect_stderr(io.StringIO()):
+            cg.generate(
+                model_path=tmpdir, prompt="x", output_path=out,
+                refiner_path="", device="cpu", _cached_pipeline=cached,
+            )
+    check(
+        "bare hunyuan-image (refiner_path='') never invokes load_refiner_pipeline",
+        len(_load_calls) == 0,
+        f"got {len(_load_calls)} call(s)",
+    )
+finally:
+    hc.load_refiner_pipeline = _orig_loader
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── Inv 2 — warn-don't-block (bare hunyuan-image; no refiner) ───")
+
+# The exact warning text is locked by Vision §Intent + dump §"Step
+# 2-specific notes". Changing it requires a paired test edit — this
+# string assertion catches casual edits to the user-facing line.
+EXPECTED_WARNING_FRAGMENTS = (
+    "hunyuan-image quality requires a refiner",
+    "pass --refiner <path>",
+    "huggingface-cli download hunyuanvideo-community/HunyuanImage-2.1-Refiner-Diffusers",
+)
+
+cached, base = _cached(family="hunyuan-image", refiner_pipe=None)
+with tempfile.TemporaryDirectory() as tmpdir:
+    out = os.path.join(tmpdir, "out.png")
+    buf = io.StringIO()
+    rc_exc = None
+    with contextlib.redirect_stderr(buf):
+        try:
+            metadata = cg.generate(
+                model_path=tmpdir, prompt="x", output_path=out,
+                refiner_path="", device="cpu", _cached_pipeline=cached,
+            )
+        except Exception as e:
+            rc_exc = e
+    stderr_text = buf.getvalue()
+    check(
+        "Inv 2: bare hunyuan-image without --refiner does NOT raise",
+        rc_exc is None,
+        f"raised {type(rc_exc).__name__}: {rc_exc}" if rc_exc else "",
+    )
+    for fragment in EXPECTED_WARNING_FRAGMENTS:
+        check(
+            f"Inv 2: warning stderr contains {fragment!r}",
+            fragment in stderr_text,
+            f"stderr={stderr_text!r}",
+        )
+    check(
+        "Inv 2: PNG written despite warn-don't-block",
+        os.path.isfile(out),
+    )
+    check(
+        "Inv 2: base pipeline called exactly once (no refiner stage)",
+        base.call_count == 1,
+        f"got {base.call_count}",
+    )
+    # Metadata must NOT carry the chain keys when the chain didn't run
+    # (Vision Inv 4: "the new keys are absent, not present-and-empty").
+    for key in ("pipeline", "refiner_path", "refiner_steps", "refiner_cfg"):
+        check(
+            f"Inv 2: base-only metadata omits {key!r} (Vision Inv 4)",
+            key not in metadata,
+            f"got {metadata.get(key)!r}",
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── Inv 3 — opt-in via refiner_path activates the chain ────────")
+
+# Drive generate() with refiner_path set. The cached-pipeline dict
+# carries a pre-built _FakeRefinerPipe so the chain activates without
+# hitting load_refiner_pipeline. Assertion: refiner __call__ ran
+# exactly once → opt-in path was taken.
+ref_pipe = _FakeRefinerPipe()
+cached, base = _cached(family="hunyuan-image", refiner_pipe=ref_pipe)
+with tempfile.TemporaryDirectory() as tmpdir:
+    out = os.path.join(tmpdir, "out.png")
+    with contextlib.redirect_stderr(io.StringIO()):
+        metadata_chain = cg.generate(
+            model_path=tmpdir, prompt="alpine lake", output_path=out,
+            negative_prompt="blurry",
+            refiner_path="/fake/refiner/path",
+            refiner_steps=4, refiner_cfg=3.5,
+            device="cpu", _cached_pipeline=cached,
+        )
+check(
+    "Inv 3: refiner __call__ invoked exactly once when refiner_path set",
+    ref_pipe.call_count == 1,
+    f"got {ref_pipe.call_count}",
+)
+check(
+    "Inv 3: base __call__ also invoked exactly once (single base pass)",
+    base.call_count == 1,
+    f"got {base.call_count}",
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── Inv 4 — output identity + PNG metadata schema (ADR-016 §h) ──")
+
+# Verify the comfyless tEXt chunk on the chained-output PNG carries:
+#   - pipeline = "base+refiner" (literal, locked)
+#   - refiner_path = exact path passed in
+#   - refiner_steps / refiner_cfg = effective values
+# AND that the base-only PNG from Inv 2 carries NONE of these keys.
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    out = os.path.join(tmpdir, "chained.png")
+    ref_pipe = _FakeRefinerPipe()
+    cached, _ = _cached(family="hunyuan-image", refiner_pipe=ref_pipe)
+    with contextlib.redirect_stderr(io.StringIO()):
+        metadata = cg.generate(
+            model_path=tmpdir, prompt="p", output_path=out,
+            refiner_path="/some/refiner/path",
+            refiner_steps=8, refiner_cfg=4.25,
+            device="cpu", _cached_pipeline=cached,
+        )
+
+    # In-memory metadata shape
+    check(
+        "Inv 4: metadata['pipeline'] == 'base+refiner'",
+        metadata.get("pipeline") == "base+refiner",
+        f"got {metadata.get('pipeline')!r}",
+    )
+    check(
+        "Inv 4: metadata['refiner_path'] preserved from input",
+        metadata.get("refiner_path") == "/some/refiner/path",
+    )
+    check(
+        "Inv 4: metadata['refiner_steps'] == effective value (8)",
+        metadata.get("refiner_steps") == 8,
+    )
+    check(
+        "Inv 4: metadata['refiner_cfg'] == effective value (4.25)",
+        metadata.get("refiner_cfg") == 4.25,
+    )
+
+    # On-disk PNG tEXt chunk shape
+    info = _PILImage.open(out).info
+    raw = info.get("comfyless")
+    check(
+        "Inv 4: PNG carries comfyless tEXt chunk",
+        raw is not None,
+    )
+    chunk = json.loads(raw) if raw else {}
+    check(
+        "Inv 4: PNG tEXt: pipeline = 'base+refiner'",
+        chunk.get("pipeline") == "base+refiner",
+    )
+    check(
+        "Inv 4: PNG tEXt: refiner_path embedded",
+        chunk.get("refiner_path") == "/some/refiner/path",
+    )
+    check(
+        "Inv 4: PNG tEXt: refiner_steps embedded",
+        chunk.get("refiner_steps") == 8,
+    )
+    check(
+        "Inv 4: PNG tEXt: refiner_cfg embedded",
+        chunk.get("refiner_cfg") == 4.25,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── Inv 6 — refiner CFG routing parity (ADR-016 §f) ─────────────")
+
+# Direct call into build_refiner_call_kwargs — refiner_cfg routes to
+# distilled_guidance_scale (mirrors base's hunyuan-image branch from
+# ADR-014 §2). Refiner is also guidance-distilled.
+fake_ref = _FakeRefinerPipe()
+fake_image = _PILImage.new("RGB", (8, 8))
+ref_kw = hc.build_refiner_call_kwargs(
+    fake_ref, fake_image, "p", "blurry",
+    refiner_steps=4, refiner_cfg=3.5, generator=None,
+)
+check(
+    "Inv 6: distilled_guidance_scale = refiner_cfg",
+    ref_kw.get("distilled_guidance_scale") == 3.5,
+    f"got {ref_kw!r}",
+)
+check(
+    "Inv 6: num_inference_steps = refiner_steps",
+    ref_kw.get("num_inference_steps") == 4,
+)
+check(
+    "Inv 6: image kwarg set (PIL roundtrip per ADR-016 §d)",
+    ref_kw.get("image") is fake_image,
+)
+check(
+    "Inv 6: prompt forwarded",
+    ref_kw.get("prompt") == "p",
+)
+check(
+    "Inv 6: negative_prompt forwarded when set",
+    ref_kw.get("negative_prompt") == "blurry",
+)
+# Negative-case: empty/None negative_prompt is omitted, not present-and-empty.
+# Mirrors base's ADR-014 §5 behavior — pipeline owns the empty-string semantics.
+ref_kw_empty = hc.build_refiner_call_kwargs(
+    fake_ref, fake_image, "p", "",
+    refiner_steps=4, refiner_cfg=3.5, generator=None,
+)
+check(
+    "Inv 6: empty negative_prompt omitted from refiner kwargs",
+    "negative_prompt" not in ref_kw_empty,
+)
+ref_kw_none = hc.build_refiner_call_kwargs(
+    fake_ref, fake_image, "p", None,
+    refiner_steps=4, refiner_cfg=3.5, generator=None,
+)
+check(
+    "Inv 6: None negative_prompt omitted from refiner kwargs",
+    "negative_prompt" not in ref_kw_none,
+)
+# The other CFG kwargs MUST NOT appear on a refiner call — the refiner
+# is distilled, not 2-pass true-CFG (same lock as the base hunyuan-image
+# branch in test_hunyuan above).
+check(
+    "Inv 6: refiner kwargs do NOT include guidance_scale",
+    "guidance_scale" not in ref_kw,
+)
+check(
+    "Inv 6: refiner kwargs do NOT include true_cfg_scale",
+    "true_cfg_scale" not in ref_kw,
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── Inv 7 — LoRAs base-only (structural + runtime) ─────────────")
+
+# Structural: hunyuan_chain.py must not import or call any LoRA loader.
+# Refiner has a separate transformer with separate weights; base LoRAs
+# would not produce meaningful output on it (ADR-016 §g, Vision Inv 7).
+for forbidden in ("load_lora_with_key_fix", "load_lora_weights", "load_lora",
+                  "set_adapters", "fuse_lora"):
+    check(
+        f"hunyuan_chain.py does NOT reference {forbidden!r} (refiner LoRA-free)",
+        forbidden not in chain_src,
+    )
+
+# Runtime: chained generate() with --lora set must invoke the LoRA
+# loader exactly once and against the BASE pipe, never the refiner.
+# The cached-pipeline gate in generate() skips LoRA loading entirely
+# (server owns adapter state), so we must bypass that path AND
+# _load_pipeline to exercise the LoRA loop directly. Stub
+# _load_pipeline to return our FakeBasePipe,
+# inject FakeRefinerPipe via the loader stub, run with --lora, then
+# assert the LoRA loader received the BASE pipe id and NOT the refiner.
+lora_calls = []
+ref_pipe = _FakeRefinerPipe()
+base_pipe = _FakeBasePipe(family="hunyuan-image")
+_orig_load = cg._load_pipeline
+_orig_loader2 = hc.load_refiner_pipeline
+_orig_lora2 = cg.load_lora_with_key_fix
+def _stub_load(model_path, **kw):
+    return base_pipe, "hunyuan-image", False
+def _stub_refiner_loader(*a, **kw):
+    return ref_pipe
+def _lora_spy2(pipe, path, *a, **kw):
+    lora_calls.append({"pipe_id": id(pipe), "path": path})
+    return True
+cg._load_pipeline = _stub_load
+hc.load_refiner_pipeline = _stub_refiner_loader
+cg.load_lora_with_key_fix = _lora_spy2
+try:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out = os.path.join(tmpdir, "out.png")
+        with contextlib.redirect_stderr(io.StringIO()):
+            cg.generate(
+                model_path=tmpdir, prompt="p", output_path=out,
+                refiner_path="/fake/refiner",
+                refiner_steps=4, refiner_cfg=3.5,
+                loras=[{"path": "/fake/lora.safetensors", "weight": 1.0}],
+                device="cpu",
+            )
+finally:
+    cg._load_pipeline = _orig_load
+    hc.load_refiner_pipeline = _orig_loader2
+    cg.load_lora_with_key_fix = _orig_lora2
+check(
+    "Inv 7: LoRA loader called exactly once (base-only; LoRA stack length 1)",
+    len(lora_calls) == 1,
+    f"got {len(lora_calls)} call(s)",
+)
+check(
+    "Inv 7: LoRA loader received the BASE pipe id, not refiner",
+    lora_calls and lora_calls[0]["pipe_id"] == id(base_pipe),
+    f"got pipe_id={lora_calls[0]['pipe_id'] if lora_calls else '?'}",
+)
+check(
+    "Inv 7: LoRA loader never received the refiner pipe id",
+    all(c["pipe_id"] != id(ref_pipe) for c in lora_calls),
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── Inv 8 — refiner scheduler / sampler / sigmas pinned ─────────")
+
+# Structural: hunyuan_chain.py must not mutate the refiner's scheduler
+# (no `.scheduler =`, no `set_timesteps` call, no `swap_sampler(` call).
+# The refiner uses its on-disk FlowMatchEulerDiscreteScheduler config;
+# v1 ships no refiner-side scheduler/sampler/sigmas surface (ADR-016 §g).
+# `swap_sampler(` (with open paren) catches the call site; the docstring
+# mention is intentional (explains the caller's per-pipe responsibility).
+for forbidden in (".scheduler =", "set_timesteps(", "swap_sampler(",
+                  "register_to_config("):
+    check(
+        f"hunyuan_chain.py does NOT contain {forbidden!r} (refiner scheduler pinned)",
+        forbidden not in chain_src,
+    )
+
+# Runtime: a chained generate() with base-side --sampler swap must
+# leave the refiner pipe's scheduler unchanged. The base-side
+# swap_sampler is a per-pipe context manager (operates on `pipe`, not
+# refiner_pipe); the chain's call ordering inside generate() wraps
+# swap_sampler around the entire run_chain call, but only the base
+# scheduler is swapped. We track this by attaching a sentinel
+# `.scheduler` to the refiner pipe and asserting identity-preservation
+# across a chained run.
+sentinel_scheduler = object()
+ref_pipe = _FakeRefinerPipe()
+ref_pipe.scheduler = sentinel_scheduler
+cached, _ = _cached(family="hunyuan-image", refiner_pipe=ref_pipe)
+with tempfile.TemporaryDirectory() as tmpdir:
+    out = os.path.join(tmpdir, "out.png")
+    with contextlib.redirect_stderr(io.StringIO()):
+        cg.generate(
+            model_path=tmpdir, prompt="p", output_path=out,
+            refiner_path="/fake/refiner", sampler="default",
+            device="cpu", _cached_pipeline=cached,
+        )
+check(
+    "Inv 8: refiner.scheduler identity preserved across chained run",
+    ref_pipe.scheduler is sentinel_scheduler,
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── Inv 9 — shared Qwen2.5-VL text_encoder (asymmetric, ADR-016 §e)")
+
+# Structural: load_refiner_pipeline must pass `text_encoder=` and
+# `tokenizer=` into the refiner's from_pretrained call. Locks the
+# asymmetric optimization at the source level.
+check(
+    "hunyuan_chain.py passes text_encoder= into refiner from_pretrained",
+    "text_encoder=base_pipe.text_encoder" in chain_src,
+)
+check(
+    "hunyuan_chain.py passes tokenizer= into refiner from_pretrained",
+    "tokenizer=base_pipe.tokenizer" in chain_src,
+)
+# Defensive: refiner has NO text_encoder_2 slot (per ADR-016 §e). The
+# loader must not pass one — would either be silently dropped or raise.
+check(
+    "hunyuan_chain.py does NOT pass text_encoder_2= (refiner has no slot)",
+    "text_encoder_2=" not in chain_src,
+)
+
+# Runtime: drive load_refiner_pipeline with stubbed
+# detect_pipeline_class + a fake refiner class whose from_pretrained
+# captures kwargs. Assert text_encoder identity matches base.
+captured_kwargs = {}
+class _FakeRefinerClass:
+    @classmethod
+    def from_pretrained(cls, path, **kwargs):
+        captured_kwargs["path"] = path
+        captured_kwargs.update(kwargs)
+        return _FakeRefinerPipe()
+
+# Hunyuan_chain reaches into nodes.eric_diffusion_utils for the resolver
+# + detector. The test setup at the top of this file stubbed
+# nodes.eric_diffusion_utils with only `build_model_metadata`; populate
+# the three names hunyuan_chain.load_refiner_pipeline imports inside its
+# body, then patch them with spies for this test block.
+eduh = sys.modules["nodes.eric_diffusion_utils"]
+_orig_resolve = getattr(eduh, "resolve_hf_path", None)
+_orig_detect = getattr(eduh, "detect_pipeline_class", None)
+_orig_tiling = getattr(eduh, "resolve_vae_tiling", None)
+eduh.resolve_hf_path = lambda p, **kw: p
+eduh.detect_pipeline_class = lambda p: (
+    _FakeRefinerClass, "HunyuanImageRefinerPipeline", "hunyuan-image-refiner",
+)
+eduh.resolve_vae_tiling = lambda fam, flag="auto": False
+try:
+    base = _FakeBasePipe()
+    refiner = hc.load_refiner_pipeline(
+        "/fake/refiner", base_pipe=base,
+        precision="bf16", device="cpu", vae_tiling="auto",
+    )
+finally:
+    eduh.resolve_hf_path = _orig_resolve
+    eduh.detect_pipeline_class = _orig_detect
+    eduh.resolve_vae_tiling = _orig_tiling
+
+check(
+    "Inv 9: refiner from_pretrained received text_encoder= identity-equal to base",
+    captured_kwargs.get("text_encoder") is base.text_encoder,
+)
+check(
+    "Inv 9: refiner from_pretrained received tokenizer= identity-equal to base",
+    captured_kwargs.get("tokenizer") is base.tokenizer,
+)
+check(
+    "Inv 9: refiner from_pretrained received local_files_only=True (no network)",
+    captured_kwargs.get("local_files_only") is True,
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── Inv 9 — wrong-class refiner path raises clean ValueError ────")
+
+# Negative case for Inv 9 / Vision §"Failure semantics": pointing
+# --refiner at a non-refiner pipeline (e.g. a base or Flux pipeline by
+# mistake) must raise a clean error citing the class mismatch.
+eduh.resolve_hf_path = lambda p, **kw: p
+eduh.detect_pipeline_class = lambda p: (
+    object, "HunyuanImagePipeline", "hunyuan-image",  # base, not refiner
+)
+try:
+    expect_raises(
+        "load_refiner_pipeline rejects non-refiner pipeline class",
+        lambda: hc.load_refiner_pipeline(
+            "/fake/path", base_pipe=_FakeBasePipe(),
+            precision="bf16", device="cpu",
+        ),
+        ValueError,
+    )
+finally:
+    eduh.resolve_hf_path = _orig_resolve
+    eduh.detect_pipeline_class = _orig_detect
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── Inv 10 — non-regression: refiner_path on non-hunyuan family ─")
+
+# Setting --refiner on a non-hunyuan-image family must raise cleanly
+# (no silent base-only fallback — the opt-in signal was explicit, the
+# operator wants the refiner, masking the misconfig defeats the point).
+# Vision Inv 10 + failure-semantics §4.
+for non_hunyuan_family in ("qwen-image", "flux", "flux2", "sdxl", "auraflow",
+                           "chroma", "sd1", "sd3", "zimage"):
+    cached, _ = _cached(family=non_hunyuan_family, refiner_pipe=None)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out = os.path.join(tmpdir, "out.png")
+        expect_raises(
+            f"Inv 10: refiner_path set on {non_hunyuan_family} → ValueError",
+            lambda c=cached, o=out, t=tmpdir: cg.generate(
+                model_path=t, prompt="p", output_path=o,
+                refiner_path="/fake/refiner",
+                device="cpu", _cached_pipeline=c,
+            ),
+            ValueError,
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── Inv 10 — non-regression: non-hunyuan families behave identically")
+
+# Source-level co-lock: the refiner gate logic in generate() must be
+# gated on model_family == "hunyuan-image" (or refiner_path set, for
+# the negative case). A future engineer who fans the gate out to other
+# families would break this lock.
+with open("comfyless/generate.py") as f:
+    gen_src = f.read()
+check(
+    "generate() refiner gate is family-conditional (model_family == \"hunyuan-image\")",
+    'model_family == "hunyuan-image"' in gen_src,
+)
+check(
+    "generate() refiner non-hunyuan-family branch raises ValueError",
+    "raise ValueError" in gen_src and "--refiner is only supported" in gen_src,
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── Inv 3 — --refiner argparse flag wired into _parse_args ──────")
+
+# Structural co-lock: the --refiner argparse flag must be present in
+# _parse_args and the canonical mapping must route it to refiner_path.
+# Catches accidental rename of the flag or the canonical key without
+# touching the paired test.
+check(
+    "_parse_args declares --refiner flag",
+    'p.add_argument("--refiner"' in gen_src,
+)
+from comfyless.params_schema import _CLI_TO_CANONICAL
+check(
+    "_CLI_TO_CANONICAL maps 'refiner' → 'refiner_path'",
+    _CLI_TO_CANONICAL.get("refiner") == "refiner_path",
+)
+
+
 # ──────────────────────────────────────────────────────────────────────
 print(f"\n────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")

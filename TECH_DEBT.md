@@ -354,3 +354,23 @@ ADR-010's "Deferred / Out of Scope" section formally declares the following non-
 - ControlNet variants (the SAI repo carries a `controlnet/` directory; not wired).
 - Lite-variant filename detection or warning (permissive, doc-only policy — by design).
 - Other `--iterate` axes beyond `prompt` and `seed` for cascade dispatch (cfg, model, transformer, etc. are JSON-config concerns, not iterate axes — ADR-010 amendment 3).
+
+---
+
+## Hunyuan-Image refiner
+
+### [Tests] Inv 8 chain runtime test passes trivially under sampler="default"
+- **Location:** `test_hunyuan.py` — Inv 8 runtime block (refiner.scheduler identity preservation across chained run)
+- **Observed:** 2026-05-31 code-reviewer MINOR-2 on Step 2 (refiner-chain slice)
+- **Why not now:** The structural source-level forbidden-token sweep (`.scheduler =`, `set_timesteps(`, `swap_sampler(`, `register_to_config(` in hunyuan_chain.py) is the load-bearing assertion for Vision Inv 8. The runtime block adds defense-in-depth; today it passes trivially because `sampler="default"` makes `swap_sampler` a no-op context, so refiner.scheduler identity is preserved even if the base swap accidentally leaked. Risk is structurally impossible given hunyuan_chain.py contains no scheduler mutations against `refiner_pipe`.
+- **Suggested fix:** When a real swappable sampler exercises the chain (e.g. extending Inv 8 to run with `sampler="multistep2"`), the runtime assertion becomes non-trivial — refiner.scheduler must remain identity-equal to the sentinel even with a base-side schedule swap active. ~5-line test extension.
+- **Trigger:** Next non-default sampler addition to the chained code path, or any change to hunyuan_chain.py's scheduler-pinning structure.
+- **Priority:** Low
+
+### [Code] MINOR-1 forward-watch — refiner-load + LoRA-load ordering vs. daemon cache eviction
+- **Location:** `comfyless/generate.py` refiner gate at L903-944, LoRA load loop at L968-991
+- **Observed:** 2026-05-31 code-reviewer MINOR-1 on Step 2 (refiner-chain slice)
+- **Why not now:** v1 LoRA-load failure semantics are warn-and-continue (catch Exception → log → keep going), so a LoRA fault does not orphan the already-loaded refiner inside a single `generate()` invocation. Vision §"Failure semantics" does not speak to mid-load failure ordering. Real risk surfaces in Step 4 when the daemon caches both pipelines and needs a deterministic eviction order on cache_key mismatch.
+- **Suggested fix:** In Step 4's `comfyless/server.py` cache-eviction path, evict `refiner_pipeline` BEFORE `pipeline` on cache_key mismatch, in case a Python-side reference cycle or partial-setup state holds either alive through a half-loaded chain. Document in ADR-016 §(i) / Step 4 security review.
+- **Trigger:** Step 4 of the refiner slice (`comfyless/server.py` cache-aware two-stage handling) — fold into the security-auditor pass.
+- **Priority:** Medium
