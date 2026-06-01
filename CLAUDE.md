@@ -64,9 +64,9 @@ python3 test_machine_boundary_validator.py  # 118 tests: machine-boundary valida
 python3 test_iterate.py                     #  92 tests: comfyless --iterate (ADR-008)
 python3 test_samplers.py                    #  41 tests: custom schedulers / sampler swap
 python3 test_server_robustness.py           #   8 tests: comfyless IPC timeouts + BrokenPipe survival
-python3 test_mcp_server.py                  # 375 tests: comfyless MCP server (ADR-011 slice 1 + ADR-015 slice 2 catalog/list_models/list_loras)
+python3 test_mcp_server.py                  # 394 tests: comfyless MCP server (ADR-011 slice 1 + ADR-015 slice 2 catalog/list_models/list_loras + slice 2b list_transformers)
 ```
-All nine suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 1225 unit tests; expect 0 failures.
+All nine suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 1244 unit tests; expect 0 failures.
 
 `test_flux2.py` is a live GPU smoke test that performs an actual Flux.2 generation — separate from the unit suites above. Run only when you need to verify end-to-end Flux.2 behavior.
 
