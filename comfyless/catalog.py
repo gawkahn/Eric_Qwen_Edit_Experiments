@@ -40,6 +40,7 @@ import json
 import os
 import re
 import unicodedata
+from dataclasses import dataclass
 from typing import Dict, Iterator, Literal, Optional, Tuple, TypedDict
 
 
@@ -619,3 +620,194 @@ def build_catalog(
             _add_entry(catalog, entry, name)
 
     return catalog
+
+
+# ---------------------------------------------------------------------------
+# Request-time reference resolution (ADR-015 slice 3).
+#
+# `generate` (and future `extract_params` / `iterate`) hands an agent-supplied
+# reference value to `resolve_reference`, which turns it into a server-side
+# `abs_path` OR a failure cause. This is the request-time half of the catalog;
+# `build_catalog` above is the spawn-time half. The two share `normalize_name`
+# and `_FORBIDDEN_NAME_CHARS` so a request candidate and a catalog key cannot
+# disagree on normalization (ADR-015 §2 step 1).
+#
+# This module NEVER renders an agent-facing string. It returns a structured
+# `ResolveResult` whose `cause` (on failure) is OPERATOR-AUDIT ONLY. The
+# handler in `comfyless/mcp_server.py` maps every failure cause onto the single
+# uniform agent-facing error `"reference not available"` (ADR-015 §2 step 2,
+# HIGH-1) and writes the fine-grained cause to the stderr audit line only
+# (§2 step 2, the load-bearing oracle-closure commitment). Keeping the
+# uniform-error rendering in ONE place (the handler) — not scattered across
+# this resolver — is what makes the byte-identical-frame property auditable.
+# ---------------------------------------------------------------------------
+
+# Operator-audit-only failure causes. NEVER agent-facing — the agent frame is
+# uniform across all of these (ADR-015 §2 step 2). Differences exist solely so
+# the operator's stderr audit line can name what actually went wrong.
+#
+# Mapping to ADR-015 §2's enumerated causes:
+#   - UnknownName        — normalized candidate not a catalog key (catalog miss).
+#   - KindMismatch       — candidate IS a catalog key but the entry's kind is not
+#                          the kind this field accepts (e.g. a lora name supplied
+#                          as `model`). Folded into the uniform "not available"
+#                          frame so the wrong-kind case cannot be distinguished
+#                          from a miss — without this, a kind mismatch would fall
+#                          through to `_load_pipeline` and surface as a DIFFERENT
+#                          (InternalError) frame, a mild existence oracle. This
+#                          STRENGTHENS HIGH-1 beyond the ADR's five-cause list
+#                          (Vision slice-3 §"Open questions"; flagged for review).
+#   - MalformedReference — empty after basename-strip, NUL byte, or a
+#                          `_FORBIDDEN_NAME_CHARS` codepoint. (ADR-015 §2 step 2
+#                          "malformed-reference rejection".)
+#   - PathMoved          — catalog hit, but `abs_path` no longer exists at
+#                          request time (a drive remount / move / delete between
+#                          spawn and request — MEDIUM-1). Request-time HF-cache
+#                          eviction also surfaces here: catalog entries store the
+#                          already-resolved LOCAL cache path (build-time HF
+#                          resolution, Vision invariant 6), so a post-spawn cache
+#                          clear makes that local path vanish — indistinguishable
+#                          from any other PathMoved, which is correct (the agent
+#                          frame is uniform regardless). The ADR's separate
+#                          request-time `HFCacheMiss` audit label is therefore
+#                          subsumed by PathMoved: the catalog does not retain the
+#                          originating repo ID, so request-time re-resolution
+#                          would be a no-op on an absolute local path. (Vision
+#                          slice-3 §"Open questions"; flagged for review.)
+#   - WithinFailure      — catalog hit, `abs_path` exists, but fails the
+#                          request-time `_within(--model-base)` re-check
+#                          (defense-in-depth, ADR-015 §2 step 3 / MEDIUM-1).
+ResolveCause = Literal[
+    "UnknownName",
+    "KindMismatch",
+    "MalformedReference",
+    "PathMoved",
+    "WithinFailure",
+]
+
+
+@dataclass(frozen=True)
+class ResolveResult:
+    """Outcome of `resolve_reference`. Discriminated on `ok`.
+
+    On success (`ok=True`): `abs_path` is the server-side load target,
+    `name` is the agent-presentable resolved catalog name (NFC; what the
+    response renders — never `abs_path`), `kind` is the entry kind, and
+    `path_was_discarded` is True iff the input was path-shaped and its
+    directory component was stripped (drives the §2 INFO path-discard
+    notice — interpolating `name`, NEVER the agent-supplied raw value).
+
+    On failure (`ok=False`): `cause` names the OPERATOR-AUDIT-ONLY reason;
+    `abs_path` / `name` / `kind` are None. `path_was_discarded` is still
+    set so the audit line can record that a path was supplied.
+    """
+
+    ok: bool
+    abs_path: Optional[str] = None
+    name: Optional[str] = None
+    kind: Optional[str] = None
+    path_was_discarded: bool = False
+    cause: Optional[ResolveCause] = None
+
+
+def resolve_reference(
+    catalog: CatalogDict,
+    raw_ref: str,
+    model_base: str,
+    *,
+    expected_kind: Optional[str] = None,
+) -> ResolveResult:
+    """Resolve one agent-supplied reference value to a server-side path.
+
+    ADR-015 §2:
+      step 1 — basename-strip a path-shaped value, then NFC-normalize.
+      step 2 — catalog lookup; any failure → a single uniform agent error
+               (rendered by the HANDLER, not here; this returns the cause).
+      step 3 — request-time `realpath`/`_within` fail-closed on a hit; never
+               fall back to a stale catalog path.
+
+    `expected_kind` (optional): when set, a catalog hit of a different kind
+    returns `ok=False, cause="KindMismatch"` — folded into the uniform
+    not-available outcome so wrong-kind cannot be distinguished from a miss.
+    `None` accepts any kind.
+
+    Pure with respect to its inputs except for the request-time filesystem
+    stat (`os.path.exists`) and `_within`'s `realpath` — both read-only.
+    Raises nothing for agent-supplied input: malformed values (including a
+    NUL byte) become `cause="MalformedReference"`, not an exception.
+    """
+    # 1 — basename-strip (ADR-015 §2 step 1). Path-shaped == contains any
+    # separator; reduce to basename and flag the discard. `os.sep` and "/"
+    # both checked so a "\\"-style value on a POSIX host is still treated as
+    # path-shaped only via os.sep (POSIX sep is "/"); the "/" check is the
+    # operative one here and matches `os.path.basename` semantics.
+    if not isinstance(raw_ref, str):
+        return ResolveResult(ok=False, cause="MalformedReference")
+    path_was_discarded = False
+    candidate = raw_ref
+    if "/" in raw_ref or os.sep in raw_ref:
+        candidate = os.path.basename(raw_ref)
+        path_was_discarded = True
+
+    # 2 — malformed gate. Empty after basename-strip (e.g. "/foo/bar/"), a
+    # NUL byte, or any `_FORBIDDEN_NAME_CHARS` codepoint → MalformedReference.
+    # Runs on the candidate BEFORE normalize_name so a control/zero-width
+    # char cannot smuggle through (the build-side gate in `_add_entry` is the
+    # symmetric guarantee that catalog KEYS are clean).
+    if (
+        candidate == ""
+        or "\x00" in candidate
+        or _FORBIDDEN_NAME_CHARS.search(candidate) is not None
+    ):
+        return ResolveResult(
+            ok=False, path_was_discarded=path_was_discarded,
+            cause="MalformedReference",
+        )
+
+    # 3 — normalize + lookup.
+    name_norm = normalize_name(candidate)
+    entry = catalog.get(name_norm)
+    if entry is None:
+        return ResolveResult(
+            ok=False, path_was_discarded=path_was_discarded,
+            cause="UnknownName",
+        )
+
+    # 4 — kind enforcement (folds into not-available; no kind oracle).
+    if expected_kind is not None and entry["kind"] != expected_kind:
+        return ResolveResult(
+            ok=False, path_was_discarded=path_was_discarded,
+            cause="KindMismatch",
+        )
+
+    abs_path = entry["abs_path"]
+
+    # 5 — request-time existence (PathMoved; also subsumes post-spawn HF-cache
+    # eviction — see the ResolveCause docstring). `_within` below does its own
+    # `realpath` but does NOT verify existence, so this check is required to
+    # distinguish a moved/deleted target from an in-base one.
+    if not os.path.exists(abs_path):
+        return ResolveResult(
+            ok=False, path_was_discarded=path_was_discarded,
+            cause="PathMoved",
+        )
+
+    # 6 — request-time `_within` fail-closed (ADR-015 §2 step 3 / MEDIUM-1).
+    # Defense-in-depth: the catalog SHOULD only hold in-base paths (build-time
+    # check), but a remount/move between spawn and request can invalidate that.
+    # Reuse the daemon's `_within` (lazy import; keeps this module's import-time
+    # side effects stdlib-only, matching `_parse_manifest_entry`).
+    from comfyless.server import _within
+    if not _within(abs_path, model_base):
+        return ResolveResult(
+            ok=False, path_was_discarded=path_was_discarded,
+            cause="WithinFailure",
+        )
+
+    return ResolveResult(
+        ok=True,
+        abs_path=abs_path,
+        name=name_norm,
+        kind=entry["kind"],
+        path_was_discarded=path_was_discarded,
+    )

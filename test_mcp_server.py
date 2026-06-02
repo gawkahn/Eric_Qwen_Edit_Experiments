@@ -3038,6 +3038,171 @@ check("Sanitize: _FORBIDDEN_NAME_CHARS is a compiled regex",
 
 
 # ════════════════════════════════════════════════════════════════════════
+print("\n== Slice 3 Step 1: resolve_reference (request-time resolver) ==")
+# ════════════════════════════════════════════════════════════════════════
+#
+# Unit-level coverage of the pure resolver added to comfyless/catalog.py.
+# Handler-integration coverage (uniform agent error, audit cause, notices,
+# resolved_params-as-names) lands in Step 3 (Vision N1-N17). Here we prove
+# the resolver returns the right ResolveResult / ResolveCause for every
+# input shape — the building block the handler maps onto the uniform frame.
+#
+# Maps to Vision slice-3 invariants 1, 2 (cause set incl. KindMismatch),
+# 4 (request-time existence + _within fail-closed), and the basename-strip
+# / path_was_discarded flag that drives the §2 INFO notice.
+
+_s3_root = tempfile.mkdtemp(prefix="s3-resolver-")
+_s3_mb = os.path.join(_s3_root, "model-base")
+os.makedirs(_s3_mb, exist_ok=True)
+_make_model_fixture(_s3_mb, "qwen-image")
+_make_loras_fixture(_s3_mb, ["anime-style"])
+_make_transformer_fixture(_s3_mb, "diffusion_models", ["flux-dit"])
+_s3_cat = cat_mod.build_catalog(_s3_mb, None)
+
+# --- positive: bare name hit (no discard) ---
+_r = cat_mod.resolve_reference(_s3_cat, "qwen-image", _s3_mb, expected_kind="model")
+check("resolve: bare model name → ok", _r.ok, repr(_r))
+check("resolve: bare model name → name is the catalog key",
+      _r.name == "qwen-image", repr(_r))
+check("resolve: bare model name → kind=model", _r.kind == "model", repr(_r))
+check("resolve: bare model name → abs_path set + in model-base",
+      bool(_r.abs_path) and _r.abs_path.startswith(os.path.realpath(_s3_mb)),
+      repr(_r))
+check("resolve: bare name → path_was_discarded False",
+      _r.path_was_discarded is False, repr(_r))
+check("resolve: hit has no cause", _r.cause is None, repr(_r))
+
+# --- positive: path-shaped value → basename-strip + discard flag ---
+_r = cat_mod.resolve_reference(
+    _s3_cat, "/some/agent/dir/qwen-image", _s3_mb, expected_kind="model")
+check("resolve: path-shaped value resolves via basename", _r.ok, repr(_r))
+check("resolve: path-shaped → name is the catalog name (not the dir)",
+      _r.name == "qwen-image", repr(_r))
+check("resolve: path-shaped → path_was_discarded True",
+      _r.path_was_discarded is True, repr(_r))
+check("resolve: path-shaped → abs_path is catalog abs_path, NOT the supplied dir",
+      _r.abs_path == _s3_cat["qwen-image"]["abs_path"], repr(_r))
+
+# --- positive: lora + transformer kinds resolve under the right expected_kind ---
+_r = cat_mod.resolve_reference(_s3_cat, "anime-style", _s3_mb, expected_kind="lora")
+check("resolve: lora name under expected_kind=lora → ok + kind=lora",
+      _r.ok and _r.kind == "lora", repr(_r))
+_r = cat_mod.resolve_reference(_s3_cat, "flux-dit", _s3_mb, expected_kind="transformer")
+check("resolve: transformer name under expected_kind=transformer → ok",
+      _r.ok and _r.kind == "transformer", repr(_r))
+
+# --- positive: expected_kind=None accepts any kind ---
+_r = cat_mod.resolve_reference(_s3_cat, "anime-style", _s3_mb)
+check("resolve: expected_kind=None accepts a lora", _r.ok and _r.kind == "lora",
+      repr(_r))
+
+# --- failure: UnknownName ---
+_r = cat_mod.resolve_reference(_s3_cat, "does-not-exist", _s3_mb, expected_kind="model")
+check("resolve: unknown name → not ok", not _r.ok, repr(_r))
+check("resolve: unknown name → cause=UnknownName", _r.cause == "UnknownName", repr(_r))
+check("resolve: unknown name → abs_path None (no leak)", _r.abs_path is None, repr(_r))
+
+# --- failure: KindMismatch (lora name supplied where a model is expected) ---
+_r = cat_mod.resolve_reference(_s3_cat, "anime-style", _s3_mb, expected_kind="model")
+check("resolve: lora name as model → not ok", not _r.ok, repr(_r))
+check("resolve: lora name as model → cause=KindMismatch",
+      _r.cause == "KindMismatch", repr(_r))
+check("resolve: KindMismatch → abs_path None (no leak)", _r.abs_path is None, repr(_r))
+
+# --- failure: MalformedReference (null byte / empty-after-strip / forbidden char) ---
+_r = cat_mod.resolve_reference(_s3_cat, "qwen-image\x00", _s3_mb, expected_kind="model")
+check("resolve: NUL byte → cause=MalformedReference (no exception)",
+      not _r.ok and _r.cause == "MalformedReference", repr(_r))
+_r = cat_mod.resolve_reference(_s3_cat, "/trailing/dir/", _s3_mb, expected_kind="model")
+check("resolve: path with trailing slash (empty basename) → MalformedReference",
+      not _r.ok and _r.cause == "MalformedReference", repr(_r))
+_r = cat_mod.resolve_reference(_s3_cat, "", _s3_mb, expected_kind="model")
+check("resolve: empty string → MalformedReference",
+      not _r.ok and _r.cause == "MalformedReference", repr(_r))
+# Build the zero-width char programmatically — no literal hostile codepoint
+# in this source file (mirrors catalog.py's bidi-detection-friendly policy).
+_zw_name = "ze" + chr(0x200b) + "ro"
+_r = cat_mod.resolve_reference(_s3_cat, _zw_name, _s3_mb, expected_kind="model")
+check("resolve: zero-width char → MalformedReference",
+      not _r.ok and _r.cause == "MalformedReference", repr(_r))
+_r = cat_mod.resolve_reference(_s3_cat, 12345, _s3_mb, expected_kind="model")  # type: ignore[arg-type]
+check("resolve: non-str input → MalformedReference (no exception)",
+      not _r.ok and _r.cause == "MalformedReference", repr(_r))
+
+# --- failure: PathMoved (catalog hit whose abs_path no longer exists) ---
+_moved_root = tempfile.mkdtemp(prefix="s3-moved-")
+_moved_mb = os.path.join(_moved_root, "model-base")
+os.makedirs(_moved_mb, exist_ok=True)
+_make_loras_fixture(_moved_mb, ["ghost"])
+_moved_cat = cat_mod.build_catalog(_moved_mb, None)
+os.remove(os.path.join(_moved_mb, "loras", "ghost.safetensors"))
+_r = cat_mod.resolve_reference(_moved_cat, "ghost", _moved_mb, expected_kind="lora")
+check("resolve: catalog hit whose path was deleted → not ok", not _r.ok, repr(_r))
+check("resolve: deleted path → cause=PathMoved", _r.cause == "PathMoved", repr(_r))
+check("resolve: PathMoved → no fallback abs_path returned", _r.abs_path is None, repr(_r))
+
+# --- failure: WithinFailure (hand-built catalog entry pointing OUTSIDE model-base) ---
+# build_catalog never produces this; construct it directly to prove the
+# request-time _within net fires (Vision invariant 4 / MEDIUM-1).
+_outside_root = tempfile.mkdtemp(prefix="s3-outside-")
+_outside_file = os.path.join(_outside_root, "escaped.safetensors")
+with open(_outside_file, "wb") as _f:
+    _f.write(b"outside-model-base")
+_evil_cat = {
+    "escaped": {
+        "abs_path": os.path.realpath(_outside_file),
+        "kind": "lora", "source": "manifest",
+        "model_family": None, "target_family": None,
+    }
+}
+_r = cat_mod.resolve_reference(_evil_cat, "escaped", _s3_mb, expected_kind="lora")
+check("resolve: entry abs_path outside model-base → not ok", not _r.ok, repr(_r))
+check("resolve: outside model-base → cause=WithinFailure",
+      _r.cause == "WithinFailure", repr(_r))
+check("resolve: WithinFailure → no abs_path returned (no load)",
+      _r.abs_path is None, repr(_r))
+
+# --- malformed char in a DISCARDED directory component is stripped, not rejected ---
+# Proves the malformed gate runs on the post-basename-strip candidate, not raw R:
+# a NUL in the discarded dir must not poison a clean basename (code-reviewer gap 1).
+_r = cat_mod.resolve_reference(
+    _s3_cat, "/ev\x00il/qwen-image", _s3_mb, expected_kind="model")
+check("resolve: NUL in discarded dir → clean basename still resolves",
+      _r.ok and _r.name == "qwen-image", repr(_r))
+check("resolve: NUL-in-dir resolve → path_was_discarded True",
+      _r.path_was_discarded is True, repr(_r))
+
+# --- path_was_discarded is preserved on a FAILING path-shaped input ---
+# Step 2's audit line records that a path was supplied even on failure
+# (code-reviewer gap 2).
+_r = cat_mod.resolve_reference(
+    _s3_cat, "/some/dir/does-not-exist", _s3_mb, expected_kind="model")
+check("resolve: failing path-shaped input → cause=UnknownName",
+      not _r.ok and _r.cause == "UnknownName", repr(_r))
+check("resolve: failing path-shaped input → path_was_discarded preserved",
+      _r.path_was_discarded is True, repr(_r))
+
+# --- NFC-equivalence: a decomposed request resolves to a composed catalog key ---
+# Proves request candidate and catalog key cannot disagree on normalization
+# (invariant 1; code-reviewer gap 3). Build a lora whose name is composed "é".
+_nfc_root = tempfile.mkdtemp(prefix="s3-nfc-")
+_nfc_mb = os.path.join(_nfc_root, "model-base")
+os.makedirs(_nfc_mb, exist_ok=True)
+_composed = "caf" + chr(0x00e9)            # "café" with precomposed é (U+00E9)
+_make_loras_fixture(_nfc_mb, [_composed])
+_nfc_cat = cat_mod.build_catalog(_nfc_mb, None)
+_decomposed = "caf" + "e" + chr(0x0301)    # "café" with combining acute (e + U+0301)
+_r = cat_mod.resolve_reference(_nfc_cat, _decomposed, _nfc_mb, expected_kind="lora")
+check("resolve: NFD request resolves to NFC catalog key (normalization symmetry)",
+      _r.ok and _r.name == cat_mod.normalize_name(_composed), repr(_r))
+
+# --- module surface: ResolveResult dataclass + ResolveCause exported ---
+check("resolve: ResolveResult exported", hasattr(cat_mod, "ResolveResult"))
+check("resolve: resolve_reference is callable",
+      callable(getattr(cat_mod, "resolve_reference", None)))
+
+
+# ════════════════════════════════════════════════════════════════════════
 print("\n== Module hygiene ==")
 # ════════════════════════════════════════════════════════════════════════
 
