@@ -462,6 +462,24 @@ mcp_server.py non-thread assertion).
   shorthand; the implemented + tested name is `refiner_path`. No code
   change for this Changelog entry — corrects ADR text alignment with
   implementation.
+- 2026-06-02 — refiner VAE tiling bug closed (`7e2f71b`): live 2K smoke
+  (seed 42, 1920×1088) surfaced `RuntimeError` in
+  `AutoencoderKLHunyuanImageRefiner._dcae_downsample_rearrange` during
+  tiled encode. Root cause: the 32× DCAE refiner VAE has the same
+  no-tile requirement as the base VAE; `hunyuan-image-refiner` was
+  intentionally deferred to this slice in `_VAE_TILING_FAMILIES_DEFAULT_OFF`.
+  Fix: added `"hunyuan-image-refiner"` to the set; refiner log now
+  reads `Refiner VAE tiling disabled (vae_tiling=auto)`. Smoke re-run
+  PASS: base 50 steps + refiner 4 steps, 38.9 s wall time, EXIT 0,
+  image saved. `code-reviewer` (Opus): APPROVED. Unit gate: 244 tests,
+  0 failures.
+- 2026-06-02 — **slice fully closed.** All commits on `hunyuan-support`:
+  Step 1 `7ca5b67` (ADR + schema/defaults), Step 2 `46a48f6`
+  (`hunyuan_chain.py` + `--refiner` CLI flag), Step 3 `e948325`
+  (ComfyUI node `refiner_path` input), Step 4 `138db5f` (IPC daemon
+  parity + §12 security review), Step 5 `7e2f71b` (VAE-tiling fix),
+  closure (this commit). Full unit gate: 1289/1289. Live 2K
+  base+refiner smoke: PASS (2026-06-02).
 
 ## AI-Disclosure
 
