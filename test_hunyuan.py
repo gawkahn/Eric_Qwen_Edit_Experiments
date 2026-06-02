@@ -577,10 +577,7 @@ check(
 )
 
 # Invariant 2 — every other family under auto stays tiled (preserves the
-# pre-existing behavior on 8×/16× VAEs). Sweeps the full family roster the
-# slice's Vision §"Invariants 2" enumerates, plus the Hunyuan-Image refiner
-# (intentionally NOT in the default-off set in v1; the refiner slice owns
-# the call about extending the no-tile default there).
+# pre-existing behavior on 8×/16× VAEs).
 AUTO_TILED_FAMILIES = [
     "qwen-edit", "qwen-image",
     "flux", "flux2", "flux2klein",
@@ -588,13 +585,24 @@ AUTO_TILED_FAMILIES = [
     "sd1", "sd3", "sdxl",
     "zimage",
     "stablecascade",
-    "hunyuan-image-refiner",
 ]
 for fam in AUTO_TILED_FAMILIES:
     check(
         f"{fam} + auto → tiling True (preserves current behavior)",
         utils_mod.resolve_vae_tiling(fam, "auto") is True,
     )
+
+# Refiner uses the same 32× DCAE VAE as base → no-tile default. Confirmed
+# by live 2026-06-02 smoke: tiled encode raises shape error on 1920×1088 in
+# AutoencoderKLHunyuanImageRefiner._dcae_downsample_rearrange.
+check(
+    "hunyuan-image-refiner + auto → tiling False (DCAE 32× VAE; same as base)",
+    utils_mod.resolve_vae_tiling("hunyuan-image-refiner", "auto") is False,
+)
+check(
+    "hunyuan-image-refiner + on → tiling True (force-on wins over family default)",
+    utils_mod.resolve_vae_tiling("hunyuan-image-refiner", "on") is True,
+)
 
 # Invariant 3a — explicit "on" forces tiling even on a default-off family.
 check(

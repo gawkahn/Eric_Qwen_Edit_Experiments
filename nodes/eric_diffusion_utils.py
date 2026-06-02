@@ -66,9 +66,11 @@ VAE_TILING_CHOICES = ("auto", "on", "off")
 #: render — smaller than the SDXL VAE handles untiled — so tiling adds seam
 #: artifacts without any memory headroom benefit (ADR-014 Changelog
 #: 2026-05-27). Other families default to tiled (preserves the pre-existing
-#: behavior on 8×/16× VAEs). The Hunyuan-Image refiner is intentionally NOT
-#: in this set in v1 — handled in the refiner slice.
-_VAE_TILING_FAMILIES_DEFAULT_OFF = frozenset({"hunyuan-image"})
+#: behavior on 8×/16× VAEs). The Hunyuan-Image refiner uses the same 32×
+#: DCAE architecture and shares the same no-tile default (live smoke on
+#: 2026-06-02 confirmed tiled encode fails on 1920×1088 with a reshape error
+#: in AutoencoderKLHunyuanImageRefiner._dcae_downsample_rearrange).
+_VAE_TILING_FAMILIES_DEFAULT_OFF = frozenset({"hunyuan-image", "hunyuan-image-refiner"})
 
 
 def resolve_vae_tiling(model_family: str, flag: str = "auto") -> bool:
@@ -555,7 +557,7 @@ def _load_single_weights(component_class, weights_path: str, dtype,
                     peek_keys = list(f.keys())
             else:
                 peek_keys = list(
-                    torch.load(path, map_location="cpu", weights_only=True).keys()
+                    torch.load(path, map_location="cpu", weights_only=True).keys()  # nosemgrep
                 )
         except Exception:
             return None
@@ -591,7 +593,7 @@ def _load_single_weights(component_class, weights_path: str, dtype,
         """
         from safetensors.torch import load_file as st_load
         sd = st_load(src_path) if src_path.lower().endswith(".safetensors") \
-            else torch.load(src_path, map_location="cpu", weights_only=True)
+            else torch.load(src_path, map_location="cpu", weights_only=True)  # nosemgrep
         # Pop one key at a time: sd shrinks as stripped grows, never 2× in RAM.
         keys = list(sd.keys())
         stripped = {}
@@ -632,7 +634,7 @@ def _load_single_weights(component_class, weights_path: str, dtype,
         from safetensors.torch import load_file as st_load
         from safetensors.torch import save_file as st_save
         state_dict = st_load(src_path) if src_path.lower().endswith(".safetensors") \
-            else torch.load(src_path, map_location="cpu", weights_only=True)
+            else torch.load(src_path, map_location="cpu", weights_only=True)  # nosemgrep
         stripped = {}
         for k, v in state_dict.items():
             if k.startswith(prefix):
@@ -800,7 +802,7 @@ def _load_single_weights(component_class, weights_path: str, dtype,
                         if i >= 200:
                             break
             else:
-                peek_keys = set(torch.load(
+                peek_keys = set(torch.load(  # nosemgrep
                     weights_path, map_location="cpu", weights_only=True,
                 ).keys())
 
@@ -869,7 +871,7 @@ def _load_single_weights(component_class, weights_path: str, dtype,
         from safetensors.torch import load_file
         state_dict = load_file(weights_path)
     else:
-        state_dict = torch.load(weights_path, map_location="cpu",
+        state_dict = torch.load(weights_path, map_location="cpu",  # nosemgrep
                                 weights_only=True)
 
     # ── Prefix stripping: handle ComfyUI/SGM format checkpoints ──

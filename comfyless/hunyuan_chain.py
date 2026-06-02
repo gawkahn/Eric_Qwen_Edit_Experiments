@@ -81,10 +81,12 @@ def load_refiner_pipeline(
     would defeat the point).
 
     Family-aware VAE tiling resolution per ADR-014's tile-VAE-skip
-    amendment: the refiner declares its own family
-    (`hunyuan-image-refiner`) which is NOT in the
-    `_VAE_TILING_FAMILIES_DEFAULT_OFF` set today, so `auto` resolves to
-    tiling-on. Operator override (`--vae-tiling off`) still applies.
+    amendment: the refiner uses the same 32× DCAE VAE as the base and
+    shares the `hunyuan-image-refiner` → no-tile default in
+    `_VAE_TILING_FAMILIES_DEFAULT_OFF`. Live smoke on 2026-06-02 confirmed
+    tiled encode raises a shape error on 1920×1088 in
+    `_dcae_downsample_rearrange`. Operator override (`--vae-tiling on`)
+    still applies if desired.
     """
     from nodes.eric_diffusion_utils import (
         detect_pipeline_class,
