@@ -812,11 +812,16 @@ check(
     "server.py cache_key tuple includes vae_tiling entry",
     "req.get(\"vae_tiling\")" in server_src,
 )
-# Two _load_pipeline call sites exist in _handle_generate (initial load and
-# LoRA-removal-failure reload path); both must thread vae_tiling.
+# Three vae_tiling threading sites exist in _handle_generate after the
+# Step-4 refiner-chain slice: (1) initial base load via _load_pipeline,
+# (2) LoRA-removal-failure reload base via _load_pipeline, (3) refiner
+# load via _maybe_load_refiner → hunyuan_chain.load_refiner_pipeline.
+# All three must thread vae_tiling identically so the family-aware
+# default applies uniformly across base + refiner stages.
 check(
-    "server.py threads vae_tiling to BOTH _load_pipeline call sites",
-    server_src.count("vae_tiling=req.get(\"vae_tiling\") or \"auto\"") == 2,
+    "server.py threads vae_tiling identically to all 3 ML-stack call sites "
+    "(2× _load_pipeline + _maybe_load_refiner → load_refiner_pipeline)",
+    server_src.count("vae_tiling=req.get(\"vae_tiling\") or \"auto\"") == 3,
     f"got {server_src.count('vae_tiling=req.get(\"vae_tiling\") or \"auto\"')} occurrence(s)",
 )
 
@@ -1651,6 +1656,325 @@ with open("comfyless/mcp_server.py") as f:
 check(
     "mcp_server.py does NOT thread refiner_path / --refiner (Vision Inv 12)",
     "refiner" not in mcp_src_step3,
+)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Refiner slice — Step 4 (IPC daemon parity, Vision Inv 11)
+# ══════════════════════════════════════════════════════════════════════
+#
+# Step 4 wires the refiner chain into the comfyless daemon
+# (comfyless/server.py). Tests parallel the Step-2 tile-VAE-skip
+# structural co-locking pattern PLUS behavior coverage of the two
+# daemon-specific helpers (_maybe_load_refiner, _evict_chain) which
+# are pure enough to drive on CPU without ML-stack imports.
+#
+# Inv 11 from Vision: daemon wire protocol gains an optional refiner
+# field; cache_key includes it; cache miss evicts BOTH base + refiner;
+# additive — clients that omit it see byte-for-byte identical behavior.
+
+with open("comfyless/server.py") as f:
+    server_src = f.read()
+
+
+print("── Step 4 / Inv 11 — server.py cache_key trailing entry for refiner_path")
+
+# Same pattern as the Step-3 tile-VAE-skip vae_tiling entry lock.
+# A request that omits the field collapses to "" via `or ""`. The
+# structural check locks the exact form so a future engineer who
+# accidentally drops the `or ""` (which would let None into the tuple,
+# crashing __hash__) trips this test.
+check(
+    "server.py cache_key tuple includes refiner_path entry",
+    'req.get("refiner_path")' in server_src,
+)
+check(
+    "server.py cache_key refiner_path entry has empty-string fallback",
+    'req.get("refiner_path") or ""' in server_src,
+)
+
+
+print("── Step 4 / Inv 11 — _maybe_load_refiner helper exists with the contract")
+
+# Helper signature lock. Catches an accidental rename or inlining that
+# would invalidate the unit test below.
+check(
+    "server.py defines _maybe_load_refiner helper",
+    "def _maybe_load_refiner(" in server_src,
+)
+# The helper raises on non-hunyuan family (Vision §"Failure semantics" §4).
+check(
+    "_maybe_load_refiner raises ValueError on non-hunyuan family",
+    "refiner_path is only supported for the hunyuan-image family" in server_src,
+)
+
+
+print("── Step 4 / Inv 11 — _maybe_load_refiner behavior (CPU-driven)")
+
+# Drive _maybe_load_refiner directly. server.py imports inside the
+# function body, so the helper itself is importable without triggering
+# the full ML stack. We stub hunyuan_chain.load_refiner_pipeline so the
+# helper never touches disk.
+import comfyless.server as cs
+
+# Case 1: refiner_path empty → returns None.
+_orig_load_refiner = hc.load_refiner_pipeline
+hc.load_refiner_pipeline = lambda *a, **kw: _FakeRefinerPipe()
+try:
+    out = cs._maybe_load_refiner(
+        {"refiner_path": ""}, _FakeBasePipe(), "hunyuan-image",
+        "bf16", "cpu",
+    )
+    check(
+        "_maybe_load_refiner returns None when refiner_path is empty",
+        out is None,
+    )
+    # Case 2: refiner_path whitespace-only → also unset (.strip()).
+    out_ws = cs._maybe_load_refiner(
+        {"refiner_path": "   "}, _FakeBasePipe(), "hunyuan-image",
+        "bf16", "cpu",
+    )
+    check(
+        "_maybe_load_refiner treats whitespace-only refiner_path as unset",
+        out_ws is None,
+    )
+    # Case 3: refiner_path set + family hunyuan-image → load_refiner_pipeline
+    # is invoked, helper returns its output.
+    fake_ref = _FakeRefinerPipe()
+    hc.load_refiner_pipeline = lambda *a, **kw: fake_ref
+    out_loaded = cs._maybe_load_refiner(
+        {"refiner_path": "/p"}, _FakeBasePipe(), "hunyuan-image",
+        "bf16", "cpu",
+    )
+    check(
+        "_maybe_load_refiner returns load_refiner_pipeline output when hunyuan-image",
+        out_loaded is fake_ref,
+    )
+    # Case 4: refiner_path set + non-hunyuan family → clean ValueError.
+    for non_hunyuan_fam in ("flux", "qwen-image", "sdxl"):
+        expect_raises(
+            f"_maybe_load_refiner rejects refiner_path on {non_hunyuan_fam}",
+            lambda f=non_hunyuan_fam: cs._maybe_load_refiner(
+                {"refiner_path": "/p"}, _FakeBasePipe(), f,
+                "bf16", "cpu",
+            ),
+            ValueError,
+        )
+finally:
+    hc.load_refiner_pipeline = _orig_load_refiner
+
+
+print("── Step 4 / Inv 11 + MINOR-1 — _evict_chain drops refiner FIRST")
+
+# Eviction order lock (Step-2 code-reviewer MINOR-1 forward-watch). The
+# helper must remove server_state["refiner_pipeline"] BEFORE
+# server_state["pipeline"] so any Python-side reference cycle on the
+# chain releases before the base eviction triggers CUDA frees. We
+# verify by deletion order via a tracking dict subclass — capture every
+# __delitem__ call and assert the refiner key fires first.
+check(
+    "server.py defines _evict_chain helper",
+    "def _evict_chain(" in server_src,
+)
+# Source-level order lock: refiner del MUST appear before base del in
+# _evict_chain's body. A regex-like substring check on the relevant
+# block catches a future engineer who accidentally swaps the order.
+_evict_idx = server_src.find("def _evict_chain(")
+_evict_block = server_src[_evict_idx:_evict_idx + 1200]
+_refiner_del_idx = _evict_block.find('del server_state["refiner_pipeline"]')
+_pipeline_del_idx = _evict_block.find('del server_state["pipeline"]')
+check(
+    "_evict_chain source: refiner del precedes pipeline del",
+    0 <= _refiner_del_idx < _pipeline_del_idx,
+    f"refiner_del at {_refiner_del_idx}, pipeline_del at {_pipeline_del_idx}",
+)
+
+# Behavior: order-tracking dict subclass observes the del sequence.
+class _OrderedTrackDict(dict):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.del_order = []
+    def __delitem__(self, key):
+        self.del_order.append(key)
+        super().__delitem__(key)
+    def clear(self):
+        # clear() also surfaces in del_order as a sentinel so we can
+        # verify it runs after explicit dels (belt-and-suspenders reset).
+        self.del_order.append("__clear__")
+        super().clear()
+
+# Build a server_state with both pipelines + extra keys; call _evict_chain.
+# torch.cuda.empty_cache is the only side effect we need to stub —
+# server.py imports torch inside the helper, and torch is a real import
+# in the test venv; .cuda.empty_cache() is a no-op on CPU-only torch.
+import torch as _torch
+_orig_empty_cache = _torch.cuda.empty_cache
+_torch.cuda.empty_cache = lambda: None
+try:
+    _state = _OrderedTrackDict({
+        "pipeline": _FakeBasePipe(),
+        "refiner_pipeline": _FakeRefinerPipe(),
+        "model_family": "hunyuan-image",
+        "cache_key": ("k",),
+    })
+    cs._evict_chain(_state)
+finally:
+    _torch.cuda.empty_cache = _orig_empty_cache
+
+check(
+    "_evict_chain runtime: refiner_pipeline deleted before pipeline",
+    _state.del_order.index("refiner_pipeline") < _state.del_order.index("pipeline"),
+    f"del_order={_state.del_order!r}",
+)
+check(
+    "_evict_chain runtime: server_state fully reset after eviction",
+    len(_state) == 0,
+)
+
+
+print("── Step 4 / Inv 11 — generate() call threads refiner_path/steps/cfg")
+
+# server.py's call to generate() must forward the three refiner-stage
+# fields. Otherwise the daemon would load the refiner via
+# _maybe_load_refiner, cache it, then call generate() with refiner_path="",
+# which would route through generate()'s warn-don't-block branch and
+# never use the cached refiner.
+for forwarded in (
+    "refiner_path=req.get(\"refiner_path\"",
+    "refiner_steps=req.get(\"refiner_steps\"",
+    "refiner_cfg=req.get(\"refiner_cfg\"",
+):
+    check(
+        f"server.py generate() call threads {forwarded!r}",
+        forwarded in server_src,
+    )
+
+# The cached dict passed via _cached_pipeline MUST carry refiner_pipeline
+# (None when base-only). Step-2's generate() already reads
+# _cached_pipeline.get("refiner_pipeline") (the forward seam from
+# Step-2 code-reviewer MINOR-1).
+check(
+    "server.py cached dict threads refiner_pipeline forward into generate()",
+    '"refiner_pipeline": server_state.get("refiner_pipeline")' in server_src,
+)
+
+
+print("── Step 4 / Inv 11 — RefinerLoadError surfaces distinctly")
+
+# Vision §"Failure semantics" §3: wrong-class refiner raises ValueError.
+# server.py distinguishes ValueError → "RefinerLoadError" from other
+# load errors → "LoadError" so the wire client/LLM can route differently.
+check(
+    "server.py distinguishes RefinerLoadError from generic LoadError",
+    'err_type = "RefinerLoadError" if isinstance(e, ValueError) else "LoadError"'
+    in server_src
+    or '"RefinerLoadError"' in server_src,
+)
+
+
+print("── Step 4 — refiner_path inside _check_paths + _PATH_FIELDS (security-auditor CRITICAL+HIGH closure)")
+
+# Security-auditor 2026-06-01 CRITICAL: refiner_path must appear in the
+# _check_paths --model-base containment loop AND in the _PATH_FIELDS
+# null-byte rejection set. Both are ADR-001 §3 invariants that apply to
+# any model-path-shaped wire field. Initial Step-4 diff missed them; this
+# block locks the closure at runtime.
+check(
+    "server.py _PATH_FIELDS frozenset contains 'refiner_path' "
+    "(null-byte rejection at IPC boundary)",
+    '"refiner_path"' in server_src and "_PATH_FIELDS = frozenset" in server_src,
+)
+# Behavior: import the frozenset directly and verify membership.
+check(
+    "cs._PATH_FIELDS contains 'refiner_path' at runtime",
+    "refiner_path" in cs._PATH_FIELDS,
+)
+# Source order in _check_paths: refiner_path must appear inside the
+# field tuple. Catches future engineer who copy-paste-renames the tuple
+# without including refiner_path.
+_check_idx = server_src.find("def _check_paths(")
+_check_block = server_src[_check_idx:_check_idx + 2000]
+check(
+    "_check_paths source: refiner_path appears in the validation field tuple",
+    '"refiner_path"' in _check_block,
+)
+
+# Behavior: synthesize a fake req with refiner_path OUTSIDE model_base
+# and assert _check_paths rejects it with a clear PathError. Also assert
+# refiner_path INSIDE model_base passes.
+with tempfile.TemporaryDirectory() as _mb:
+    # Mirror the realpath canonicalization run_server applies on startup
+    # so _within's symlink-resolved comparison agrees with the test's
+    # base under mergerfs / system tmpdir realpath rewrites.
+    _mb_real = os.path.realpath(_mb)
+    inside = os.path.join(_mb_real, "refiner-dir")
+    outside = "/tmp/__refiner_outside_base__"  # outside _mb_real
+    err_inside = cs._check_paths(
+        {"model": os.path.join(_mb_real, "m"), "refiner_path": inside}, _mb_real,
+    )
+    check(
+        "_check_paths accepts refiner_path INSIDE --model-base",
+        err_inside is None,
+        f"got {err_inside!r}",
+    )
+    err_outside = cs._check_paths(
+        {"model": os.path.join(_mb_real, "m"), "refiner_path": outside}, _mb_real,
+    )
+    check(
+        "_check_paths REJECTS refiner_path OUTSIDE --model-base (ADR-001 §3)",
+        err_outside is not None and "refiner_path" in err_outside,
+        f"got {err_outside!r}",
+    )
+    # Relative refiner_path → also rejected (must be absolute).
+    err_relative = cs._check_paths(
+        {"model": os.path.join(_mb_real, "m"), "refiner_path": "relative/path"}, _mb_real,
+    )
+    check(
+        "_check_paths REJECTS relative refiner_path (must be absolute)",
+        err_relative is not None and "refiner_path" in err_relative
+        and "absolute" in err_relative,
+        f"got {err_relative!r}",
+    )
+
+# Behavior: refiner_path with NUL byte rejected by _validate_request
+# (the same path that defends every other path field).
+_nul_req = {
+    "type": "generate", "model": "/m", "prompt": "p",
+    "refiner_path": "/m/refiner\x00/etc/passwd",
+}
+err_nul = cs._validate_request(_nul_req)
+check(
+    "_validate_request REJECTS refiner_path containing NUL byte",
+    err_nul is not None and "refiner_path" in err_nul
+    and "null byte" in err_nul,
+    f"got {err_nul!r}",
+)
+
+
+print("── Step 4 / Inv 11 — IPC schema validates refiner_path at the boundary")
+
+# Defense-in-depth: refiner_path is already in SCHEMA_KIND (Step 1) so
+# the validator rejects non-string values BEFORE they reach the daemon's
+# request handler. The dump's "_RUNTIME_KIND gains refiner: _KIND_STR"
+# wording was naming sloppiness — the canonical schema key is
+# refiner_path, which lives in SCHEMA_KIND (sidecar-shaped) not
+# _RUNTIME_KIND (server-flag). Same boundary defense, correctly typed.
+from comfyless.params_validation import (
+    SCHEMA_KIND as _SK, _KIND_STR as _KS,
+    validate_machine_request as _vmr,
+)
+check(
+    "params_validation.SCHEMA_KIND['refiner_path'] == _KIND_STR",
+    _SK.get("refiner_path") == _KS,
+)
+_bad_req = {
+    "type": "generate", "model": "/m", "prompt": "p",
+    "refiner_path": 42,  # non-string — must be rejected
+}
+_res = _vmr(_bad_req)
+check(
+    "validate_machine_request rejects non-string refiner_path at IPC boundary",
+    not _res.ok and _res.error.get("field") == "refiner_path",
 )
 
 

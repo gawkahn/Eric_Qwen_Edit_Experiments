@@ -438,6 +438,30 @@ mcp_server.py non-thread assertion).
 - 2026-05-30 — proposed (initial draft, settles Vision OQ-1 through
   OQ-6 via pre-flight `inspect.signature` + `model_index.json`
   inspection + diffusers source review). Status: `proposed`.
+- 2026-06-01 — Step-2 / Step-3 / Step-4 shipped on `hunyuan-support`
+  branch. Step 2 (`46a48f6`): `comfyless/hunyuan_chain.py` + `--refiner`
+  CLI flag + chain dispatch. Step 3 (`e948325`): ComfyUI Generate node
+  `refiner_path` input + parity. Step 4 (this commit): daemon
+  thread-through (`comfyless/server.py`) + `security-auditor` pass.
+  Reviewers: `code-reviewer` (Opus) approved each step; `security-auditor`
+  (Opus) found 1 CRITICAL + 1 HIGH on the initial Step-4 diff, both
+  remediated in this commit (`refiner_path` added to `_PATH_FIELDS`
+  null-byte rejection + `_check_paths` `--model-base` containment loop).
+  Security artifact: `docs/security/review-hunyuan-refiner-server-2026-06-01.md`
+  (also serves as the broader §12 IPC review for `comfyless/server.py`
+  per CLAUDE.md "Review bar" debt — that debt is now **closed**).
+- 2026-06-01 — wire-field naming reconciliation: §(i) text says the
+  daemon-side wire field is `refiner` and the cache_key trailing entry
+  reads `req.get("refiner")`. The implemented wire field is
+  **`refiner_path`** — matches `SCHEMA_KIND["refiner_path"]` (the
+  canonical schema key shipped in Step 1) and the existing
+  `transformer_path` / `vae_path` / `text_encoder_path` /
+  `text_encoder_2_path` `*_path` convention for path-bearing schema
+  entries. `_delegate_to_server` (Step 1) and `_handle_generate`
+  (Step 4) both use `refiner_path`. Treat the §(i) "`refiner`" text as
+  shorthand; the implemented + tested name is `refiner_path`. No code
+  change for this Changelog entry — corrects ADR text alignment with
+  implementation.
 
 ## AI-Disclosure
 

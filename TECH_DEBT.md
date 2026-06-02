@@ -422,3 +422,19 @@ ADR-010's "Deferred / Out of Scope" section formally declares the following non-
 - **Suggested fix:** Migrate exact-substring checks to regex with whitespace tolerance: e.g. `re.search(r'refiner_path\s*:\s*str\s*=\s*[\'"]{2,}', node_gen_src)` for the signature lock, and a parallel pattern for the INPUT_TYPES default. Tightens what's actually locked (the semantic shape) while loosening incidental-syntax sensitivity.
 - **Trigger:** First false-positive in CI (or in local-gate runs) caused by a reformatter touching node_gen_src or gen_src.
 - **Priority:** Low
+
+### [Security] Cache-eviction-storm DoS via refiner_path toggle on daemon
+- **Location:** `comfyless/server.py` cache_key composition + eviction trigger (cache_key includes refiner_path; mode toggle forces base+refiner reload, ~80 GB VRAM cycle + 30-90 s wall time)
+- **Observed:** 2026-06-01 security-auditor MEDIUM on Step 4 (refiner daemon parity slice). See `docs/security/review-hunyuan-refiner-server-2026-06-01.md`.
+- **Why not now:** Same-UID threat model: a malicious same-UID client already has the cheap `{"type":"unload"}` shutdown-DoS primitive against this daemon (2026-04-23 finding 3, deferred SO_PEERCRED check). The cache-storm DoS is an amplification within that threat model, not a new attack class. Operator-facing tradeoff documented in ADR-016 §(i) ("switching --refiner mode incurs a ~80 GB reload"). The previous unauthenticated-unload deferral was scoped to "shutdown nuisance"; this entry covers the warm-cache-tie-up variant.
+- **Suggested fix:** Same cluster as ADR-001 Deferred §3 (request-rate limiting / VRAM swap bounds). If acted on standalone: per-connection cooldown on cache-key flips — reject a flip if the prior flip was within N seconds; return a `Backoff` error frame. Cluster with the SO_PEERCRED entry when the LLM-agent surface lands and the threat model elevates.
+- **Trigger:** LLM-agent surface lands (untrusted client threat model elevates above same-UID), OR multi-tenant comfyless deployment, OR observed operator pain from accidental toggle thrash.
+- **Priority:** Medium
+
+### [Code] Daemon refiner_path normalization asymmetry between cache_key and generate() call
+- **Location:** `comfyless/server.py` cache_key composition (`(req.get("refiner_path") or "").strip()`) vs generate() call thread-through (`req.get("refiner_path", "") or ""`)
+- **Observed:** 2026-06-01 security-auditor LOW on Step 4 (refiner daemon parity slice).
+- **Why not now:** Both branches converge on empty string for any sane wire input. Difference would only surface on `refiner_path: null`, which `SCHEMA_KIND["refiner_path"] = _KIND_STR` rejects at the IPC boundary before reaching either site. Not exploitable.
+- **Suggested fix:** Normalize both sites to `(req.get("refiner_path") or "").strip()`. One-line cleanup; aligns with the parallel `vae_tiling` thread-through convention.
+- **Trigger:** Next edit touching either site.
+- **Priority:** Low
