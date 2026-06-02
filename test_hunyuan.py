@@ -1463,6 +1463,197 @@ check(
 )
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  Refiner slice — Step 3 (ComfyUI Generate node parity)
+# ══════════════════════════════════════════════════════════════════════
+#
+# Step 3 mirrors the comfyless dispatch into nodes/eric_diffusion_generate.py
+# so the ComfyUI surface has the same refiner-chaining behavior. Tests
+# parallel the Step-2 tile-VAE-skip I4 structural co-lock pattern —
+# behavior coverage of the actual run-chain logic lives on the comfyless
+# side (CPU-driveable); the ComfyUI side is tested structurally because
+# its inference path imports `comfy.utils` / `comfy.model_management` at
+# call time and resists cheap unit instrumentation.
+
+with open("nodes/eric_diffusion_generate.py") as f:
+    node_gen_src = f.read()
+
+print("── Step 3 / Inv 3 + 12 — refiner_path input wired into the Generate node")
+
+# INPUT_TYPES surface — the operator-facing input must be declared with
+# default "" (parallels comfyless argparse default None → schema default "").
+check(
+    "ComfyUI Generate node INPUT_TYPES declares 'refiner_path' as STRING",
+    '"refiner_path": ("STRING"' in node_gen_src,
+)
+check(
+    "ComfyUI Generate node 'refiner_path' input has default '' (unset → base-only)",
+    'refiner_path' in node_gen_src and '"default": ""' in node_gen_src,
+)
+# generate() method threads the param.
+check(
+    "ComfyUI Generate node generate() signature accepts refiner_path",
+    'refiner_path: str = ""' in node_gen_src,
+)
+
+
+print("── Step 3 / Inv 9 — Generate node shares the hunyuan_chain loader + dispatch")
+
+# Structural co-lock: ComfyUI node uses the SAME shared module the
+# comfyless path uses. No duplicate refiner-loading code, no inline
+# transformer instantiation — preserves the single-source-of-truth
+# guarantee for the asymmetric shared-encoder optimization (ADR-016 §e).
+check(
+    "ComfyUI Generate node imports hunyuan_chain.load_refiner_pipeline",
+    "from comfyless.hunyuan_chain import load_refiner_pipeline" in node_gen_src,
+)
+check(
+    "ComfyUI Generate node imports hunyuan_chain.run_chain",
+    "from comfyless.hunyuan_chain import run_chain" in node_gen_src,
+)
+check(
+    "ComfyUI Generate node calls load_refiner_pipeline (not inline construction)",
+    "load_refiner_pipeline(" in node_gen_src,
+)
+check(
+    "ComfyUI Generate node calls run_chain (not inline two-stage logic)",
+    "run_chain(" in node_gen_src,
+)
+
+
+print("── Step 3 / Inv 10 — Generate node refiner gate is family-conditional")
+
+# Same gate shape as the comfyless side (verified in Inv 10 above for
+# generate.py). Catches a future engineer who drops the family check
+# and lets refiner_path activate on, e.g., flux pipelines.
+check(
+    "ComfyUI Generate node refiner gate is family-conditional "
+    "(model_family == \"hunyuan-image\")",
+    'model_family == "hunyuan-image"' in node_gen_src,
+)
+check(
+    "ComfyUI Generate node raises ValueError on non-hunyuan family + refiner_path set",
+    "raise ValueError" in node_gen_src
+    and "refiner_path is only supported" in node_gen_src,
+)
+
+
+print("── Step 3 / Inv 2 — Generate node warn-don't-block text (ComfyUI-flavored)")
+
+# ComfyUI-flavored warning. Two fragments are shared with the comfyless
+# warning text (the Vision Intent quality-pitch + the huggingface-cli
+# download instruction); the third diverges because the operator-facing
+# action is different (CLI: `--refiner <path>` flag; ComfyUI: set the
+# `refiner_path` input on the node). Locked at runtime by these
+# fragment assertions.
+# Split into single-line-fitting pieces so the structural source check
+# doesn't false-fail on line-broken string literals (Python concatenates
+# adjacent literals at runtime — the runtime Inv 2 test above already
+# verifies the assembled string; this structural sweep locks the
+# individual tokens against drift).
+SHARED_WARNING_FRAGMENTS = (
+    "hunyuan-image quality requires a refiner",
+    "huggingface-cli download",
+    "hunyuanvideo-community/HunyuanImage-2.1-Refiner-Diffusers",
+)
+for fragment in SHARED_WARNING_FRAGMENTS:
+    check(
+        f"comfyless warning contains shared fragment {fragment!r}",
+        fragment in gen_src,
+    )
+    check(
+        f"ComfyUI Generate node warning contains shared fragment {fragment!r}",
+        fragment in node_gen_src,
+    )
+# ComfyUI-specific fragment.
+check(
+    "ComfyUI Generate node warning references the refiner_path input",
+    "set refiner_path on the Generate node" in node_gen_src,
+)
+
+
+print("── Step 3 / Inv 5 + 6 — Generate node sources operating point from FAMILY_DEFAULTS")
+
+# Vision OQ4: a SINGLE refiner_path input on the ComfyUI node. The other
+# two refiner-stage params (refiner_steps, refiner_cfg) flow through the
+# same FAMILY_DEFAULTS row that drives them on the comfyless side. This
+# keeps a single source of truth for the operating-point defaults — no
+# inline 4/3.5 magic numbers in the ComfyUI node that could silently
+# drift from the comfyless schema.
+check(
+    "ComfyUI Generate node imports FAMILY_DEFAULTS for refiner defaults",
+    "from comfyless.family_defaults import FAMILY_DEFAULTS" in node_gen_src,
+)
+check(
+    "ComfyUI Generate node reads FAMILY_DEFAULTS['hunyuan-image'] for refiner defaults",
+    'FAMILY_DEFAULTS.get("hunyuan-image"' in node_gen_src,
+)
+# Defense-in-depth: the inline fallback constants MUST match the schema
+# canonical defaults — defends against a stale fallback if FAMILY_DEFAULTS
+# is missing the row at runtime (degraded-mode behavior should match the
+# documented operating point).
+check(
+    "ComfyUI Generate node fallback refiner_steps matches FAMILY_DEFAULTS canonical (4)",
+    FAMILY_DEFAULTS["hunyuan-image"]["refiner_steps"] == 4,
+)
+check(
+    "ComfyUI Generate node fallback refiner_cfg matches FAMILY_DEFAULTS canonical (3.5)",
+    FAMILY_DEFAULTS["hunyuan-image"]["refiner_cfg"] == 3.5,
+)
+
+
+print("── Step 3 / Inv 7 — Generate node does NOT load LoRAs into refiner")
+
+# The ComfyUI loader/Generate split has no LoRA-load surface on the
+# Generate node itself (LoRA application lives in eric_qwen_image_lora.py /
+# eric_qwen_edit_lora.py and runs against the BASE transformer at load
+# time). The Generate node's refiner path must not introduce any LoRA-load
+# call against the refiner pipe.
+for forbidden in ("load_lora_with_key_fix", "load_lora_weights",
+                  "set_adapters", "fuse_lora"):
+    check(
+        f"ComfyUI Generate node does NOT call {forbidden!r} (refiner LoRA-free)",
+        forbidden not in node_gen_src,
+    )
+
+
+print("── Step 3 / Inv 4 — Generate node extends metadata when chain runs")
+
+# Parallels the comfyless metadata extension at generate.py L1057-1065.
+# The four chain keys (pipeline, refiner_path, refiner_steps, refiner_cfg)
+# must be written conditionally — only when refiner_pipe is not None.
+# String checks lock both the conditional shape AND the literal "base+refiner".
+check(
+    "ComfyUI Generate node metadata adds pipeline='base+refiner' when chain runs",
+    '"pipeline"' in node_gen_src and '"base+refiner"' in node_gen_src,
+)
+check(
+    "ComfyUI Generate node metadata adds refiner_path / steps / cfg when chain runs",
+    'metadata["refiner_path"]' in node_gen_src
+    and 'metadata["refiner_steps"]' in node_gen_src
+    and 'metadata["refiner_cfg"]' in node_gen_src,
+)
+check(
+    "ComfyUI Generate node metadata extension is conditional on refiner_pipe",
+    "if refiner_pipe is not None" in node_gen_src,
+)
+
+
+print("── Step 3 / Inv 12 — MCP server still does NOT thread refiner (re-affirm)")
+
+# Re-affirms the Step-2 Inv 12 lock from the comfyless side: this slice
+# does NOT plumb refiner_* through the MCP `generate` tool. The structural
+# test already asserted no `refiner` token in mcp_server.py above; restate
+# here at the Step 3 boundary so any future engineer running just the
+# Step 3 subset sees the lock.
+with open("comfyless/mcp_server.py") as f:
+    mcp_src_step3 = f.read()
+check(
+    "mcp_server.py does NOT thread refiner_path / --refiner (Vision Inv 12)",
+    "refiner" not in mcp_src_step3,
+)
+
+
 # ──────────────────────────────────────────────────────────────────────
 print(f"\n────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")

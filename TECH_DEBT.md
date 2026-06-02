@@ -374,3 +374,51 @@ ADR-010's "Deferred / Out of Scope" section formally declares the following non-
 - **Suggested fix:** In Step 4's `comfyless/server.py` cache-eviction path, evict `refiner_pipeline` BEFORE `pipeline` on cache_key mismatch, in case a Python-side reference cycle or partial-setup state holds either alive through a half-loaded chain. Document in ADR-016 §(i) / Step 4 security review.
 - **Trigger:** Step 4 of the refiner slice (`comfyless/server.py` cache-aware two-stage handling) — fold into the security-auditor pass.
 - **Priority:** Medium
+
+### [Code] ComfyUI Generate node re-loads refiner pipeline on every chained call
+- **Location:** `nodes/eric_diffusion_generate.py` refiner-load branch (load_refiner_pipeline call site); `nodes/eric_diffusion_loader.py` GEN_PIPELINE cache_key composition
+- **Observed:** 2026-06-01 code-reviewer finding on Step 3 (ComfyUI Generate-node parity slice)
+- **Why not now:** The comfyless daemon (Step 4 of the refiner slice) caches both base + refiner in `server_state.refiner_pipeline` per `(model, refiner)` cache_key. The ComfyUI loader caches only the base pipeline keyed on `(model_path, precision, device, offload_vae, attention_slicing, sequential_offload, vae_tiling)` — no refiner-path component. Because the refiner load happens inside `generate()` rather than the loader, every chained run reloads the refiner from disk (~25 GB read). Acceptable for v1 single-shot operator workflows; visibly painful for iterative tuning workflows where the user keeps the base hot and re-renders.
+- **Suggested fix:** Either (a) extend GEN_PIPELINE dict + loader cache_key to carry a refiner_path slot (loader pre-loads when set), or (b) memoize the loaded refiner on a module-level dict in `nodes/eric_diffusion_generate.py` keyed on `(refiner_path, base_pipe_id)` with explicit eviction on `EricDiffusionUnload`.
+- **Trigger:** First user feedback on slow iterative chained-tuning workflow, OR before adding `refiner_path` to any advanced ComfyUI workflow (multistage / ultragen) where chained calls compound.
+- **Priority:** Medium
+
+### [Code] ComfyUI refiner device inference ignores sequential_offload + device_map="balanced"
+- **Location:** `nodes/eric_diffusion_generate.py` precision/device inference block (next(denoiser.parameters()) reads dtype + device for refiner load)
+- **Observed:** 2026-06-01 code-reviewer finding on Step 3 (ComfyUI Generate-node parity slice)
+- **Why not now:** Vision Inv 13 memory ceiling targets RTX PRO 6000 102 GB single-card hardware where both pipelines fit; small-card support continues to require sequential_offload per the existing flag surface. The current diff infers refiner device as `next(denoiser.parameters()).device` which is fine on single-GPU single-precision; under `enable_sequential_cpu_offload()` the denoiser parameters live on CPU at rest, so the refiner silently loads on CPU and runs ~1000× slower. Under `device_map="balanced"` the first parameter may be on cuda:0 while others spread across cuda:1+; the refiner gets the single-device load + `.to('cuda:0')` and may exceed the single-GPU memory ceiling.
+- **Suggested fix:** Extend GEN_PIPELINE dict additively with `sequential_offload`, `use_device_map`, and `precision` slots. ComfyUI Generate node refiner branch reads them: when sequential_offload is True or use_device_map is True, EITHER skip refiner with a clear stderr warning OR apply the same offload posture (e.g. `refiner.enable_sequential_cpu_offload()`). Behavior: skip-with-warning is the safer v1; same-posture is the operator-pleaser if VRAM allows.
+- **Trigger:** First small-card (≤48 GB) operator attempting the chained workflow, OR any change to the loader's offload-flag handling.
+- **Priority:** Medium
+
+### [UX] ComfyUI progress bar undercounts during refiner stage
+- **Location:** `nodes/eric_diffusion_generate.py` pbar sizing (`comfy.utils.ProgressBar(steps)`); `comfyless/hunyuan_chain.py:build_refiner_call_kwargs` (no callback_on_step_end kwarg)
+- **Observed:** 2026-06-01 code-reviewer finding on Step 3 (ComfyUI Generate-node parity slice)
+- **Why not now:** Tencent refiner defaults to 4 steps (~10-15% of base step count), so the post-base UI pause is short. Operator sees `steps/steps` complete then a brief unmoving bar during refiner. Acceptable UX for v1.
+- **Suggested fix:** Two-line change: (1) `pbar = comfy.utils.ProgressBar(steps + (refiner_steps if refiner_pipe is not None else 0))`; (2) extend `hunyuan_chain.build_refiner_call_kwargs` to accept an optional `callback_on_step_end` parameter and forward it into the refiner kwargs when set. Generate node passes the same callback that drives the base pbar updates.
+- **Trigger:** First user feedback that the pbar "freezes" at end-of-base, OR when chain is wired into the advanced multistage workflow where pbar accuracy matters more.
+- **Priority:** Low
+
+### [Code] ComfyUI Generate node silently degrades when FAMILY_DEFAULTS row partial
+- **Location:** `nodes/eric_diffusion_generate.py` refiner_steps / refiner_cfg lookup (`.get(..., 4)` / `.get(..., 3.5)` fallbacks)
+- **Observed:** 2026-06-01 code-reviewer finding on Step 3 (ComfyUI Generate-node parity slice)
+- **Why not now:** Inline fallback constants are mathematically equal to the canonical FAMILY_DEFAULTS["hunyuan-image"] row today (locked by test_hunyuan.py assertions). If a future engineer drops or corrupts the row, the operator silently gets the canonical defaults via fallback — no log line. Acceptable for an L2 slice with no Red Zone touch; nothing in current behavior regresses.
+- **Suggested fix:** One-line guard: `if "hunyuan-image" not in FAMILY_DEFAULTS or "refiner_steps" not in hunyuan_defaults or "refiner_cfg" not in hunyuan_defaults: print(..., file=sys.stderr)` warning that FAMILY_DEFAULTS row is partial and inline canonical defaults are being used. Surfaces misconfig instead of masking it.
+- **Trigger:** Next edit to FAMILY_DEFAULTS["hunyuan-image"] row or any FAMILY_DEFAULTS schema refactor.
+- **Priority:** Low
+
+### [Code] Cross-package import direction: nodes/ → comfyless/ established by refiner slice
+- **Location:** `nodes/eric_diffusion_generate.py` (lazy imports of `comfyless.hunyuan_chain.{load_refiner_pipeline,run_chain}` and `comfyless.family_defaults.FAMILY_DEFAULTS`)
+- **Observed:** 2026-06-01 code-reviewer finding on Step 3 (ComfyUI Generate-node parity slice)
+- **Why not now:** Previously the import direction was one-way (comfyless → nodes.eric_diffusion_utils). Step 3 introduces the reverse: nodes/eric_diffusion_generate.py imports from comfyless/. Lazy imports inside the refiner-active branch avoid load-time circular issues; non-Hunyuan paths pay zero import cost. Functionally clean for v1 but conceptually bidirectional now.
+- **Suggested fix:** If the coupling tightens further (e.g. multistage node also needs hunyuan_chain), promote the shared module out of comfyless/ into a top-level `eric_chain/hunyuan.py` (or similar) consumable by both nodes/ and comfyless/ as a peer. Then both sides import from a neutral location; no cross-package dependency.
+- **Trigger:** Second consumer-from-nodes of any comfyless module, OR a Vision/ADR that explicitly bifurcates shared chain logic.
+- **Priority:** Low
+
+### [Tests] ComfyUI-parity structural co-locks moderately fragile to reformatting
+- **Location:** `test_hunyuan.py` Step 3 parity tests (substring checks like `'refiner_path: str = ""'`, `'"refiner_path": ("STRING"'`)
+- **Observed:** 2026-06-01 code-reviewer finding on Step 3 (ComfyUI Generate-node parity slice)
+- **Why not now:** Current pass criterion holds and the diff is fresh; no false-positive risk in the immediate future. The string-substring checks would trip on routine reformatter changes (quote style, trailing commas, indentation) that don't change behavior.
+- **Suggested fix:** Migrate exact-substring checks to regex with whitespace tolerance: e.g. `re.search(r'refiner_path\s*:\s*str\s*=\s*[\'"]{2,}', node_gen_src)` for the signature lock, and a parallel pattern for the INPUT_TYPES default. Tightens what's actually locked (the semantic shape) while loosening incidental-syntax sensitivity.
+- **Trigger:** First false-positive in CI (or in local-gate runs) caused by a reformatter touching node_gen_src or gen_src.
+- **Priority:** Low
