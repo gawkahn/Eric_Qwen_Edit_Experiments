@@ -344,10 +344,12 @@ with tempfile.TemporaryDirectory() as tmp_out, \
               audit_record.get("input", {}).get("model") == "/some/path")
         check("audit line retains `seed` field (non-path params kept)",
               audit_record.get("input", {}).get("seed") == 42)
-        # error_class names the step-2 rejection category
-        # (model outside --model-base → PathAllowlist)
-        check("audit line error_class == 'PathAllowlist' (step-2)",
-              audit_record.get("error_class") == "PathAllowlist",
+        # error_class names the reference-resolution cause (slice 3): a
+        # path-shaped model whose basename ("path") is not a catalog entry
+        # -> UnknownName. The agent saw the uniform "reference not available";
+        # the operator audit retains the fine cause.
+        check("audit line error_class == 'UnknownName' (slice-3 reference)",
+              audit_record.get("error_class") == "UnknownName",
               detail=f"actual: {audit_record.get('error_class')!r}")
         check("audit line elapsed_seconds is a number",
               isinstance(audit_record.get("elapsed_seconds"), (int, float)))
@@ -682,22 +684,46 @@ def _mock_load_pipeline(*a, **kw):
 
 
 def _mock_generate(*, model_path, prompt, output_path, **kw):
-    # Write a fake PNG so callers that check the file see something.
+    # Write a fake PNG so callers that check the file see something. Echo the
+    # path-typed fields the real generate() returns (model/transformer_path/
+    # loras) so the slice-3 names-rendering (_resolved_params_as_names) has the
+    # same keys to remap to catalog names.
     Image.new("RGB", (8, 8), "white").save(output_path)
     return {
         "prompt": prompt, "negative_prompt": kw.get("negative_prompt", ""),
         "model": model_path, "seed": kw.get("seed", 42),
         "steps": kw.get("steps", 28), "cfg_scale": kw.get("cfg_scale", 3.5),
+        "transformer_path": kw.get("transformer_path", ""),
+        "loras": list(kw.get("loras") or []),
         "elapsed_seconds": 0.01,
     }
 
 
 def _setup_mb_and_out():
-    """Return (model_base, output_dir, model_dir_inside_base, cfg)."""
+    """Return (model_base, output_dir, model_dir_inside_base, cfg).
+
+    Slice 3: the model dir gets a `model_index.json` so the spawn-time catalog
+    mints a `kind:"model"` entry named "qwen-image"; a lora "test-lora" and a
+    transformer "test-dit" are also seeded. Handler tests reference these by
+    catalog NAME (or by a path-shaped value whose basename is a catalog name).
+    All fixtures must exist BEFORE _validate_startup_args, which builds the
+    catalog at that call.
+    """
     mb = tempfile.mkdtemp()
     out = tempfile.mkdtemp()
     inside_model = os.path.join(mb, "qwen-image")
     os.makedirs(inside_model)
+    with open(os.path.join(inside_model, "model_index.json"), "w",
+              encoding="utf-8") as _f:
+        json.dump({"_class_name": "QwenImagePipeline"}, _f)
+    _lora_dir = os.path.join(mb, "loras")
+    os.makedirs(_lora_dir, exist_ok=True)
+    with open(os.path.join(_lora_dir, "test-lora.safetensors"), "wb") as _f:
+        _f.write(b"fake-lora")
+    _dit_dir = os.path.join(mb, "diffusion_models")
+    os.makedirs(_dit_dir, exist_ok=True)
+    with open(os.path.join(_dit_dir, "test-dit.safetensors"), "wb") as _f:
+        _f.write(b"fake-dit")
     cfg = mcps._validate_startup_args(
         output_dir=out, model_base=mb,
         default_model=None, mcp_max_iterations=100,
@@ -722,127 +748,254 @@ def _call(cfg, args, *, expect_error_class=None):
     return result, raised, captured_err.getvalue()
 
 
-# N5: absolute path OUTSIDE --model-base
-mb, out, _inside, cfg = _setup_mb_and_out()
-result, err, stderr = _call(cfg, {
-    "prompt": "p", "model": "/etc/anything",
-})
-check("N5: model='/etc/anything' (outside --model-base) → MCP error",
-      result is None and err is not None and "validation failed" in err,
-      detail=f"err={err!r}")
-check("N5: audit line written on rejection",
-      "PathAllowlist" in stderr or "validation failed" in stderr)
-
-# N6: traversal via .. segments — realpath collapses ..; if it lands outside,
-# _check_paths rejects. Use a path like inside_model/../../../etc/passwd.
-result, err, stderr = _call(cfg, {
-    "prompt": "p",
-    "model": os.path.join(_inside, "..", "..", "..", "etc", "passwd"),
-})
-check("N6: '..' traversal → MCP error after realpath",
-      result is None and err is not None and "validation failed" in err)
-
-# N7: symlink inside model_base pointing outside model_base
-sym_target_outside = tempfile.mkdtemp()
-symlink_in_base = os.path.join(mb, "evil-symlink")
-os.symlink(sym_target_outside, symlink_in_base)
-result, err, stderr = _call(cfg, {
-    "prompt": "p", "model": symlink_in_base,
-})
-check("N7: symlink-inside-base pointing outside → MCP error",
-      result is None and err is not None and "validation failed" in err)
-
-# N8: savepath escapes --output-dir via `..` traversal. The daemon's
-# template machinery (mirrored by _resolve_mcp_output_path) lstrips
-# leading slashes so an "absolute" savepath becomes relative-from-output-
-# dir (deliberate human-UX behavior in the daemon; preserved for MCP per
-# invariant-3 wording — "rejects on _within failure", not "rejects on
-# absolute-path"). A `..`-traversal savepath, however, DOES escape and
-# must be rejected.
-result, err, stderr = _call(cfg, {
-    "prompt": "p", "model": _inside,
-    "savepath": "../../etc/passwd",
-})
-check("N8: savepath '..' traversal outside --output-dir → MCP error",
-      result is None and err is not None and "validation failed" in err,
-      detail=f"err={err!r}")
-
-# N9: loras[0].path outside --model-base
-result, err, stderr = _call(cfg, {
-    "prompt": "p", "model": _inside,
-    "loras": [{"path": "/etc/bad.safetensors", "weight": 0.5}],
-})
-check("N9: loras[0].path outside --model-base → MCP error",
-      result is None and err is not None and "validation failed" in err)
-
-
-# ════════════════════════════════════════════════════════════════════════
-print("\n== Step 2: HF cache miss (N10) ==")
-# ════════════════════════════════════════════════════════════════════════
-
-# `snapshot_download` is imported INSIDE resolve_hf_path's body, so we
-# must patch it on the source module (`huggingface_hub`) — patching
-# nodes.eric_diffusion_utils.snapshot_download doesn't find an attribute
-# since it's a local import.
+# eu is still needed by the cascade tests below (they spy on
+# eu.resolve_hf_path). Cascade is NOT migrated in slice 3 (OQ-C -> slice 3b),
+# so its raw-path + HF-resolution contract is unchanged and still covered by
+# the "Step 3: cascade dispatch" section further down.
 import nodes.eric_diffusion_utils as eu  # noqa: E402
-import huggingface_hub  # noqa: E402
-from huggingface_hub.errors import LocalEntryNotFoundError  # noqa: E402
-
-def _mock_snapshot_local(repo_id, *, local_files_only=True, **_):
-    # Always miss the local cache so resolve_hf_path raises ValueError
-    # when allow_download is False.
-    raise LocalEntryNotFoundError(repo_id)
-
-mb, out, _inside, cfg = _setup_mb_and_out()
-captured_err = io.StringIO()
-raised = None
-with unittest.mock.patch.object(sys, "stderr", captured_err), \
-     unittest.mock.patch.object(huggingface_hub, "snapshot_download",
-                                _mock_snapshot_local):
-    try:
-        _run(mcps._call_tool_impl(cfg, "generate", {
-            "prompt": "p", "model": "Qwen/Qwen-Image",
-        }))
-    except ValueError as e:
-        raised = str(e)
-check("N10: HF repo ID not in local cache → MCP error (no network call)",
-      raised is not None and "HF repo not in local cache" in raised,
-      detail=f"raised={raised!r}")
-check("N10: audit line records HFCacheMiss",
-      "HFCacheMiss" in captured_err.getvalue())
 
 
 # ════════════════════════════════════════════════════════════════════════
-print("\n== Step 2: allow_hf_download=False regression (N11) ==")
+print("\n== Slice 3 Step 2: generate catalog-name migration (N1-N17) ==")
 # ════════════════════════════════════════════════════════════════════════
+#
+# Replaces the slice-1 path-allowlist (old N5-N9) and HF-cache (old N10-N11)
+# handler tests: the names contract removes the raw-path input vector those
+# probed (the agent supplies catalog names; a path's basename is looked up).
+# What remains is the load-bearing uniform-error contract (ADR-015 §2 step 2 /
+# HIGH-1) + the resolved_params-as-names output (§3) + the path-discard notice
+# (§2 INFO-2). _setup_mb_and_out seeds catalog names: model "qwen-image",
+# lora "test-lora", transformer "test-dit".
 
-# Monkey-patch resolve_hf_path to record every (path, allow_download)
-# call across the entire generate code path; assert every recorded
-# allow_download is False.
+
+def _audit_error_class(stderr_text):
+    """Return the error_class from the first status=error audit line, or None."""
+    for _l in stderr_text.splitlines():
+        _l = _l.strip()
+        if not _l.startswith("{"):
+            continue
+        try:
+            _o = _json.loads(_l)
+        except _json.JSONDecodeError:
+            continue
+        if _o.get("status") == "error":
+            return _o.get("error_class")
+    return None
+
+
+_UNIFORM = "reference not available"
+
+# --- N1: unknown model name -> uniform error; audit cause UnknownName ---
 mb, out, _inside, cfg = _setup_mb_and_out()
-recorded_calls: list = []
-original_resolve = eu.resolve_hf_path
+r, e1, se1 = _call(cfg, {"prompt": "p", "model": "nonexistent-model"})
+check("N1: unknown model name -> uniform 'reference not available'",
+      r is None and e1 == _UNIFORM, detail=f"err={e1!r}")
+check("N1: audit cause = UnknownName", _audit_error_class(se1) == "UnknownName",
+      detail=f"cause={_audit_error_class(se1)!r}")
 
-def _spy_resolve(path, *, allow_download=False):
-    recorded_calls.append((path, allow_download))
-    return original_resolve(path, allow_download=allow_download)
+# --- N2: catalog hit whose abs_path vanished post-spawn -> uniform; PathMoved.
+# (Also the request-time HF-cache-eviction case: the stored local path vanishes.)
+mb, out, _inside, cfg = _setup_mb_and_out()
+os.remove(os.path.join(mb, "loras", "test-lora.safetensors"))
+r, e2, se2 = _call(cfg, {"prompt": "p", "model": "qwen-image",
+                         "loras": [{"name": "test-lora", "weight": 0.5}]})
+check("N2: deleted/moved catalog path -> uniform error (no fallback, no load)",
+      r is None and e2 == _UNIFORM, detail=f"err={e2!r}")
+check("N2: audit cause = PathMoved", _audit_error_class(se2) == "PathMoved",
+      detail=f"cause={_audit_error_class(se2)!r}")
+
+# --- N3: kind mismatch (lora name supplied as model) -> uniform; KindMismatch.
+mb, out, _inside, cfg = _setup_mb_and_out()
+r, e3, se3 = _call(cfg, {"prompt": "p", "model": "test-lora"})
+check("N3: lora name supplied as model -> uniform error",
+      r is None and e3 == _UNIFORM, detail=f"err={e3!r}")
+check("N3: audit cause = KindMismatch", _audit_error_class(se3) == "KindMismatch",
+      detail=f"cause={_audit_error_class(se3)!r}")
+
+# --- N4: malformed (null byte in model) -> uniform; MalformedReference ---
+mb, out, _inside, cfg = _setup_mb_and_out()
+r, e4, se4 = _call(cfg, {"prompt": "p", "model": "qwen-image\x00x"})
+check("N4: null byte in model -> uniform error",
+      r is None and e4 == _UNIFORM, detail=f"err={e4!r}")
+check("N4: audit cause = MalformedReference",
+      _audit_error_class(se4) == "MalformedReference",
+      detail=f"cause={_audit_error_class(se4)!r}")
+
+# --- N5 (KEYSTONE): N1-N4 agent frames are BYTE-IDENTICAL (HIGH-1) ---
+check("N5 (keystone): all reference-failure agent frames byte-identical",
+      e1 == e2 == e3 == e4 == _UNIFORM,
+      detail=f"{e1!r} {e2!r} {e3!r} {e4!r}")
+
+# --- N6: the fine causes ARE distinct on the operator audit (oracle stays
+# operator-side, not agent-side). ---
+check("N6: operator audit causes are distinct across N1-N4",
+      len({_audit_error_class(se1), _audit_error_class(se2),
+           _audit_error_class(se3), _audit_error_class(se4)}) == 4,
+      detail=f"{_audit_error_class(se1)},{_audit_error_class(se2)},"
+             f"{_audit_error_class(se3)},{_audit_error_class(se4)}")
+
+# --- N7: bare valid model name -> success; resolved_params.model is the name;
+# no path-discard notice (nothing discarded). ---
+mb, out, _inside, cfg = _setup_mb_and_out()
+r, e, se = _call(cfg, {"prompt": "p", "model": "qwen-image"})
+check("N7: bare model name -> success", r is not None and e is None,
+      detail=f"err={e!r}")
+_obj = _json.loads(r[0].text) if r else {}
+check("N7: resolved_params.model is the catalog name",
+      _obj.get("resolved_params", {}).get("model") == "qwen-image",
+      detail=f"model={_obj.get('resolved_params', {}).get('model')!r}")
+check("N7: no path-discard notice for a bare name",
+      all("discarded" not in n.get("message", "")
+          for n in _obj.get("notices", [])))
+
+# --- N8: path-shaped model -> success via basename; discard notice present. ---
+mb, out, _inside, cfg = _setup_mb_and_out()
+r, e, se = _call(cfg, {"prompt": "p",
+                       "model": "/agent/hallucinated/dir/qwen-image"})
+check("N8: path-shaped model resolves via basename -> success",
+      r is not None and e is None, detail=f"err={e!r}")
+_obj = _json.loads(r[0].text) if r else {}
+check("N8: resolved_params.model is the catalog name (not the supplied dir)",
+      _obj.get("resolved_params", {}).get("model") == "qwen-image")
+check("N8: path-discard INFO notice present",
+      any(n.get("level") == "INFO" and "discarded" in n.get("message", "")
+          for n in _obj.get("notices", [])))
+
+# --- N9 (INFO-2): notice carries the resolved NAME, never the supplied dir. ---
+check("N9: notice text contains the resolved catalog name",
+      any("qwen-image" in n.get("message", "")
+          for n in _obj.get("notices", [])))
+check("N9: supplied directory text never round-trips into the response",
+      r is not None and "/agent/hallucinated/dir" not in r[0].text)
+
+# --- N10: loras[].name resolves; resolved_params.loras = name+weight; the old
+# loras[].path key is rejected (contract break). ---
+mb, out, _inside, cfg = _setup_mb_and_out()
+r, e, se = _call(cfg, {"prompt": "p", "model": "qwen-image",
+                       "loras": [{"name": "test-lora", "weight": 0.8}]})
+check("N10: loras[].name resolves -> success", r is not None and e is None,
+      detail=f"err={e!r}")
+_obj = _json.loads(r[0].text) if r else {}
+check("N10: resolved_params.loras renders name+weight (no path)",
+      _obj.get("resolved_params", {}).get("loras") == [{"name": "test-lora",
+                                                        "weight": 0.8}],
+      detail=f"loras={_obj.get('resolved_params', {}).get('loras')!r}")
+mb, out, _inside, cfg = _setup_mb_and_out()
+r, e, se = _call(cfg, {"prompt": "p", "model": "qwen-image",
+                       "loras": [{"path": "test-lora", "weight": 0.5}]})
+check("N10: old loras[].path key rejected (name required)",
+      r is None and e is not None and "loras[0].name" in e, detail=f"err={e!r}")
+
+# --- N10b: inline loras shape validation (code-reviewer gap 1). Each malformed
+# shape returns its NAMED ValidationError/MissingField (these are contract
+# errors, not reference-resolution failures, so naming the field is correct). ---
+mb, out, _inside, cfg = _setup_mb_and_out()
+for _bad, _needle in (
+    ({"loras": "notalist"}, "loras: expected list"),
+    ({"loras": ["notadict"]}, "loras[0]: expected object"),
+    ({"loras": [{"weight": 1.0}]}, "loras[0].name: required field absent"),
+    ({"loras": [{"name": "test-lora"}]}, "loras[0].weight: required field absent"),
+    ({"loras": [{"name": "test-lora", "weight": True}]}, "loras[0].weight: expected number"),
+    ({"loras": [{"name": "test-lora", "weight": "x"}]}, "loras[0].weight: expected number"),
+):
+    _a = {"prompt": "p", "model": "qwen-image", **_bad}
+    r, e, se = _call(cfg, _a)
+    check(f"N10b: malformed loras -> named error ({_needle})",
+          r is None and e is not None and _needle in e, detail=f"err={e!r}")
+
+# --- N10c: non-str transformer value -> uniform error (resolver is the sole
+# type gate for transformer; code-reviewer Finding 3). ---
+mb, out, _inside, cfg = _setup_mb_and_out()
+r, e, se = _call(cfg, {"prompt": "p", "model": "qwen-image", "transformer": 123})
+check("N10c: non-str transformer -> uniform error",
+      r is None and e == _UNIFORM, detail=f"err={e!r}")
+
+# --- N11: success response carries NO --model-base abs path anywhere; the
+# transformer renders as a name and the dropped component keys are absent. ---
+mb, out, _inside, cfg = _setup_mb_and_out()
+r, e, se = _call(cfg, {"prompt": "p", "model": "qwen-image",
+                       "transformer": "test-dit",
+                       "loras": [{"name": "test-lora", "weight": 1.0}]})
+_txt = r[0].text if r else ""
+check("N11: no --model-base abs path in success response",
+      r is not None and mb not in _txt and "/loras/" not in _txt
+      and "/diffusion_models/" not in _txt, detail=f"resp={_txt[:160]!r}")
+_obj = _json.loads(_txt) if r else {}
+check("N11: resolved_params.transformer renders the catalog name",
+      _obj.get("resolved_params", {}).get("transformer") == "test-dit")
+check("N11: resolved_params has no transformer_path/vae_path keys",
+      "transformer_path" not in _obj.get("resolved_params", {})
+      and "vae_path" not in _obj.get("resolved_params", {}))
+
+# --- N12: a uniform-error frame leaks neither an abs path nor the fine cause. ---
+mb, out, _inside, cfg = _setup_mb_and_out()
+r, e, se = _call(cfg, {"prompt": "p", "model": "/etc/passwd"})  # basename unknown
+check("N12: uniform error leaks no path / no fine cause to the agent",
+      e == _UNIFORM and "UnknownName" not in (e or "") and "/etc" not in (e or ""),
+      detail=f"err={e!r}")
+
+# --- N13: the audit line for a reference failure carries the fine cause but
+# NO catalog abs_path. ---
+check("N13: audit carries fine cause, not the model-base abs path",
+      "UnknownName" in se and mb not in se)
+
+# --- removed-field guard (OQ-A): the slice-1 raw-path keys are rejected. ---
+mb, out, _inside, cfg = _setup_mb_and_out()
+for _rf in ("transformer_path", "vae_path", "text_encoder_path",
+            "text_encoder_2_path"):
+    r, e, se = _call(cfg, {"prompt": "p", "model": "qwen-image", _rf: "x"})
+    check(f"removed-field guard: `{_rf}` rejected as unsupported",
+          r is None and e is not None and "field not supported" in e,
+          detail=f"err={e!r}")
+
+# --- N15: generate input schema migrated (rename + drop). ---
+_props = mcps._GENERATE_INPUT_SCHEMA["properties"]
+check("N15: schema has `transformer` (renamed), not `transformer_path`",
+      "transformer" in _props and "transformer_path" not in _props)
+check("N15: schema drops vae_path/text_encoder_path/text_encoder_2_path",
+      not any(k in _props for k in ("vae_path", "text_encoder_path",
+                                    "text_encoder_2_path")))
+check("N15: loras item requires `name` not `path`",
+      _props["loras"]["items"]["required"] == ["name", "weight"]
+      and "name" in _props["loras"]["items"]["properties"]
+      and "path" not in _props["loras"]["items"]["properties"])
+
+# --- MEDIUM-1: lora_warnings (which embed the resolved abs_path) must NOT
+# cross into resolved_params. Mock generate() to return a warning carrying a
+# --model-base abs path; assert _resolved_params_as_names strips it. ---
+mb, out, _inside, cfg = _setup_mb_and_out()
+
+
+def _mock_generate_with_warning(*, model_path, prompt, output_path, **kw):
+    Image.new("RGB", (8, 8), "white").save(output_path)
+    return {
+        "prompt": prompt, "model": model_path, "seed": 1,
+        "loras": list(kw.get("loras") or []),
+        "lora_warnings": [f"LoRA skipped (0 modules applied): {model_path}"],
+        "elapsed_seconds": 0.01,
+    }
+
 
 with unittest.mock.patch.object(sys, "stderr", io.StringIO()), \
-     unittest.mock.patch.object(eu, "resolve_hf_path", _spy_resolve), \
-     unittest.mock.patch.object(gen_mod, "resolve_hf_path", _spy_resolve), \
      unittest.mock.patch.object(gen_mod, "_load_pipeline", _mock_load_pipeline), \
-     unittest.mock.patch.object(gen_mod, "generate", _mock_generate):
-    try:
-        _run(mcps._call_tool_impl(cfg, "generate", {
-            "prompt": "p", "model": _inside,
-        }))
-    except ValueError:
-        pass
-check("N11: resolve_hf_path was called at least once",
-      len(recorded_calls) >= 1, detail=f"calls={len(recorded_calls)}")
-check("N11: every recorded allow_download is False",
-      all(ad is False for (_p, ad) in recorded_calls),
-      detail=f"truthy: {[c for c in recorded_calls if c[1]]}")
+     unittest.mock.patch.object(gen_mod, "generate", _mock_generate_with_warning):
+    _rr = _run(mcps._call_tool_impl(cfg, "generate",
+                                    {"prompt": "p", "model": "qwen-image"}))
+_robj = _json.loads(_rr[0].text)
+check("MEDIUM-1: lora_warnings stripped from resolved_params (no abs_path leak)",
+      "lora_warnings" not in _robj.get("resolved_params", {}))
+check("MEDIUM-1: no --model-base abs path anywhere in the response",
+      mb not in _rr[0].text, detail=f"resp={_rr[0].text[:160]!r}")
+
+# --- N14: cascade is NOT migrated in slice 3 (OQ-C -> slice 3b). The cascade
+# handler must contain no catalog name-resolution — proves no partial migration.
+import inspect as _inspect  # noqa: E402
+_cascade_src = _inspect.getsource(mcps._handle_generate_cascade)
+check("N14: _handle_generate_cascade contains no resolve_reference call",
+      "resolve_reference" not in _cascade_src)
+check("N14: _handle_generate_cascade contains no catalog-name machinery",
+      "_reference_error" not in _cascade_src
+      and "_discard_notice" not in _cascade_src)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -884,8 +1037,10 @@ if result is not None and isinstance(result, list) and len(result) >= 1:
     response_obj = _json.loads(response_text)
     check("N25: response is a TextContent with JSON body",
           isinstance(response_obj, dict) and "output_path" in response_obj)
-    check("N25: response contains `resolved_params` (full blob)",
+    check("N25: response contains `resolved_params` (names blob)",
           "resolved_params" in response_obj)
+    check("N25: resolved_params.model is the catalog name (not a path)",
+          response_obj.get("resolved_params", {}).get("model") == "qwen-image")
     check("N25: response contains `elapsed_seconds`",
           "elapsed_seconds" in response_obj)
 else:
@@ -964,34 +1119,43 @@ check("N16: model omitted + no --default-model → MCP error",
 print("\n== Step 2 audit fold-in: null-byte + missing-prompt (F1, F2) ==")
 # ════════════════════════════════════════════════════════════════════════
 
-# Security-auditor F1: null-byte in any path-typed field must be rejected
-# BEFORE _check_paths' realpath would explode. Audit class must be
-# ValidationError, NOT InternalError.
-for nb_field in ("model", "transformer_path", "vae_path",
-                 "text_encoder_path", "text_encoder_2_path", "savepath"):
+# Slice 3: a null byte in a REFERENCE field is a malformed reference -> the
+# uniform "reference not available" frame (audit cause MalformedReference),
+# NOT a named ValidationError (which would be an oracle on the field). The
+# non-reference write-dest field `savepath` keeps its named ValidationError.
+for nb_field in ("model", "transformer"):
     mb, out, _inside, cfg = _setup_mb_and_out()
-    args = {"prompt": "p", "model": _inside}
-    args[nb_field] = ((_inside if nb_field != "savepath" else "") + "\x00null")
-    if nb_field == "savepath":
-        # savepath doesn't need to start with _inside
-        args["savepath"] = "out\x00null.png"
+    args = {"prompt": "p", "model": "qwen-image"}
+    args[nb_field] = "qwen-image\x00null"
     result, err, stderr = _call(cfg, args)
-    check(f"F1: null byte in `{nb_field}` → MCP error",
-          result is None and err is not None and "null byte not allowed" in err,
+    check(f"F1: null byte in reference `{nb_field}` -> uniform error",
+          result is None and err == "reference not available",
           detail=f"err={err!r}")
-    check(f"F1: null-byte audit class is ValidationError (not InternalError) for `{nb_field}`",
-          "ValidationError" in stderr and "InternalError" not in stderr)
+    check(f"F1: null-byte reference `{nb_field}` audit cause MalformedReference",
+          _audit_error_class(stderr) == "MalformedReference"
+          and "InternalError" not in stderr)
 
-# Null byte in loras[i].path
+# Null byte in loras[i].name -> uniform error (MalformedReference).
 mb, out, _inside, cfg = _setup_mb_and_out()
 result, err, stderr = _call(cfg, {
-    "prompt": "p", "model": _inside,
-    "loras": [{"path": _inside + "\x00null", "weight": 0.5}],
+    "prompt": "p", "model": "qwen-image",
+    "loras": [{"name": "test-lora\x00null", "weight": 0.5}],
 })
-check("F1: null byte in loras[0].path → MCP error",
-      result is None and err is not None and "null byte not allowed" in err)
-check("F1: loras null-byte audit class is ValidationError",
-      "ValidationError" in stderr)
+check("F1: null byte in loras[0].name -> uniform error",
+      result is None and err == "reference not available", detail=f"err={err!r}")
+check("F1: loras null-byte audit cause MalformedReference",
+      _audit_error_class(stderr) == "MalformedReference")
+
+# Null byte in the non-reference field `savepath` -> named ValidationError.
+mb, out, _inside, cfg = _setup_mb_and_out()
+result, err, stderr = _call(cfg, {
+    "prompt": "p", "model": "qwen-image", "savepath": "out\x00null.png",
+})
+check("F1: null byte in `savepath` -> named ValidationError (not a reference)",
+      result is None and err is not None and "null byte not allowed" in err,
+      detail=f"err={err!r}")
+check("F1: savepath null-byte audit class is ValidationError",
+      "ValidationError" in stderr and "InternalError" not in stderr)
 
 # Security-auditor F2: missing prompt must be rejected BEFORE _load_pipeline
 # wastes 30-90s. Audit class must be MissingField, NOT InternalError.

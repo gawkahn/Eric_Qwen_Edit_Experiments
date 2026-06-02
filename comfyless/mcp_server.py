@@ -71,6 +71,21 @@ _MCP_CASCADE_PATH_TYPED_FIELDS = (
     "scaffolding_repo",
 )
 
+# Reference field NAMES removed from the MCP `generate` surface in slice 3
+# (ADR-015 OQ-A). `transformer_path` is superseded by the catalog name
+# `transformer`; the three component overrides have no catalog kind and are
+# dropped (the CLI retains them). Sending any of these is a CONTRACT error,
+# named explicitly: field names are public schema knowledge, so this leaks
+# nothing about the filesystem (unlike a reference VALUE). Rejecting — not
+# silently ignoring — is required: silently accepting a raw `vae_path` would
+# reintroduce the caller-supplied-path input attack surface ADR-015 removes.
+_GENERATE_REMOVED_FIELDS = (
+    "transformer_path",
+    "vae_path",
+    "text_encoder_path",
+    "text_encoder_2_path",
+)
+
 # Fields dropped entirely from audit lines per invariant 5.
 _AUDIT_DROPPED_FIELDS = frozenset({"prompt", "negative_prompt"})
 
@@ -138,6 +153,55 @@ def redact_metadata_for_png(metadata: dict) -> dict:
     return out
 
 
+def _resolved_params_as_names(
+    metadata: dict,
+    *,
+    model_name: str,
+    transformer_name: Optional[str],
+    lora_names: list,
+) -> dict:
+    """Render generate()'s metadata blob with weight references as catalog
+    NAMES instead of abs_paths (ADR-015 §3 / slice-3 invariant 5).
+
+    This is the MCP-RESPONSE renderer (the agent's authoritative record),
+    distinct from `redact_metadata_for_png` (the on-disk PNG sink, which
+    basenames). Returns a NEW dict. ONLY the path-typed weight fields are
+    rewritten:
+      - `model`            -> the resolved catalog name
+      - `transformer_path` -> dropped; replaced by `transformer` = the
+                              resolved name (omitted entirely when no
+                              transformer was used)
+      - vae_path / text_encoder_path / text_encoder_2_path -> dropped
+        (removed from the MCP surface per OQ-A; they are "" here regardless)
+      - loras[]            -> [{name, weight}] (the `path` key is dropped)
+    Every other field (resolved seed, model_family, timing, lora_warnings,
+    sampler, ...) passes through verbatim. No abs_path crosses the boundary.
+    """
+    out = dict(metadata)
+    out["model"] = model_name
+    out.pop("transformer_path", None)
+    if transformer_name:
+        out["transformer"] = transformer_name
+    out.pop("vae_path", None)
+    out.pop("text_encoder_path", None)
+    out.pop("text_encoder_2_path", None)
+    # `lora_warnings` strings embed the resolved abs_path (generate.py:
+    # "LoRA skipped ...: <abs_path>"). Drop them from the agent-facing blob —
+    # an abs_path must not cross the boundary (invariant 5). Today the MCP path
+    # always passes a cached pipeline so the warning-producing loop never runs
+    # and this list is empty; popping makes the no-leak guarantee an ENFORCED
+    # contract rather than an emergent property of that caching accident.
+    # (security-auditor slice-3 step-2 MEDIUM-1, 2026-06-02.) The warnings
+    # remain on the operator's PNG metadata / stderr for debugging.
+    out.pop("lora_warnings", None)
+    src_loras = metadata.get("loras") or []
+    out["loras"] = [
+        {"name": lora_names[i], "weight": src_loras[i].get("weight")}
+        for i in range(len(src_loras))
+    ]
+    return out
+
+
 # ════════════════════════════════════════════════════════════════════════
 # Tool description text (refinable per ADR-011 §2 amendment 2026-04-30)
 # ════════════════════════════════════════════════════════════════════════
@@ -152,15 +216,19 @@ Model selection guidance:
 - Fastest at modest quality: Stable Cascade via cascade_config
 - General-purpose / latest: flux2 (Flux.2)
 
-If `model` is omitted, the server uses the path configured at spawn time
+If `model` is omitted, the server uses the model configured at spawn time
 via --default-model. Omitting `model` without a configured default
 returns an error.
 
-All path-typed fields (model, transformer_path, vae_path,
-text_encoder_path, text_encoder_2_path, loras[].path, and cascade stage
-paths) must resolve under --model-base. Output paths must resolve under
---output-dir. HuggingFace downloads are not performed; models must be
-local or already cached.
+Weight references (`model`, `transformer`, `loras[].name`) are CATALOG
+NAMES, not filesystem paths — discover them via `list_models`,
+`list_transformers`, and `list_loras`. A path-shaped value has its
+directory component discarded and its basename resolved through the
+catalog; rely on the names, not on any path. A reference that does not
+resolve returns a single uniform "reference not available" error.
+
+Output paths (`savepath`) must resolve under --output-dir. HuggingFace
+downloads are not performed; weights must be local or already cached.
 """
 
 
@@ -182,15 +250,21 @@ _GENERATE_INPUT_SCHEMA: dict[str, Any] = {
         "model": {
             "type": "string",
             "description": (
-                "Absolute path to a model directory under --model-base, "
-                "OR an HF repo ID already present in the local cache. "
-                "Optional if --default-model is configured at spawn."
+                "Catalog name of a model (discover via list_models). A "
+                "path-shaped value has its directory discarded and its "
+                "basename resolved via the catalog. Optional if "
+                "--default-model is configured at spawn."
             ),
         },
-        "transformer_path": {"type": "string"},
-        "vae_path": {"type": "string"},
-        "text_encoder_path": {"type": "string"},
-        "text_encoder_2_path": {"type": "string"},
+        "transformer": {
+            "type": "string",
+            "description": (
+                "Catalog name of a single-file diffusion-transformer (DiT) "
+                "weight (discover via list_transformers). A path-shaped "
+                "value has its directory discarded and its basename "
+                "resolved via the catalog. Optional."
+            ),
+        },
         "seed": {"type": "integer"},
         "steps": {"type": "integer"},
         "width": {"type": "integer"},
@@ -205,10 +279,18 @@ _GENERATE_INPUT_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": {
                 "type": "object",
-                "required": ["path", "weight"],
+                "required": ["name", "weight"],
                 "additionalProperties": False,
                 "properties": {
-                    "path": {"type": "string"},
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "Catalog name of a LoRA adapter (discover via "
+                            "list_loras). A path-shaped value has its "
+                            "directory discarded and its basename resolved "
+                            "via the catalog."
+                        ),
+                    },
                     "weight": {"type": "number"},
                 },
             },
@@ -584,6 +666,47 @@ class _MCPHandlerError(Exception):
         super().__init__(safe_message)
 
 
+# ════════════════════════════════════════════════════════════════════════
+# Uniform reference-resolution error + path-discard notice (ADR-015 §2/§3)
+# ════════════════════════════════════════════════════════════════════════
+
+# The load-bearing uniform agent-facing reference-resolution error (ADR-015
+# §2 step 2 / HIGH-1). EVERY reference-resolution failure — whatever its
+# fine-grained cause — returns this BYTE-IDENTICAL message to the agent; the
+# fine cause rides only on the stderr audit line (via
+# _MCPHandlerError.error_class -> _emit_audit_line). Keeping the message in a
+# single constant is what makes the byte-equality property (keystone test N5)
+# auditable and closes the HF-cache enumeration oracle (TECH_DEBT 2026-05-17).
+_UNIFORM_REFERENCE_ERROR = "reference not available"
+
+
+def _reference_error(cause: str) -> _MCPHandlerError:
+    """Build the uniform agent-facing reference error. `cause` is a
+    `comfyless.catalog.ResolveCause` (UnknownName / KindMismatch /
+    MalformedReference / PathMoved / WithinFailure) and lands ONLY on the
+    audit line; the agent sees `_UNIFORM_REFERENCE_ERROR` regardless."""
+    return _MCPHandlerError(cause, _UNIFORM_REFERENCE_ERROR)
+
+
+# Path-discard INFO notice (ADR-015 §2 step 2 Hit notice / INFO-2). Interpolates
+# the RESOLVED CATALOG NAME only — NEVER the agent-supplied raw reference value,
+# which may carry attacker-chosen directory text that must not round-trip into
+# the agent transcript.
+_REFERENCE_PATH_DISCARD_NOTICE = (
+    "reference '{name}' resolved via catalog; supplied path discarded — "
+    "do not rely on paths for later actions."
+)
+
+
+def _discard_notice(name: str) -> dict:
+    """INFO notice for a reference resolved from a path-shaped value. `name`
+    is the resolved catalog name (NEVER the agent-supplied raw value)."""
+    return {
+        "level": "INFO",
+        "message": _REFERENCE_PATH_DISCARD_NOTICE.format(name=name),
+    }
+
+
 async def _call_tool_impl(
     cfg: _StartupConfig,
     name: str,
@@ -675,10 +798,30 @@ async def _handle_generate(
     failure category; unknown exceptions propagate up to _call_tool_impl's
     BaseException catch.
     """
-    # 1 — Canonical type validation (ADR-012). FIRST handler action after
-    # audit-line setup, per security-auditor F3.
+    # 0 — Removed-field guard (slice 3 / OQ-A). Reject the slice-1 raw-path
+    # field names outright. `transformer_path` is now the catalog name
+    # `transformer`; vae/text_encoder overrides are dropped (no catalog kind).
+    # Silently accepting a raw `vae_path` would reintroduce the caller-
+    # supplied-path input attack surface ADR-015 removes. Field NAMES are
+    # public schema knowledge, so naming them is not an enumeration oracle.
+    for _removed in _GENERATE_REMOVED_FIELDS:
+        if _removed in arguments:
+            raise _MCPHandlerError(
+                "ValidationError",
+                f"validation failed: {_removed}: field not supported on the "
+                f"MCP surface; reference weights by catalog name (see "
+                f"list_models / list_transformers)",
+            )
+
+    # 1 — Canonical type validation (ADR-012), MINUS `loras`. The MCP loras
+    # entry shape is {name, weight}; the SHARED canonical validator hard-
+    # requires the slice-1 {path, weight} shape, so loras are validated and
+    # resolved by name in step 5. Top-level `model` is still str-checked here;
+    # `transformer` passes through (the resolver type-checks it). FIRST
+    # substantive action after audit setup, per security-auditor F3.
     from comfyless.params_validation import validate_machine_request
-    val = validate_machine_request(arguments)
+    _args_no_loras = {k: v for k, v in arguments.items() if k != "loras"}
+    val = validate_machine_request(_args_no_loras)
     if not val.ok:
         err = val.error or {}
         raise _MCPHandlerError(
@@ -687,151 +830,165 @@ async def _handle_generate(
         )
     payload: dict = dict(val.payload or {})
 
-    # 1.5 — Required-field presence (server-specific; canonical validator
-    # is type-only per ADR-012 design). Mirrors the daemon's missing-prompt
-    # gate at server.py:133-136. Required BEFORE expensive _load_pipeline
-    # so we fail-fast on malformed input — security-auditor step-2 F2.
+    # 1.5 — Required prompt (server-specific; canonical validator is type-only
+    # per ADR-012). Fail-fast BEFORE the expensive resolve+load path.
     if not (payload.get("prompt") or "").strip():
         raise _MCPHandlerError(
             "MissingField",
             "validation failed: prompt: required field absent",
         )
 
-    # 1.6 — Null-byte path defense (daemon parity; server.py:138-149).
-    # os.path.realpath raises on NUL; without this check the NUL would
-    # escape `_check_paths` (step 5 below) and fall into the outer
-    # BaseException handler, producing audit class "InternalError" instead
-    # of the correct "ValidationError" and emitting a stderr-side traceback
-    # on malformed input — security-auditor step-2 F1.
-    for _nb_field in (
-        "model", "transformer_path", "vae_path",
-        "text_encoder_path", "text_encoder_2_path", "savepath",
-    ):
-        if "\x00" in (payload.get(_nb_field) or ""):
-            raise _MCPHandlerError(
-                "ValidationError",
-                f"validation failed: {_nb_field}: null byte not allowed",
-            )
-    for _nb_i, _nb_lora in enumerate(payload.get("loras") or []):
-        if "\x00" in (_nb_lora.get("path") or ""):
-            raise _MCPHandlerError(
-                "ValidationError",
-                f"validation failed: loras[{_nb_i}].path: null byte not allowed",
-            )
+    # 1.6 — Null-byte gate on the non-reference write-dest field `savepath`
+    # only (ValidationError, distinct from reference resolution). Reference
+    # fields (model / transformer / loras[].name) get null-byte handling
+    # from the resolver -> the uniform "reference not available" error
+    # (MalformedReference), so they are NOT gated here.
+    if "\x00" in (payload.get("savepath") or ""):
+        raise _MCPHandlerError(
+            "ValidationError",
+            "validation failed: savepath: null byte not allowed",
+        )
 
-    # 2 — --default-model fallback (invariants 8, 9; N15, N16).
-    model_input = (payload.get("model") or "").strip()
-    if not model_input:
+    # 2 — Notices accumulator (ADR-015 §3). Path-discard INFO entries are
+    # appended as references resolve from path-shaped values (invariant 6/7).
+    notices: list = []
+
+    from comfyless.catalog import resolve_reference
+
+    # 3 — Resolve the model reference. Agent-supplied -> catalog resolver
+    # (uniform error on ANY failure; fine cause to audit only). Omitted ->
+    # --default-model, an OPERATOR-trusted path that BYPASSES the agent-facing
+    # resolver (OQ-D) but still passes the request-time _within net.
+    model_in = (payload.get("model") or "").strip()
+    if model_in:
+        rr = resolve_reference(
+            cfg.catalog, model_in, cfg.model_base, expected_kind="model")
+        if not rr.ok:
+            raise _reference_error(rr.cause)
+        model_abs = rr.abs_path
+        model_name = rr.name
+        if rr.path_was_discarded:
+            notices.append(_discard_notice(rr.name))
+    else:
         if cfg.default_model is None:
             raise _MCPHandlerError(
                 "MissingField",
                 "validation failed: model: required field absent and "
                 "--default-model not configured at spawn",
             )
-        model_input = cfg.default_model
-    payload["model"] = model_input
-
-    # 3 — Defense-in-depth re-validation of --default-model at request time
-    # (invariant 8). Startup already validated; the within-check fires here
-    # whenever the active model EQUALS the configured default — which covers
-    # BOTH the omitted-model fallback path (model_input was just assigned)
-    # AND the agent-passed-default-path-explicitly case (string equality with
-    # the realpath'd cfg.default_model). Catches a hypothetical post-startup
-    # symlink swap that would have escaped the model-base. Note: this is in
-    # addition to the per-request _check_paths step 5 below, which validates
-    # ANY model path (default or not) against --model-base.
-    if cfg.default_model is not None and model_input == cfg.default_model:
+        # Operator-trusted default; re-check containment at request time
+        # (catches a post-startup symlink swap — slice-1 step-3 carry-forward).
         if not _within(cfg.default_model, cfg.model_base):
             raise _MCPHandlerError(
                 "DefaultModelEscape",
                 "validation failed: --default-model no longer resolves "
                 "under --model-base",
             )
+        model_abs = cfg.default_model
+        model_name = os.path.basename(cfg.default_model)
 
-    # 4 — Resolve HF repo IDs to local paths (HARD-CODED allow_download=
-    # False per invariant 4). The agent-supplied INPUT is kept separately
-    # so PNG-redaction can pass HF repo IDs through unchanged (N30).
-    from nodes.eric_diffusion_utils import resolve_hf_path
-    try:
-        resolved: dict = {}
-        for field in (
-            "model", "transformer_path", "vae_path",
-            "text_encoder_path", "text_encoder_2_path",
-        ):
-            v = (payload.get(field) or "").strip()
-            if v:
-                resolved[field] = resolve_hf_path(v, allow_download=False)
-        loras_resolved: list = []
-        for i, lora in enumerate(payload.get("loras") or []):
-            lpath = (lora.get("path") or "").strip()
-            loras_resolved.append({
-                **lora,
-                "path": resolve_hf_path(lpath, allow_download=False),
-            })
-    except ValueError:
-        # ValueError surfaces when allow_download=False and the repo is
-        # not in the local cache (HFCacheMiss path; N10). DO NOT echo the
-        # repo ID back — that's an enumeration oracle.
-        raise _MCPHandlerError(
-            "HFCacheMiss",
-            "validation failed: HF repo not in local cache (set up via "
-            "`huggingface-cli download <repo>` first; MCP server does "
-            "not perform downloads)",
-        ) from None
+    # 4 — Resolve the optional transformer reference (kind:"transformer").
+    # Truthy covers a non-empty name; a non-str value flows to the resolver
+    # and returns MalformedReference -> uniform error.
+    transformer_val = payload.get("transformer")
+    transformer_abs = ""
+    transformer_name: Optional[str] = None
+    if transformer_val:
+        rr = resolve_reference(
+            cfg.catalog, transformer_val, cfg.model_base,
+            expected_kind="transformer")
+        if not rr.ok:
+            raise _reference_error(rr.cause)
+        transformer_abs = rr.abs_path
+        transformer_name = rr.name
+        if rr.path_was_discarded:
+            notices.append(_discard_notice(rr.name))
 
-    # 5 — Path allowlist against --model-base (invariant 2; N5-N9).
-    # Reuse the daemon's _check_paths helper verbatim.
+    # 5 — Validate + resolve LoRA references (kind:"lora"). The MCP entry shape
+    # is {name, weight}; validate minimally here (the shared canonical lora
+    # validator requires the slice-1 `path` key and is not used), then resolve
+    # each name to an abs_path for the load call.
+    loras_in = arguments.get("loras")
+    loras_resolved: list = []   # canonical {path, weight} for the load call
+    lora_names: list = []
+    if loras_in is not None:
+        if not isinstance(loras_in, list):
+            raise _MCPHandlerError(
+                "ValidationError", "validation failed: loras: expected list")
+        for i, lora in enumerate(loras_in):
+            if not isinstance(lora, dict):
+                raise _MCPHandlerError(
+                    "ValidationError",
+                    f"validation failed: loras[{i}]: expected object")
+            if "name" not in lora:
+                raise _MCPHandlerError(
+                    "MissingField",
+                    f"validation failed: loras[{i}].name: required field absent")
+            if "weight" not in lora:
+                raise _MCPHandlerError(
+                    "MissingField",
+                    f"validation failed: loras[{i}].weight: required field absent")
+            w = lora["weight"]
+            if isinstance(w, bool) or not isinstance(w, (int, float)):
+                raise _MCPHandlerError(
+                    "ValidationError",
+                    f"validation failed: loras[{i}].weight: expected number")
+            rr = resolve_reference(
+                cfg.catalog, lora.get("name"), cfg.model_base,
+                expected_kind="lora")
+            if not rr.ok:
+                raise _reference_error(rr.cause)
+            loras_resolved.append({"path": rr.abs_path, "weight": float(w)})
+            lora_names.append(rr.name)
+            if rr.path_was_discarded:
+                notices.append(_discard_notice(rr.name))
+
+    # 6 — Defense-in-depth: re-validate every RESOLVED abs_path under
+    # --model-base at the load boundary (auditor carry-forward #6 / invariant
+    # 9). The resolver already _within-checked agent refs and step 3 re-checked
+    # the default; this is the final net immediately before load. A failure
+    # here is a containment escape on an already-resolved path -> the uniform
+    # reference error (the value is never echoed).
     from comfyless.server import _check_paths
-    resolved_payload = {**payload, **resolved}
-    if loras_resolved:
-        resolved_payload["loras"] = loras_resolved
-    err_msg = _check_paths(resolved_payload, cfg.model_base)
-    if err_msg:
-        # _check_paths returns "field path outside --model-base: '/x/y'"
-        # — split on the first colon so the rejected VALUE is not echoed
-        # back (avoid enumeration oracle on the model_base tree).
-        safe_head = err_msg.split(":", 1)[0] if ":" in err_msg else err_msg
-        raise _MCPHandlerError(
-            "PathAllowlist",
-            f"validation failed: {safe_head}",
-        )
+    if _check_paths(
+        {"model": model_abs, "transformer_path": transformer_abs,
+         "loras": loras_resolved},
+        cfg.model_base,
+    ):
+        raise _reference_error("WithinFailure")
 
-    # 6 — Output-path resolution + containment under --output-dir
-    # (invariant 3; N8).
+    # 7 — Output-path resolution + containment under --output-dir. The
+    # {model}/{transformer} savepath template tokens use the resolved NAMES
+    # (no abs_path leaks into generated filenames). Unchanged containment.
     try:
-        output_path = _resolve_mcp_output_path(cfg, payload)
+        output_path = _resolve_mcp_output_path(
+            cfg,
+            {**payload, "model": model_name,
+             "transformer_path": (transformer_name or "")},
+        )
     except _MCPHandlerError:
         raise
     except Exception as e:
-        # savepath template expansion / collision logic can raise;
-        # treat as a path-validation failure and DO NOT echo the value.
         raise _MCPHandlerError(
             "OutputPath",
             f"validation failed: output_path resolution rejected "
             f"({type(e).__name__})",
         ) from None
 
-    # 7 — Load + generate (HARD-CODED allow_hf_download=False per
-    # invariant 4; in-process — no daemon delegation in slice 1, see
-    # TECH_DEBT entry "MCP server: daemon delegation deferred").
-    #
-    # Operator-tuning knobs (precision / offload_vae / attention_slicing /
-    # sequential_offload) are deliberately NOT exposed on the MCP schema
-    # (_GENERATE_INPUT_SCHEMA additionalProperties:False blocks them). These
-    # are server-side perf concerns the operator picks at spawn time, not
-    # something the LLM agent should be tuning per-call. Hard-coded defaults
-    # match the CLI's defaults; a future slice may add operator-side spawn
-    # flags (e.g. --precision, --offload-vae) if the demand surfaces.
+    # 8 — Load + generate (HARD-CODED allow_hf_download=False; in-process).
+    # Component overrides vae/text_encoder are removed from the MCP surface
+    # (OQ-A) -> always "" here. Operator-tuning knobs (precision/offload/...)
+    # are spawn-time concerns, not agent-facing — hard-coded defaults.
     from comfyless.generate import _load_pipeline, generate
     pipe, model_family, guidance_embeds = _load_pipeline(
-        resolved["model"],
+        model_abs,
         precision="bf16",
         device="cuda",
         offload_vae=False,
-        transformer_path=resolved.get("transformer_path", "") or "",
-        vae_path=resolved.get("vae_path", "") or "",
-        text_encoder_path=resolved.get("text_encoder_path", "") or "",
-        text_encoder_2_path=resolved.get("text_encoder_2_path", "") or "",
+        transformer_path=transformer_abs,
+        vae_path="",
+        text_encoder_path="",
+        text_encoder_2_path="",
         vae_from_transformer=bool(payload.get("vae_from_transformer")),
         attention_slicing=False,
         sequential_offload=False,
@@ -843,7 +1000,7 @@ async def _handle_generate(
         "guidance_embeds": guidance_embeds,
     }
     metadata = generate(
-        model_path=resolved["model"],
+        model_path=model_abs,
         prompt=payload["prompt"],
         output_path=output_path,
         negative_prompt=payload.get("negative_prompt", ""),
@@ -862,25 +1019,33 @@ async def _handle_generate(
         offload_vae=False,
         attention_slicing=False,
         sequential_offload=False,
-        transformer_path=resolved.get("transformer_path", "") or "",
-        vae_path=resolved.get("vae_path", "") or "",
-        text_encoder_path=resolved.get("text_encoder_path", "") or "",
-        text_encoder_2_path=resolved.get("text_encoder_2_path", "") or "",
+        transformer_path=transformer_abs,
+        vae_path="",
+        text_encoder_path="",
+        text_encoder_2_path="",
         vae_from_transformer=bool(payload.get("vae_from_transformer")),
         allow_hf_download=False,
         _cached_pipeline=cached,
         mcp_caller=True,  # signals _save_with_metadata to apply MCP redaction
     )
 
-    # 8 — Build inline response (invariant 11: no sidecar on disk; the
-    # resolved-params blob is returned in-frame instead). The IN-FRAME
-    # blob carries the FULL paths (the agent's authoritative record);
-    # only the on-disk PNG metadata is redacted to basenames.
+    # 9 — Inline response (invariant 11: no sidecar on disk). resolved_params
+    # renders weight references as catalog NAMES (invariant 5); the
+    # path-discard notices ride alongside (invariant 6/7). The on-disk PNG
+    # metadata is separately basename-redacted by generate(mcp_caller=True).
+    resolved_params = _resolved_params_as_names(
+        metadata,
+        model_name=model_name,
+        transformer_name=transformer_name,
+        lora_names=lora_names,
+    )
     response = {
         "output_path": output_path,
-        "resolved_params": metadata,
+        "resolved_params": resolved_params,
         "elapsed_seconds": metadata.get("elapsed_seconds"),
     }
+    if notices:
+        response["notices"] = notices
     return [TextContent(type="text", text=json.dumps(response, default=str))]
 
 
