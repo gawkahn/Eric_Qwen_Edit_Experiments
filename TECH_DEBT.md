@@ -25,6 +25,7 @@ cases while retaining the finer-grained `HFCacheMiss`/`PathAllowlist`
 classes on the stderr audit line for operator visibility.
 See `docs/security/review-slice-1-mcp-step2-2026-05-17.md` F3.
 **2026-05-23 update:** ADR-015 (`docs/decisions/ADR-015-mcp-catalog-reference-resolution.md`) commits to a uniform agent-facing error class across **all** reference-resolution failures (catalog miss, catalog hit whose path moved, HF-cache miss, request-time `_within` failure) with fine-grained cause on stderr only — closing this oracle by construction. Trigger met; mark **Resolved: <date> — slice 3 shipped uniform-error contract** when ADR-015 slice 3 lands.
+**Resolved: 2026-06-02** — ADR-015 slice 3 (step 1 resolver + step 2 `_handle_generate` migration) shipped the uniform agent-facing reference error (`"reference not available"`) for ALL causes, with the fine cause (`UnknownName`/`KindMismatch`/`MalformedReference`/`PathMoved`/`WithinFailure`) on the stderr audit line only. Request-time HF-cache-miss is now indistinguishable from any other failure (subsumed by `PathMoved`). Proof: `test_mcp_server.py` keystone N5 (four-frame byte-equality) + N3. Reviews: `docs/security/review-slice-3-step1-2026-06-02.md`, `docs/security/review-slice-3-step2-2026-06-02.md`.
 
 **MCP server: daemon delegation deferred** *(2026-05-17)*
 `comfyless/mcp_server.py:_call_tool_impl` (slice 1 step 2) runs generation
