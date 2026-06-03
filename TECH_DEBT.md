@@ -168,6 +168,38 @@ Trigger: any CI being wired for this repo, OR any sibling test gaining the
 same gating pattern. Fix is a 2-line change in `test_dry_load_integration.py`
 plus a CI runner update.
 
+**LoRA audit: convert write-path lacks O_NOFOLLOW/dir-fd intermediate-symlink narrowing** *(2026-06-02)*
+`scripts/lora_audit.py:_convert_one` (S3 `--convert`) writes the converted
+sibling via `target_path.parent.mkdir(parents=True, exist_ok=True)` +
+`safetensors.torch.save_file(tmp)` + `os.replace(tmp, target)`. The output path
+is containment-checked once with `target_path.resolve().relative_to(base_dir)`
+*before* the `mkdir`/write, but the write itself does not use the
+`O_NOFOLLOW`/dir-fd-relative narrowing that the *read* path (`_open_no_follow`)
+and the planned `--delete` path (ADR §9) apply. A same-uid attacker who swaps an
+intermediate directory under an out-of-`audit_root` `--output-dir` for a symlink
+in the TOCTOU window between the resolve-check and `mkdir`/`os.replace` can
+redirect the write outside the validated base. This is within the ADR §6/§8
+accepted residual (the same attacker can write there directly; the tool grants
+no new capability) and `--output-dir` defaults inside `audit_root`, so the MVP
+posture holds. The convert source read (`_load_state_dict(source_path)`) is the
+read-side analogue: unlike the S2 dry-load path (which re-runs
+`_passes_scan_containment` per file, M-1), `_convert_one` does not re-check
+source containment before re-reading — same accepted same-uid residual.
+Surfaced by security-auditor S3 review (MEDIUM, accepted; no CHANGES REQUIRED)
+and code-reviewer S3 review (LOW-3).
+Why not now: out of S3's declared edit scope; same-uid TOCTOU is below the MVP
+threat floor; closing it is a non-trivial dir-fd write rewrite that belongs with
+the S4 delete-path hardening (which already adopts the dir-fd pattern).
+Fix shape: open the validated target parent with
+`os.open(parent, O_NOFOLLOW|O_DIRECTORY|O_CLOEXEC)`, re-check its
+`/proc/self/fd` realpath against `base_dir`, and `os.replace` dir-fd-relative;
+mirror the ADR §9 `safe_unlink` shape. Optionally re-run
+`_passes_scan_containment` on the source before re-reading.
+Trigger: the F-10 risk-trigger fires (LLM/remote caller supplies paths → whole
+tool re-classifies to Red Zone, write-path narrowing becomes mandatory), OR S4
+lands the dir-fd delete path (fold the convert write into the same pattern).
+See `docs/security/review-lora-audit-s3-2026-06-02.md`.
+
 ---
 
 ## Dependencies

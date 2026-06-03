@@ -965,10 +965,392 @@ def test_dry_load_containment_recheck() -> None:
                   detail=f"dl={dl}")
 
 
+# ── S3 convert-path fixtures + tests (ADR §8, §10) ─────────────────────
+def _build_convert_fixture(root: Path) -> tuple[Path, Path]:
+    """Build a 2-LoRA tree + synthetic base under *root*.
+
+    Both LoRAs use keys that do NOT match the synthetic base, so they are
+    classified non-usable and fall through to the convertable probe (where
+    `find_matching_plan` is patched in the tests). One sits under a subdir to
+    exercise relative-path preservation. Returns (tree_dir, base_dir).
+    """
+    tree = root / "tree"
+    base = root / "synth" / "transformer"
+    _build_synth_base(base)
+    tree.mkdir(parents=True, exist_ok=True)
+    (tree / "sub").mkdir(exist_ok=True)
+    safetensors.torch.save_file({
+        "double_blocks.0.img_attn.qkv.lora_A.weight": torch.zeros(4, 16),
+        "double_blocks.0.img_attn.qkv.lora_B.weight": torch.zeros(16, 4),
+    }, str(tree / "alpha.safetensors"))
+    safetensors.torch.save_file({
+        "double_blocks.1.img_attn.qkv.lora_A.weight": torch.zeros(4, 16),
+        "double_blocks.1.img_attn.qkv.lora_B.weight": torch.zeros(16, 4),
+    }, str(tree / "sub" / "beta.safetensors"))
+    return tree, base
+
+
+def _fake_plan(*_a, **_k):
+    """A ConversionPlan stand-in carrying just the attributes the audit tool
+    reads (source_family, target_family). The real convert_state_dict is
+    patched out, so its qkv_splits/model_signature are never consulted."""
+    return types.SimpleNamespace(
+        source_family="bfl_chroma",
+        target_family="diffusers_chroma",
+        model_signature="",
+        qkv_splits=[],
+    )
+
+
+class _ConvertPatch:
+    """Swap the module's convert surface (find_matching_plan,
+    convert_state_dict) for fakes; restore on exit. Mirrors _DryLoadPatch."""
+
+    def __init__(self, mod, *, planner=None, converter=None):
+        self.mod = mod
+        self.planner = planner
+        self.converter = converter
+        self._saved: dict = {}
+
+    def __enter__(self):
+        self._saved["plan"] = self.mod.find_matching_plan
+        self._saved["conv"] = self.mod.convert_state_dict
+        if self.planner is not None:
+            self.mod.find_matching_plan = self.planner
+        if self.converter is not None:
+            self.mod.convert_state_dict = self.converter
+        return self
+
+    def __exit__(self, *exc):
+        self.mod.find_matching_plan = self._saved["plan"]
+        self.mod.convert_state_dict = self._saved["conv"]
+
+
+def _file_entry(manifest: dict, rel: str) -> dict:
+    return next(
+        (f for f in manifest["files"] if f["relative_path"] == rel), None
+    )
+
+
+def test_convert_writes_sibling() -> None:
+    print("\n[20] test_convert_writes_sibling (S3 ADR §8)")
+    mod = _import_script()
+    with tempfile.TemporaryDirectory(prefix="convert_ok_") as tmp:
+        tree, base = _build_convert_fixture(Path(tmp))
+        src_a = (tree / "alpha.safetensors").read_bytes()
+        src_b = (tree / "sub" / "beta.safetensors").read_bytes()
+
+        def good_convert(sd, plan, **kw):
+            return {"converted.weight": torch.zeros(4, 4)}
+
+        with _ConvertPatch(mod, planner=_fake_plan, converter=good_convert):
+            exit_code = mod.main([
+                "--audit-root", str(tree), "--no-config",
+                "--base", f"klein={base}", "--convert",
+                "-o", str(tree / "manifest.json"),
+            ])
+        check("convert run exits cleanly", exit_code in (0, 2),
+              detail=f"got {exit_code}")
+        sib_a = tree / "alpha.diffusers_chroma.safetensors"
+        sib_b = tree / "sub" / "beta.diffusers_chroma.safetensors"
+        check("top-level sibling written", sib_a.is_file())
+        check("subdir sibling written (relative path preserved)", sib_b.is_file())
+        check("source alpha NOT modified",
+              (tree / "alpha.safetensors").read_bytes() == src_a)
+        check("source beta NOT modified",
+              (tree / "sub" / "beta.safetensors").read_bytes() == src_b)
+        manifest = json.loads((tree / "manifest.json").read_text())
+        ea = _file_entry(manifest, "alpha.safetensors")
+        eb = _file_entry(manifest, "sub/beta.safetensors")
+        check("alpha manifest convert_output is relative sibling path",
+              ea and ea["convert_output"] == "alpha.diffusers_chroma.safetensors",
+              detail=f"got {ea and ea.get('convert_output')}")
+        check("beta manifest convert_output preserves subdir",
+              eb and eb["convert_output"] == "sub/beta.diffusers_chroma.safetensors",
+              detail=f"got {eb and eb.get('convert_output')}")
+        check("alpha convert_reason null on success",
+              ea and ea["convert_reason"] is None)
+        check("no stray .tmp left behind",
+              not any(p.name.endswith(".tmp") for p in tree.rglob("*")))
+
+
+def test_convert_collision_skipped() -> None:
+    print("\n[21] test_convert_collision_skipped (S3 ADR §8)")
+    mod = _import_script()
+    with tempfile.TemporaryDirectory(prefix="convert_coll_") as tmp:
+        tree, base = _build_convert_fixture(Path(tmp))
+        # Pre-create the target sibling for alpha with sentinel content.
+        collide = tree / "alpha.diffusers_chroma.safetensors"
+        collide.write_bytes(b"PRE-EXISTING-DO-NOT-CLOBBER")
+        pre = collide.read_bytes()
+
+        def good_convert(sd, plan, **kw):
+            return {"converted.weight": torch.zeros(4, 4)}
+
+        err = io.StringIO()
+        with _ConvertPatch(mod, planner=_fake_plan, converter=good_convert):
+            with contextlib.redirect_stderr(err):
+                exit_code = mod.main([
+                    "--audit-root", str(tree), "--no-config",
+                    "--base", f"klein={base}", "--convert",
+                    "-o", str(tree / "manifest.json"),
+                ])
+        check("convert run exits cleanly", exit_code in (0, 2),
+              detail=f"got {exit_code}")
+        check("collision target NOT overwritten",
+              collide.read_bytes() == pre)
+        check("WARN convert_skipped_collision emitted",
+              "convert_skipped_collision" in err.getvalue(),
+              detail=err.getvalue()[:300])
+        manifest = json.loads((tree / "manifest.json").read_text())
+        ea = _file_entry(manifest, "alpha.safetensors")
+        check("alpha convert_reason == collision",
+              ea and ea["convert_reason"] == "collision",
+              detail=f"got {ea and ea.get('convert_reason')}")
+        check("alpha convert_output null on collision",
+              ea and ea["convert_output"] is None)
+        # beta has no pre-existing collision → should still be written
+        eb = _file_entry(manifest, "sub/beta.safetensors")
+        check("non-colliding beta still converted",
+              eb and eb["convert_output"] == "sub/beta.diffusers_chroma.safetensors")
+
+
+def test_convert_atomic_tmp_cleanup() -> None:
+    print("\n[22] test_convert_atomic_tmp_cleanup (S3 ADR §10)")
+    mod = _import_script()
+    with tempfile.TemporaryDirectory(prefix="convert_tmp_") as tmp:
+        tree, base = _build_convert_fixture(Path(tmp))
+
+        def good_convert(sd, plan, **kw):
+            return {"converted.weight": torch.zeros(4, 4)}
+
+        # Break os.replace ONLY for our convert targets so the manifest's own
+        # atomic write (lora_audit.json/.json.tmp) is unaffected.
+        real_replace = os.replace
+
+        def flaky_replace(src, dst, *a, **k):
+            if str(dst).endswith(".diffusers_chroma.safetensors"):
+                raise OSError("simulated disk-full during replace")
+            return real_replace(src, dst, *a, **k)
+
+        os.replace = flaky_replace
+        try:
+            with _ConvertPatch(mod, planner=_fake_plan, converter=good_convert):
+                exit_code = mod.main([
+                    "--audit-root", str(tree), "--no-config",
+                    "--base", f"klein={base}", "--convert",
+                    "-o", str(tree / "manifest.json"),
+                ])
+        finally:
+            os.replace = real_replace
+
+        check("convert run exits cleanly despite write failures",
+              exit_code in (0, 2), detail=f"got {exit_code}")
+        check("no target sibling left after failed replace",
+              not (tree / "alpha.diffusers_chroma.safetensors").exists()
+              and not (tree / "sub" / "beta.diffusers_chroma.safetensors").exists())
+        check("no orphan .tmp left after cleanup",
+              not any(p.name.endswith(".tmp") for p in tree.rglob("*")))
+        check("source alpha still present and intact",
+              (tree / "alpha.safetensors").is_file())
+        manifest = json.loads((tree / "manifest.json").read_text())
+        ea = _file_entry(manifest, "alpha.safetensors")
+        check("alpha convert_reason == convert_failed",
+              ea and ea["convert_reason"] == "convert_failed",
+              detail=f"got {ea and ea.get('convert_reason')}")
+
+
+def test_convert_per_file_fault_isolation() -> None:
+    print("\n[23] test_convert_per_file_fault_isolation (Vision invariant 9)")
+    mod = _import_script()
+    with tempfile.TemporaryDirectory(prefix="convert_iso_") as tmp:
+        tree, base = _build_convert_fixture(Path(tmp))
+
+        def half_convert(sd, plan, **kw):
+            # alpha carries double_blocks.0 keys → raise; beta succeeds.
+            if any("double_blocks.0" in k for k in sd):
+                raise ValueError("boom on alpha")
+            return {"converted.weight": torch.zeros(4, 4)}
+
+        with _ConvertPatch(mod, planner=_fake_plan, converter=half_convert):
+            exit_code = mod.main([
+                "--audit-root", str(tree), "--no-config",
+                "--base", f"klein={base}", "--convert",
+                "-o", str(tree / "manifest.json"),
+            ])
+        check("run completes despite one conversion raising",
+              exit_code in (0, 2), detail=f"got {exit_code}")
+        manifest = json.loads((tree / "manifest.json").read_text())
+        ea = _file_entry(manifest, "alpha.safetensors")
+        eb = _file_entry(manifest, "sub/beta.safetensors")
+        check("failing alpha → convert_failed, no output",
+              ea and ea["convert_reason"] == "convert_failed"
+              and ea["convert_output"] is None,
+              detail=f"alpha={ea and (ea.get('convert_reason'), ea.get('convert_output'))}")
+        check("succeeding beta → output set, reason null",
+              eb and eb["convert_output"] == "sub/beta.diffusers_chroma.safetensors"
+              and eb["convert_reason"] is None,
+              detail=f"beta={eb and (eb.get('convert_reason'), eb.get('convert_output'))}")
+        check("beta sibling actually on disk",
+              (tree / "sub" / "beta.diffusers_chroma.safetensors").is_file())
+        check("alpha sibling NOT on disk",
+              not (tree / "alpha.diffusers_chroma.safetensors").exists())
+
+
+def test_convert_output_dir_directory() -> None:
+    print("\n[24] test_convert_output_dir_directory (S3 ADR §8)")
+    mod = _import_script()
+    with tempfile.TemporaryDirectory(prefix="convert_outdir_") as tmp:
+        tree, base = _build_convert_fixture(Path(tmp))
+        out_dir = tree / "converted"  # inside audit-root → containment OK
+
+        def good_convert(sd, plan, **kw):
+            return {"converted.weight": torch.zeros(4, 4)}
+
+        with _ConvertPatch(mod, planner=_fake_plan, converter=good_convert):
+            exit_code = mod.main([
+                "--audit-root", str(tree), "--no-config",
+                "--base", f"klein={base}", "--convert",
+                "--output-dir", str(out_dir),
+                "-o", str(tree / "manifest.json"),
+            ])
+        check("convert run exits cleanly", exit_code in (0, 2),
+              detail=f"got {exit_code}")
+        check("top-level target under output-dir",
+              (out_dir / "alpha.diffusers_chroma.safetensors").is_file())
+        check("subdir mirrored under output-dir",
+              (out_dir / "sub" / "beta.diffusers_chroma.safetensors").is_file())
+        check("no sibling written next to source",
+              not (tree / "alpha.diffusers_chroma.safetensors").exists())
+        manifest = json.loads((tree / "manifest.json").read_text())
+        eb = _file_entry(manifest, "sub/beta.safetensors")
+        check("manifest convert_output is the relative subpath (base-independent)",
+              eb and eb["convert_output"] == "sub/beta.diffusers_chroma.safetensors",
+              detail=f"got {eb and eb.get('convert_output')}")
+
+
+def test_convert_no_write_when_not_convertable() -> None:
+    print("\n[25] test_convert_no_write_when_not_convertable (S3 guard)")
+    mod = _import_script()
+    with tempfile.TemporaryDirectory(prefix="convert_noop_") as tmp:
+        tree, base = _build_convert_fixture(Path(tmp))
+
+        def never(*_a, **_k):
+            raise AssertionError(
+                "convert_state_dict must not be called for non-convertable files"
+            )
+
+        # Planner returns None → both LoRAs classify unconvertable; the convert
+        # loop must skip them entirely (converter is the tripwire).
+        with _ConvertPatch(mod, planner=lambda *a, **k: None, converter=never):
+            exit_code = mod.main([
+                "--audit-root", str(tree), "--no-config",
+                "--base", f"klein={base}", "--convert",
+                "-o", str(tree / "manifest.json"),
+            ])
+        check("run exits cleanly with nothing to convert",
+              exit_code in (0, 2), detail=f"got {exit_code}")
+        check("no converted siblings written",
+              not any(".diffusers_chroma." in p.name for p in tree.rglob("*")))
+        manifest = json.loads((tree / "manifest.json").read_text())
+        all_null = all(
+            f["convert_output"] is None and f["convert_reason"] is None
+            for f in manifest["files"]
+        )
+        check("every entry has null convert_output and convert_reason", all_null)
+
+
+def test_convert_print_manifest_stdout_clean() -> None:
+    print("\n[26] test_convert_print_manifest_stdout_clean (S3 stdout contract)")
+    mod = _import_script()
+    with tempfile.TemporaryDirectory(prefix="convert_stdout_") as tmp:
+        tree, base = _build_convert_fixture(Path(tmp))
+
+        def noisy_convert(sd, plan, **kw):
+            # Real convert_state_dict prints [LoRA-Convert] chatter; simulate
+            # that the convert loop must not let it pollute JSON-only stdout.
+            print("noisy chatter from convert_state_dict that must be captured")
+            return {"converted.weight": torch.zeros(4, 4)}
+
+        out = io.StringIO()
+        with _ConvertPatch(mod, planner=_fake_plan, converter=noisy_convert):
+            with contextlib.redirect_stdout(out):
+                exit_code = mod.main([
+                    "--audit-root", str(tree), "--no-config",
+                    "--base", f"klein={base}", "--convert", "--print-manifest",
+                ])
+        check("convert --print-manifest exits cleanly",
+              exit_code in (0, 2), detail=f"got {exit_code}")
+        captured = out.getvalue()
+        check("no converter chatter leaked to stdout",
+              "noisy chatter" not in captured)
+        # stdout must be exactly one JSON document.
+        try:
+            parsed = json.loads(captured)
+            ok = isinstance(parsed, dict) and "files" in parsed
+        except json.JSONDecodeError:
+            ok = False
+        check("stdout is a single clean manifest JSON document", ok,
+              detail=f"first 120 chars: {captured[:120]!r}")
+
+
+def test_convert_output_dir_traversal_rejected() -> None:
+    print("\n[27] test_convert_output_dir_traversal_rejected (S3 ADR §15)")
+    # ADR §15 row S3 names "output-dir traversal rejection" as a deliverable.
+    # An --output-dir outside --audit-root with neither escape flag must be
+    # rejected at startup (exit 1) BEFORE any conversion writes occur.
+    with tempfile.TemporaryDirectory(prefix="convert_trav_") as tmp:
+        tree, base = _build_convert_fixture(Path(tmp))
+        outside = Path(tmp) / "outside_root"
+        outside.mkdir()
+        result = _run_subprocess([
+            "--audit-root", str(tree), "--no-config",
+            "--base", f"klein={base}", "--convert",
+            "--output-dir", str(outside),
+        ])
+        check("exit code 1 (startup rejection)", result.returncode == 1,
+              detail=f"got {result.returncode}; stderr: {result.stderr[:200]}")
+        check("stderr explains the output-dir containment failure",
+              "output-dir" in result.stderr,
+              detail=result.stderr[:200])
+        check("no converted sibling written under the escape dir",
+              not any(outside.rglob("*.safetensors")))
+        check("no converted sibling written next to source either",
+              not any(".diffusers_chroma." in p.name for p in tree.rglob("*")))
+
+
+def test_convert_stale_tmp_surfaced_not_deleted() -> None:
+    print("\n[28] test_convert_stale_tmp_surfaced_not_deleted (ADR §10 F-2)")
+    # An interrupted convert leaves a *.safetensors.tmp orphan. The tool must
+    # surface it as stale_tmp_file on the next scan and NEVER auto-delete it
+    # (invariant 4; concurrent-invocation safety).
+    mod = _import_script()
+    with tempfile.TemporaryDirectory(prefix="convert_staletmp_") as tmp:
+        tree, base = _build_convert_fixture(Path(tmp))
+        orphan = tree / "sub" / "beta.diffusers_chroma.safetensors.tmp"
+        orphan.write_bytes(b"interrupted convert payload")
+        exit_code = mod.main([
+            "--audit-root", str(tree), "--no-config",
+            "--base", f"klein={base}",
+            "-o", str(tree / "manifest.json"),
+        ])
+        check("scan exits cleanly with an orphan tmp present",
+              exit_code in (0, 2), detail=f"got {exit_code}")
+        check("orphan .tmp NOT deleted by the tool", orphan.is_file())
+        manifest = json.loads((tree / "manifest.json").read_text())
+        stale = [
+            w for w in manifest["warnings"]
+            if w["code"] == "stale_tmp_file"
+            and "beta.diffusers_chroma.safetensors.tmp" in (w["file"] or "")
+        ]
+        check("orphan surfaced as stale_tmp_file warning", len(stale) == 1,
+              detail=f"warnings: {manifest['warnings']}")
+
+
 # ── Driver ─────────────────────────────────────────────────────────────
 def main() -> int:
     print("=" * 70)
-    print(f"  test_lora_audit.py — S1+S2 of ADR-014")
+    print(f"  test_lora_audit.py — S1+S2+S3 of ADR-014")
     print(f"  script: {_SCRIPT_PATH}")
     print(f"  fixtures: {_FIX_ROOT}")
     print("=" * 70)
@@ -993,6 +1375,15 @@ def main() -> int:
         test_dry_load_print_manifest_stdout_clean()
         test_dry_load_loaded_false_nulls_applied_modules()
         test_dry_load_containment_recheck()
+        test_convert_writes_sibling()
+        test_convert_collision_skipped()
+        test_convert_atomic_tmp_cleanup()
+        test_convert_per_file_fault_isolation()
+        test_convert_output_dir_directory()
+        test_convert_no_write_when_not_convertable()
+        test_convert_print_manifest_stdout_clean()
+        test_convert_output_dir_traversal_rejected()
+        test_convert_stale_tmp_surfaced_not_deleted()
     finally:
         teardown_fixtures()
     print("\n" + "─" * 70)

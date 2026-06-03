@@ -21,8 +21,10 @@ import tomllib
 import types
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional
+
+import safetensors.torch  # third-party: convert-output writer (ADR §8, §10)
 
 # ── folder_paths stub (ADR §2, F-4) ────────────────────────────────────
 # MUST be installed BEFORE any node-module load — eric_qwen_edit_lora.py
@@ -75,6 +77,7 @@ build_param_dict_from_dir = _check_mod.build_param_dict_from_dir
 LoRACheckResult = _check_mod.LoRACheckResult
 _read_safetensors_header = _check_mod._read_safetensors_header
 find_matching_plan = _convert_mod.find_matching_plan
+convert_state_dict = _convert_mod.convert_state_dict  # S3: convert-path writer
 detect_lora_format = _convert_base_mod.detect_lora_format
 _load_state_dict = _qwen_mod._load_state_dict
 load_lora_with_key_fix = _qwen_mod.load_lora_with_key_fix
@@ -123,6 +126,10 @@ R_SIZE_CAP_EXCEEDED = "size_cap_exceeded"
 
 # Per-base verdict reason when a base couldn't be classified against
 R_BASE_UNAVAILABLE = "base_unavailable"
+
+# Convert-path outcome reasons (ADR §8; recorded in FileEntry.convert_reason)
+R_CONVERT_COLLISION = "collision"
+R_CONVERT_FAILED = "convert_failed"
 
 # Warning codes
 W_EXCLUDED_SYMLINK_ESCAPE = "excluded_symlink_escape"
@@ -175,6 +182,7 @@ class FileEntry:
     verdicts_by_base: dict[str, dict[str, Any]] = field(default_factory=dict)
     convert_plan: Optional[dict[str, Any]] = None
     convert_output: Optional[str] = None
+    convert_reason: Optional[str] = None  # S3: "collision" | "convert_failed" | None
     error: Optional[str] = None
 
     def to_json(self) -> dict[str, Any]:
@@ -182,6 +190,7 @@ class FileEntry:
             "classification": self.classification,
             "convert_output": self.convert_output,
             "convert_plan": self.convert_plan,
+            "convert_reason": self.convert_reason,
             "error": self.error,
             "kind": self.kind,
             "reason": self.reason,
@@ -208,8 +217,8 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="lora_audit",
         description=(
             f"LoRA audit / classify / manifest tool (v{_TOOL_VERSION}). "
-            "S1+S2 of ADR-014 — shape-match classification and optional "
-            "dry-load; --convert, --delete reject at runtime."
+            "S1+S2+S3 of ADR-014 — shape-match classification, optional "
+            "dry-load, and optional --convert; --delete rejects at runtime."
         ),
     )
     p.add_argument(
@@ -261,9 +270,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--output-dir", type=Path, default=None,
-        help="Convert output directory (for --convert; S3, not S1).",
+        help="Convert output directory (for --convert). Converted siblings "
+             "are written under <output-dir>/<relative_source_dir>/ instead "
+             "of next to the source. Validated for containment (ADR §6).",
     )
-    # S3/S4 flags — parse but reject at runtime
     p.add_argument(
         "--dry-load", action="store_true",
         help="Sequentially load each base pipeline (diffusers, "
@@ -274,7 +284,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--convert", action="store_true",
-        help="(S3 of ADR-014; not implemented in S2.)",
+        help="For each 'convertable' file, write a converted sibling "
+             "<source_stem>.<target_family>.safetensors (atomic; pre-write "
+             "collision skip; source never modified). ADR §8. Default off.",
     )
     p.add_argument(
         "--delete", action="store_true",
@@ -1041,6 +1053,161 @@ def _run_dry_load(
             any_base_failed = True
 
 
+# ── Convert path (ADR §8 + §10; S3) ────────────────────────────────────
+def _convert_one(
+    entry: FileEntry,
+    audit_root: Path,
+    output_dir: Optional[Path],
+    base_by_name: dict[str, BaseSpec],
+) -> tuple[Optional[str], Optional[str]]:
+    """Convert one `convertable` FileEntry to a sibling safetensors file.
+
+    Returns `(convert_output_relative, convert_reason)`:
+      - `(rel_path, None)`            — written successfully.
+      - `(None, "collision")`        — target already exists; skipped, source
+                                        untouched (ADR §8 pre-write check).
+      - `(None, "convert_failed")`   — load / plan / convert / write error;
+                                        skipped, source untouched.
+
+    Containment chain (security): the output path is
+    `<base_dir>/<relative_source_dir>/<stem>.<target_family>.safetensors`,
+    where `base_dir` is either `audit_root` (already realpath-contained at
+    scan time) or the `--output-dir` (already validated by
+    `_validate_output_dir`, ADR §6). `entry.relative_path` is an rglob result
+    that passed `_passes_scan_containment` and therefore contains no `..`
+    component, so the join cannot escape `base_dir`. A defensive post-join
+    re-check is applied anyway.
+
+    Source is NEVER modified (Vision invariant 3): the target path always
+    carries the inserted `.<target_family>` infix, so it can never equal the
+    source path, and the write goes via a `.tmp` in the target directory.
+    """
+    plan_dict = entry.convert_plan or {}
+    target_family = plan_dict.get("target_family")
+    target_base_name = plan_dict.get("target_base")
+    if not target_family or not target_base_name:
+        # A convertable entry always carries both; treat absence as a failure
+        # rather than silently skipping (keeps the manifest diagnosable).
+        return None, R_CONVERT_FAILED
+
+    base = base_by_name.get(target_base_name)
+    if base is None or base.param_dict is None:
+        # The base that yielded the plan at scan time is gone/unavailable.
+        return None, R_CONVERT_FAILED
+
+    rel = PurePosixPath(entry.relative_path)
+    target_name = f"{rel.stem}.{target_family}.safetensors"
+    parent = rel.parent
+    out_rel = (
+        target_name if str(parent) == "."
+        else f"{parent.as_posix()}/{target_name}"
+    )
+
+    base_dir = output_dir if output_dir is not None else audit_root
+    target_path = base_dir / out_rel
+    source_path = audit_root / entry.relative_path
+
+    # Defensive containment re-check (no `..` is possible in out_rel, but the
+    # security posture is "verify the join, don't trust the derivation").
+    try:
+        target_path.resolve().relative_to(base_dir.resolve())
+    except ValueError:
+        _emit_warn(f"convert_skipped_escape: {out_rel}")
+        return None, R_CONVERT_FAILED
+
+    # Pre-write collision check (ADR §8). os.replace() below would otherwise
+    # clobber an existing target; this pre-check is the no-overwrite guard.
+    # Source can never be the target (different name), but a samefile guard
+    # is kept for defence in depth.
+    if target_path.exists():
+        _emit_warn(f"convert_skipped_collision: {out_rel}")
+        return None, R_CONVERT_COLLISION
+
+    try:
+        source_sd = _load_state_dict(str(source_path))
+        # Re-derive the live ConversionPlan (first-match-wins is deterministic
+        # within one process; the FileEntry only carries the serialized dict).
+        plan = find_matching_plan(source_sd, base.param_names)
+        if plan is None:
+            return None, R_CONVERT_FAILED
+        converted = convert_state_dict(source_sd, plan)
+        if not converted:
+            # Empty result means no module matched — nothing useful to write.
+            return None, R_CONVERT_FAILED
+    except Exception as e:  # noqa: BLE001 — per-file fault isolation (inv. 9)
+        _emit_warn(
+            f"convert_failed: {out_rel}: {type(e).__name__}: {str(e)[:200]}"
+        )
+        return None, R_CONVERT_FAILED
+
+    # Atomic write. The `.tmp` lives in the TARGET directory, so os.replace()
+    # is always intra-filesystem — ADR §10's cross-filesystem shutil.move()
+    # fallback is moot here (we never replace across directories). A SIGKILL
+    # between save_file and os.replace leaves an orphan `*.safetensors.tmp`,
+    # surfaced as `stale_tmp_file` on the next scan (ADR §10 F-2 Option A);
+    # the tool never auto-deletes it.
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target_path.with_name(target_path.name + ".tmp")
+    try:
+        safetensors.torch.save_file(converted, str(tmp))
+        os.replace(tmp, target_path)
+    except Exception as e:  # noqa: BLE001 — per-file fault isolation (inv. 9)
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        _emit_warn(
+            f"convert_failed: {out_rel}: {type(e).__name__}: {str(e)[:200]}"
+        )
+        return None, R_CONVERT_FAILED
+
+    return out_rel, None
+
+
+def _run_convert(
+    audit_root: Path,
+    output_dir: Optional[Path],
+    bases: list[BaseSpec],
+    files: list[FileEntry],
+    warnings: list[Warning_],
+) -> None:
+    """Iterate `convertable` entries and populate convert_output/convert_reason.
+
+    Per-file fault isolation (Vision invariant 9): a single conversion that
+    raises must not abort the loop. `_convert_one` already catches its own
+    expected failure modes; this loop adds a backstop `except` so any
+    unforeseen error still maps to `convert_failed` and the run continues.
+    """
+    base_by_name = {b.name: b for b in bases}
+    n_done = n_skip = n_fail = 0
+    for entry in files:
+        if entry.classification != CLASS_CONVERTABLE:
+            continue
+        try:
+            out_rel, reason = _convert_one(
+                entry, audit_root, output_dir, base_by_name
+            )
+        except Exception as e:  # noqa: BLE001 — backstop fault isolation
+            out_rel, reason = None, R_CONVERT_FAILED
+            _emit_warn(
+                f"convert_failed: {entry.relative_path}: "
+                f"{type(e).__name__}: {str(e)[:200]}"
+            )
+        entry.convert_output = out_rel
+        entry.convert_reason = reason
+        if reason is None:
+            n_done += 1
+        elif reason == R_CONVERT_COLLISION:
+            n_skip += 1
+        else:
+            n_fail += 1
+    _emit_info(
+        f"convert: {n_done} written, {n_skip} skipped (collision), "
+        f"{n_fail} failed"
+    )
+
+
 # ── Scan loop (Vision invariant 9: per-file fault isolation) ───────────
 def _scan(
     audit_root: Path, bases: list[BaseSpec], warnings: list[Warning_]
@@ -1142,11 +1309,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             raise
         return EXIT_STARTUP_FAIL
 
-    if args.convert:
-        _emit_error("--convert not implemented in S2 — see ADR-014 §15")
-        return EXIT_STARTUP_FAIL
     if args.delete or args.yes:
-        _emit_error("--delete / --yes not implemented in S2 — see ADR-014 §15")
+        _emit_error("--delete / --yes not implemented in S3 — see ADR-014 §15")
         return EXIT_STARTUP_FAIL
 
     try:
@@ -1221,6 +1385,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         # `_dry_load_per_base` for `_applied_modules` parsing.
         with contextlib.redirect_stdout(io.StringIO()):
             _run_dry_load(audit_root, bases, files, warnings)
+
+    if args.convert:
+        # convert_state_dict / the reused loaders print diagnostics to stdout;
+        # wrap the loop to preserve the machine-caller stdout contract (Vision
+        # §13 — empty unless --print-manifest, JSON-only otherwise).
+        with contextlib.redirect_stdout(io.StringIO()):
+            _run_convert(audit_root, output_dir, bases, files, warnings)
 
     manifest = _build_manifest(
         audit_root=audit_root,
