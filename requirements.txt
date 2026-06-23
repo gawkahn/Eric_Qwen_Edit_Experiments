@@ -14,6 +14,9 @@
 # comfyless-side dep contract.
 # ────────────────────────────────────────────────────────────────────────
 torch==2.11.0
+# torchvision must match torch's minor (2.11 ↔ 0.26); required by the
+# diffusers SD image-transform path — basic SD generation errors without it.
+torchvision==0.26.0
 diffusers==0.37.1
 transformers==5.5.3
 accelerate==1.13.0
@@ -24,3 +27,12 @@ numpy==2.4.4
 mcp==1.27.0
 click==8.3.2
 scipy==1.17.1
+# Tokenizer backends (transformers soft deps) — required by the diffusers
+# text-encoder paths comfyless drives. sentencepiece+protobuf convert bare
+# spiece.model T5 tokenizers (Chroma); tiktoken covers tekken/Mistral encoders
+# (Flux.2); ftfy is the CLIP text-cleanup path (SDXL/SD1/Pony). ComfyUI ships
+# its own tokenizers, so the node-pack path doesn't need these.
+sentencepiece==0.2.1
+protobuf==7.35.1
+tiktoken==0.13.0
+ftfy==6.3.1

@@ -28,6 +28,11 @@ dependencies = [
     # comfyless-side dep contract.
     # ────────────────────────────────────────────────────────────────────────
     "torch==2.11.0",
+    # torchvision is the companion to torch (must match its minor: torch
+    # 2.11 ↔ torchvision 0.26). Required by the diffusers SD image-transform
+    # path — basic SD generation errors without it. Bumping torchvision drags
+    # torch with it, so pin both together.
+    "torchvision==0.26.0",
     "diffusers==0.37.1",
     "transformers==5.5.3",
     "accelerate==1.13.0",
@@ -38,6 +43,21 @@ dependencies = [
     "mcp==1.27.0",
     "click==8.3.2",
     "scipy==1.17.1",
+    # ── Tokenizer backends (transformers soft deps) ─────────────────────────
+    # Not pulled in transitively by transformers, but required by the
+    # diffusers text-encoder paths comfyless drives:
+    #   sentencepiece + protobuf — slow→fast conversion of bare `spiece.model`
+    #     T5 tokenizers (e.g. Chroma ships spiece.model with no tokenizer.json).
+    #   tiktoken — tekken / Mistral-style encoders (Flux.2) and convert fallbacks.
+    #   ftfy — CLIP text-cleanup path (SDXL / SD1 / Pony); suppresses the
+    #     "ftfy not found" fallback warning.
+    # ComfyUI provides its own tokenizers, so the node-pack path doesn't need
+    # these — they exist for the comfyless `.venv` (ADR-013).
+    # ────────────────────────────────────────────────────────────────────────
+    "sentencepiece==0.2.1",
+    "protobuf==7.35.1",
+    "tiktoken==0.13.0",
+    "ftfy==6.3.1",
 ]
 
 [project.urls]
