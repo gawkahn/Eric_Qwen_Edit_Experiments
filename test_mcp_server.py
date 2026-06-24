@@ -3360,6 +3360,36 @@ _r = cat_mod.resolve_reference(_nfc_cat, _decomposed, _nfc_mb, expected_kind="lo
 check("resolve: NFD request resolves to NFC catalog key (normalization symmetry)",
       _r.ok and _r.name == cat_mod.normalize_name(_composed), repr(_r))
 
+# --- slice 3b: expected_kind accepts a TUPLE of kinds ----------------------
+# Cascade stages resolve against {"model","transformer"} (a stage weight
+# catalogs as transformer when single-file, model when a diffusers tree).
+# Vision slice-3b invariants 2 (kind-set) + 8 (purely additive / byte-compat).
+_kinds_mt = ("model", "transformer")
+# model name accepted under the tuple
+_r = cat_mod.resolve_reference(_s3_cat, "qwen-image", _s3_mb, expected_kind=_kinds_mt)
+check("resolve: model name under ('model','transformer') → ok + kind=model",
+      _r.ok and _r.kind == "model", repr(_r))
+# transformer name accepted under the same tuple
+_r = cat_mod.resolve_reference(_s3_cat, "flux-dit", _s3_mb, expected_kind=_kinds_mt)
+check("resolve: transformer name under ('model','transformer') → ok + kind=transformer",
+      _r.ok and _r.kind == "transformer", repr(_r))
+# a lora name is NOT in the set → KindMismatch (folds into uniform not-available)
+_r = cat_mod.resolve_reference(_s3_cat, "anime-style", _s3_mb, expected_kind=_kinds_mt)
+check("resolve: lora name under ('model','transformer') → cause=KindMismatch",
+      not _r.ok and _r.cause == "KindMismatch", repr(_r))
+check("resolve: tuple KindMismatch → abs_path None (no leak)",
+      _r.abs_path is None, repr(_r))
+# byte-compat: a 1-tuple behaves identically to the bare str it wraps
+_r_str = cat_mod.resolve_reference(_s3_cat, "qwen-image", _s3_mb, expected_kind="model")
+_r_tup = cat_mod.resolve_reference(_s3_cat, "qwen-image", _s3_mb, expected_kind=("model",))
+check("resolve: 1-tuple ('model',) == bare str 'model' (additive, no behavior drift)",
+      _r_str.ok == _r_tup.ok and _r_str.kind == _r_tup.kind
+      and _r_str.abs_path == _r_tup.abs_path, (repr(_r_str), repr(_r_tup)))
+# a 1-tuple still REJECTS a wrong kind exactly as the bare str would
+_r = cat_mod.resolve_reference(_s3_cat, "anime-style", _s3_mb, expected_kind=("model",))
+check("resolve: 1-tuple ('model',) rejects a lora → KindMismatch",
+      not _r.ok and _r.cause == "KindMismatch", repr(_r))
+
 # --- module surface: ResolveResult dataclass + ResolveCause exported ---
 check("resolve: ResolveResult exported", hasattr(cat_mod, "ResolveResult"))
 check("resolve: resolve_reference is callable",

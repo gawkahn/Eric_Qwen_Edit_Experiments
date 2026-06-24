@@ -41,7 +41,7 @@ import os
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Dict, Iterator, Literal, Optional, Tuple, TypedDict
+from typing import Dict, Iterator, Literal, Optional, Tuple, TypedDict, Union
 
 
 # Hard cap on `model_index.json` size at read time. `model_index.json` in
@@ -715,7 +715,7 @@ def resolve_reference(
     raw_ref: str,
     model_base: str,
     *,
-    expected_kind: Optional[str] = None,
+    expected_kind: Optional[Union[str, Tuple[str, ...]]] = None,
 ) -> ResolveResult:
     """Resolve one agent-supplied reference value to a server-side path.
 
@@ -726,10 +726,14 @@ def resolve_reference(
       step 3 — request-time `realpath`/`_within` fail-closed on a hit; never
                fall back to a stale catalog path.
 
-    `expected_kind` (optional): when set, a catalog hit of a different kind
-    returns `ok=False, cause="KindMismatch"` — folded into the uniform
-    not-available outcome so wrong-kind cannot be distinguished from a miss.
-    `None` accepts any kind.
+    `expected_kind` (optional): when set, a catalog hit whose kind is not
+    accepted returns `ok=False, cause="KindMismatch"` — folded into the uniform
+    not-available outcome so wrong-kind cannot be distinguished from a miss. May
+    be a single kind string OR a tuple of acceptable kinds (slice 3b: cascade
+    stages accept `("model", "transformer")` because a stage weight catalogs as
+    `transformer` when single-file and `model` when a diffusers tree). A bare
+    `str` is treated as a 1-tuple, so existing single-kind callers are
+    byte-unaffected. `None` accepts any kind.
 
     Pure with respect to its inputs except for the request-time filesystem
     stat (`os.path.exists`) and `_within`'s `realpath` — both read-only.
@@ -773,12 +777,19 @@ def resolve_reference(
             cause="UnknownName",
         )
 
-    # 4 — kind enforcement (folds into not-available; no kind oracle).
-    if expected_kind is not None and entry["kind"] != expected_kind:
-        return ResolveResult(
-            ok=False, path_was_discarded=path_was_discarded,
-            cause="KindMismatch",
+    # 4 — kind enforcement (folds into not-available; no kind oracle). A bare
+    # str normalizes to a 1-tuple so single-kind callers are unchanged; a tuple
+    # accepts any listed kind (slice 3b cascade stages: {"model","transformer"}).
+    if expected_kind is not None:
+        allowed_kinds = (
+            (expected_kind,) if isinstance(expected_kind, str)
+            else tuple(expected_kind)
         )
+        if entry["kind"] not in allowed_kinds:
+            return ResolveResult(
+                ok=False, path_was_discarded=path_was_discarded,
+                cause="KindMismatch",
+            )
 
     abs_path = entry["abs_path"]
 
