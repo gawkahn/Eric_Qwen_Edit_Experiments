@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-24
 **ADR:** [ADR-015](../decisions/ADR-015-mcp-catalog-reference-resolution.md) (Status: accepted; rounds 1+2 CLEAN). Slice-3b row of the [ADR-015 §5](../decisions/ADR-015-mcp-catalog-reference-resolution.md) revised plan (deferred from slice 3 per OQ-C). Parent: [ADR-011](../decisions/ADR-011-comfyless-mcp-server.md). Builds on the slice-3 non-cascade migration ([slice-3-mcp-generate-catalog.md](slice-3-mcp-generate-catalog.md), IMPLEMENTED 2026-06-02) which it mirrors.
-**Status:** APPROVED by Grant 2026-06-24 (OQ-1 resolved: extend `resolve_reference` `expected_kind` to accept a tuple of kinds — cascade stages resolve against `{model, transformer}`; OQ-2 resolved: `scaffolding_repo` dropped from the agent surface, server uses the cascade default, HF-cache-miss on the default surfaces as a load-time error not a reference oracle — acceptable).
+**Status:** IMPLEMENTED 2026-06-24 (commits `7a92e2f` step 1 + `48a0833` step 2 on `main`; both Opus reviews CLEAN, code-reviewer's one PathMoved-coverage finding folded). Proof: `test_mcp_server.py` 460→483; full 9-suite 1310→1333, 0 failures. Reviews: `docs/security/review-slice-3b-cascade-catalog-2026-06-24.md`; ADR-015 Changelog 2026-06-24 entry. APPROVED by Grant 2026-06-24 (OQ-1 resolved: extend `resolve_reference` `expected_kind` to accept a tuple of kinds — cascade stages resolve against `{model, transformer}`; OQ-2 resolved: `scaffolding_repo` dropped from the agent surface, server uses the cascade default, HF-cache-miss on the default surfaces as a load-time error not a reference oracle — acceptable).
 **AI-Disclosure:** Claude (Opus 4.8, 1M context) authored; Grant reviewed and approved.
 
 ---
