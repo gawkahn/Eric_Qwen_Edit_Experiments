@@ -202,6 +202,38 @@ def _resolved_params_as_names(
     return out
 
 
+def _resolved_cascade_params_as_names(
+    metadata: dict,
+    *,
+    stage_names: dict,
+) -> dict:
+    """Render the cascade metadata blob with `cascade_config` stage references
+    as catalog NAMES instead of abs_paths (ADR-015 §3 / slice-3b invariant 1/4).
+
+    The MCP-RESPONSE renderer (the agent's authoritative record), distinct from
+    `redact_metadata_for_png` (the on-disk PNG sink, which basenames). Returns a
+    NEW dict. Only the `cascade_config` sub-dict is rewritten:
+      - `stage_c` / `stage_b` / `stage_a` -> the resolved catalog name
+        (`stage_a` omitted entirely when unused)
+      - `scaffolding_repo`                -> DROPPED. It is the operator-default
+        architecture config, not agent-affectable (slice-3b removed-field rule),
+        and must not cross the boundary as a path.
+    Every other `cascade_config` field (dtypes, prior/decoder steps + cfg,
+    width/height, timing) and every top-level field pass through verbatim. No
+    abs_path crosses the boundary.
+    """
+    out = dict(metadata)
+    cc_out = dict(metadata.get("cascade_config") or {})
+    for stage in ("stage_c", "stage_b", "stage_a"):
+        if stage in stage_names:
+            cc_out[stage] = stage_names[stage]
+        else:
+            cc_out.pop(stage, None)
+    cc_out.pop("scaffolding_repo", None)
+    out["cascade_config"] = cc_out
+    return out
+
+
 # ════════════════════════════════════════════════════════════════════════
 # Tool description text (refinable per ADR-011 §2 amendment 2026-04-30)
 # ════════════════════════════════════════════════════════════════════════
@@ -1055,12 +1087,17 @@ async def _handle_generate_cascade(
 ) -> list[TextContent]:
     """Stable Cascade dispatch via cascade_config.
 
-    Same Red Zone discipline as `_handle_generate`: canonical validation
-    → null-byte gate → cascade-config schema validation → HF resolution
-    (allow_download=False at every call site, including cascade-specific
-    ones) → path-allowlist for cascade_config.stage_* + scaffolding_repo
-    → output-path containment → in-process cascade.build_pipelines +
-    cascade.run_one → cascade._save_with_metadata with mcp_caller=True.
+    Slice 3b: cascade stage references are CATALOG NAMES, mirroring the
+    non-cascade `_handle_generate`. Same Red Zone discipline: canonical
+    validation → cascade-config schema validation → scaffolding_repo
+    removed-field rejection → catalog resolution of stage_c/stage_b/stage_a
+    (kind {model, transformer}; every failure folds into the uniform
+    "reference not available" error, fine cause to the stderr audit only)
+    → load-boundary _within net → output-path containment → in-process
+    cascade.build_pipelines + cascade.run_one (allow_hf_download=False at
+    every call site) → cascade._save_with_metadata with mcp_caller=True.
+    The response renders cascade_config.stage_* as catalog names and drops
+    scaffolding_repo; path-discard INFO notices ride alongside.
     """
     # 1 — Canonical type validation (top-level types only; cascade_config
     # passes through as a generic object).
@@ -1082,10 +1119,12 @@ async def _handle_generate_cascade(
             "validation failed: prompt: required field absent",
         )
 
-    # 1.6 — Null-byte path defense (mirrors non-cascade handler and the
-    # daemon's server.py:138-149 block). Cascade_config sub-fields are
-    # checked AFTER cascade.validate_config below — but the top-level
-    # savepath / loras path fields (if any) need the same gate here.
+    # 1.6 — Null-byte gate on the non-reference write-dest field `savepath`
+    # only (mirrors the non-cascade handler). Cascade stage reference fields get
+    # their null-byte / malformed handling from resolve_reference in step 2.5
+    # (-> the uniform "reference not available" error), so they are NOT gated
+    # here; only `savepath` (a write destination, distinct from reference
+    # resolution) needs the explicit ValidationError gate.
     for _nb_field in ("savepath",):
         if "\x00" in (payload.get(_nb_field) or ""):
             raise _MCPHandlerError(
@@ -1100,6 +1139,25 @@ async def _handle_generate_cascade(
             "ValidationError",
             "validation failed: cascade_config: expected object",
         )
+
+    # 2.0 — Removed-field guard (slice 3b). scaffolding_repo is the cascade
+    # architecture-config provider, not an aesthetic weight choice; it is NOT
+    # agent-selectable on the MCP surface. Reject if supplied (checked on the
+    # RAW agent input, before validate_config's setdefault masks it). Naming
+    # the field leaks nothing — field names are public schema knowledge, unlike
+    # a reference VALUE — and rejecting (not silently ignoring) keeps the
+    # caller-supplied-path input surface closed. The server falls back to
+    # cascade.validate_config's operator-trusted default (§OQ-2). Mirrors the
+    # non-cascade _GENERATE_REMOVED_FIELDS rule.
+    if "scaffolding_repo" in raw_cc:
+        raise _MCPHandlerError(
+            "ValidationError",
+            "validation failed: cascade_config.scaffolding_repo: field not "
+            "supported on the MCP surface; the server uses its default "
+            "scaffolding repo (cascade architecture config is not "
+            "agent-selectable)",
+        )
+
     from comfyless.cascade import validate_config as _cascade_validate_config
     try:
         cfg_cc = _cascade_validate_config(raw_cc, source="mcp_request")
@@ -1111,45 +1169,47 @@ async def _handle_generate_cascade(
             f"validation failed: cascade_config: {type(e).__name__}",
         ) from None
 
-    # 2.5 — Null-byte path defense on cascade_config path-typed fields.
-    for _nb_field in _MCP_CASCADE_PATH_TYPED_FIELDS:
-        if "\x00" in (cfg_cc.get(_nb_field) or ""):
-            raise _MCPHandlerError(
-                "ValidationError",
-                f"validation failed: cascade_config.{_nb_field}: null byte not allowed",
-            )
+    # 2.5 — Resolve cascade stage references via the catalog (slice 3b). The
+    # stage fields (stage_c/stage_b required, stage_a optional) are agent-
+    # supplied catalog NAMES resolved against kind {model, transformer} — a
+    # stage weight catalogs as transformer when single-file and model when a
+    # diffusers tree. The resolver handles basename-strip, NFC-normalize, null-
+    # byte / malformed gating, request-time existence + _within fail-closed; ANY
+    # failure cause folds into the single uniform "reference not available"
+    # error (the fine cause to the stderr audit only). This extends the HIGH-1
+    # uniform-error contract to the cascade path, closing the slice-1 cascade
+    # oracle (its distinct cache-miss / path-allowlist agent errors that named
+    # the cause). The old per-field null-byte gate + HF resolution + allowlist
+    # are all subsumed by resolve_reference. scaffolding_repo is NOT resolved
+    # here — it is the
+    # operator-trusted default (validate_config setdefault), resolved internally
+    # by cascade.build_pipelines, and never agent-affectable.
+    from comfyless.catalog import resolve_reference
+    notices: list = []
+    resolved_cc = dict(cfg_cc)
+    stage_names: dict = {}
+    for stage in ("stage_c", "stage_b", "stage_a"):
+        raw_v = cfg_cc.get(stage)
+        if stage == "stage_a" and not raw_v:
+            continue  # stage_a is optional (validate_config requires only c + b)
+        rr = resolve_reference(
+            cfg.catalog, raw_v, cfg.model_base,
+            expected_kind=("model", "transformer"))
+        if not rr.ok:
+            raise _reference_error(rr.cause)
+        resolved_cc[stage] = rr.abs_path
+        stage_names[stage] = rr.name
+        if rr.path_was_discarded:
+            notices.append(_discard_notice(rr.name))
 
-    # 3 — Resolve HF repo IDs in cascade_config to local paths.
-    from nodes.eric_diffusion_utils import resolve_hf_path
-    try:
-        resolved_cc = dict(cfg_cc)
-        for field in _MCP_CASCADE_PATH_TYPED_FIELDS:
-            v = (cfg_cc.get(field) or "").strip()
-            if v:
-                resolved_cc[field] = resolve_hf_path(v, allow_download=False)
-    except ValueError:
-        raise _MCPHandlerError(
-            "HFCacheMiss",
-            "validation failed: cascade HF repo not in local cache (set up "
-            "via `huggingface-cli download <repo>` first; MCP server does "
-            "not perform downloads)",
-        ) from None
-
-    # 4 — Path allowlist for cascade-specific fields against --model-base.
-    for field in _MCP_CASCADE_PATH_TYPED_FIELDS:
-        p = (resolved_cc.get(field) or "").strip()
-        if not p:
-            continue
-        if not p.startswith("/"):
-            raise _MCPHandlerError(
-                "PathAllowlist",
-                f"validation failed: cascade_config.{field} must be absolute",
-            )
-        if not _within(p, cfg.model_base):
-            raise _MCPHandlerError(
-                "PathAllowlist",
-                f"validation failed: cascade_config.{field} outside --model-base",
-            )
+    # 3 — Load-boundary _within net (defense-in-depth) on every resolved stage
+    # abs_path immediately before load. The resolver already _within-checked at
+    # request time; this is the final net (mirrors non-cascade step 6). A
+    # failure here is a containment escape on an already-resolved path -> the
+    # uniform reference error (the value is never echoed).
+    for stage in stage_names:
+        if not _within(resolved_cc[stage], cfg.model_base):
+            raise _reference_error("WithinFailure")
 
     # 5 — Output-path resolution. Cascade dispatch ignores top-level model/
     # seed for savepath token expansion; mirror the daemon's cascade savepath
@@ -1201,13 +1261,20 @@ async def _handle_generate_cascade(
     }
     _cascade_save_with_metadata(pil, output_path, metadata, mcp_caller=True)
 
-    # 8 — Inline response (no sidecar on disk; in-frame blob carries full
-    # paths — only the PNG embedding is redacted).
+    # 8 — Inline response (invariant 1: no abs_path crosses the boundary).
+    # resolved_params renders cascade_config.stage_* as catalog NAMES and drops
+    # scaffolding_repo; the path-discard notices ride alongside. The on-disk PNG
+    # metadata is separately basename-redacted by _save_with_metadata
+    # (mcp_caller=True) — a distinct sink that is unchanged.
+    resolved_params = _resolved_cascade_params_as_names(
+        metadata, stage_names=stage_names)
     response = {
         "output_path": output_path,
-        "resolved_params": metadata,
+        "resolved_params": resolved_params,
         "elapsed_seconds": metadata["elapsed_seconds"],
     }
+    if notices:
+        response["notices"] = notices
     return [TextContent(type="text", text=json.dumps(response, default=str))]
 
 

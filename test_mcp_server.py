@@ -987,15 +987,17 @@ check("MEDIUM-1: lora_warnings stripped from resolved_params (no abs_path leak)"
 check("MEDIUM-1: no --model-base abs path anywhere in the response",
       mb not in _rr[0].text, detail=f"resp={_rr[0].text[:160]!r}")
 
-# --- N14: cascade is NOT migrated in slice 3 (OQ-C -> slice 3b). The cascade
-# handler must contain no catalog name-resolution — proves no partial migration.
+# --- N14 (slice 3b): cascade IS now migrated to catalog names (OQ-C resolved).
+# The handler must route stage references through resolve_reference and fold
+# failures into the uniform error — the inverse of the slice-3 assertion.
 import inspect as _inspect  # noqa: E402
 _cascade_src = _inspect.getsource(mcps._handle_generate_cascade)
-check("N14: _handle_generate_cascade contains no resolve_reference call",
-      "resolve_reference" not in _cascade_src)
-check("N14: _handle_generate_cascade contains no catalog-name machinery",
-      "_reference_error" not in _cascade_src
-      and "_discard_notice" not in _cascade_src)
+check("N14: _handle_generate_cascade NOW calls resolve_reference (3b migration)",
+      "resolve_reference" in _cascade_src)
+check("N14: _handle_generate_cascade uses the uniform-error + notice machinery",
+      "_reference_error" in _cascade_src and "_discard_notice" in _cascade_src)
+check("N14: cascade handler no longer emits the slice-1 PathAllowlist agent error",
+      "PathAllowlist" not in _cascade_src and "HFCacheMiss" not in _cascade_src)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1176,11 +1178,14 @@ check("F2: whitespace-only `prompt` → MCP error",
 
 
 # ════════════════════════════════════════════════════════════════════════
-print("\n== Step 3: cascade dispatch (N19, N20, N21, N22) ==")
+print("\n== Slice 3b: cascade dispatch — catalog-name migration ==")
 # ════════════════════════════════════════════════════════════════════════
 #
 # cascade dispatch is exercised with mocked build_pipelines + run_one to
-# isolate the path-validation surface from torch/diffusers load overhead.
+# isolate the reference-resolution surface from torch/diffusers load overhead.
+# Slice 3b: stage_c/stage_b/stage_a are catalog NAMES resolved against kind
+# {model, transformer}; scaffolding_repo is rejected if supplied; all failures
+# fold into the uniform "reference not available" error (cause to audit only).
 
 import comfyless.cascade as cas_mod  # noqa: E402
 
@@ -1193,27 +1198,23 @@ def _mock_cascade_run_one(prior, decoder, cfg_cc, *, prompt, negative_prompt,
     return img, {"prior_seconds": 0.05, "decoder_seconds": 0.02}
 
 
-def _call_cascade(cfg, args, *, mock_hf_miss=False):
-    """Invoke _call_tool_impl with cascade mocks; capture stderr."""
+def _call_cascade(cfg, args):
+    """Invoke _call_tool_impl with cascade mocks; capture stderr.
+
+    Slice 3b: stage references resolve against the spawn-time catalog
+    (in cfg), so no HF-resolution mock is needed — the build-time HF
+    resolution the slice-1 handler did per-request is gone.
+    """
     captured_err = io.StringIO()
     raised = None
     result = None
-    patches = [
-        unittest.mock.patch.object(sys, "stderr", captured_err),
-        unittest.mock.patch.object(cas_mod, "build_pipelines",
-                                   _mock_cascade_build_pipelines),
-        unittest.mock.patch.object(cas_mod, "run_one", _mock_cascade_run_one),
-    ]
-    if mock_hf_miss:
-        import huggingface_hub as _hh
-        patches.append(unittest.mock.patch.object(
-            _hh, "snapshot_download",
-            lambda repo_id, **_: (_ for _ in ()).throw(LocalEntryNotFoundError(repo_id)),
-        ))
     from contextlib import ExitStack
     with ExitStack() as stack:
-        for p in patches:
-            stack.enter_context(p)
+        stack.enter_context(unittest.mock.patch.object(sys, "stderr", captured_err))
+        stack.enter_context(unittest.mock.patch.object(
+            cas_mod, "build_pipelines", _mock_cascade_build_pipelines))
+        stack.enter_context(unittest.mock.patch.object(
+            cas_mod, "run_one", _mock_cascade_run_one))
         try:
             result = _run(mcps._call_tool_impl(cfg, "generate", args))
         except ValueError as e:
@@ -1221,111 +1222,184 @@ def _call_cascade(cfg, args, *, mock_hf_miss=False):
     return result, raised, captured_err.getvalue()
 
 
-def _good_cascade_args(inside_path):
-    """Build a cascade_config that uses only paths inside --model-base."""
-    return {
-        "prompt": "a cat",
-        "cascade_config": {
-            "stage_c": inside_path,
-            "stage_b": inside_path,
-            "stage_a": inside_path,
-            "scaffolding_repo": inside_path,
-        },
-    }
+def _good_cascade_args(stage_c="test-dit", stage_b="test-dit", stage_a=None):
+    """Build a cascade_config that uses catalog NAMES (slice 3b).
+
+    Defaults use `test-dit` (a kind:"transformer" catalog entry from
+    _setup_mb_and_out) for both required stages — the common single-file
+    cascade-UNet case. `scaffolding_repo` is NOT supplied: it is removed from
+    the agent surface; the server uses cascade.validate_config's default.
+    """
+    cc: dict = {"stage_c": stage_c, "stage_b": stage_b}
+    if stage_a is not None:
+        cc["stage_a"] = stage_a
+    return {"prompt": "a cat", "cascade_config": cc}
 
 
-# Cascade happy-path: success returns inline blob + writes redacted PNG
+# Cascade happy-path: catalog NAMES resolve; response renders names, no paths.
 mb, out, _inside, cfg = _setup_mb_and_out()
-result, err, stderr = _call_cascade(cfg, _good_cascade_args(_inside))
+result, err, stderr = _call_cascade(cfg, _good_cascade_args())
 check("cascade happy-path: success returns TextContent response",
       result is not None and err is None,
       detail=f"err={err!r}")
 if result is not None:
     resp = _json.loads(result[0].text)
-    check("cascade happy-path: response carries resolved_params with cascade_config",
-          isinstance(resp.get("resolved_params", {}).get("cascade_config"), dict))
+    rp_cc = resp.get("resolved_params", {}).get("cascade_config", {})
+    check("cascade happy-path: resolved_params carries cascade_config dict",
+          isinstance(rp_cc, dict))
+    check("cascade happy-path: response renders stage_c as the catalog NAME",
+          rp_cc.get("stage_c") == "test-dit", detail=repr(rp_cc))
+    check("cascade happy-path: response renders stage_b as the catalog NAME",
+          rp_cc.get("stage_b") == "test-dit", detail=repr(rp_cc))
+    # Invariant 1/4: scaffolding_repo never crosses the boundary.
+    check("cascade happy-path: scaffolding_repo ABSENT from response",
+          "scaffolding_repo" not in rp_cc, detail=repr(rp_cc))
+    # Invariant 1: no path-shaped value under ANY cascade_config key.
+    check("cascade happy-path: no '/'-bearing value in response cascade_config",
+          all("/" not in str(v) for v in rp_cc.values()), detail=repr(rp_cc))
     check("cascade happy-path: response carries elapsed_seconds",
           "elapsed_seconds" in resp and resp["elapsed_seconds"] >= 0)
-    # Verify the on-disk PNG carries BASENAME-redacted cascade fields
+    # PNG sink (invariant 7, unchanged): stage_* basenamed, output_path dropped.
     if os.path.exists(resp["output_path"]):
         png_meta = _read_comfyless_chunk(resp["output_path"])
         cc_embedded = png_meta.get("cascade_config", {})
         check("cascade PNG embeds basename for cascade_config.stage_c",
-              cc_embedded.get("stage_c") == os.path.basename(_inside))
-        check("cascade PNG embeds basename for cascade_config.scaffolding_repo",
-              cc_embedded.get("scaffolding_repo") == os.path.basename(_inside))
-        check("cascade PNG drops output_path",
-              "output_path" not in png_meta)
+              cc_embedded.get("stage_c") == "test-dit.safetensors",
+              detail=repr(cc_embedded))
+        check("cascade PNG drops output_path", "output_path" not in png_meta)
         check("cascade PNG retains `prompt` verbatim",
               png_meta.get("prompt") == "a cat")
-        # Audit-line check: cascade audit retains stage_* paths verbatim
-        check("N22: cascade audit retains stage_c (path NOT redacted in audit)",
-              _inside in stderr,
-              detail="audit-line should contain the FULL stage_c path")
-        check("N22: cascade audit drops `prompt`",
-              "a cat" not in stderr)
+        # Audit retains the stage NAME (operator-side; names are not paths) and
+        # drops the prompt. No abs_path is in play on the agent surface.
+        check("cascade audit retains stage_c name; drops prompt",
+              "test-dit" in stderr and "a cat" not in stderr)
 
-# N19: stage_c outside --model-base
+# Both kinds resolve: stage_c=transformer (test-dit), stage_b=model (qwen-image).
 mb, out, _inside, cfg = _setup_mb_and_out()
-bad_args = _good_cascade_args(_inside)
-bad_args["cascade_config"]["stage_c"] = "/etc/anything"
+result, err, stderr = _call_cascade(
+    cfg, _good_cascade_args(stage_c="test-dit", stage_b="qwen-image"))
+check("cascade: transformer-kind + model-kind stages both resolve",
+      result is not None and err is None, detail=f"err={err!r}")
+if result is not None:
+    rp_cc = _json.loads(result[0].text)["resolved_params"]["cascade_config"]
+    check("cascade: model-kind stage_b renders its catalog name",
+          rp_cc.get("stage_b") == "qwen-image", detail=repr(rp_cc))
+
+# stage_a present (optional third stage) resolves + renders its name.
+mb, out, _inside, cfg = _setup_mb_and_out()
+result, err, stderr = _call_cascade(
+    cfg, _good_cascade_args(stage_a="qwen-image"))
+check("cascade: optional stage_a resolves + renders name",
+      result is not None and err is None
+      and _json.loads(result[0].text)["resolved_params"]["cascade_config"]
+          .get("stage_a") == "qwen-image",
+      detail=f"err={err!r}")
+
+# Path-shaped stage value → basename-strip → resolves + path-discard notice.
+mb, out, _inside, cfg = _setup_mb_and_out()
+result, err, stderr = _call_cascade(
+    cfg, _good_cascade_args(stage_c="/some/agent/dir/test-dit"))
+check("cascade: path-shaped stage_c resolves via basename",
+      result is not None and err is None, detail=f"err={err!r}")
+if result is not None:
+    resp = _json.loads(result[0].text)
+    check("cascade: path-shaped stage_c → resolved to catalog name in response",
+          resp["resolved_params"]["cascade_config"].get("stage_c") == "test-dit")
+    _notices = resp.get("notices", [])
+    check("cascade: path-shaped stage_c emits a path-discard INFO notice",
+          any(n.get("level") == "INFO" and "test-dit" in n.get("message", "")
+              for n in _notices), detail=repr(_notices))
+    check("cascade: path-discard notice does NOT echo the supplied directory",
+          all("/some/agent/dir" not in n.get("message", "") for n in _notices),
+          detail=repr(_notices))
+
+# --- Negative: unknown stage name → uniform error; audit cause UnknownName ---
+mb, out, _inside, cfg = _setup_mb_and_out()
+result, err, stderr = _call_cascade(
+    cfg, _good_cascade_args(stage_c="does-not-exist"))
+check("cascade: unknown stage name → uniform 'reference not available'",
+      result is None and err == mcps._UNIFORM_REFERENCE_ERROR, detail=f"err={err!r}")
+check("cascade: unknown stage name audited as UnknownName",
+      "UnknownName" in stderr)
+
+# --- Negative: lora-kind name as a stage → uniform error; KindMismatch ------
+mb, out, _inside, cfg = _setup_mb_and_out()
+result, err, stderr = _call_cascade(
+    cfg, _good_cascade_args(stage_c="test-lora"))
+check("cascade: lora-kind name as stage_c → uniform error (kind-set excludes lora)",
+      result is None and err == mcps._UNIFORM_REFERENCE_ERROR, detail=f"err={err!r}")
+check("cascade: lora-as-stage audited as KindMismatch",
+      "KindMismatch" in stderr)
+
+# --- Negative: path-shaped value that misses → uniform error; no echo -------
+mb, out, _inside, cfg = _setup_mb_and_out()
+result, err, stderr = _call_cascade(
+    cfg, _good_cascade_args(stage_c="/etc/passwd"))
+check("cascade: path-shaped miss (/etc/passwd) → uniform error",
+      result is None and err == mcps._UNIFORM_REFERENCE_ERROR, detail=f"err={err!r}")
+check("cascade: path-shaped miss does NOT echo the supplied path to the agent",
+      err is not None and "/etc/passwd" not in err and "passwd" not in err)
+
+# --- Negative: NUL byte in a stage name → uniform error; MalformedReference -
+mb, out, _inside, cfg = _setup_mb_and_out()
+result, err, stderr = _call_cascade(
+    cfg, _good_cascade_args(stage_c="test-dit\x00null"))
+check("cascade: NUL in stage_c → uniform error (no exception)",
+      result is None and err == mcps._UNIFORM_REFERENCE_ERROR, detail=f"err={err!r}")
+check("cascade: NUL stage_c audited as MalformedReference",
+      "MalformedReference" in stderr)
+
+# --- Negative: catalog hit whose abs_path moved post-spawn → PathMoved -------
+# Build the catalog (in cfg), then delete the resolved stage fixture so the
+# resolver's request-time os.path.exists fails closed — proves no stale-path
+# load and the uniform frame (Vision slice-3b negative case 9).
+mb, out, _inside, cfg = _setup_mb_and_out()
+os.remove(os.path.join(mb, "diffusion_models", "test-dit.safetensors"))
+result, err, stderr = _call_cascade(cfg, _good_cascade_args(stage_c="test-dit"))
+check("cascade: stage abs_path moved post-spawn → uniform 'reference not available'",
+      result is None and err == mcps._UNIFORM_REFERENCE_ERROR, detail=f"err={err!r}")
+check("cascade: moved stage path audited as PathMoved (no stale-path load)",
+      "PathMoved" in stderr)
+
+# --- Negative: scaffolding_repo supplied → removed-field ValidationError -----
+mb, out, _inside, cfg = _setup_mb_and_out()
+bad_args = _good_cascade_args()
+bad_args["cascade_config"]["scaffolding_repo"] = "anything"
 result, err, stderr = _call_cascade(cfg, bad_args)
-check("N19: cascade_config.stage_c outside --model-base → MCP error",
+check("cascade: scaffolding_repo supplied → ValidationError naming the field",
       result is None and err is not None
-      and "cascade_config.stage_c outside --model-base" in err)
-check("N19: cascade allowlist rejection audited as PathAllowlist",
-      "PathAllowlist" in stderr)
+      and "scaffolding_repo" in err and "not supported" in err, detail=f"err={err!r}")
+check("cascade: scaffolding_repo rejection audited as ValidationError",
+      "ValidationError" in stderr)
 
-# N20: scaffolding_repo outside --model-base
+# --- Byte-equality: cascade uniform error == the non-cascade uniform error ---
+check("cascade: uniform error message is the shared _UNIFORM_REFERENCE_ERROR",
+      mcps._UNIFORM_REFERENCE_ERROR == "reference not available")
+
+# --- allow_hf_download=False reaches build_pipelines (invariant 6) -----------
 mb, out, _inside, cfg = _setup_mb_and_out()
-bad_args = _good_cascade_args(_inside)
-bad_args["cascade_config"]["scaffolding_repo"] = "/etc/anything"
-result, err, stderr = _call_cascade(cfg, bad_args)
-check("N20: cascade_config.scaffolding_repo outside --model-base → MCP error",
-      result is None and err is not None
-      and "cascade_config.scaffolding_repo outside --model-base" in err)
+_recorded_hf = []
 
-# N21: allow_hf_download=False enforcement extends to cascade
-# Spy on resolve_hf_path; assert every recorded allow_download is False.
-mb, out, _inside, cfg = _setup_mb_and_out()
-recorded_calls = []
-original_resolve = eu.resolve_hf_path
-
-def _spy_resolve_cascade(path, *, allow_download=False):
-    recorded_calls.append((path, allow_download))
-    return original_resolve(path, allow_download=allow_download)
+def _spy_build_pipelines(cfg_cc, device, allow_hf_download):
+    _recorded_hf.append(allow_hf_download)
+    return (_FakePipe(), _FakePipe())
 
 with unittest.mock.patch.object(sys, "stderr", io.StringIO()), \
-     unittest.mock.patch.object(eu, "resolve_hf_path", _spy_resolve_cascade), \
-     unittest.mock.patch.object(cas_mod, "build_pipelines", _mock_cascade_build_pipelines), \
+     unittest.mock.patch.object(cas_mod, "build_pipelines", _spy_build_pipelines), \
      unittest.mock.patch.object(cas_mod, "run_one", _mock_cascade_run_one):
     try:
-        _run(mcps._call_tool_impl(cfg, "generate", _good_cascade_args(_inside)))
+        _run(mcps._call_tool_impl(cfg, "generate", _good_cascade_args()))
     except ValueError:
         pass
-check("N21: cascade resolve_hf_path calls recorded (at least 1)",
-      len(recorded_calls) >= 1, detail=f"calls={len(recorded_calls)}")
-check("N21: cascade-side every recorded allow_download is False",
-      all(ad is False for (_p, ad) in recorded_calls),
-      detail=f"truthy: {[c for c in recorded_calls if c[1]]}")
+check("cascade: build_pipelines invoked with allow_hf_download=False",
+      _recorded_hf == [False], detail=f"recorded={_recorded_hf}")
 
-# Cascade-side null-byte rejection on stage_c
+# Cascade-side missing-prompt (unchanged behavior)
 mb, out, _inside, cfg = _setup_mb_and_out()
-bad_args = _good_cascade_args(_inside)
-bad_args["cascade_config"]["stage_c"] = _inside + "\x00null"
-result, err, stderr = _call_cascade(cfg, bad_args)
-check("cascade null byte in stage_c → ValidationError",
-      result is None and err is not None
-      and "cascade_config.stage_c: null byte not allowed" in err)
-check("cascade null-byte audit class is ValidationError",
-      "ValidationError" in stderr and "InternalError" not in stderr)
-
-# Cascade-side missing-prompt
-mb, out, _inside, cfg = _setup_mb_and_out()
-bad_args = _good_cascade_args(_inside)
+bad_args = _good_cascade_args()
 del bad_args["prompt"]
 result, err, stderr = _call_cascade(cfg, bad_args)
-check("cascade missing-prompt → MissingField (BEFORE build_pipelines)",
+check("cascade missing-prompt → MissingField (BEFORE resolution)",
       result is None and err is not None
       and "prompt: required field absent" in err)
 check("cascade missing-prompt audit class is MissingField",
