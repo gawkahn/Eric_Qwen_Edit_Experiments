@@ -240,13 +240,21 @@ def _resolved_cascade_params_as_names(
 
 _GENERATE_TOOL_DESCRIPTION = """\
 Generate an image from a text prompt. Covers all comfyless model families:
-qwen-image, flux, flux2, chroma, and Stable Cascade (via cascade_config).
+qwen-image, flux, flux2, chroma, krea / krea-turbo, and Stable Cascade
+(via cascade_config).
 
 Model selection guidance:
 - Text rendering + photorealism: qwen-image (Qwen-Image-2512)
 - Anime / manga / illustration: Illustrious, Pony, or Chroma
 - Fastest at modest quality: Stable Cascade via cascade_config
+- Few-step / distilled: krea-turbo (Krea-2-Turbo, ~8 steps, CFG off)
 - General-purpose / latest: flux2 (Flux.2)
+
+Per-family defaults are applied automatically for any generation parameter
+you omit (e.g. steps / cfg_scale / true_cfg_scale), so omitting them yields
+each model's recommended values; anything you pass explicitly wins. Krea-2
+in particular: Raw wants 52 steps / cfg 3.5, Turbo wants 8 steps / cfg 0.0
+— just omit steps and cfg_scale to get them.
 
 If `model` is omitted, the server uses the model configured at spawn time
 via --default-model. Omitting `model` without a configured default
@@ -1007,6 +1015,24 @@ async def _handle_generate(
             f"({type(e).__name__})",
         ) from None
 
+    # 7.5 — Per-family default overlay (ADR-009 caller-responsibility; the MCP
+    # is a caller, like the CLI's _run_one). `payload` holds exactly the keys
+    # the agent supplied (validate_machine_request is type-only, no default
+    # injection), so those are the "explicit" keys; FAMILY_DEFAULTS fills the
+    # rest for this model's family. This is the CLI/MCP parity fix — without
+    # it an agent omitting steps/cfg for Krea-2-Turbo would get 28/3.5 instead
+    # of 8/0.0. `_apply_family_defaults` keys on gen_params["model"] and
+    # re-detects the family; on a diffusers without the model's class (e.g.
+    # Krea2Pipeline today) it no-ops — which is exactly when generation is
+    # unavailable anyway. The CLI applies the SAME helper, so both surfaces
+    # agree by construction.
+    from comfyless.generate import _apply_family_defaults, COMFYLESS_SCHEMA
+    _canon_keys = set(COMFYLESS_SCHEMA)
+    gen_params: dict = {k: payload[k] for k in payload if k in _canon_keys}
+    _explicit_keys = set(gen_params)
+    gen_params["model"] = model_abs
+    _apply_family_defaults(gen_params, _explicit_keys, set())
+
     # 8 — Load + generate (HARD-CODED allow_hf_download=False; in-process).
     # Component overrides vae/text_encoder are removed from the MCP surface
     # (OQ-A) -> always "" here. Operator-tuning knobs (precision/offload/...)
@@ -1035,16 +1061,16 @@ async def _handle_generate(
         model_path=model_abs,
         prompt=payload["prompt"],
         output_path=output_path,
-        negative_prompt=payload.get("negative_prompt", ""),
-        seed=payload.get("seed", -1),
-        steps=payload.get("steps", 28),
-        cfg_scale=payload.get("cfg_scale", 3.5),
-        true_cfg_scale=payload.get("true_cfg_scale"),
-        width=payload.get("width", 1024),
-        height=payload.get("height", 1024),
-        max_sequence_length=payload.get("max_sequence_length", 512),
-        sampler=payload.get("sampler", "default"),
-        schedule=payload.get("schedule", "linear"),
+        negative_prompt=gen_params.get("negative_prompt", ""),
+        seed=gen_params.get("seed", -1),
+        steps=gen_params.get("steps", 28),
+        cfg_scale=gen_params.get("cfg_scale", 3.5),
+        true_cfg_scale=gen_params.get("true_cfg_scale"),
+        width=gen_params.get("width", 1024),
+        height=gen_params.get("height", 1024),
+        max_sequence_length=gen_params.get("max_sequence_length", 512),
+        sampler=gen_params.get("sampler", "default"),
+        schedule=gen_params.get("schedule", "linear"),
         loras=loras_resolved or [],
         precision="bf16",
         device="cuda",

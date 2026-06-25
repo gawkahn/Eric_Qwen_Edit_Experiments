@@ -1494,6 +1494,72 @@ check("_MCP_CASCADE_PATH_TYPED_FIELDS contains the 4 cascade path fields",
 
 
 # ════════════════════════════════════════════════════════════════════════
+print("\n== Krea-2 slice: MCP family-default overlay (ADR-009 parity) ==")
+# ════════════════════════════════════════════════════════════════════════
+#
+# The MCP generate handler must apply FAMILY_DEFAULTS to canonical keys the
+# agent omits, matching the CLI's _run_one (ADR-009 caller-responsibility).
+# Without this, an agent omitting steps/cfg for Krea-2-Turbo would get the
+# schema fallbacks (28/3.5) instead of the family defaults (8/0.0).
+#
+# Proven here with the qwen-image fixture (FAMILY_DEFAULTS: steps=50,
+# true_cfg_scale=4.0; QwenImagePipeline IS importable, so the overlay's
+# detect_pipeline_class succeeds). The krea / krea-turbo overlay rides the
+# IDENTICAL code path; on a diffusers without Krea2Pipeline it no-ops by
+# design (detect_pipeline_class raises -> _apply_family_defaults catches),
+# which is exactly when krea generation is unavailable anyway. So this test
+# guards the wiring that makes krea defaults flow the moment the dep lands.
+
+_fam_capture: dict = {}
+
+
+def _capturing_generate(*, model_path, prompt, output_path, **kw):
+    _fam_capture.clear()
+    _fam_capture.update(kw)
+    Image.new("RGB", (8, 8), "white").save(output_path)
+    return {
+        "prompt": prompt, "negative_prompt": kw.get("negative_prompt", ""),
+        "model": model_path, "seed": kw.get("seed", 42),
+        "steps": kw.get("steps", 28), "cfg_scale": kw.get("cfg_scale", 3.5),
+        "transformer_path": "", "loras": [], "elapsed_seconds": 0.01,
+    }
+
+
+def _call_capturing(cfg, args):
+    captured_err = io.StringIO()
+    with unittest.mock.patch.object(sys, "stderr", captured_err), \
+         unittest.mock.patch.object(gen_mod, "_load_pipeline", _mock_load_pipeline), \
+         unittest.mock.patch.object(gen_mod, "generate", _capturing_generate):
+        _run(mcps._call_tool_impl(cfg, "generate", args))
+
+
+# Omitted keys get the family default.
+mb, out, _inside, cfg = _setup_mb_and_out()
+_call_capturing(cfg, {"prompt": "p", "model": "qwen-image"})
+check("MCP overlay: omitted steps -> family default 50 (qwen-image)",
+      _fam_capture.get("steps") == 50,
+      detail=f"got {_fam_capture.get('steps')!r}")
+check("MCP overlay: omitted true_cfg_scale -> family default 4.0",
+      _fam_capture.get("true_cfg_scale") == 4.0,
+      detail=f"got {_fam_capture.get('true_cfg_scale')!r}")
+
+# Explicit agent value wins over the family default (negative case).
+mb, out, _inside, cfg = _setup_mb_and_out()
+_call_capturing(cfg, {"prompt": "p", "model": "qwen-image", "steps": 7})
+check("MCP overlay: explicit steps=7 preserved (not overwritten by family)",
+      _fam_capture.get("steps") == 7,
+      detail=f"got {_fam_capture.get('steps')!r}")
+
+# cfg_scale=0.0 must survive to generate() and not be coerced to the 3.5
+# fallback — this is the Krea-2-Turbo footgun (CFG disabled at 0.0). The key
+# is present in the payload, so gen_params.get('cfg_scale', 3.5) returns 0.0.
+mb, out, _inside, cfg = _setup_mb_and_out()
+_call_capturing(cfg, {"prompt": "p", "model": "qwen-image", "cfg_scale": 0.0})
+check("MCP overlay: explicit cfg_scale=0.0 reaches generate() (not 3.5 fallback)",
+      _fam_capture.get("cfg_scale") == 0.0,
+      detail=f"got {_fam_capture.get('cfg_scale')!r}")
+
+
 print("\n== Slice 2 Step 1: scan_model_family (catalog scan-time helper) ==")
 # ════════════════════════════════════════════════════════════════════════
 #
