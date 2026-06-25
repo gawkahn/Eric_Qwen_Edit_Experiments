@@ -184,6 +184,76 @@ finally:
     srv._check_paths = orig_check_paths
 
 
+# ══════════════════════════════════════════════════════════════════════
+# Daemon Krea-2 parameter pass-through (ADR-009 caller-responsibility).
+#
+# The daemon is family-agnostic: CFG routing happens inside generate() →
+# _build_call_kwargs, and per ADR-009 the daemon does NOT inject family
+# defaults (the CLI client applies them in _run_one before delegating).
+# These tests pin both facts for Krea-2 so a future refactor can't silently
+# (a) add family-default injection to the daemon — which would double-apply
+# with the client — or (b) mangle krea params. We mock _load_pipeline (krea
+# isn't loadable until diffusers ships Krea2Pipeline) and generate (capture
+# the forwarded kwargs); both are imported inside _handle_generate from
+# comfyless.generate, so we patch them on that module.
+import comfyless.generate as _gen
+
+_orig_load = _gen._load_pipeline
+_orig_generate = _gen.generate
+_captured: dict = {}
+
+
+def _fake_load(model_path, **kw):
+    return object(), "krea-turbo", False  # (pipe, model_family, guidance_embeds)
+
+
+def _fake_generate(**kwargs):
+    _captured.clear()
+    _captured.update(kwargs)
+    return {"model_family": "krea-turbo"}
+
+
+_gen._load_pipeline = _fake_load
+_gen.generate = _fake_generate
+try:
+    _outdir = tempfile.mkdtemp()
+
+    # 1. Explicit Turbo params are forwarded verbatim.
+    _captured.clear()
+    _state: dict = {}
+    _resp = srv._handle_generate(
+        {"type": "generate", "model": "/fake/Krea-2-Turbo",
+         "prompt": "a cat", "steps": 8, "cfg_scale": 0.0},
+        _outdir, _outdir, "cuda", "bf16", _state,
+    )
+    check("daemon: krea request succeeds (status ok)",
+          _resp.get("status") == "ok", f"resp={_resp!r}")
+    check("daemon: model_family cached as krea-turbo",
+          _state.get("model_family") == "krea-turbo")
+    check("daemon: explicit steps=8 forwarded to generate()",
+          _captured.get("steps") == 8, f"got {_captured.get('steps')!r}")
+    check("daemon: explicit cfg_scale=0.0 forwarded to generate()",
+          _captured.get("cfg_scale") == 0.0, f"got {_captured.get('cfg_scale')!r}")
+
+    # 2. Omitted params get the schema fallback, NOT a family default — the
+    #    daemon does not run the FAMILY_DEFAULTS overlay (ADR-009). If a
+    #    refactor wired the overlay into the daemon, steps would become 8/52
+    #    and cfg 0.0/3.5 here, and this assertion would catch it.
+    _captured.clear()
+    _state = {}
+    srv._handle_generate(
+        {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "a cat"},
+        _outdir, _outdir, "cuda", "bf16", _state,
+    )
+    check("daemon: omitted steps -> schema fallback 28 (no family overlay)",
+          _captured.get("steps") == 28, f"got {_captured.get('steps')!r}")
+    check("daemon: omitted cfg_scale -> schema fallback 3.5 (no family overlay)",
+          _captured.get("cfg_scale") == 3.5, f"got {_captured.get('cfg_scale')!r}")
+finally:
+    _gen._load_pipeline = _orig_load
+    _gen.generate = _orig_generate
+
+
 # ──────────────────────────────────────────────────────────────────────
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
