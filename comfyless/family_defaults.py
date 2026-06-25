@@ -69,6 +69,20 @@ FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
     # Source: BFL Klein model card.
     "flux2klein": {"cfg_scale": 3.5, "steps": 24},
 
+    # ── krea (Krea-2-Raw) ───────────────────────────────────────────────
+    # Krea2Pipeline, non-distilled. Single-pass guidance_scale (flux-like).
+    # Raw is a fine-tuning base ("not recommended for inference" per Krea)
+    # but supported. Source: krea/Krea-2-Raw model card (52 steps, cfg 3.5).
+    "krea":       {"cfg_scale": 3.5, "steps": 52},
+
+    # ── krea-turbo (Krea-2-Turbo) ───────────────────────────────────────
+    # Krea2Pipeline, distilled (is_distilled=true → this family). CFG is
+    # disabled (cfg=0.0 → single forward pass). Recommended mu/timestep-
+    # shift of 1.15 is not yet exposed (TECH_DEBT → CFG Routing); diffusers'
+    # default dynamic shift applies. Source: krea/Krea-2-Turbo model card
+    # (8 steps, cfg 0.0).
+    "krea-turbo": {"cfg_scale": 0.0, "steps": 8},
+
     # ── qwen-edit (Qwen-Image-Edit-2511) ────────────────────────────────
     # Edit pipeline uses true_cfg path. 30 steps tracks documented sweet
     # spot in pipelines/pipeline_qwen_edit.py.

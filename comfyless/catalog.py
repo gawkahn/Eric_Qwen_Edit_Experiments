@@ -117,7 +117,11 @@ def scan_model_family(model_dir: str) -> Optional[str]:
     class_name = index.get("_class_name")
     if not isinstance(class_name, str) or not class_name:
         return None
-    return infer_model_family(class_name)
+    # `is_distilled` lets one pipeline class split into two families (e.g.
+    # Krea-2 Raw vs Turbo share `Krea2Pipeline`); pass it so the catalog
+    # classifies `krea` vs `krea-turbo` at scan time (no diffusers class
+    # import required — same scan-vs-load split documented above).
+    return infer_model_family(class_name, bool(index.get("is_distilled", False)))
 
 
 # ════════════════════════════════════════════════════════════════════════

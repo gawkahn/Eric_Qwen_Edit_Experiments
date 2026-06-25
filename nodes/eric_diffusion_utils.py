@@ -34,6 +34,7 @@ _FAMILY_PATTERNS = [
     ("flux2",               "flux2"),
     ("chroma",              "chroma"),
     ("flux",                "flux"),
+    ("krea2",               "krea"),
     ("auraflow",            "auraflow"),
     ("stablediffusion3",    "sd3"),
     ("stablediffusionxl",   "sdxl"),
@@ -42,11 +43,23 @@ _FAMILY_PATTERNS = [
 ]
 
 
-def infer_model_family(class_name: str) -> str:
-    """Map a diffusers pipeline class name to a short family string."""
+def infer_model_family(class_name: str, is_distilled: bool = False) -> str:
+    """Map a diffusers pipeline class name to a short family string.
+
+    ``is_distilled`` lets one pipeline class resolve to two families when the
+    model's own ``model_index.json`` distinguishes variants. Krea-2 ships a
+    single ``Krea2Pipeline`` class for both the Raw checkpoint
+    (``is_distilled: false``) and the distilled Turbo checkpoint
+    (``is_distilled: true``), which want very different defaults (Raw: 52
+    steps / cfg 3.5; Turbo: 8 steps / cfg 0.0). The distilled krea variant
+    is reported as ``"krea-turbo"`` so ``FAMILY_DEFAULTS`` can carry both.
+    The single-arg call form is unchanged for every existing caller.
+    """
     lower = class_name.lower().replace("_", "").replace("-", "")
     for substr, family in _FAMILY_PATTERNS:
         if substr in lower:
+            if family == "krea" and is_distilled:
+                return "krea-turbo"
             return family
     return lower  # best-effort fallback for unrecognised models
 
@@ -80,7 +93,7 @@ def detect_pipeline_class(model_path: str):
             f"Try upgrading diffusers: pip install -U diffusers"
         )
 
-    family = infer_model_family(class_name)
+    family = infer_model_family(class_name, bool(index.get("is_distilled", False)))
     return pipeline_class, class_name, family
 
 

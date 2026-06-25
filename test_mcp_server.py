@@ -1544,6 +1544,7 @@ _CHARACTERIZATION_CASES = [
     ("StableDiffusionXLPipeline",    "sdxl"),
     ("StableDiffusionPipeline",      "sd1"),
     ("ZImagePipeline",               "zimage"),
+    ("Krea2Pipeline",                "krea"),  # non-distilled (no is_distilled)
 ]
 
 for _cls_name, _expected in _CHARACTERIZATION_CASES:
@@ -1560,6 +1561,35 @@ for _cls_name, _expected in _CHARACTERIZATION_CASES:
             f"scan_model_family({_cls_name!r}) matches infer_model_family",
             _got == infer_model_family(_cls_name),
         )
+
+# Krea-2: one pipeline class (Krea2Pipeline) splits into two families via
+# the model's own is_distilled flag — proves the scan classifies krea vs
+# krea-turbo at scan time WITHOUT diffusers shipping Krea2Pipeline (it lives
+# only on diffusers main; the scan never imports the class).
+def _write_krea_index(parent_dir: str, is_distilled) -> str:
+    child = os.path.join(parent_dir, "krea_model")
+    os.makedirs(child, exist_ok=True)
+    idx: dict = {"_class_name": "Krea2Pipeline"}
+    if is_distilled is not None:
+        idx["is_distilled"] = is_distilled
+    with open(os.path.join(child, "model_index.json"), "w") as f:
+        json.dump(idx, f)
+    return child
+
+with tempfile.TemporaryDirectory() as _td:
+    _d = _write_krea_index(_td, True)
+    check(
+        "scan_model_family Krea2Pipeline + is_distilled=true -> 'krea-turbo'",
+        cat_mod.scan_model_family(_d) == "krea-turbo",
+        detail=f"got {cat_mod.scan_model_family(_d)!r}",
+    )
+with tempfile.TemporaryDirectory() as _td:
+    _d = _write_krea_index(_td, False)
+    check(
+        "scan_model_family Krea2Pipeline + is_distilled=false -> 'krea'",
+        cat_mod.scan_model_family(_d) == "krea",
+        detail=f"got {cat_mod.scan_model_family(_d)!r}",
+    )
 
 # Negative: model_dir does not exist
 check(

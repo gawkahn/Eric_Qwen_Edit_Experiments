@@ -608,6 +608,20 @@ def _build_call_kwargs(
             kwargs["max_sequence_length"] = max_sequence_length
         return kwargs
 
+    if model_family in ("krea", "krea-turbo"):
+        # Krea2Pipeline: single-pass guidance_scale. Turbo runs cfg=0.0
+        # (CFG disabled); Raw runs real CFG at cfg≈3.5, which can use a
+        # negative prompt — unlike Flux's distilled guidance embedding.
+        # Introspect so a negative prompt / max_sequence_length is only
+        # forwarded when the installed Krea2Pipeline.__call__ accepts it.
+        kwargs = {**base, "guidance_scale": cfg_scale}
+        sig = inspect.signature(pipe.__call__)
+        if negative_prompt and "negative_prompt" in sig.parameters:
+            kwargs["negative_prompt"] = negative_prompt
+        if "max_sequence_length" in sig.parameters:
+            kwargs["max_sequence_length"] = max_sequence_length
+        return kwargs
+
     if model_family in ("sdxl", "sd3", "sd1", "zimage"):
         kwargs = {**base, "guidance_scale": cfg_scale}
         if negative_prompt:

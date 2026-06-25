@@ -609,6 +609,84 @@ check("overlay: silent when all family keys are explicit",
 
 
 # ──────────────────────────────────────────────────────────────────────
+print("\n── Krea-2 family detection + defaults + routing ────────────────")
+
+from nodes.eric_diffusion_utils import infer_model_family
+
+# Detection: one Krea2Pipeline class → two families via is_distilled.
+check("krea: Krea2Pipeline → 'krea' (single-arg form unchanged)",
+      infer_model_family("Krea2Pipeline") == "krea")
+check("krea: Krea2Pipeline + is_distilled=False → 'krea'",
+      infer_model_family("Krea2Pipeline", False) == "krea")
+check("krea-turbo: Krea2Pipeline + is_distilled=True → 'krea-turbo'",
+      infer_model_family("Krea2Pipeline", True) == "krea-turbo")
+# is_distilled only flips the krea family — never leaks onto other classes.
+check("krea: is_distilled is a no-op for non-krea classes",
+      infer_model_family("FluxPipeline", True) == "flux")
+
+# Family-default values are the model-card numbers.
+check("krea: cfg_scale=3.5 (Raw model card)",
+      FAMILY_DEFAULTS["krea"].get("cfg_scale") == 3.5)
+check("krea: steps=52 (Raw model card)",
+      FAMILY_DEFAULTS["krea"].get("steps") == 52)
+check("krea-turbo: cfg_scale=0.0 (Turbo, CFG disabled)",
+      FAMILY_DEFAULTS["krea-turbo"].get("cfg_scale") == 0.0)
+check("krea-turbo: steps=8 (Turbo model card)",
+      FAMILY_DEFAULTS["krea-turbo"].get("steps") == 8)
+
+
+# _build_call_kwargs routing — fake pipes so we don't need diffusers'
+# Krea2Pipeline installed (it ships only on diffusers main).
+class _FakeKreaPipe:
+    def __call__(self, prompt, height, width, num_inference_steps, generator,
+                 guidance_scale=None, negative_prompt=None,
+                 max_sequence_length=None):
+        pass
+
+
+class _FakeKreaPipeNoNeg:
+    def __call__(self, prompt, height, width, num_inference_steps, generator,
+                 guidance_scale=None):
+        pass
+
+
+# Raw: real CFG via guidance_scale, NOT true_cfg_scale; negative prompt
+# forwarded when accepted.
+_kw = g._build_call_kwargs(
+    _FakeKreaPipe(), "krea", False, "a cat", "blurry",
+    1024, 1024, 52, 3.5, None, 512, None,
+)
+check("krea routing: guidance_scale=3.5 passed",
+      _kw.get("guidance_scale") == 3.5)
+check("krea routing: NOT true_cfg_scale (flux-like, not qwen)",
+      "true_cfg_scale" not in _kw)
+check("krea routing: negative_prompt forwarded when accepted + provided",
+      _kw.get("negative_prompt") == "blurry")
+check("krea routing: max_sequence_length forwarded when accepted",
+      _kw.get("max_sequence_length") == 512)
+
+# Turbo: cfg=0.0 passes through unchanged (CFG disabled, single pass).
+_kw = g._build_call_kwargs(
+    _FakeKreaPipe(), "krea-turbo", False, "a cat", "",
+    2048, 2048, 8, 0.0, None, 512, None,
+)
+check("krea-turbo routing: guidance_scale=0.0 passed through",
+      _kw.get("guidance_scale") == 0.0)
+check("krea-turbo routing: no negative_prompt when none provided",
+      "negative_prompt" not in _kw)
+
+# Pipe that doesn't accept negative_prompt → it is not forwarded.
+_kw = g._build_call_kwargs(
+    _FakeKreaPipeNoNeg(), "krea", False, "a cat", "blurry",
+    1024, 1024, 52, 3.5, None, 512, None,
+)
+check("krea routing: negative_prompt dropped when pipe doesn't accept it",
+      "negative_prompt" not in _kw)
+check("krea routing: max_sequence_length dropped when pipe doesn't accept it",
+      "max_sequence_length" not in _kw)
+
+
+# ──────────────────────────────────────────────────────────────────────
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print("──────────────────────────────────────────────────")
