@@ -157,6 +157,25 @@ all 100–200 transitive deps, with per-platform lock files for wheels.
 Trigger: any new greenfield project in this space; do it from day one there.
 See `pyproject.toml` comments and `project_dependency_pin_strategy.md` memory.
 
+**Krea-2 runtime blocked on a diffusers release** *(2026-06-25)*
+Krea-2 (`Krea-2-Raw`, `Krea-2-Turbo`) support landed code-first
+(`docs/vision/slice-krea2-support.md`): family detection, `FAMILY_DEFAULTS`,
+CFG routing, catalog classification, and MCP parity all work on the current
+pin. But `Krea2Pipeline` exists **only on diffusers `main`** — no PyPI
+release ships it (0.38.0 verified without it; transformers 5.5.3 already has
+`Qwen3VLModel` and diffusers 0.37.1 already has `AutoencoderKLQwenImage`, so
+the pipeline + `Krea2Transformer2DModel` are the only missing pieces).
+Per decision (2026-06-25): no nightly/git pin (§11 exact-pin) and no
+vendoring. `generate` therefore raises the existing "upgrade diffusers"
+`ValueError` at load until a tagged release exports `Krea2Pipeline`.
+Why not now: bumping diffusers to `main` violates §11 and would diverge from
+ComfyUI's bundled stack (ADR-013 torch divergence concerns); the dep bump is
+its own ADR'd slice.
+Trigger: a tagged diffusers release exporting `Krea2Pipeline` (watch 0.39.0).
+When met: a separate slice pins the new diffusers (+ matching torchvision if
+needed), runs `uv lock`, updates `requirements.txt` + `pyproject.toml`
+together, and smoke-tests Raw/Turbo generation.
+
 ---
 
 ## Sampler Coverage
@@ -190,6 +209,22 @@ Queued in Backlog.
 ---
 
 ## CFG Routing
+
+### [Code] Krea-2-Turbo `mu` / timestep-shift (1.15) not exposed
+- **Location:** `comfyless/family_defaults.py` (`krea-turbo`), `comfyless/generate.py` `_build_call_kwargs` krea branch
+- **Observed:** 2026-06-25 during Krea-2 support slice
+- **Why not now:** Krea's CLI recommends Turbo at `mu=1.15` (a FlowMatchEuler timestep-shift), but `COMFYLESS_SCHEMA` has no shift/`mu` knob; diffusers' `Krea2Pipeline` computes a dynamic shift from resolution by default, so Turbo still runs without it. Out of scope for the code-first slice.
+- **Suggested fix:** Add an optional `shift`/`mu` schema key, forward it in the krea CFG branch after checking `inspect.signature(pipe.__call__)`, and set `krea-turbo` default to 1.15. Verify against the actual diffusers `Krea2Pipeline.__call__` signature once a release ships it.
+- **Trigger:** Turbo output quality shortfall traced to timestep shift, OR the diffusers dep slice lands and the real `__call__` signature is inspectable.
+- **Priority:** Low
+
+### [Code] ComfyUI node-side `_build_call_kwargs` lacks krea routing
+- **Location:** `nodes/eric_diffusion_generate.py` (the ComfyUI-node mirror of `comfyless/generate.py:_build_call_kwargs`)
+- **Observed:** 2026-06-25 during Krea-2 support slice (code-reviewer note)
+- **Why not now:** The Krea-2 slice was scoped to the comfyless surfaces (CLI/daemon/MCP) only; the ComfyUI node mirror was intentionally left untouched, so it has no `krea`/`krea-turbo` branch and would fall through to the unknown-family introspection path. Conscious deferral, not silent drift.
+- **Suggested fix:** Add the same `("krea","krea-turbo")` guidance_scale branch to the node-side `_build_call_kwargs` if/when Krea-2 is exercised through the ComfyUI node UI.
+- **Trigger:** Krea-2 used via the ComfyUI Eric Diffusion Generate node, OR the next deliberate change to `nodes/eric_diffusion_generate.py` CFG routing.
+- **Priority:** Low
 
 ### [Code] SD3 `max_sequence_length` not forwarded in CFG routing
 - **Location:** `nodes/eric_diffusion_generate.py:214`, `comfyless/generate.py` sdxl/sd3/sd1/zimage block

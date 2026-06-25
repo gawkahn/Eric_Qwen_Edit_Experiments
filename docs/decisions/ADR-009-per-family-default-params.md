@@ -188,6 +188,34 @@ them. The dict is therefore designed for one-edit changes:
   (caller responsibility, as documented above). No code change; this
   is a documentation hedge against future refactors that might split
   the paths.
+- **2026-06-25** — Krea-2 support slice
+  (`docs/vision/slice-krea2-support.md`). Two extensions, no change to the
+  precedence ladder:
+  1. **One pipeline class may now map to two families via model
+     metadata.** `Krea2Pipeline` maps to `"krea"`, and the distilled
+     variant — identified by `is_distilled: true` in `model_index.json` —
+     to `"krea-turbo"`, so Krea-2-Raw (52 steps / cfg 3.5) and
+     Krea-2-Turbo (8 steps / cfg 0.0, CFG disabled) get distinct
+     defaults despite sharing a class. `infer_model_family` gains an
+     optional `is_distilled` arg (default False → single-arg form
+     unchanged for all existing callers); `detect_pipeline_class` and
+     `comfyless/catalog.py:scan_model_family` read the flag and pass it.
+     Both krea families route through the existing `guidance_scale`
+     branch in `_build_call_kwargs` (flux-like single-pass CFG).
+  2. **The MCP caller now applies the overlay.** When this ADR was
+     written the MCP surface did not exist (it arrived with ADR-011); its
+     `generate` handler applied hardcoded fallbacks (28 steps / cfg 3.5)
+     instead of `FAMILY_DEFAULTS`, so an agent omitting params got
+     wrong-for-family values. Per the "caller responsibility" model of
+     this ADR, the MCP handler is now a caller that applies the overlay
+     (fill canonical keys absent from the agent payload; explicit agent
+     values win). This affects ALL families, not just Krea (e.g.
+     qwen-image now gets 50 steps via MCP). The **daemon**
+     (`comfyless/server.py`) is unchanged and remains caller-responsible:
+     its only client is the CLI, which already applies the overlay in
+     `_run_one` before delegating. Runtime generation is gated on a
+     diffusers release shipping `Krea2Pipeline` (see `TECH_DEBT.md` →
+     Dependencies); classification and defaults work on the current pin.
 
 ## AI-Disclosure
 
