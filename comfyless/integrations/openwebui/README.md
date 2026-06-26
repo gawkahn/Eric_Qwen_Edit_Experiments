@@ -48,7 +48,17 @@ is a deployment.
 4. Open the tool's **Valves** (gear icon) and adjust if needed:
    - `mcpo_base_url` — change if mcpo is not on the default docker bridge gateway.
    - `api_key` — set if mcpo was started with `--api-key`.
-   - `default_model` — a catalog model name to use when the model doesn't pick one.
+   - `default_model` — a catalog model name (exact, case-sensitive) used when the
+     chat model doesn't name one. **Suggested default: `Qwen-Image-2512`** — the
+     balanced flagship text-to-image model with tuned defaults. For snappier
+     in-chat iteration use a turbo model (`Z-Image-Turbo`, `Krea-2-Turbo`); for
+     the Flux look use `Flux.2-dev`. Leaving it **empty** is also valid — then the
+     chat model names the model per call and the server's FAMILY_DEFAULTS still
+     apply. Do **not** set it to an edit-only model (`Qwen-Image-Edit-2511`,
+     `FireRed-Image-Edit-1.0`) or a Stable Cascade entry (`stable_cascade*` route
+     through the separate cascade tool, not `/generate`). The catalog name is the
+     model's directory name under `--model-base`; list valid names by building the
+     catalog (`comfyless.catalog.build_catalog`) or via the MCP `list_models` tool.
    - `max_return_px` / `max_return_bytes` — transport-image bounds (server clamps
      bytes to a 1 MiB ceiling regardless).
 5. Enable the tool for the model/chat (the **tools** toggle in the chat input, or
