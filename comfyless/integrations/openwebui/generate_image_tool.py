@@ -1,7 +1,7 @@
 """
 title: Comfyless Image Generation
 author: Grant Kahn
-version: 0.1.0
+version: 0.1.2
 required_open_webui_version: 0.5.0
 requirements: aiohttp
 license: MIT
@@ -271,10 +271,14 @@ class Tools:
         # Upload into OpenWebUI's file store under the caller's own identity.
         # ADR-017 guarantees PNG (invariant 4); pin the stored content-type and
         # extension to image/png rather than trusting a server-supplied mime.
-        # Users.get_user_by_id is a synchronous indexed lookup — fast on the hot
-        # path and matching the OWUI native-tool convention; not offloaded.
+        # Users.get_user_by_id is async on this OWUI build (aiosqlite DB layer);
+        # the isawaitable guard awaits it while staying portable to builds where
+        # it is synchronous. Passing the un-awaited coroutine makes the handler
+        # fail with "'coroutine' object has no attribute 'email'".
         try:
             user_obj = Users.get_user_by_id(user["id"])
+            if inspect.isawaitable(user_obj):
+                user_obj = await user_obj
             if user_obj is None:
                 await emit_status("Upload failed.", done=True)
                 return "Error: could not resolve the OpenWebUI user for the upload."
@@ -284,10 +288,17 @@ class Tools:
                 filename=filename,
                 headers=Headers({"content-type": "image/png"}),
             )
+            # upload_file_handler is a FastAPI route handler; called directly
+            # (outside request DI) every parameter with a Form(...)/Query(...)
+            # default is the sentinel field object, not a value. Pass them all
+            # explicitly — omitting `metadata` leaves it a Form(None) object the
+            # handler then calls .get() on ("'Form' object has no attribute 'get'").
             result = upload_file_handler(
                 request=__request__,
                 file=upload,
+                metadata=None,
                 process=False,
+                process_in_background=False,
                 user=user_obj,
             )
             if inspect.isawaitable(result):
