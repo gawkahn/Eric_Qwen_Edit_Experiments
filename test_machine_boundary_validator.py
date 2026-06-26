@@ -107,7 +107,8 @@ _NUMERIC_KINDS = {pv._KIND_INT, pv._KIND_FLOAT, pv._KIND_FLOAT_NONE}
 # reaches into it: any numeric field added to runtime-only schema must auto-
 # cover via this loop (step-3 audit F9). Today _RUNTIME_KIND has no numeric
 # fields (only str / bool) so the loop is preventive.
-_PARAMETRIC_FIELDS = {**pv.SCHEMA_KIND, **pv._RUNTIME_KIND}
+_PARAMETRIC_FIELDS = {
+    **pv.SCHEMA_KIND, **pv._RUNTIME_KIND, **pv._MCP_TRANSPORT_KIND}
 for field, kind in _PARAMETRIC_FIELDS.items():
     if kind not in _NUMERIC_KINDS:
         continue

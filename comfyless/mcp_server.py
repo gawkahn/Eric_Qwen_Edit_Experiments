@@ -336,6 +336,38 @@ _GENERATE_INPUT_SCHEMA: dict[str, Any] = {
             },
         },
         "savepath": {"type": "string"},
+        "return_image": {
+            "type": "boolean",
+            "description": (
+                "When true, the response includes the generated image as a "
+                "base64 PNG (`image_b64` + `image_mime`) in addition to "
+                "`output_path`. Default false — when false/absent the "
+                "response is unchanged. The full-resolution PNG on disk is "
+                "never affected; only a size-bounded transport copy is "
+                "returned (see max_return_px)."
+            ),
+        },
+        "max_return_px": {
+            "type": "integer",
+            "description": (
+                "Longest-edge cap (pixels) for the base64 image returned "
+                "when return_image=true. Default 768. Aspect is preserved "
+                "and the image is never upscaled; the on-disk PNG keeps its "
+                "full resolution. Ignored when return_image is false/absent."
+            ),
+        },
+        "max_return_bytes": {
+            "type": "integer",
+            "description": (
+                "Hard ceiling (bytes) on the base64 image payload returned "
+                "when return_image=true. The server enforces a 1 MiB "
+                "ceiling; a smaller value is honored, a larger value is "
+                "clamped down to 1 MiB. If the pixel-bounded copy still "
+                "exceeds this budget the image is downscaled further until "
+                "it fits. The on-disk PNG is never shrunk. Ignored when "
+                "return_image is false/absent."
+            ),
+        },
         "cascade_config": {
             "type": "object",
             "description": (
@@ -747,6 +779,179 @@ def _discard_notice(name: str) -> dict:
     }
 
 
+# ════════════════════════════════════════════════════════════════════════
+# Optional base64 image return  (ADR-017)
+# ════════════════════════════════════════════════════════════════════════
+
+# Default longest-edge bound for the returned transport copy (ADR-017; default
+# lowered 1024 → 768 in the 2026-06-25 byte-bound refinement so the iterative
+# byte-downscale below almost never fires). Also the fallback when
+# max_return_px is absent or a nonsensical (<= 0) value — the bound is
+# load-bearing, so an invalid value clamps to the default, never unbounded.
+_DEFAULT_MAX_RETURN_PX = 768
+
+# Hard ceiling (bytes) on the returned base64 payload length. Matches the
+# local_agents MCP-proxy 1 MiB result cap (docs/specs/mcp-proxy-v1.md) and the
+# scope-A "each tool bounds its own output" convention (mcp-server-v1.md). A
+# request MAY ask for a SMALLER cap; a LARGER value is clamped DOWN to this
+# ceiling — the agent can never raise it, so it is a true hard cap. Default
+# (absent / nonsensical) = this ceiling.
+_RETURN_BYTES_CEILING = 1024 * 1024
+
+# Floor for the iterative byte-downscale loop: never shrink the transport copy
+# below this longest edge. A PNG at this size is a few KB — far under any
+# realistic byte cap — so the floor is a defensive backstop, not a normal exit.
+_RETURN_PX_FLOOR = 64
+
+# Upper clamp on the effective pixel cap (security review 2026-06-25 LOW-2).
+# `max_return_px` has no natural ceiling, so a caller asking for a huge value
+# against a large (e.g. 50 MP) on-disk image would make the FIRST base64
+# encode run at full resolution before the byte loop shrinks it — a transient
+# in-memory spike. Clamping the effective pixel cap bounds that first encode;
+# the returned payload is already byte-capped regardless. 4096 is far above
+# any sane transport copy (the byte cap shrinks it much further in practice).
+_MAX_RETURN_PX_CEILING = 4096
+
+# Bounded iteration count for the byte-downscale loop (defensive; each step
+# shrinks dimensions multiplicatively so convergence is fast — typically 0–1
+# steps at the 768px default).
+_RETURN_BYTES_MAX_ITERS = 8
+
+# Fail-soft INFO notice (ADR-017 invariant 8). Emitted when return_image was
+# requested but the optional transport copy could not be produced (encode
+# failure, or the byte budget could not be met even at the px floor); the
+# generation itself succeeded and `output_path` is valid. Carries NO path,
+# NO exception text — just a category signal so the caller knows image_b64 is
+# absent despite the request.
+_RETURN_IMAGE_FAILED_NOTICE = {
+    "level": "INFO",
+    "message": (
+        "return_image was requested but the transport copy could not be "
+        "encoded; the image is on disk (see output_path). image_b64 omitted."
+    ),
+}
+
+
+def _encode_return_image(
+    output_path: str, max_px: Any, max_bytes: Any,
+) -> tuple[str, str]:
+    """Re-encode the on-disk PNG into a size-bounded base64 PNG for transport.
+
+    ADR-017 invariants:
+      - Reads the already-written, already-§3e-redacted PNG at `output_path`.
+        The on-disk file is NEVER modified — both bounds below apply only to
+        the in-memory transport copy.
+      - PIXEL bound: downscales so the longest edge ≤ the effective pixel cap
+        (aspect preserved, NEVER upscaled). `max_px` <= 0 / non-int clamps to
+        _DEFAULT_MAX_RETURN_PX.
+      - BYTE bound: after the pixel downscale, iteratively shrinks the copy
+        until len(base64) ≤ the effective byte cap = min(max_bytes,
+        _RETURN_BYTES_CEILING) (a non-int / <= 0 max_bytes uses the ceiling).
+        The agent cannot raise the cap above the ceiling — true hard cap.
+      - Re-encodes to PNG WITHOUT carrying the source file's text chunks (no
+        `pnginfo=`) — the transport copy is metadata-free, so no filesystem
+        string or embedded-metadata value can ride out via the image bytes.
+      - mime is the constant "image/png".
+
+    Returns (base64_ascii_str, "image/png"). Raises on any failure (including
+    the pathological case where even the px-floor copy exceeds the byte cap);
+    the caller MUST treat a raise as fail-soft (omit image_b64, never fail the
+    generation).
+    """
+    import base64
+    import io
+
+    from PIL import Image
+
+    eff_px = (
+        max_px if (isinstance(max_px, int) and not isinstance(max_px, bool)
+                   and max_px > 0)
+        else _DEFAULT_MAX_RETURN_PX
+    )
+    eff_px = min(eff_px, _MAX_RETURN_PX_CEILING)  # bound first-encode spike
+    eff_bytes = (
+        min(max_bytes, _RETURN_BYTES_CEILING)
+        if (isinstance(max_bytes, int) and not isinstance(max_bytes, bool)
+            and max_bytes > 0)
+        else _RETURN_BYTES_CEILING
+    )
+
+    def _encode(image) -> str:
+        buf = io.BytesIO()
+        # No pnginfo= → transport copy carries no text chunks (see docstring).
+        image.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    with Image.open(output_path) as src:
+        src.load()
+        w, h = src.size
+        longest = max(w, h)
+        if longest > eff_px:  # pixel bound (never upscale)
+            scale = eff_px / longest
+            img = src.resize(
+                (max(1, round(w * scale)), max(1, round(h * scale))),
+                Image.LANCZOS)
+        else:
+            img = src.copy()  # detach from the file; strips metadata on re-save
+
+    b64 = _encode(img)
+    # Byte bound: shrink the transport copy until the payload fits or floor.
+    iters = 0
+    while len(b64) > eff_bytes and iters < _RETURN_BYTES_MAX_ITERS:
+        cur_longest = max(img.size)
+        if cur_longest <= _RETURN_PX_FLOOR:
+            break
+        # base64 length scales ~linearly with pixel COUNT, so scale each
+        # dimension by sqrt(target/current); the 0.9 factor undershoots to
+        # converge in a few steps even when PNG compression is non-linear.
+        ratio = (eff_bytes / len(b64)) ** 0.5 * 0.9
+        new_longest = max(_RETURN_PX_FLOOR, int(cur_longest * ratio))
+        if new_longest >= cur_longest:
+            new_longest = cur_longest - 1  # guarantee forward progress
+        s = new_longest / cur_longest
+        img = img.resize(
+            (max(1, round(img.size[0] * s)), max(1, round(img.size[1] * s))),
+            Image.LANCZOS)
+        b64 = _encode(img)
+        iters += 1
+
+    if len(b64) > eff_bytes:
+        # Could not meet the byte budget (pathological). Raise → caller
+        # fail-soft omits image_b64 rather than returning an over-budget
+        # payload that would breach a downstream transport cap.
+        raise ValueError("return image exceeds byte budget after downscale")
+    return b64, "image/png"
+
+
+def _maybe_attach_return_image(
+    response: dict,
+    notices: list,
+    payload: dict,
+    output_path: str,
+) -> None:
+    """Attach `image_b64`/`image_mime` to `response` when the caller set
+    return_image=true. Fail-soft (ADR-017 invariant 8): any failure leaves
+    the response frame intact (image fields omitted) and appends an INFO
+    notice — a return-image failure MUST NOT fail a successful generation.
+    Shared by both the non-cascade and cascade handlers (invariant 7)."""
+    if not bool(payload.get("return_image", False)):
+        return
+    try:
+        img_b64, img_mime = _encode_return_image(
+            output_path,
+            payload.get("max_return_px", _DEFAULT_MAX_RETURN_PX),
+            payload.get("max_return_bytes", _RETURN_BYTES_CEILING),
+        )
+        response["image_b64"] = img_b64
+        response["image_mime"] = img_mime
+    except Exception:  # noqa: BLE001 — invariant 8: fail-soft on any encode
+        # failure (PIL error, byte-budget-unmeetable ValueError, etc.). NOT
+        # BaseException: KeyboardInterrupt/SystemExit and any future audit-
+        # emission BaseException (global §0 rule 2) must propagate, never be
+        # absorbed into a fail-soft notice.
+        notices.append(dict(_RETURN_IMAGE_FAILED_NOTICE))
+
+
 async def _call_tool_impl(
     cfg: _StartupConfig,
     name: str,
@@ -1102,6 +1307,9 @@ async def _handle_generate(
         "resolved_params": resolved_params,
         "elapsed_seconds": metadata.get("elapsed_seconds"),
     }
+    # ADR-017: optional, gated, size-bounded base64 return. Reads the
+    # already-written on-disk PNG; fail-soft (never fails a successful gen).
+    _maybe_attach_return_image(response, notices, payload, output_path)
     if notices:
         response["notices"] = notices
     return [TextContent(type="text", text=json.dumps(response, default=str))]
@@ -1299,6 +1507,10 @@ async def _handle_generate_cascade(
         "resolved_params": resolved_params,
         "elapsed_seconds": metadata["elapsed_seconds"],
     }
+    # ADR-017: optional, gated, size-bounded base64 return (cascade path —
+    # invariant 7: identical behavior to the non-cascade handler). Reads the
+    # already-written on-disk PNG; fail-soft (never fails a successful gen).
+    _maybe_attach_return_image(response, notices, payload, output_path)
     if notices:
         response["notices"] = notices
     return [TextContent(type="text", text=json.dumps(response, default=str))]

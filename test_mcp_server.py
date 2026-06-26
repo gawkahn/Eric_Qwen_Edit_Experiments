@@ -3567,6 +3567,303 @@ check("resolve: resolve_reference is callable",
 
 
 # ════════════════════════════════════════════════════════════════════════
+print("\n== ADR-017: optional base64 image return (return_image) ==")
+# ════════════════════════════════════════════════════════════════════════
+#
+# Gated, size-bounded base64 PNG return on generate + cascade. Invariants:
+# default path byte-unchanged; bytes never in the audit line / stderr;
+# size-bounded transport copy; on-disk PNG stays full-res; mime constant;
+# fail-soft (never fails a successful gen); non-cascade + cascade identical.
+
+import base64 as _b64  # noqa: E402
+
+
+def _call_with_gen(cfg, args, gen_fn):
+    """Like _call but with a caller-supplied generate() mock."""
+    captured_err = io.StringIO()
+    raised = None
+    result = None
+    with unittest.mock.patch.object(sys, "stderr", captured_err), \
+         unittest.mock.patch.object(gen_mod, "_load_pipeline", _mock_load_pipeline), \
+         unittest.mock.patch.object(gen_mod, "generate", gen_fn):
+        try:
+            result = _run(mcps._call_tool_impl(cfg, "generate", args))
+        except ValueError as e:
+            raised = str(e)
+        except BaseException as e:
+            raised = f"UNEXPECTED-{type(e).__name__}: {e}"
+    return result, raised, captured_err.getvalue()
+
+
+def _mock_generate_large(*, model_path, prompt, output_path, **kw):
+    """generate() mock writing a 1536x768 PNG — exceeds the 1024 default cap."""
+    Image.new("RGB", (1536, 768), "white").save(output_path)
+    return {
+        "prompt": prompt, "negative_prompt": kw.get("negative_prompt", ""),
+        "model": model_path, "seed": kw.get("seed", 42),
+        "steps": kw.get("steps", 28), "cfg_scale": kw.get("cfg_scale", 3.5),
+        "transformer_path": kw.get("transformer_path", ""),
+        "loras": list(kw.get("loras") or []),
+        "elapsed_seconds": 0.01,
+    }
+
+
+def _mock_generate_noise(*, model_path, prompt, output_path, **kw):
+    """generate() mock writing a 768x768 INCOMPRESSIBLE (random-noise) PNG so
+    its base64 payload is large (~2 MB) — exercises the byte-cap downscale.
+    White/flat images compress to a few hundred bytes and never trip it."""
+    Image.frombytes("RGB", (768, 768), os.urandom(768 * 768 * 3)).save(
+        output_path)
+    return {
+        "prompt": prompt, "negative_prompt": kw.get("negative_prompt", ""),
+        "model": model_path, "seed": kw.get("seed", 42),
+        "steps": kw.get("steps", 28), "cfg_scale": kw.get("cfg_scale", 3.5),
+        "transformer_path": kw.get("transformer_path", ""),
+        "loras": list(kw.get("loras") or []),
+        "elapsed_seconds": 0.01,
+    }
+
+
+def _mock_generate_with_meta(*, model_path, prompt, output_path, **kw):
+    """generate() mock that writes a PNG carrying a path-bearing tEXt chunk so
+    the metadata-strip assertion is LOAD-BEARING: _encode_return_image re-saves
+    with no pnginfo=, so the transport copy must NOT carry the planted chunk
+    (invariant 5 — the data-egress control). A metadata-free source could not
+    distinguish 'code strips' from 'source had none'."""
+    from PIL import PngImagePlugin
+    _meta = PngImagePlugin.PngInfo()
+    _meta.add_text("abspath", "/home/gawkahn/secret/leak.png")
+    _meta.add_text("prompt", prompt)
+    Image.new("RGB", (16, 16), "white").save(output_path, pnginfo=_meta)
+    return {
+        "prompt": prompt, "negative_prompt": kw.get("negative_prompt", ""),
+        "model": model_path, "seed": kw.get("seed", 42),
+        "steps": kw.get("steps", 28), "cfg_scale": kw.get("cfg_scale", 3.5),
+        "transformer_path": kw.get("transformer_path", ""),
+        "loras": list(kw.get("loras") or []),
+        "elapsed_seconds": 0.01,
+    }
+
+
+def _good_gen_args(**extra):
+    a = {"prompt": "a cat", "model": "qwen-image"}
+    a.update(extra)
+    return a
+
+
+# --- N1: return_image absent → response carries NO image fields (anchor) ---
+mb, out, _inside, cfg = _setup_mb_and_out()
+result, err, stderr = _call(cfg, _good_gen_args())
+check("ADR-017 N1: return_image absent → success",
+      result is not None and err is None, detail=f"err={err!r}")
+if result is not None:
+    resp = _json.loads(result[0].text)
+    check("ADR-017 N1: no image_b64 when return_image absent",
+          "image_b64" not in resp)
+    check("ADR-017 N1: no image_mime when return_image absent",
+          "image_mime" not in resp)
+
+# --- N2: return_image=false explicit → same as absent ---
+mb, out, _inside, cfg = _setup_mb_and_out()
+result, err, stderr = _call(cfg, _good_gen_args(return_image=False))
+if result is not None:
+    resp = _json.loads(result[0].text)
+    check("ADR-017 N2: return_image=false → no image fields",
+          "image_b64" not in resp and "image_mime" not in resp)
+
+# --- N3: return_image=true → valid PNG base64, longest edge ≤ default cap ---
+mb, out, _inside, cfg = _setup_mb_and_out()
+result, err, stderr = _call(cfg, _good_gen_args(return_image=True))
+check("ADR-017 N3: return_image=true → success",
+      result is not None and err is None, detail=f"err={err!r}")
+if result is not None:
+    resp = _json.loads(result[0].text)
+    check("ADR-017 N3: image_b64 present", "image_b64" in resp)
+    check("ADR-017 N3: image_mime == image/png",
+          resp.get("image_mime") == "image/png")
+    _pim = Image.open(io.BytesIO(_b64.b64decode(resp["image_b64"])))
+    _pim.load()
+    check("ADR-017 N3: image_b64 decodes to a valid PNG", _pim.format == "PNG")
+    check("ADR-017 N3: returned longest edge ≤ 768 (default cap)",
+          max(_pim.size) <= 768)
+    # Invariant 5: the transport copy is re-encoded WITHOUT pnginfo, so it
+    # carries no tEXt chunks — no on-disk metadata (or filesystem string)
+    # can ride out through the returned image bytes. (A base64 substring
+    # scan is meaningless here: base64's alphabet includes '/'.)
+    check("ADR-017 N3: transport PNG carries NO text chunks (no metadata leak)",
+          not getattr(_pim, "text", {}))
+
+# --- N3b: metadata strip is LOAD-BEARING — source PNG carries a path-bearing
+#          tEXt chunk; the transport copy must NOT (invariant 5) ---
+mb, out, _inside, cfg = _setup_mb_and_out()
+result, err, stderr = _call_with_gen(
+    cfg, _good_gen_args(return_image=True), _mock_generate_with_meta)
+check("ADR-017 N3b: meta-carrying gen succeeds",
+      result is not None and err is None, detail=f"err={err!r}")
+if result is not None:
+    resp = _json.loads(result[0].text)
+    _disk = Image.open(resp["output_path"])
+    _disk.load()
+    # test sanity: the planted chunk really is on the source the encoder reads
+    check("ADR-017 N3b: source PNG carries the planted tEXt chunk (sanity)",
+          getattr(_disk, "text", {}).get("abspath")
+          == "/home/gawkahn/secret/leak.png",
+          detail=repr(getattr(_disk, "text", {})))
+    _pim = Image.open(io.BytesIO(_b64.b64decode(resp["image_b64"])))
+    _pim.load()
+    # load-bearing: the re-encode (no pnginfo=) dropped ALL text chunks
+    check("ADR-017 N3b: transport copy carries NO text chunks (strip proven)",
+          not getattr(_pim, "text", {}), detail=repr(getattr(_pim, "text", {})))
+    check("ADR-017 N3b: planted abspath value absent from image_b64 payload",
+          "/home/gawkahn/secret" not in _b64.b64decode(resp["image_b64"])
+          .decode("latin-1"))
+
+# --- N4: image larger than cap → downscaled; on-disk PNG stays full-res ---
+mb, out, _inside, cfg = _setup_mb_and_out()
+result, err, stderr = _call_with_gen(
+    cfg, _good_gen_args(return_image=True, max_return_px=1024),
+    _mock_generate_large)
+check("ADR-017 N4: large-image gen succeeds",
+      result is not None and err is None, detail=f"err={err!r}")
+if result is not None:
+    resp = _json.loads(result[0].text)
+    _pim = Image.open(io.BytesIO(_b64.b64decode(resp["image_b64"])))
+    _pim.load()
+    check("ADR-017 N4: returned longest edge ≤ max_return_px (1024)",
+          max(_pim.size) <= 1024)
+    check("ADR-017 N4: aspect preserved (1536x768 → 1024x512)",
+          _pim.size == (1024, 512), detail=repr(_pim.size))
+    _disk = Image.open(resp["output_path"])
+    _disk.load()
+    check("ADR-017 N4: on-disk PNG stays FULL-RES (1536x768)",
+          _disk.size == (1536, 768), detail=repr(_disk.size))
+
+# --- N5: base64 payload NEVER appears in the audit line / stderr ---
+mb, out, _inside, cfg = _setup_mb_and_out()
+result, err, stderr = _call(cfg, _good_gen_args(return_image=True))
+if result is not None:
+    resp = _json.loads(result[0].text)
+    _b = resp["image_b64"]
+    check("ADR-017 N5: full image_b64 payload NOT in stderr/audit",
+          _b not in stderr)
+    check("ADR-017 N5: no 64-char b64 prefix leaked to stderr",
+          _b[:64] not in stderr)
+    check("ADR-017 N5: 'image_b64' key name absent from audit line",
+          '"image_b64"' not in stderr)
+
+# --- N6: non-bool return_image / non-int max_return_px → ValidationError ---
+mb, out, _inside, cfg = _setup_mb_and_out()
+result, err, stderr = _call(cfg, _good_gen_args(return_image="yes"))
+check("ADR-017 N6: return_image non-bool → ValidationError before gen",
+      result is None and err is not None
+      and "return_image" in err and "bool" in err, detail=f"err={err!r}")
+mb, out, _inside, cfg = _setup_mb_and_out()
+result, err, stderr = _call(
+    cfg, _good_gen_args(return_image=True, max_return_px=2.5))
+check("ADR-017 N6: max_return_px non-int → ValidationError before gen",
+      result is None and err is not None and "max_return_px" in err,
+      detail=f"err={err!r}")
+mb, out, _inside, cfg = _setup_mb_and_out()
+result, err, stderr = _call(
+    cfg, _good_gen_args(return_image=True, max_return_bytes="big"))
+check("ADR-017 N6: max_return_bytes non-int → ValidationError before gen",
+      result is None and err is not None and "max_return_bytes" in err,
+      detail=f"err={err!r}")
+
+# --- N7: cascade path with return_image=true → image_b64 present + valid ---
+mb, out, _inside, cfg = _setup_mb_and_out()
+_cargs = _good_cascade_args()
+_cargs["return_image"] = True
+result, err, stderr = _call_cascade(cfg, _cargs)
+check("ADR-017 N7: cascade return_image=true → success",
+      result is not None and err is None, detail=f"err={err!r}")
+if result is not None:
+    resp = _json.loads(result[0].text)
+    check("ADR-017 N7: cascade image_b64 present", "image_b64" in resp)
+    check("ADR-017 N7: cascade image_mime == image/png",
+          resp.get("image_mime") == "image/png")
+    _pim = Image.open(io.BytesIO(_b64.b64decode(resp["image_b64"])))
+    _pim.load()
+    check("ADR-017 N7: cascade image_b64 decodes to valid bounded PNG",
+          _pim.format == "PNG" and max(_pim.size) <= 1024)
+    check("ADR-017 N7: cascade b64 NOT in stderr", resp["image_b64"] not in stderr)
+
+# --- N8: encode failure → fail-soft (gen still returns; no image_b64) ---
+def _boom_encoder(*a, **k):
+    raise RuntimeError("encoder exploded")
+
+mb, out, _inside, cfg = _setup_mb_and_out()
+_captured_err = io.StringIO()
+_raised = None
+_result = None
+with unittest.mock.patch.object(sys, "stderr", _captured_err), \
+     unittest.mock.patch.object(gen_mod, "_load_pipeline", _mock_load_pipeline), \
+     unittest.mock.patch.object(gen_mod, "generate", _mock_generate), \
+     unittest.mock.patch.object(mcps, "_encode_return_image", _boom_encoder):
+    try:
+        _result = _run(mcps._call_tool_impl(
+            cfg, "generate", _good_gen_args(return_image=True)))
+    except BaseException as e:
+        _raised = f"{type(e).__name__}: {e}"
+check("ADR-017 N8: encode-failure does NOT raise (fail-soft)",
+      _raised is None, detail=f"raised={_raised!r}")
+if _result is not None:
+    resp = _json.loads(_result[0].text)
+    check("ADR-017 N8: generation still returns output_path",
+          "output_path" in resp)
+    check("ADR-017 N8: generation still returns resolved_params",
+          "resolved_params" in resp)
+    check("ADR-017 N8: no image_b64 on encode failure", "image_b64" not in resp)
+    check("ADR-017 N8: fail-soft INFO notice present",
+          any("transport copy" in n.get("message", "")
+              for n in resp.get("notices", [])))
+
+# --- N9: byte cap enforced — payload downscaled under a tight max_return_bytes;
+#         on-disk PNG stays full-res (768x768) ---
+mb, out, _inside, cfg = _setup_mb_and_out()
+result, err, stderr = _call_with_gen(
+    cfg, _good_gen_args(return_image=True, max_return_px=768,
+                        max_return_bytes=65536),
+    _mock_generate_noise)
+check("ADR-017 N9: byte-capped gen succeeds",
+      result is not None and err is None, detail=f"err={err!r}")
+if result is not None:
+    resp = _json.loads(result[0].text)
+    check("ADR-017 N9: image_b64 present under tight byte cap", "image_b64" in resp)
+    check("ADR-017 N9: len(image_b64) ≤ max_return_bytes (65536)",
+          len(resp["image_b64"]) <= 65536, detail=f"len={len(resp['image_b64'])}")
+    _pim = Image.open(io.BytesIO(_b64.b64decode(resp["image_b64"])))
+    _pim.load()
+    check("ADR-017 N9: byte-capped payload still a valid PNG", _pim.format == "PNG")
+    check("ADR-017 N9: byte-cap forced downscale below the 768 px bound",
+          max(_pim.size) < 768, detail=repr(_pim.size))
+    _disk = Image.open(resp["output_path"])
+    _disk.load()
+    check("ADR-017 N9: on-disk PNG stays FULL-RES (768x768) despite byte cap",
+          _disk.size == (768, 768), detail=repr(_disk.size))
+
+# --- N10: clamp — a max_return_bytes ABOVE the 1 MiB ceiling does not raise the
+#          effective cap; an incompressible 768px image still comes back ≤ 1 MiB ---
+mb, out, _inside, cfg = _setup_mb_and_out()
+result, err, stderr = _call_with_gen(
+    cfg, _good_gen_args(return_image=True, max_return_px=768,
+                        max_return_bytes=10_000_000),
+    _mock_generate_noise)
+check("ADR-017 N10: over-ceiling byte request succeeds",
+      result is not None and err is None, detail=f"err={err!r}")
+if result is not None:
+    resp = _json.loads(result[0].text)
+    # The agent asked for 10 MB; the server clamps to the 1 MiB ceiling, so an
+    # incompressible 768px image (≈2 MB base64 unclamped) comes back downscaled.
+    check("ADR-017 N10: requested 10MB clamped → payload ≤ 1 MiB ceiling",
+          len(resp["image_b64"]) <= 1024 * 1024,
+          detail=f"len={len(resp['image_b64'])}")
+    _pim = Image.open(io.BytesIO(_b64.b64decode(resp["image_b64"])))
+    _pim.load()
+    check("ADR-017 N10: clamped payload still a valid PNG", _pim.format == "PNG")
+
+
+# ════════════════════════════════════════════════════════════════════════
 print("\n== Module hygiene ==")
 # ════════════════════════════════════════════════════════════════════════
 

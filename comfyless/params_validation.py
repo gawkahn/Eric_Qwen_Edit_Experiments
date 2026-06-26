@@ -76,7 +76,24 @@ _RUNTIME_KIND = types.MappingProxyType({
 })
 
 
-_ALL_FIELDS = types.MappingProxyType({**SCHEMA_KIND, **_RUNTIME_KIND})
+# MCP-surface transport-control fields (ADR-017). Neither sidecar-shaped
+# (not in COMFYLESS_SCHEMA — they do not round-trip through replayable
+# sidecar JSON) nor daemon-runtime fields (not added from spawn flags). They
+# govern only the OPTIONAL base64 image return on the MCP generate surface.
+# Registered here so the canonical validator (ADR-012: the sole owner of
+# machine-boundary type predicates) type-rejects a non-bool return_image /
+# non-int max_return_px BEFORE the expensive generate path runs. The daemon
+# socket ignores these keys at its own logic layer; type-checking them
+# centrally is harmless and keeps the "one validator" rule intact.
+_MCP_TRANSPORT_KIND = types.MappingProxyType({
+    "return_image":     _KIND_BOOL,
+    "max_return_px":    _KIND_INT,
+    "max_return_bytes": _KIND_INT,
+})
+
+
+_ALL_FIELDS = types.MappingProxyType(
+    {**SCHEMA_KIND, **_RUNTIME_KIND, **_MCP_TRANSPORT_KIND})
 
 
 @dataclass(frozen=True)
