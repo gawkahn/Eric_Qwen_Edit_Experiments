@@ -58,15 +58,15 @@ python -m py_compile nodes/<file>.py   # syntax check a single file
 ```bash
 python3 test_manual_loop.py                 # 186 tests: samplers, manual loop, encode helper, Qwen edit
 python3 test_multistage.py                  # 141 tests: multistage infrastructure
-python3 test_params_schema.py               # 135 tests: comfyless COMFYLESS_SCHEMA + adapters
+python3 test_params_schema.py               # 153 tests: comfyless COMFYLESS_SCHEMA + adapters
 python3 test_cascade.py                     # 129 tests: comfyless Stable Cascade dispatch (ADR-010)
-python3 test_machine_boundary_validator.py  # 118 tests: machine-boundary validator (ADR-012)
+python3 test_machine_boundary_validator.py  # 122 tests: machine-boundary validator (ADR-012)
 python3 test_iterate.py                     #  92 tests: comfyless --iterate (ADR-008)
 python3 test_samplers.py                    #  41 tests: custom schedulers / sampler swap
-python3 test_server_robustness.py           #   8 tests: comfyless IPC timeouts + BrokenPipe survival
-python3 test_mcp_server.py                  # 483 tests: comfyless MCP server (ADR-011 slice 1 + ADR-015 slice 2 catalog/list_models/list_loras + slice 2b list_transformers + slice 3 generate catalog-name migration + slice 3b cascade catalog-name migration)
+python3 test_server_robustness.py           #  14 tests: comfyless IPC timeouts + BrokenPipe survival
+python3 test_mcp_server.py                  # 534 tests: comfyless MCP server (ADR-011 slice 1 + ADR-015 slice 2 catalog/list_models/list_loras + slice 2b list_transformers + slice 3 generate catalog-name migration + slice 3b cascade catalog-name migration)
 ```
-All nine suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 1333 unit tests; expect 0 failures.
+All nine suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 1412 unit tests; expect 0 failures.
 
 `test_flux2.py` is a live GPU smoke test that performs an actual Flux.2 generation — separate from the unit suites above. Run only when you need to verify end-to-end Flux.2 behavior.
 
@@ -247,6 +247,12 @@ Existing `QWEN_IMAGE_PIPELINE` / `QWEN_EDIT_PIPELINE` nodes are untouched and us
 | Modify LoRA loading | `nodes/eric_qwen_edit_lora.py` or `nodes/eric_qwen_image_lora.py` |
 | Prompt rewriting / LLM API | `nodes/eric_qwen_prompt_rewriter.py` (reads `api_keys.ini`) |
 | 2× VAE upscale (Wan2.1) | `nodes/eric_qwen_upscale_vae.py` |
+
+## OpenWebUI integration (comfyless → mcpo → OWUI)
+
+`comfyless/integrations/openwebui/generate_image_tool.py` is a native OpenWebUI Tool (runs inside the OWUI container) that drives image generation from chat and renders results inline. It calls the comfyless MCP server through the **mcpo** OpenAPI bridge — launched via `start-mcpo.sh` at the repo root (model-base = `hf-local`, the curated set; scanning the parent `.../models` also surfaces HF-cache snapshot-hash names). Tools exposed to the model: `generate_image`, `list_models`, `list_loras`, `list_transformers` (catalog names only, no paths). Requires a tool-calling model — gpt-oss works; roleplay-finetuned models (e.g. Dolphin-Venice) do not reliably emit tool calls. See ADR-017 and `comfyless/integrations/openwebui/README.md`.
+
+The MCP server (`comfyless/mcp_server.py`) caches one pipeline in-process and evicts + frees it on config change (mirrors the `server.py` daemon) so a long-lived server doesn't OOM across model switches; LoRAs are applied via the shared `generate._apply_loras`. See `docs/security/review-mcp-pipeline-cache-2026-06-27.md`.
 
 ## Important Constraints
 

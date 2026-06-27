@@ -331,3 +331,17 @@ ADR-010's "Deferred / Out of Scope" section formally declares the following non-
 - ControlNet variants (the SAI repo carries a `controlnet/` directory; not wired).
 - Lite-variant filename detection or warning (permissive, doc-only policy — by design).
 - Other `--iterate` axes beyond `prompt` and `seed` for cascade dispatch (cfg, model, transformer, etc. are JSON-config concerns, not iterate axes — ADR-010 amendment 3).
+
+---
+
+## MCP Catalog
+
+### [Code] Family pairing for list_loras / list_transformers (MCP) *(2026-06-27)*
+- **What:** `list_loras` / `list_transformers` cannot return a model-family for scan-derived entries — only manifest-declared entries carry `target_family` / `model_family`. So "list LoRAs in the same family as model X" is not answerable today.
+- **Why not now:** A separate LoRA-catalog project is the intended source of this metadata; this server will most likely query that catalog (for models, transformers, AND LoRAs) rather than grow its own manifest or add inference.
+- **Trigger:** The LoRA-catalog project landing / being wired into comfyless.
+
+### [Code] Agent-facing LoRA-failure signal over MCP *(2026-06-27)*
+- **What:** When a LoRA fails to apply over MCP, the warning is logged operator-side only (it embeds an absolute path, which must not cross the boundary per ADR-015); the agent gets no signal that a requested LoRA didn't apply.
+- **Why not now:** Surfacing it needs name-based redaction of the warning; out of scope for the OOM/LoRA-apply fix.
+- **Trigger:** An agent/UX need for LoRA application status, or the LoRA-catalog integration above.
