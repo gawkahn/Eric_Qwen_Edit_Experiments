@@ -187,12 +187,14 @@ def _resolved_params_as_names(
     out.pop("text_encoder_2_path", None)
     # `lora_warnings` strings embed the resolved abs_path (generate.py:
     # "LoRA skipped ...: <abs_path>"). Drop them from the agent-facing blob —
-    # an abs_path must not cross the boundary (invariant 5). Today the MCP path
-    # always passes a cached pipeline so the warning-producing loop never runs
-    # and this list is empty; popping makes the no-leak guarantee an ENFORCED
-    # contract rather than an emergent property of that caching accident.
-    # (security-auditor slice-3 step-2 MEDIUM-1, 2026-06-02.) The warnings
-    # remain on the operator's PNG metadata / stderr for debugging.
+    # an abs_path must not cross the boundary (invariant 5). LOAD-BEARING, not
+    # dead code: the MCP cached-pipeline loader (_get_or_load_cached_pipeline)
+    # DOES run the warning-producing loop (_apply_loras) on every cache miss, so
+    # this list can be non-empty; this pop is the enforced boundary that keeps
+    # those abs_paths out of the response. Removing it re-opens the egress
+    # (regression test N11). (security-auditor slice-3 step-2 MEDIUM-1,
+    # 2026-06-02; reaffirmed 2026-06-27 when the cached loader began applying
+    # LoRAs.) The warnings remain on the operator's PNG metadata / stderr.
     out.pop("lora_warnings", None)
     src_loras = metadata.get("loras") or []
     out["loras"] = [
@@ -1035,6 +1037,117 @@ async def _call_tool_impl(
         raise ValueError(safe)
 
 
+# ════════════════════════════════════════════════════════════════════════
+# In-process single-slot pipeline cache (parity with the server.py daemon's
+# cache + eviction). The MCP path loads pipelines in-process; without this it
+# reloaded the full pipeline every call AND never freed the previous model, so
+# a long-lived server OOM'd after several generations / model switches. This
+# keeps ONE fully-configured pipeline (model + transformer override + LoRAs)
+# resident, keyed on the whole effective config, and evicts the prior one
+# (del + gc + empty_cache) on any change. Requests are serialized (stdio MCP),
+# so no locking is needed — BUT that safety also depends on the generate
+# handlers having NO `await` point between the cache key-check and the
+# cache-update (the blocking _load_pipeline/generate/pipe() calls run inline).
+# If those are ever moved to run_in_executor / made concurrent, this cache
+# becomes racy and MUST get a lock.
+# ════════════════════════════════════════════════════════════════════════
+_PIPELINE_CACHE: dict = {
+    "key": None,
+    "pipeline": None,
+    "model_family": None,
+    "guidance_embeds": None,
+    "lora_warnings": [],
+}
+
+
+def _evict_pipeline_cache() -> None:
+    """Drop the cached pipeline and free its GPU memory, if any."""
+    if _PIPELINE_CACHE.get("pipeline") is None:
+        return
+    _PIPELINE_CACHE["key"] = None
+    _PIPELINE_CACHE["pipeline"] = None
+    _PIPELINE_CACHE["model_family"] = None
+    _PIPELINE_CACHE["guidance_embeds"] = None
+    _PIPELINE_CACHE["lora_warnings"] = []
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _pipeline_cache_key(
+    model_abs: str,
+    transformer_abs: str,
+    vae_from_transformer: bool,
+    loras_resolved: list,
+) -> tuple:
+    """Hashable key over the full effective config that varies in the MCP path.
+
+    precision/device/offload and the vae/text-encoder component overrides are
+    hard-coded constants in `_handle_generate`, so they cannot vary and are not
+    part of the key. The LoRA set IS part of the key (path + weight, in order),
+    so any LoRA change is a cache miss → evict + reload + re-apply.
+    """
+    lora_key = tuple(
+        (str(spec.get("path", "")), float(spec.get("weight", 1.0)))
+        for spec in (loras_resolved or [])
+    )
+    # vae_from_transformer is a no-op without a transformer override
+    # (_load_pipeline only extracts a VAE when transformer_path is set), so
+    # fold it out of the key when no transformer is set — avoids a spurious
+    # miss + full reload when the flag toggles with no transformer.
+    vft = bool(vae_from_transformer and transformer_abs)
+    return (model_abs, transformer_abs, vft, lora_key)
+
+
+def _get_or_load_cached_pipeline(
+    model_abs: str,
+    transformer_abs: str,
+    vae_from_transformer: bool,
+    loras_resolved: list,
+) -> dict:
+    """Return the cached pipeline dict for this config, loading on a miss.
+
+    On a miss the prior pipeline is evicted (freeing its VRAM) before the new
+    one loads, then LoRAs are applied (the MCP path previously skipped LoRA
+    application entirely). Returns the shared _PIPELINE_CACHE dict, which has
+    the {pipeline, model_family, guidance_embeds} keys generate() consumes.
+    """
+    from comfyless.generate import _load_pipeline, _apply_loras, _log
+    key = _pipeline_cache_key(model_abs, transformer_abs, vae_from_transformer, loras_resolved)
+    if _PIPELINE_CACHE.get("pipeline") is not None and _PIPELINE_CACHE.get("key") == key:
+        _log("[comfyless-mcp] Reusing cached pipeline (config unchanged)")
+        return _PIPELINE_CACHE
+    _evict_pipeline_cache()
+    pipe, model_family, guidance_embeds = _load_pipeline(
+        model_abs,
+        precision="bf16",
+        device="cuda",
+        offload_vae=False,
+        transformer_path=transformer_abs,
+        vae_path="",
+        text_encoder_path="",
+        text_encoder_2_path="",
+        vae_from_transformer=vae_from_transformer,
+        attention_slicing=False,
+        sequential_offload=False,
+        allow_hf_download=False,
+    )
+    lora_warnings = _apply_loras(pipe, loras_resolved)
+    _PIPELINE_CACHE.update({
+        "key": key,
+        "pipeline": pipe,
+        "model_family": model_family,
+        "guidance_embeds": guidance_embeds,
+        "lora_warnings": lora_warnings,
+    })
+    return _PIPELINE_CACHE
+
+
 async def _handle_generate(
     cfg: _StartupConfig,
     arguments: dict,
@@ -1242,26 +1355,17 @@ async def _handle_generate(
     # Component overrides vae/text_encoder are removed from the MCP surface
     # (OQ-A) -> always "" here. Operator-tuning knobs (precision/offload/...)
     # are spawn-time concerns, not agent-facing — hard-coded defaults.
-    from comfyless.generate import _load_pipeline, generate
-    pipe, model_family, guidance_embeds = _load_pipeline(
+    from comfyless.generate import generate
+    cached = _get_or_load_cached_pipeline(
         model_abs,
-        precision="bf16",
-        device="cuda",
-        offload_vae=False,
-        transformer_path=transformer_abs,
-        vae_path="",
-        text_encoder_path="",
-        text_encoder_2_path="",
-        vae_from_transformer=bool(payload.get("vae_from_transformer")),
-        attention_slicing=False,
-        sequential_offload=False,
-        allow_hf_download=False,
+        transformer_abs,
+        bool(payload.get("vae_from_transformer")),
+        loras_resolved or [],
     )
-    cached = {
-        "pipeline": pipe,
-        "model_family": model_family,
-        "guidance_embeds": guidance_embeds,
-    }
+    # NOTE: cached["lora_warnings"] are logged operator-side by _apply_loras but
+    # are NOT surfaced in `notices` — they embed the absolute LoRA path, which
+    # must never cross the MCP boundary (ADR-015 no-abs-path contract). An
+    # agent-facing LoRA-failure signal would need name-based redaction (future).
     metadata = generate(
         model_path=model_abs,
         prompt=payload["prompt"],
@@ -1466,17 +1570,27 @@ async def _handle_generate_cascade(
         build_pipelines as _cascade_build_pipelines,
         run_one as _cascade_run_one,
         _save_with_metadata as _cascade_save_with_metadata,
+        dispose_pipelines as _cascade_dispose_pipelines,
     )
+    # Free any resident non-cascade pipeline first so cascade's two pipelines
+    # don't share VRAM with a cached model from a prior generate call.
+    _evict_pipeline_cache()
     prior_pipe, decoder_pipe = _cascade_build_pipelines(
         resolved_cc, device="cuda", allow_hf_download=False,
     )
-    pil, runtime = _cascade_run_one(
-        prior_pipe, decoder_pipe, resolved_cc,
-        prompt=payload["prompt"],
-        negative_prompt=payload.get("negative_prompt", ""),
-        seed=int(payload.get("seed") or 0),
-        device="cuda",
-    )
+    try:
+        pil, runtime = _cascade_run_one(
+            prior_pipe, decoder_pipe, resolved_cc,
+            prompt=payload["prompt"],
+            negative_prompt=payload.get("negative_prompt", ""),
+            seed=int(payload.get("seed") or 0),
+            device="cuda",
+        )
+    finally:
+        # Cascade does not cache (two large pipelines); dispose both every call
+        # so the server doesn't leak VRAM across cascade generations. `pil` is a
+        # CPU image already materialized by run_one, so it survives disposal.
+        _cascade_dispose_pipelines(prior_pipe, decoder_pipe)
 
     # 7 — Build metadata and save PNG (with MCP redaction map applied).
     import datetime as _dt

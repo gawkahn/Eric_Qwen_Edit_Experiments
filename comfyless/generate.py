@@ -799,6 +799,40 @@ def _load_pipeline(
     return pipe, model_family, guidance_embeds
 
 
+def _apply_loras(pipe, loras: Optional[List[Dict[str, Any]]]) -> List[str]:
+    """Apply LoRA specs ({path, weight}) onto an already-loaded pipeline.
+
+    Returns human-readable warnings for skipped/failed LoRAs. Shared by
+    generate()'s one-shot path and the MCP server's cached-pipeline loader so
+    both apply LoRAs identically — the MCP path previously passed a pre-loaded
+    pipeline to generate(), which skips LoRA loading, so LoRAs were silently
+    never applied over MCP.
+    """
+    warnings: List[str] = []
+    loras = loras or []
+    for i, lora_spec in enumerate(loras):
+        lora_path = lora_spec["path"]
+        lora_weight = float(lora_spec.get("weight", 1.0))
+        adapter_name = Path(lora_path).stem.replace(" ", "_").replace(".", "_")
+        _log(f"[comfyless] LoRA {i+1}/{len(loras)}: "
+             f"{Path(lora_path).name} (weight={lora_weight})")
+        try:
+            success = load_lora_with_key_fix(
+                pipe, lora_path, adapter_name,
+                log_prefix="[comfyless-LoRA]",
+                weight=lora_weight,
+            )
+            if not success:
+                msg = f"LoRA skipped (0 modules applied): {lora_path}"
+                _log(f"[comfyless] WARNING: {msg}")
+                warnings.append(msg)
+        except Exception as e:
+            msg = f"LoRA load failed: {lora_path}: {e}"
+            _log(f"[comfyless] WARNING: {msg}")
+            warnings.append(msg)
+    return warnings
+
+
 # ════════════════════════════════════════════════════════════════════════
 #  Core generate function
 # ════════════════════════════════════════════════════════════════════════
@@ -884,29 +918,11 @@ def generate(
     # ── Load LoRAs ────────────────────────────────────────────────────
     lora_warnings: List[str] = []
     loras = loras or []
-    # When a cached pipeline is provided the server has already managed LoRAs;
-    # skip loading but keep the list so it appears correctly in metadata.
+    # When a cached pipeline is provided the caller has already applied LoRAs
+    # via _apply_loras (the MCP cached loader does this); skip re-applying but
+    # keep the list so it appears correctly in metadata.
     if _cached_pipeline is None:
-        for i, lora_spec in enumerate(loras):
-            lora_path = lora_spec["path"]
-            lora_weight = float(lora_spec.get("weight", 1.0))
-            adapter_name = Path(lora_path).stem.replace(" ", "_").replace(".", "_")
-            _log(f"[comfyless] LoRA {i+1}/{len(loras)}: "
-                 f"{Path(lora_path).name} (weight={lora_weight})")
-            try:
-                success = load_lora_with_key_fix(
-                    pipe, lora_path, adapter_name,
-                    log_prefix="[comfyless-LoRA]",
-                    weight=lora_weight,
-                )
-                if not success:
-                    msg = f"LoRA skipped (0 modules applied): {lora_path}"
-                    _log(f"[comfyless] WARNING: {msg}")
-                    lora_warnings.append(msg)
-            except Exception as e:
-                msg = f"LoRA load failed: {lora_path}: {e}"
-                _log(f"[comfyless] WARNING: {msg}")
-                lora_warnings.append(msg)
+        lora_warnings = _apply_loras(pipe, loras)
 
     # ── Build generator ───────────────────────────────────────────────
     exec_device = getattr(pipe, "_execution_device", None) or device
