@@ -1,7 +1,7 @@
 """
 title: Comfyless Image Generation
 author: Grant Kahn
-version: 0.2.1
+version: 0.2.2
 required_open_webui_version: 0.5.0
 requirements: aiohttp
 license: MIT
@@ -166,16 +166,25 @@ class Tools:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=payload, headers=headers) as resp:
                     status = resp.status
-                    # Bound the read BEFORE materializing: read one byte past the
-                    # ceiling; a full buffer means the body is oversized.
-                    raw = await resp.content.read(_RESPONSE_BODY_CEILING + 1)
+                    # Read the FULL body in bounded chunks. resp.content.read(n)
+                    # does NOT guarantee n bytes — it returns whatever is buffered,
+                    # so a single read(ceiling) TRUNCATES a multi-chunk body (e.g.
+                    # the ~1 MiB generate frame). Iterate to EOF, capping the
+                    # running total to stay bounded against an oversized upstream.
+                    body = bytearray()
+                    oversized = False
+                    async for chunk in resp.content.iter_chunked(65536):
+                        body.extend(chunk)
+                        if len(body) > _RESPONSE_BODY_CEILING:
+                            oversized = True
+                            break
         except Exception as exc:  # noqa: BLE001
             log.warning("mcpo POST to %s failed: %s", url, exc)
             return None, "could not reach the image backend"
-        if len(raw) > _RESPONSE_BODY_CEILING:
+        if oversized:
             log.warning("mcpo %s response exceeded %d bytes; rejecting", path, _RESPONSE_BODY_CEILING)
             return None, "image backend returned an oversized response"
-        body_text = raw.decode("utf-8", errors="replace")
+        body_text = bytes(body).decode("utf-8", errors="replace")
         if status != 200:
             log.warning("mcpo %s returned HTTP %s: %.1000s", path, status, body_text)
             return None, f"image backend returned HTTP {status}"
