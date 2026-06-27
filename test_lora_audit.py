@@ -144,6 +144,25 @@ def _base_arg() -> str:
     return f"klein={_BASE}"
 
 
+@contextlib.contextmanager
+def _temp_lora_tree():
+    """A fresh, isolated copy of the standard fixture tree in a tempdir.
+
+    Destructive --delete tests MUST use this, never the shared `_TREE`: an
+    actual unlink against `_TREE` would wipe fixture files mid-suite and
+    corrupt every test scheduled after it. Tree contents (same as
+    `_build_lora_tree`): deletable = {zero, truncated, garbage.pt};
+    non-deletable = {usable, sub/unconvertable}.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="lora_audit_del_"))
+    try:
+        tree = tmp / "tree"
+        _build_lora_tree(tree)
+        yield tree
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ── Tests ──────────────────────────────────────────────────────────────
 def test_no_real_folder_paths_import() -> None:
     print("\n[1] test_no_real_folder_paths_import (F-4)")
@@ -312,23 +331,27 @@ def test_machine_caller_non_interactive() -> None:
     print("\n[7] test_machine_caller_non_interactive (Vision #11, F-13)")
     import re as _re
     prefix_re = _re.compile(r"^\[(INFO|WARN|ERROR)\] ")
-    result = _run_subprocess([
-        "--audit-root", str(_TREE), "--no-config",
-        "--base", _base_arg(),
-        "--delete", "--yes",
-    ], stdin=subprocess.DEVNULL, timeout=15.0)
-    check("exit code is documented value (0/1/2)",
-          result.returncode in (0, 1, 2),
-          detail=f"got {result.returncode}")
-    check("--delete --yes rejects in S1 with exit 1",
-          result.returncode == 1)
-    bad_lines = [
-        line for line in result.stderr.splitlines()
-        if line and not prefix_re.match(line)
-    ]
-    check("every stderr line matches ^\\[(INFO|WARN|ERROR)\\] regex",
-          not bad_lines,
-          detail=f"bad lines: {bad_lines[:3]}")
+    # Destructive: --delete --yes deletes the 3 deletable files. Use an
+    # isolated temp tree so the shared _TREE survives for later tests.
+    with _temp_lora_tree() as tree:
+        result = _run_subprocess([
+            "--audit-root", str(tree), "--no-config",
+            "--base", _base_arg(),
+            "--delete", "--yes",
+        ], stdin=subprocess.DEVNULL, timeout=15.0)
+        check("--delete --yes completes non-interactively (no hang/EOFError)",
+              result.returncode in (0, 1, 2),
+              detail=f"got {result.returncode}; stderr: {result.stderr[:300]}")
+        check("--delete --yes exits 0 (run completed cleanly)",
+              result.returncode == 0,
+              detail=f"got {result.returncode}")
+        bad_lines = [
+            line for line in result.stderr.splitlines()
+            if line and not prefix_re.match(line)
+        ]
+        check("every stderr line matches ^\\[(INFO|WARN|ERROR)\\] regex",
+              not bad_lines,
+              detail=f"bad lines: {bad_lines[:3]}")
     result2 = _run_subprocess([
         "--audit-root", str(_TREE), "--no-config",
         "--base", _base_arg(),
@@ -1347,10 +1370,152 @@ def test_convert_stale_tmp_surfaced_not_deleted() -> None:
               detail=f"warnings: {manifest['warnings']}")
 
 
+# ── S4 delete tests (ADR §9) ───────────────────────────────────────────
+_DELETABLE = ("zero.safetensors", "truncated.safetensors", "garbage.pt")
+_NON_DELETABLE = ("usable.safetensors", "sub/unconvertable.safetensors")
+
+
+def test_delete_preview_no_io() -> None:
+    print("\n[29] test_delete_preview_no_io (Vision #5, gate 3 preview)")
+    with _temp_lora_tree() as tree:
+        result = _run_subprocess([
+            "--audit-root", str(tree), "--no-config", "--base", _base_arg(),
+            "--delete",  # NO --yes
+        ], stdin=subprocess.DEVNULL, timeout=15.0)
+        check("preview exits 0", result.returncode == 0,
+              detail=f"got {result.returncode}; stderr: {result.stderr[:300]}")
+        for name in _DELETABLE:
+            check(f"deletable file untouched in preview: {name}",
+                  (tree / name).exists())
+        check("preview prints 'would delete 3 files'",
+              "would delete 3 files" in result.stderr,
+              detail=result.stderr[:300])
+        wd = [ln for ln in result.stderr.splitlines() if "would_delete:" in ln]
+        check("preview lists each deletable path", len(wd) == 3,
+              detail=f"{len(wd)} would_delete lines")
+
+
+def test_delete_executes_with_yes() -> None:
+    print("\n[30] test_delete_executes_with_yes (gate 3 execute)")
+    with _temp_lora_tree() as tree:
+        result = _run_subprocess([
+            "--audit-root", str(tree), "--no-config", "--base", _base_arg(),
+            "--delete", "--yes", "--print-manifest",
+        ], stdin=subprocess.DEVNULL, timeout=15.0)
+        check("execute exits 0", result.returncode == 0,
+              detail=f"got {result.returncode}; stderr: {result.stderr[:300]}")
+        for name in _DELETABLE:
+            check(f"deletable file removed: {name}",
+                  not (tree / name).exists())
+        manifest = json.loads(result.stdout)
+        by_path = {f["relative_path"]: f for f in manifest["files"]}
+        for name in _DELETABLE:
+            entry = by_path.get(name, {})
+            check(f"manifest records deleted:true for {name}",
+                  entry.get("deleted") is True and entry.get("delete_reason") is None,
+                  detail=str(entry))
+
+
+def test_delete_no_promotion() -> None:
+    print("\n[31] test_delete_no_promotion (Vision #4, gate 1)")
+    with _temp_lora_tree() as tree:
+        result = _run_subprocess([
+            "--audit-root", str(tree), "--no-config", "--base", _base_arg(),
+            "--delete", "--yes", "--print-manifest",
+        ], stdin=subprocess.DEVNULL, timeout=15.0)
+        check("execute exits 0", result.returncode == 0,
+              detail=f"got {result.returncode}; stderr: {result.stderr[:300]}")
+        for name in _NON_DELETABLE:
+            check(f"non-deletable file NOT removed even with --yes: {name}",
+                  (tree / name).exists())
+        manifest = json.loads(result.stdout)
+        by_path = {f["relative_path"]: f for f in manifest["files"]}
+        for name in _NON_DELETABLE:
+            entry = by_path.get(name, {})
+            check(f"manifest deleted:false for non-deletable {name}",
+                  entry.get("deleted") is False, detail=str(entry))
+
+
+def test_delete_reclassify_skip() -> None:
+    print("\n[32] test_delete_reclassify_skip (ADR §9 F-5)")
+    mod = _import_script()
+    with _temp_lora_tree() as tree:
+        # `usable.safetensors` is a valid LoRA — NOT deletable. Forge a
+        # FileEntry that lies and claims it is deletable (simulating a
+        # scan-time classification the file no longer matches at unlink time).
+        target = tree / "usable.safetensors"
+        entry = mod.FileEntry(
+            relative_path="usable.safetensors",
+            classification=mod.CLASS_DELETABLE,
+            reason=mod.R_ZERO_BYTE,
+        )
+        warnings: list = []
+        mod._run_delete(tree, [entry], warnings, confirmed=True)
+        check("F-5: file with changed classification NOT deleted",
+              target.exists())
+        check("F-5: entry.deleted is False", entry.deleted is False)
+        check("F-5: delete_reason == classification_changed",
+              entry.delete_reason == mod.R_DELETE_CLASSIFICATION_CHANGED,
+              detail=str(entry.delete_reason))
+        check("F-5: emits delete_skipped_classification_changed warning",
+              any(w.code == mod.W_DELETE_SKIPPED_RECLASSIFY for w in warnings))
+
+
+def test_delete_containment_outside_root() -> None:
+    print("\n[33] test_delete_containment_outside_root (ADR §9 gate 2)")
+    mod = _import_script()
+    with _temp_lora_tree() as tree:
+        # A genuinely-deletable (zero-byte) file living OUTSIDE audit_root.
+        # _safe_unlink's parent-containment gate must refuse to unlink it.
+        outside = Path(tempfile.mkdtemp(prefix="lora_audit_outside_"))
+        try:
+            victim = outside / "zero.safetensors"
+            victim.write_bytes(b"")
+            check("precondition: outside file is deletable-signed",
+                  mod._classify_deletable(victim, 0) == mod.R_ZERO_BYTE)
+            warnings: list = []
+            ok, reason = mod._safe_unlink(victim, tree, warnings)
+            check("gate 2: unlink refused for parent outside audit_root",
+                  ok is False)
+            check("gate 2: reason == containment_failed",
+                  reason == mod.R_DELETE_CONTAINMENT_FAILED,
+                  detail=str(reason))
+            check("gate 2: file outside root still exists", victim.exists())
+        finally:
+            shutil.rmtree(outside, ignore_errors=True)
+
+
+def test_delete_per_file_fault_isolation() -> None:
+    print("\n[34] test_delete_per_file_fault_isolation (Vision #9)")
+    mod = _import_script()
+    with _temp_lora_tree() as tree:
+        # Two deletable entries; the first points at a now-missing path
+        # (unlink will fail), the second is a real zero-byte file. The loop
+        # must isolate the first failure and still delete the second.
+        missing = mod.FileEntry(
+            relative_path="gone.safetensors",
+            classification=mod.CLASS_DELETABLE, reason=mod.R_ZERO_BYTE,
+        )
+        real = mod.FileEntry(
+            relative_path="zero.safetensors",
+            classification=mod.CLASS_DELETABLE, reason=mod.R_ZERO_BYTE,
+        )
+        warnings: list = []
+        mod._run_delete(tree, [missing, real], warnings, confirmed=True)
+        check("missing-path entry skipped, not deleted", missing.deleted is False)
+        check("missing-path entry records delete_reason == unlink_failed",
+              missing.delete_reason == mod.R_DELETE_UNLINK_FAILED,
+              detail=str(missing.delete_reason))
+        check("missing-path failure surfaces as a delete_failed manifest warning",
+              any(w.code == mod.W_DELETE_FAILED for w in warnings))
+        check("missing-path entry did not abort the loop; real file deleted",
+              real.deleted is True and not (tree / "zero.safetensors").exists())
+
+
 # ── Driver ─────────────────────────────────────────────────────────────
 def main() -> int:
     print("=" * 70)
-    print(f"  test_lora_audit.py — S1+S2+S3 of ADR-014")
+    print(f"  test_lora_audit.py — S1+S2+S3+S4 of ADR-014")
     print(f"  script: {_SCRIPT_PATH}")
     print(f"  fixtures: {_FIX_ROOT}")
     print("=" * 70)
@@ -1384,6 +1549,12 @@ def main() -> int:
         test_convert_print_manifest_stdout_clean()
         test_convert_output_dir_traversal_rejected()
         test_convert_stale_tmp_surfaced_not_deleted()
+        test_delete_preview_no_io()
+        test_delete_executes_with_yes()
+        test_delete_no_promotion()
+        test_delete_reclassify_skip()
+        test_delete_containment_outside_root()
+        test_delete_per_file_fault_isolation()
     finally:
         teardown_fixtures()
     print("\n" + "─" * 70)

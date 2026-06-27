@@ -168,6 +168,25 @@ Trigger: any CI being wired for this repo, OR any sibling test gaining the
 same gating pattern. Fix is a 2-line change in `test_dry_load_integration.py`
 plus a CI runner update.
 
+**LoRA audit: `_passes_scan_containment` embeds absolute escape-target paths in manifest warnings** *(2026-06-27)*
+`scripts/lora_audit.py:_passes_scan_containment` (S1) records the absolute
+realpath of a symlink that escapes `audit_root` into the
+`excluded_symlink_escape` warning's `detail` field (`f"realpath {real} not
+under audit_root"`). When the escape target is outside `audit_root` (e.g. a
+swapped-symlink target like `/home/gawkahn/.ssh`), that absolute path ships in
+the manifest `warnings[]` — the same F-8 incremental-disclosure leak class the
+project closed for argv. Bounded by the single-user same-uid threat model (SA
+S4 review LOW: "no action required" under that model). S4's new `_safe_unlink`
+already sanitizes its equivalent `/proc/self/fd` escape-rejection detail to a
+fixed token; this entry tracks the **S1 carry-over** so the two paths can be
+unified rather than left asymmetric. Trigger to revisit: the F-10 risk-trigger
+(LLM-agent / remote caller supplies `--audit-root`, re-classifying to Red Zone
+and making manifest-sharing real), OR any decision to share manifests off the
+single-user host. Fix shape: replace `real`/`real_parent` in the detail string
+with a fixed `"escaped audit_root"` token (the `file` field already identifies
+the entry). Surfaced by security-auditor S4 review LOW
+(`docs/security/review-lora-audit-s4-2026-06-27.md`).
+
 **LoRA audit: convert write-path lacks O_NOFOLLOW/dir-fd intermediate-symlink narrowing** *(2026-06-02)*
 `scripts/lora_audit.py:_convert_one` (S3 `--convert`) writes the converted
 sibling via `target_path.parent.mkdir(parents=True, exist_ok=True)` +

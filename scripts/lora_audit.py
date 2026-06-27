@@ -131,6 +131,13 @@ R_BASE_UNAVAILABLE = "base_unavailable"
 R_CONVERT_COLLISION = "collision"
 R_CONVERT_FAILED = "convert_failed"
 
+# Delete-path outcome reasons (ADR §9; recorded in FileEntry.delete_reason).
+# delete_reason is None on a performed deletion (entry.deleted == True) and on
+# files the delete path never touched (non-deletable / preview mode).
+R_DELETE_CLASSIFICATION_CHANGED = "classification_changed"  # F-5 reclassify skip
+R_DELETE_CONTAINMENT_FAILED = "containment_failed"          # gate 2 fail
+R_DELETE_UNLINK_FAILED = "unlink_failed"                    # stat/unlink OSError
+
 # Warning codes
 W_EXCLUDED_SYMLINK_ESCAPE = "excluded_symlink_escape"
 W_DANGLING_SYMLINK = "dangling_symlink"
@@ -139,6 +146,9 @@ W_STALE_TMP_FILE = "stale_tmp_file"  # ADR §10 F-2 Option A
 W_DRY_LOAD_BASE_FAILED = "dry_load_base_failed"  # ADR §7
 W_DRY_LOAD_VRAM_CASCADE = "dry_load_vram_cascade_possible"  # ADR §7 F-3
 W_DRY_LOAD_UNLOAD_FAILED = "dry_load_unload_failed"  # ADR §7
+W_DELETE_SKIPPED_RECLASSIFY = "delete_skipped_classification_changed"  # ADR §9 F-5
+W_DELETE_CONTAINMENT_FAILED = "delete_skipped_containment_failed"  # ADR §9 gate 2
+W_DELETE_FAILED = "delete_failed"  # ADR §9 unlink/stat OSError
 
 _DEFAULT_CONFIG_PATH = Path.home() / ".config" / "lora_audit.toml"
 
@@ -183,6 +193,9 @@ class FileEntry:
     convert_plan: Optional[dict[str, Any]] = None
     convert_output: Optional[str] = None
     convert_reason: Optional[str] = None  # S3: "collision" | "convert_failed" | None
+    deleted: bool = False  # S4: True iff this file was unlinked this run
+    delete_reason: Optional[str] = None  # S4: None | classification_changed |
+    #                                      containment_failed | unlink_failed
     error: Optional[str] = None
 
     def to_json(self) -> dict[str, Any]:
@@ -191,6 +204,8 @@ class FileEntry:
             "convert_output": self.convert_output,
             "convert_plan": self.convert_plan,
             "convert_reason": self.convert_reason,
+            "deleted": self.deleted,
+            "delete_reason": self.delete_reason,
             "error": self.error,
             "kind": self.kind,
             "reason": self.reason,
@@ -217,8 +232,8 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="lora_audit",
         description=(
             f"LoRA audit / classify / manifest tool (v{_TOOL_VERSION}). "
-            "S1+S2+S3 of ADR-014 — shape-match classification, optional "
-            "dry-load, and optional --convert; --delete rejects at runtime."
+            "ADR-014 — shape-match classification, optional dry-load, "
+            "optional --convert, and optional --delete (triple-gated)."
         ),
     )
     p.add_argument(
@@ -290,11 +305,19 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--delete", action="store_true",
-        help="(S4 of ADR-014; not implemented in S1.)",
+        help="Delete files classified 'deletable' (zero-byte / truncated / "
+             "unparseable header / unrecognized-garbage). Triple-gated: "
+             "deletable classification + audit-root containment + --yes. "
+             "Without --yes, prints a preview and exits 0 with NO I/O. "
+             "Re-checks the deletable signature at unlink time (ADR §9). "
+             "Default off.",
     )
     p.add_argument(
         "--yes", action="store_true",
-        help="(S4 of ADR-014; not implemented in S1.)",
+        help="Authorize destructive operations (--delete) non-interactively. "
+             "The ONLY confirmation signal; its absence is preview-mode, never "
+             "a prompt (machine-caller contract, Vision #13). No effect "
+             "without --delete.",
     )
     return p
 
@@ -1208,6 +1231,145 @@ def _run_convert(
     )
 
 
+# ── Delete path (ADR §9; Vision invariants 3/4/13) ─────────────────────
+def _safe_unlink(
+    path: Path, audit_root: Path, warnings: list[Warning_]
+) -> tuple[bool, Optional[str]]:
+    """Dir-fd-relative unlink with F-5 pre-unlink re-classification (ADR §9).
+
+    Returns `(deleted, skip_reason)`:
+      - `(True, None)`                        — file unlinked.
+      - `(False, R_DELETE_CLASSIFICATION_CHANGED)` — file no longer matches a
+        `deletable` signature at unlink time (F-5 narrowing); skipped.
+      - `(False, R_DELETE_CONTAINMENT_FAILED)` — gate 2: parent dir failed the
+        §6 realpath descendancy control, or the parent fd's /proc realpath is
+        not under `audit_root`, or O_NOFOLLOW rejected a parent symlink.
+      - `(False, R_DELETE_UNLINK_FAILED)`     — stat/unlink raised OSError.
+
+    The unlink targets `path.name` relative to a `parent_fd` opened
+    O_NOFOLLOW|O_DIRECTORY, so a terminal-component symlink swap between the
+    fd-check and the unlink syscall cannot redirect to a different inode, and
+    an intermediate-directory swap on the parent cannot redirect the open.
+    Residual reclassify→unlink content TOCTOU is named-and-accepted (ADR §9
+    Option B); an attacker with same-uid write under `audit_root` could already
+    unlink directly, so it grants no new capability.
+    """
+    parent = path.parent
+    # Gate 2 (authoritative): §6 realpath containment control on the parent.
+    if not _passes_scan_containment(parent, audit_root, warnings):
+        warnings.append(Warning_(_rel(path, audit_root),
+                                 W_DELETE_CONTAINMENT_FAILED,
+                                 "parent failed scan containment"))
+        return False, R_DELETE_CONTAINMENT_FAILED
+    try:
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_NOFOLLOW
+                            | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError as e:
+        warnings.append(Warning_(_rel(path, audit_root),
+                                 W_DELETE_CONTAINMENT_FAILED, str(e)))
+        return False, R_DELETE_CONTAINMENT_FAILED
+    try:
+        if sys.platform == "linux":
+            real_parent = Path(os.path.realpath(f"/proc/self/fd/{parent_fd}"))
+            try:
+                real_parent.relative_to(audit_root)
+            except ValueError:
+                # F-8 leak class: real_parent here is an absolute path OUTSIDE
+                # audit_root (e.g. a swapped-symlink target). Do NOT embed it in
+                # the manifest detail — the `file` field (via _rel) already
+                # identifies the entry; a fixed token avoids disclosing the
+                # escape target if the manifest is shared for diagnostics.
+                warnings.append(Warning_(
+                    _rel(path, audit_root), W_DELETE_CONTAINMENT_FAILED,
+                    "parent fd realpath escaped audit_root"))
+                return False, R_DELETE_CONTAINMENT_FAILED
+        # Gate 1 re-check (F-5): re-run the cheap deletable signature on the
+        # file as it exists right now. The manifest classification was computed
+        # at scan time; the file may have been content-swapped since.
+        try:
+            cur_size = path.stat().st_size
+        except OSError as e:
+            warnings.append(Warning_(_rel(path, audit_root),
+                                     W_DELETE_FAILED, str(e)))
+            return False, R_DELETE_UNLINK_FAILED
+        if _classify_deletable(path, cur_size) is None:
+            warnings.append(Warning_(_rel(path, audit_root),
+                                     W_DELETE_SKIPPED_RECLASSIFY, ""))
+            return False, R_DELETE_CLASSIFICATION_CHANGED
+        try:
+            os.unlink(path.name, dir_fd=parent_fd)
+        except OSError as e:
+            warnings.append(Warning_(_rel(path, audit_root),
+                                     W_DELETE_FAILED, str(e)))
+            return False, R_DELETE_UNLINK_FAILED
+        return True, None
+    finally:
+        os.close(parent_fd)
+
+
+def _run_delete(
+    audit_root: Path,
+    files: list[FileEntry],
+    warnings: list[Warning_],
+    confirmed: bool,
+) -> None:
+    """Preview (no `--yes`) or execute (`--yes`) deletion of `deletable` files.
+
+    Triple-gate (ADR §9), enforced in code order:
+      1. classification == 'deletable'  — the loop filter; the flag NEVER
+         promotes a non-deletable file (Vision invariant 3, no-promotion).
+      2. fd-based realpath descendancy of audit_root — inside `_safe_unlink`.
+      3. confirmed (`--yes`)            — the preview-vs-execute branch below;
+         absence is preview-mode, never an interactive prompt (Vision #13).
+
+    Per-file fault isolation (Vision invariant 9): a single unlink failure must
+    not abort the loop. `_safe_unlink` catches its own OSErrors; this loop adds
+    a backstop `except` so any unforeseen error still maps to a skip reason and
+    the run continues.
+    """
+    deletable = [e for e in files if e.classification == CLASS_DELETABLE]
+    by_reason: dict[str, int] = {}
+    for e in deletable:
+        by_reason[e.reason] = by_reason.get(e.reason, 0) + 1
+    summary = ", ".join(f"{k}: {v}" for k, v in sorted(by_reason.items()))
+
+    if not confirmed:
+        # Preview mode: zero I/O (Vision invariant 4). No FileEntry mutation.
+        _emit_info(f"would delete {len(deletable)} files ({summary})")
+        for e in deletable:
+            _emit_info(f"would_delete: {e.relative_path}")
+        return
+
+    n_deleted = n_skipped = n_failed = 0
+    for e in deletable:
+        path = audit_root / e.relative_path
+        try:
+            ok, skip_reason = _safe_unlink(path, audit_root, warnings)
+        except Exception as ex:  # noqa: BLE001 — backstop fault isolation
+            ok, skip_reason = False, R_DELETE_UNLINK_FAILED
+            # Mirror _safe_unlink's own OSError paths: a backstop-caught fault
+            # must also surface in the manifest warnings[], not stderr alone,
+            # so the catalog sees a consistent record for every failure mode.
+            warnings.append(Warning_(_rel(path, audit_root), W_DELETE_FAILED,
+                                     f"{type(ex).__name__}: {str(ex)[:200]}"))
+            _emit_warn(
+                f"delete_failed: {e.relative_path}: "
+                f"{type(ex).__name__}: {str(ex)[:200]}"
+            )
+        e.deleted = ok
+        e.delete_reason = skip_reason
+        if ok:
+            n_deleted += 1
+        elif skip_reason == R_DELETE_CLASSIFICATION_CHANGED:
+            n_skipped += 1
+        else:
+            n_failed += 1
+    _emit_info(
+        f"delete: {n_deleted} removed, {n_skipped} skipped "
+        f"(classification changed), {n_failed} failed"
+    )
+
+
 # ── Scan loop (Vision invariant 9: per-file fault isolation) ───────────
 def _scan(
     audit_root: Path, bases: list[BaseSpec], warnings: list[Warning_]
@@ -1309,10 +1471,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             raise
         return EXIT_STARTUP_FAIL
 
-    if args.delete or args.yes:
-        _emit_error("--delete / --yes not implemented in S3 — see ADR-014 §15")
-        return EXIT_STARTUP_FAIL
-
     try:
         audit_root = args.audit_root.resolve(strict=True)
     except (FileNotFoundError, OSError) as e:
@@ -1392,6 +1550,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         # §13 — empty unless --print-manifest, JSON-only otherwise).
         with contextlib.redirect_stdout(io.StringIO()):
             _run_convert(audit_root, output_dir, bases, files, warnings)
+
+    if args.delete:
+        # Mutates the filesystem under audit_root (or previews under it).
+        # Classification already ran in _scan; _run_delete re-checks the
+        # deletable signature per-file at unlink time (ADR §9 F-5) and
+        # enforces fd-based audit_root containment. Emits only [INFO]/[WARN]
+        # to stderr — no stdout — so no redirect is needed here.
+        _run_delete(audit_root, files, warnings, confirmed=args.yes)
 
     manifest = _build_manifest(
         audit_root=audit_root,
