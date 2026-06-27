@@ -108,7 +108,10 @@ from comfyless.params_schema import COMFYLESS_SCHEMA, _CLI_TO_CANONICAL  # noqa:
 # metrics don't leak into the next run.  Strictly narrower than the schema
 # filter — these are known-and-intentional non-params, not "unknown to us".
 _SKIP_SIDECAR_KEYS = {"timestamp", "elapsed_seconds", "contract_version",
-                      "lora_warnings", "model_family"}
+                      "lora_warnings", "model_family",
+                      # rebalance is a runtime CLI flag, not a schema param;
+                      # recorded for provenance but re-pass --rebalance to replay.
+                      "rebalance"}
 
 
 def _type_name(t) -> str:
@@ -652,6 +655,83 @@ def _build_call_kwargs(
 
 
 # ════════════════════════════════════════════════════════════════════════
+#  Krea conditioning rebalance (ports nova452/ComfyUI-Conditioning-Rebalance)
+# ════════════════════════════════════════════════════════════════════════
+
+# Krea-2's text encoder emits a stack of Qwen3-VL layer-taps; the pipeline
+# exposes them as prompt_embeds of shape (batch, seq, n_layers, dim). The
+# rebalance scales each tap by a per-layer gain, then the whole tensor by a
+# global multiplier — boosting detail and (per the source node) bypassing the
+# safety filter's quality dilution. The preset below is the node's default,
+# which boosts taps 8/9/11 (0-based 7/8/10).
+KREA_REBALANCE_DEFAULT_MULT = 4.0
+KREA_REBALANCE_DEFAULT_WEIGHTS = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+                                  2.5, 5.0, 1.1, 4.0, 1.0]
+
+
+def _parse_rebalance_weights(s: Optional[str]) -> Optional[List[float]]:
+    """Parse comma/semicolon-separated per-layer gains. None if empty.
+
+    Raises ValueError on non-numeric input so the CLI fails loud rather than
+    silently dropping a malformed preset (matches warn-don't-block: this is a
+    typo in the user's own argument, not a recoverable runtime condition).
+    """
+    if not s or not s.strip():
+        return None
+    vals = [x for x in s.replace(";", ",").split(",") if x.strip() != ""]
+    try:
+        return [float(x) for x in vals]
+    except ValueError as e:
+        raise ValueError(f"--rebalance-weights must be comma-separated floats: {e}")
+
+
+def _apply_krea_rebalance(
+    pipe,
+    call_kwargs: dict,
+    multiplier: float,
+    per_layer_weights: Optional[List[float]],
+    max_sequence_length: int,
+    exec_device,
+) -> dict:
+    """Replace the positive `prompt` in call_kwargs with rebalanced embeds.
+
+    Pre-encodes the prompt to (batch, seq, n_layers, dim), scales each layer-tap
+    by its gain and the whole tensor by `multiplier`, then swaps `prompt` for
+    `prompt_embeds`/`prompt_embeds_mask`. A negative_prompt (Raw with CFG) is
+    left as a string for the pipeline to encode normally — only the positive
+    conditioning is rebalanced, matching the source node.
+    """
+    prompt = call_kwargs.pop("prompt")
+    prompt_embeds, prompt_embeds_mask = pipe.encode_prompt(
+        prompt, device=exec_device, max_sequence_length=max_sequence_length,
+    )
+    # Krea2 stacks the layer-taps as a 4-D (batch, seq, n_layers, dim) tensor.
+    # Guard so a variant returning 3-D embeds fails loud rather than silently
+    # scaling the sequence axis.
+    if prompt_embeds.ndim != 4:
+        raise ValueError(
+            f"--rebalance expects layer-tap-stacked prompt_embeds "
+            f"(batch, seq, n_layers, dim); got {prompt_embeds.ndim}-D "
+            f"shape {tuple(prompt_embeds.shape)}"
+        )
+    n_layers = prompt_embeds.shape[-2]
+    if per_layer_weights is not None and len(per_layer_weights) != n_layers:
+        raise ValueError(
+            f"--rebalance-weights expects {n_layers} values (one per "
+            f"text-encoder layer-tap for this model), got {len(per_layer_weights)}"
+        )
+    orig_dtype = prompt_embeds.dtype
+    t = prompt_embeds.float()
+    if per_layer_weights is not None:
+        gains = torch.tensor(per_layer_weights, dtype=t.dtype, device=t.device)
+        t = t * gains.view(1, 1, n_layers, 1)
+    t = t.to(orig_dtype) * multiplier
+    call_kwargs["prompt_embeds"] = t
+    call_kwargs["prompt_embeds_mask"] = prompt_embeds_mask
+    return call_kwargs
+
+
+# ════════════════════════════════════════════════════════════════════════
 #  Pipeline loader (extracted so the server can cache the result)
 # ════════════════════════════════════════════════════════════════════════
 
@@ -864,6 +944,9 @@ def generate(
     attention_slicing: bool = False,
     sequential_offload: bool = False,
     allow_hf_download: bool = False,
+    rebalance: bool = False,
+    rebalance_mult: float = KREA_REBALANCE_DEFAULT_MULT,
+    rebalance_weights: Optional[List[float]] = None,
     _cached_pipeline: Optional[Dict[str, Any]] = None,
     mcp_caller: bool = False,
 ) -> Dict[str, Any]:
@@ -936,6 +1019,19 @@ def generate(
         true_cfg_scale, max_sequence_length, generator,
     )
 
+    # ── Krea conditioning rebalance (optional) ────────────────────────
+    if rebalance and model_family in ("krea", "krea-turbo"):
+        weights = rebalance_weights if rebalance_weights is not None \
+            else KREA_REBALANCE_DEFAULT_WEIGHTS
+        _log(f"[comfyless] Krea rebalance: mult={rebalance_mult}, weights={weights}")
+        call_kwargs = _apply_krea_rebalance(
+            pipe, call_kwargs, rebalance_mult, weights,
+            max_sequence_length, exec_device,
+        )
+    elif rebalance:
+        print(f"[comfyless] WARNING: --rebalance ignored — only applies to "
+              f"krea/krea-turbo (model_family={model_family!r})", file=sys.stderr)
+
     _log(f"[comfyless] Generating: {width}x{height}, "
          f"steps={steps}, cfg={cfg_scale}, seed={seed}, sampler={sampler}")
 
@@ -993,6 +1089,12 @@ def generate(
     }
     if lora_warnings:
         metadata["lora_warnings"] = lora_warnings
+    if rebalance and model_family in ("krea", "krea-turbo"):
+        metadata["rebalance"] = {
+            "mult": rebalance_mult,
+            "weights": rebalance_weights if rebalance_weights is not None
+                       else KREA_REBALANCE_DEFAULT_WEIGHTS,
+        }
 
     # ── Save PNG with embedded metadata ──────────────────────────────
     pil_image = result.images[0]
@@ -1069,6 +1171,16 @@ def _parse_args() -> argparse.Namespace:
                    help="Trade speed for lower peak VRAM")
     p.add_argument("--sequential-offload", action="store_true",
                    help="Extreme VRAM savings via sequential CPU offload — very slow")
+    # ── Krea conditioning rebalance (ports ComfyUI-Conditioning-Rebalance) ──
+    p.add_argument("--rebalance", action="store_true",
+                   help="Krea only: rebalance Qwen3-VL conditioning layer-taps to "
+                        "boost detail / bypass the safety filter's quality dilution. "
+                        "Requires the in-process path (use --output, not --savepath).")
+    p.add_argument("--rebalance-mult", type=float, default=KREA_REBALANCE_DEFAULT_MULT,
+                   help="[--rebalance] Global conditioning multiplier (default 4.0).")
+    p.add_argument("--rebalance-weights", type=str, default=None, metavar="W1,...",
+                   help="[--rebalance] Comma-separated per-layer-tap gains (12 for "
+                        "Krea). Default preset: 1,1,1,1,1,1,1,2.5,5,1.1,4,1.")
     p.add_argument("--allow-hf-download", action="store_true", default=False,
                    help="Allow downloading models from HuggingFace if not in local cache. "
                         "By default only the local cache is used (no network access)")
@@ -1786,6 +1898,11 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                 savepath_override=wire_savepath,
             )
             if delegate_rc is not None:
+                if args.rebalance:
+                    print("[comfyless] WARNING: --rebalance was IGNORED — this "
+                          "request was handled by the running --serve daemon, "
+                          "which has no rebalance support. Pass an explicit "
+                          "--output to force the in-process path.", file=sys.stderr)
                 return delegate_rc
 
         # In-process path.
@@ -1831,6 +1948,9 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                 attention_slicing=args.attention_slicing,
                 sequential_offload=args.sequential_offload,
                 allow_hf_download=args.allow_hf_download,
+                rebalance=args.rebalance,
+                rebalance_mult=args.rebalance_mult,
+                rebalance_weights=_parse_rebalance_weights(args.rebalance_weights),
                 transformer_path=p_cur.get("transformer_path", ""),
                 vae_path=p_cur.get("vae_path", ""),
                 text_encoder_path=p_cur.get("text_encoder_path", ""),

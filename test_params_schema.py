@@ -117,6 +117,9 @@ _generate_canonical = {
         # Runtime-only params, not sidecar-shaped; documented in schema comment.
         "output_path", "precision", "device", "offload_vae",
         "attention_slicing", "sequential_offload", "allow_hf_download",
+        # Krea conditioning rebalance — runtime-only CLI flags (in-process
+        # path), recorded in metadata when active but not sidecar input params.
+        "rebalance", "rebalance_mult", "rebalance_weights",
         "_cached_pipeline",
         # MCP-internal call-shape flag; signals _save_with_metadata to apply
         # invariant-12 PNG redaction. Not user-facing; not a sidecar param.
@@ -684,6 +687,96 @@ check("krea routing: negative_prompt dropped when pipe doesn't accept it",
       "negative_prompt" not in _kw)
 check("krea routing: max_sequence_length dropped when pipe doesn't accept it",
       "max_sequence_length" not in _kw)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n── Krea rebalance: _parse_rebalance_weights ───────────────────")
+
+check("parse comma list", g._parse_rebalance_weights("1,2,3") == [1.0, 2.0, 3.0])
+check("parse semicolons normalized to commas",
+      g._parse_rebalance_weights("1;2;3") == [1.0, 2.0, 3.0])
+check("parse skips empty fields",
+      g._parse_rebalance_weights("1, ,2") == [1.0, 2.0])
+check("parse empty string → None", g._parse_rebalance_weights("") is None)
+check("parse whitespace-only → None", g._parse_rebalance_weights("   ") is None)
+check("parse None → None", g._parse_rebalance_weights(None) is None)
+check("parse the shipped default preset (12 values)",
+      g._parse_rebalance_weights("1,1,1,1,1,1,1,2.5,5,1.1,4,1")
+      == [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.5, 5.0, 1.1, 4.0, 1.0])
+
+# Negative case: malformed (non-numeric) input fails loud, not silent.
+_raised = False
+try:
+    g._parse_rebalance_weights("1,x,3")
+except ValueError:
+    _raised = True
+check("parse malformed → ValueError (fail loud)", _raised)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n── Krea rebalance: _apply_krea_rebalance gain math ────────────")
+
+import torch  # noqa: E402
+
+
+class _FakeEncodePipe:
+    """Minimal pipe exposing encode_prompt → (4-D embeds, mask)."""
+    def __init__(self, embeds, mask):
+        self._embeds, self._mask = embeds, mask
+        self.seen = {}
+
+    def encode_prompt(self, prompt, device=None, max_sequence_length=512):
+        self.seen = {"prompt": prompt, "device": device,
+                     "max_sequence_length": max_sequence_length}
+        return self._embeds, self._mask
+
+
+# (batch=1, seq=2, n_layers=3, dim=4) of ones → easy to verify per-layer gains.
+_embeds = torch.ones(1, 2, 3, 4)
+_mask = torch.ones(1, 2, dtype=torch.long)
+
+# Per-layer weights [1,2,3] × global mult 2.0 → layers scale to 2,4,6.
+_pipe = _FakeEncodePipe(_embeds, _mask)
+_ck = g._apply_krea_rebalance(_pipe, {"prompt": "x", "height": 1024},
+                              2.0, [1.0, 2.0, 3.0], 512, "cpu")
+_out = _ck["prompt_embeds"]
+check("rebalance: prompt popped from call_kwargs", "prompt" not in _ck)
+check("rebalance: prompt_embeds set", "prompt_embeds" in _ck)
+check("rebalance: mask passed through", _ck["prompt_embeds_mask"] is _mask)
+check("rebalance: prompt forwarded to encode_prompt", _pipe.seen["prompt"] == "x")
+check("rebalance: layer 0 gain 1×mult2 → 2", bool(torch.allclose(_out[:, :, 0, :], torch.full((1, 2, 4), 2.0))))
+check("rebalance: layer 1 gain 2×mult2 → 4", bool(torch.allclose(_out[:, :, 1, :], torch.full((1, 2, 4), 4.0))))
+check("rebalance: layer 2 gain 3×mult2 → 6", bool(torch.allclose(_out[:, :, 2, :], torch.full((1, 2, 4), 6.0))))
+
+# No per-layer weights → just the global multiplier, all layers equal.
+_pipe2 = _FakeEncodePipe(torch.ones(1, 2, 3, 4), _mask)
+_ck2 = g._apply_krea_rebalance(_pipe2, {"prompt": "y"}, 3.0, None, 512, "cpu")
+check("rebalance: multiplier-only scales uniformly by 3",
+      bool(torch.allclose(_ck2["prompt_embeds"], torch.full((1, 2, 3, 4), 3.0))))
+
+# dtype is preserved across the float() round-trip.
+_pipe3 = _FakeEncodePipe(torch.ones(1, 2, 3, 4, dtype=torch.bfloat16), _mask)
+_ck3 = g._apply_krea_rebalance(_pipe3, {"prompt": "z"}, 1.0, [1.0, 1.0, 1.0], 512, "cpu")
+check("rebalance: output dtype preserved (bfloat16)",
+      _ck3["prompt_embeds"].dtype == torch.bfloat16)
+
+# Negative case: wrong-length weights → ValueError.
+_raised = False
+try:
+    g._apply_krea_rebalance(_FakeEncodePipe(torch.ones(1, 2, 3, 4), _mask),
+                            {"prompt": "x"}, 1.0, [1.0, 2.0], 512, "cpu")
+except ValueError:
+    _raised = True
+check("rebalance: wrong-length weights → ValueError", _raised)
+
+# Negative case: 3-D embeds (no layer axis) → ValueError, not silent miss-scale.
+_raised = False
+try:
+    g._apply_krea_rebalance(_FakeEncodePipe(torch.ones(1, 2, 4), _mask),
+                            {"prompt": "x"}, 1.0, None, 512, "cpu")
+except ValueError:
+    _raised = True
+check("rebalance: 3-D embeds → ValueError (fail loud)", _raised)
 
 
 # ──────────────────────────────────────────────────────────────────────
