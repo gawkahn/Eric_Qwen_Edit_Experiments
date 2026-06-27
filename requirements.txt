@@ -17,11 +17,15 @@ torch==2.11.0
 # torchvision must match torch's minor (2.11 ↔ 0.26); required by the
 # diffusers SD image-transform path — basic SD generation errors without it.
 torchvision==0.26.0
-diffusers==0.37.1
+# diffusers: git-pinned to an unreleased commit on the krea-testing branch ONLY
+# (Krea2Pipeline is main-only; no PyPI release ships it). Exact pin = commit rev.
+# Do NOT merge this line to main — main stays on the last tagged release.
+diffusers @ git+https://github.com/huggingface/diffusers.git@29a59fd96063e302c9f016ae86f5da0d0212cf97
 transformers==5.5.3
 accelerate==1.13.0
 peft==0.18.1
-safetensors==0.7.0
+# safetensors bumped 0.7.0 → 0.8.0 (krea-testing): diffusers main needs >=0.8.0
+safetensors==0.8.0
 pillow==12.2.0
 numpy==2.4.4
 mcp==1.27.0

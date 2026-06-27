@@ -33,11 +33,19 @@ dependencies = [
     # path — basic SD generation errors without it. Bumping torchvision drags
     # torch with it, so pin both together.
     "torchvision==0.26.0",
-    "diffusers==0.37.1",
+    # diffusers: pinned to an unreleased git commit on THIS BRANCH ONLY
+    # (krea-testing). Krea2Pipeline / Krea2Transformer2DModel exist only on
+    # diffusers `main` — no PyPI release ships them (0.38.x verified without).
+    # §11 exact-pin is satisfied by the commit rev in [tool.uv.sources] below.
+    # Do NOT merge this git pin to main; main stays on the last tagged release.
+    # See docs/vision/slice-krea2-support.md and TECH_DEBT.md (Krea runtime).
+    "diffusers",
     "transformers==5.5.3",
     "accelerate==1.13.0",
     "peft==0.18.1",
-    "safetensors==0.7.0",
+    # safetensors bumped 0.7.0 → 0.8.0 on the krea-testing branch: diffusers
+    # `main` (Krea2) requires safetensors>=0.8.0. Revert with the diffusers pin.
+    "safetensors==0.8.0",
     "pillow==12.2.0",
     "numpy==2.4.4",
     "mcp==1.27.0",
@@ -63,6 +71,13 @@ dependencies = [
 [project.urls]
 Repository = "https://github.com/EricRollei/Eric_Qwen_Edit_Experiments"
 Issues = "https://github.com/EricRollei/Eric_Qwen_Edit_Experiments/issues"
+
+[tool.uv.sources]
+# Krea2Pipeline ships only on diffusers `main`. Pin to the exact tested commit
+# (0.39.0.dev0 @ 29a59fd) so `uv sync` is reproducible. krea-testing branch
+# ONLY — do not merge this source to main. Bump the rev deliberately, re-lock,
+# and re-smoke-test Krea Raw/Turbo when advancing it.
+diffusers = { git = "https://github.com/huggingface/diffusers.git", rev = "29a59fd96063e302c9f016ae86f5da0d0212cf97" }
 
 [tool.comfy]
 PublisherId = "ericrollei"

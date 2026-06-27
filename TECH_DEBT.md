@@ -175,6 +175,14 @@ Trigger: a tagged diffusers release exporting `Krea2Pipeline` (watch 0.39.0).
 When met: a separate slice pins the new diffusers (+ matching torchvision if
 needed), runs `uv lock`, updates `requirements.txt` + `pyproject.toml`
 together, and smoke-tests Raw/Turbo generation.
+Resolved: 2026-06-27 (krea-testing branch ONLY) — diffusers git-pinned to
+`main` @ 29a59fd (0.39.0.dev0) via `[tool.uv.sources]`; safetensors bumped
+0.7.0→0.8.0 (diffusers main requires >=0.8.0). §11 exact-pin satisfied by the
+commit rev. Krea-2-Turbo (8 steps) and Krea-2-Raw (CFG + negative prompt)
+both smoke-tested generating coherent images. This pin must NOT be merged to
+`main` — `main` stays on the last tagged release until a PyPI build exports
+`Krea2Pipeline` (still the trigger above for the real, mergeable bump). The
+branch exists precisely to test Krea without an unreleased pin reaching main.
 
 ---
 
