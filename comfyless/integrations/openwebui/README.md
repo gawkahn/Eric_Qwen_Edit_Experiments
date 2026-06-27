@@ -25,6 +25,14 @@ a Python plugin that runs *inside* OpenWebUI — which:
 
 The model never handles the image bytes. OpenWebUI's frontend renders the image.
 
+The tool also exposes three **read-only catalog** functions — `list_models`,
+`list_loras`, `list_transformers` — so the model can answer "what models are
+available?" and pick a valid `model` name before generating. These proxy mcpo's
+`/list_models` etc., return catalog **names** (never paths, ADR-015 opaque
+handles), and are bundled here rather than via mcpo-as-OpenAPI-tool-server so
+there's a single coherent comfyless tool surface (and no duplicate `/generate`
+that wouldn't render inline).
+
 ## Prerequisites
 
 - comfyless MCP server reachable through **mcpo** (see the
@@ -70,6 +78,11 @@ Ask the model to generate an image (e.g. "generate a picture of a red fox in
 snow"). When the model has the tool enabled it calls `generate_image(prompt=…)`,
 and the image appears inline. The model only sees a one-line confirmation
 (`model`, dimensions, seed, elapsed) — by design.
+
+Ask "what image models are available?" and the model calls `list_models`
+(likewise `list_loras` / `list_transformers`). Requires a model that actually
+tool-calls — gpt-oss does; a roleplay-finetuned model (e.g. Dolphin-Venice) may
+fabricate output instead of calling the tool.
 
 ## Updating
 

@@ -1,7 +1,7 @@
 """
 title: Comfyless Image Generation
 author: Grant Kahn
-version: 0.1.2
+version: 0.2.1
 required_open_webui_version: 0.5.0
 requirements: aiohttp
 license: MIT
@@ -49,6 +49,16 @@ log = logging.getLogger("comfyless.owui.generate_image")
 # against an oversized response from a compromised/buggy upstream — mcpo is
 # reachable unauthenticated on the docker bridge (ADR-017 defers mcpo auth).
 _B64_HARD_CEILING = 4 * 1024 * 1024  # 4 MiB
+
+# Hard ceiling on the raw mcpo response body read into memory, before JSON
+# parsing — defense-in-depth against an oversized response from a compromised/
+# buggy unauthenticated upstream. Comfortably above _B64_HARD_CEILING (the b64
+# field is a substring of the JSON body) plus frame overhead.
+_RESPONSE_BODY_CEILING = 8 * 1024 * 1024  # 8 MiB
+
+# Short timeout for read-only catalog list calls (they return tiny payloads);
+# distinct from the long generate timeout so a hung list can't block a chat turn.
+_LIST_TIMEOUT_S = 30
 
 
 def _coerce_frame(data: Any) -> Optional[dict]:
@@ -132,6 +142,77 @@ class Tools:
     def __init__(self) -> None:
         self.valves = self.Valves()
 
+    async def _post_mcpo(
+        self, path: str, payload: dict, timeout_s: Optional[int] = None
+    ) -> tuple[Any, Optional[str]]:
+        """POST to an mcpo endpoint.
+
+        Returns (data, None) on success, or (None, error) on failure where
+        `error` is a generic, model-safe message. All upstream detail (the
+        internal bridge URL, the raw response body, exception text) is logged
+        operator-side only — none of it belongs in LLM context.
+
+        `timeout_s` overrides the per-call timeout (defaults to the long
+        generate timeout). The raw body is read with a hard ceiling so a
+        compromised/buggy unauthenticated upstream cannot OOM the container.
+        """
+        url = self.valves.mcpo_base_url.rstrip("/") + "/" + path.lstrip("/")
+        headers = {"Content-Type": "application/json"}
+        if self.valves.api_key.strip():
+            headers["Authorization"] = f"Bearer {self.valves.api_key.strip()}"
+        total = timeout_s if timeout_s is not None else int(self.valves.request_timeout_s)
+        timeout = aiohttp.ClientTimeout(total=total)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    status = resp.status
+                    # Bound the read BEFORE materializing: read one byte past the
+                    # ceiling; a full buffer means the body is oversized.
+                    raw = await resp.content.read(_RESPONSE_BODY_CEILING + 1)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("mcpo POST to %s failed: %s", url, exc)
+            return None, "could not reach the image backend"
+        if len(raw) > _RESPONSE_BODY_CEILING:
+            log.warning("mcpo %s response exceeded %d bytes; rejecting", path, _RESPONSE_BODY_CEILING)
+            return None, "image backend returned an oversized response"
+        body_text = raw.decode("utf-8", errors="replace")
+        if status != 200:
+            log.warning("mcpo %s returned HTTP %s: %.1000s", path, status, body_text)
+            return None, f"image backend returned HTTP {status}"
+        try:
+            return json.loads(body_text), None
+        except (ValueError, TypeError) as exc:
+            log.warning("mcpo %s returned an unparseable body: %s", path, exc)
+            return None, "image backend returned an unreadable response"
+
+    async def _list_catalog(self, path: str, label: str) -> str:
+        """Call an mcpo list_* endpoint and format it for the model.
+
+        Read-only: returns catalog NAMES (and family), never paths — the names
+        are the exact strings to pass back as `model` (ADR-015 opaque handles).
+        """
+        data, err = await self._post_mcpo(path, {}, timeout_s=_LIST_TIMEOUT_S)
+        if err is not None:
+            return f"Error: {err}."
+        if not isinstance(data, list):
+            log.warning("mcpo %s returned a non-list: %.200s", path, str(data))
+            return f"Error: image backend returned an unexpected {label} response."
+        if not data:
+            return f"No {label} available."
+        lines = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name", "?")
+            family = item.get("model_family") or item.get("target_family") or ""
+            lines.append(f"- {name}" + (f"  (family: {family})" if family else ""))
+        if not lines:
+            # Non-empty data but nothing usable — junk, not an empty catalog.
+            log.warning("mcpo %s returned %d items, none usable: %.200s", path, len(data), str(data))
+            return f"Error: image backend returned an unexpected {label} response."
+        lines.sort(key=str.lower)
+        return f"{len(lines)} {label} available:\n" + "\n".join(lines)
+
     async def generate_image(
         self,
         prompt: str,
@@ -195,42 +276,12 @@ class Tools:
         if steps and steps > 0:
             payload["steps"] = int(steps)
 
-        url = (
-            self.valves.mcpo_base_url.rstrip("/")
-            + "/"
-            + self.valves.generate_path.lstrip("/")
-        )
-        headers = {"Content-Type": "application/json"}
-        if self.valves.api_key.strip():
-            headers["Authorization"] = f"Bearer {self.valves.api_key.strip()}"
-
         await emit_status(f"Generating image (model={chosen_model or 'default'})…")
 
-        # Outbound call to mcpo. All upstream detail (the internal bridge URL, the
-        # raw response body, exception text) is logged operator-side only; the model
-        # sees a generic message — none of that belongs in LLM context.
-        timeout = aiohttp.ClientTimeout(total=int(self.valves.request_timeout_s))
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, json=payload, headers=headers) as resp:
-                    status = resp.status
-                    body_text = await resp.text()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("comfyless generate POST to %s failed: %s", url, exc)
+        data, err = await self._post_mcpo(self.valves.generate_path, payload)
+        if err is not None:
             await emit_status("Generation failed.", done=True)
-            return "Error: could not reach the image backend."
-
-        if status != 200:
-            log.warning("comfyless generate returned HTTP %s: %.1000s", status, body_text)
-            await emit_status("Generation failed.", done=True)
-            return f"Error: image backend returned HTTP {status}."
-
-        try:
-            data = json.loads(body_text)
-        except (ValueError, TypeError) as exc:
-            log.warning("comfyless generate returned an unparseable body: %s", exc)
-            await emit_status("Generation failed.", done=True)
-            return "Error: image backend returned an unreadable response."
+            return f"Error: {err}."
 
         frame = _coerce_frame(data)
         if frame is None:
@@ -333,3 +384,28 @@ class Tools:
             f"Image generated and stored ({summary}) but it could not be auto-rendered "
             f"in this chat. It is available at {image_url}."
         )
+
+    async def list_models(self) -> str:
+        """List the image-generation models available in the comfyless catalog.
+
+        Call this when the user asks what models / checkpoints are available, or
+        before generate_image if unsure which model to use.
+
+        :return: A newline-separated list of model names with their family. Pass a
+                 name verbatim as the `model` argument to generate_image.
+        """
+        return await self._list_catalog("/list_models", "models")
+
+    async def list_loras(self) -> str:
+        """List the LoRA adapters available in the comfyless catalog.
+
+        :return: A newline-separated list of LoRA names with their target family.
+        """
+        return await self._list_catalog("/list_loras", "LoRAs")
+
+    async def list_transformers(self) -> str:
+        """List the transformer / UNet checkpoints available in the comfyless catalog.
+
+        :return: A newline-separated list of transformer names with their family.
+        """
+        return await self._list_catalog("/list_transformers", "transformers")

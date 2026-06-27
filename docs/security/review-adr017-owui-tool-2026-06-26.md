@@ -60,3 +60,28 @@ accepted in step 1 (treated as an upstream control here). OWUI runtime internals
 (`upload_file_handler`, `Users`, tool-arg binding) are external; their behavior
 was confirmed against the running container's signature during development and
 otherwise treated as documented assumptions.
+
+---
+
+## Follow-up B (2026-06-26) — catalog-listing tools + `_post_mcpo` refactor
+
+Added read-only `list_models` / `list_loras` / `list_transformers` (proxy mcpo's
+`/list_*`) and extracted the outbound POST into a shared `_post_mcpo` helper.
+
+**code-reviewer (Opus): APPROVED.** Confirmed the refactor preserves
+`generate_image`'s observable behavior (terminal status emits + model-safe
+`Error:` strings); catalog helpers handle error/non-list/empty cases.
+
+**security-auditor (Opus): ACCEPT WITH FINDINGS.** Egress (S1/S2/S5), SSRF,
+data-sensitivity, and api_key invariants all hold across the refactor. List
+responses are double-contained: server strict-allowlists `{name,kind,source,family}`
+(no `abs_path`), and `_list_catalog` surfaces only `name`+family.
+
+| # | Sev | Source | Finding | Disposition |
+|---|-----|--------|---------|-------------|
+| B1 | LOW | sec | `_post_mcpo` read the full body (`resp.text()`) before any size check — unbounded read from an unauthenticated upstream (the b64 ceiling only bounds the field post-parse). | **Fixed.** `_RESPONSE_BODY_CEILING = 8 MiB`; `resp.content.read(ceiling+1)`, reject if over. |
+| B2 | LOW | code | The shared helper applied the 600s generate timeout to list calls — a hung list could block a chat turn 10 min. | **Fixed.** `_post_mcpo` takes `timeout_s`; list calls pass `_LIST_TIMEOUT_S = 30`. |
+| B3 | LOW | code | A non-empty list of all-non-dict items reported "No X available" instead of an error. | **Fixed.** Empty data → "No X"; non-empty-but-unusable → unexpected-response error. |
+| B4 | INFO | sec | Non-200 returns the numeric HTTP status to the model. | **No change** — not a URL/body/key/path leak; status code is acceptable. |
+
+Tool version at this review: 0.2.1.
