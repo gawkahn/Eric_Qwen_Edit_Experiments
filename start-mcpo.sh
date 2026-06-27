@@ -12,7 +12,10 @@
 set -euo pipefail
 
 REPO="${REPO:-/home/gawkahn/projects/ai-lab/code/Eric_Qwen_Edit_Experiments}"
-MODEL_BASE="${MODEL_BASE:-/home/gawkahn/projects/ai-lab/ai-base/models}"
+# hf-local (not its parent .../models): the parent also walks the HF hub cache,
+# surfacing snapshot-hash-named dirs as catalog entries. hf-local is the curated
+# set with human-readable names (Grant, 2026-06-26).
+MODEL_BASE="${MODEL_BASE:-/home/gawkahn/projects/ai-lab/ai-base/models/hf-local}"
 OUTPUT_DIR="${OUTPUT_DIR:-/home/gawkahn/gen-output}"
 HOST="${MCPO_HOST:-172.17.0.1}"   # docker bridge gateway: reachable from host + containers, not the wider LAN
 PORT="${MCPO_PORT:-8090}"
