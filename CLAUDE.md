@@ -69,8 +69,10 @@ python3 test_quant.py                       # 101 tests: fp8 quantize-on-load (A
 python3 test_fp8_single_file.py             #  85 tests: ComfyUI scaled-fp8 single-file loader + DMR merge (ADR-019 slices C/C-d/DMR) — classifier variants, security-review negatives, ScaledFp8Linear numerics, dequant->merge->requant dispatcher
 python3 test_lora_order_insensitive.py      #  13 tests: direct-merge LoRAs order-insensitive to PEFT wrapping (cherry-picked from krea-testing c3461aa)
 python3 test_vae_override_class.py          #  10 tests: --vae override honors the checkpoint's own VAE class (cherry-picked from krea-testing ad6689e)
+python3 test_lora_audit.py                  # 163 tests: scripts/lora_audit.py classify / manifest / dry-load / convert / delete (ADR-014 S1–S4)
+python3 test_lora_convert_krea.py           #  24 tests: Krea-2 LoRA format-conversion plan (krea_native → diffusers_krea)
 ```
-All thirteen suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 1744 unit tests; expect 0 failures.
+All fifteen suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 1931 unit tests; expect 0 failures.
 
 `test_flux2.py` is a live GPU smoke test that performs an actual Flux.2 generation — separate from the unit suites above. Run only when you need to verify end-to-end Flux.2 behavior.
 
