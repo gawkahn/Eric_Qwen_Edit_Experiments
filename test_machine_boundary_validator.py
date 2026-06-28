@@ -523,6 +523,30 @@ except TypeError:
     check("schema map: mutation raises TypeError", True)
 
 # ──────────────────────────────────────────────────────────────────────
+print("\n== Krea rebalance runtime fields ==")
+
+# rebalance (bool) — accepted true; non-bool rejected.
+check("rebalance=True accepted",
+      validate_machine_request(base_payload(rebalance=True)).ok)
+check("rebalance='x' (non-bool) rejected",
+      not validate_machine_request(base_payload(rebalance="x")).ok)
+
+# rebalance_mult (canonical float) — int cast to float; non-numeric rejected.
+_r = validate_machine_request(base_payload(rebalance_mult=2))
+check("rebalance_mult=2 (int) accepted and cast to 2.0 (float)",
+      _r.ok and isinstance(_r.payload["rebalance_mult"], float)
+      and _r.payload["rebalance_mult"] == 2.0)
+check("rebalance_mult='x' (non-numeric) rejected",
+      not validate_machine_request(base_payload(rebalance_mult="x")).ok)
+
+# rebalance_weights (list) — list accepted; non-list rejected.
+check("rebalance_weights=[1.0,2.0] accepted",
+      validate_machine_request(base_payload(rebalance_weights=[1.0, 2.0])).ok)
+check("rebalance_weights='x' (non-list) rejected",
+      not validate_machine_request(base_payload(rebalance_weights="x")).ok)
+
+
+# ──────────────────────────────────────────────────────────────────────
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print("──────────────────────────────────────────────────")

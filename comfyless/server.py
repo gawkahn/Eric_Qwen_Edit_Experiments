@@ -331,7 +331,10 @@ def _handle_generate(
     """
     # Local imports — avoids circular dependency at module level (generate.py
     # will import server.socket_path; server imports generate.* only inside here).
-    from .generate import _load_pipeline, _expand_savepath_template, _resolve_savepath, generate
+    from .generate import (
+        _load_pipeline, _expand_savepath_template, _resolve_savepath, generate,
+        KREA_REBALANCE_DEFAULT_MULT,
+    )
     from nodes.eric_qwen_edit_lora import load_lora_with_key_fix
 
     req_precision = req.get("precision") or precision
@@ -529,6 +532,9 @@ def _handle_generate(
             offload_vae=bool(req.get("offload_vae")),
             attention_slicing=bool(req.get("attention_slicing")),
             sequential_offload=bool(req.get("sequential_offload")),
+            rebalance=bool(req.get("rebalance")),
+            rebalance_mult=req.get("rebalance_mult", KREA_REBALANCE_DEFAULT_MULT),
+            rebalance_weights=req.get("rebalance_weights"),
             transformer_path=req.get("transformer_path",    "") or "",
             vae_path=req.get("vae_path",            "") or "",
             text_encoder_path=req.get("text_encoder_path",   "") or "",

@@ -249,6 +249,34 @@ try:
           _captured.get("steps") == 28, f"got {_captured.get('steps')!r}")
     check("daemon: omitted cfg_scale -> schema fallback 3.5 (no family overlay)",
           _captured.get("cfg_scale") == 3.5, f"got {_captured.get('cfg_scale')!r}")
+
+    # 3. Rebalance knobs are forwarded to generate(); omitted -> False/preset.
+    _captured.clear()
+    _state = {}
+    srv._handle_generate(
+        {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "a cat",
+         "rebalance": True, "rebalance_mult": 2.0, "rebalance_weights": [1.0, 2.0]},
+        _outdir, _outdir, "cuda", "bf16", _state,
+    )
+    check("daemon: rebalance=True forwarded to generate()",
+          _captured.get("rebalance") is True)
+    check("daemon: rebalance_mult forwarded to generate()",
+          _captured.get("rebalance_mult") == 2.0)
+    check("daemon: rebalance_weights forwarded to generate()",
+          _captured.get("rebalance_weights") == [1.0, 2.0])
+
+    _captured.clear()
+    _state = {}
+    srv._handle_generate(
+        {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "a cat"},
+        _outdir, _outdir, "cuda", "bf16", _state,
+    )
+    check("daemon: omitted rebalance -> False",
+          _captured.get("rebalance") is False)
+    check("daemon: omitted rebalance_mult -> node preset default",
+          _captured.get("rebalance_mult") == _gen.KREA_REBALANCE_DEFAULT_MULT)
+    check("daemon: omitted rebalance_weights -> None (generate applies preset)",
+          _captured.get("rebalance_weights") is None)
 finally:
     _gen._load_pipeline = _orig_load
     _gen.generate = _orig_generate

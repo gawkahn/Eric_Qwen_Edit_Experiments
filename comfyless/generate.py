@@ -1455,6 +1455,8 @@ def _delegate_to_server(
         "offload_vae":         args.offload_vae,
         "attention_slicing":   args.attention_slicing,
         "sequential_offload":  args.sequential_offload,
+        "rebalance":           args.rebalance,
+        "rebalance_mult":      args.rebalance_mult,
         "transformer_path":    _abspath(p.get("transformer_path", "")),
         "vae_path":            _abspath(p.get("vae_path", "")),
         "text_encoder_path":   _abspath(p.get("text_encoder_path", "")),
@@ -1466,6 +1468,12 @@ def _delegate_to_server(
     wire_savepath = savepath_override if savepath_override is not None else args.savepath
     if wire_savepath:
         req["savepath"] = wire_savepath
+
+    # Per-layer weights: omit when unset so the daemon's _KIND_LIST validator
+    # never sees a null (it defaults to the node preset server-side).
+    _rb_weights = _parse_rebalance_weights(args.rebalance_weights)
+    if _rb_weights is not None:
+        req["rebalance_weights"] = _rb_weights
 
     resp = _send_server_command(req)
     if resp is None:
@@ -1898,11 +1906,6 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                 savepath_override=wire_savepath,
             )
             if delegate_rc is not None:
-                if args.rebalance:
-                    print("[comfyless] WARNING: --rebalance was IGNORED — this "
-                          "request was handled by the running --serve daemon, "
-                          "which has no rebalance support. Pass an explicit "
-                          "--output to force the in-process path.", file=sys.stderr)
                 return delegate_rc
 
         # In-process path.

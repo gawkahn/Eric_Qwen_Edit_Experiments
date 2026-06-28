@@ -258,6 +258,11 @@ each model's recommended values; anything you pass explicitly wins. Krea-2
 in particular: Raw wants 52 steps / cfg 3.5, Turbo wants 8 steps / cfg 0.0
 — just omit steps and cfg_scale to get them.
 
+Krea-2 conditioning rebalance: set `rebalance: true` (Krea-2 only) to boost
+detail and bypass the safety filter's quality dilution. Tune with
+`rebalance_mult` (default 4.0; try 1.5–2.0 for a gentler effect) and
+`rebalance_weights` (12 per-layer-tap gains). Ignored for non-Krea models.
+
 If `model` is omitted, the server uses the model configured at spawn time
 via --default-model. Omitting `model` without a configured default
 returns an error.
@@ -317,6 +322,26 @@ _GENERATE_INPUT_SCHEMA: dict[str, Any] = {
         "sampler": {"type": "string"},
         "schedule": {"type": "string"},
         "vae_from_transformer": {"type": "boolean"},
+        "rebalance": {
+            "type": "boolean",
+            "description": (
+                "Krea-2 only: rebalance the Qwen3-VL conditioning layer-taps "
+                "to boost detail / bypass the safety filter's quality "
+                "dilution. Ignored for non-Krea models."
+            ),
+        },
+        "rebalance_mult": {
+            "type": "number",
+            "description": "[rebalance] Global conditioning multiplier (default 4.0).",
+        },
+        "rebalance_weights": {
+            "type": "array",
+            "items": {"type": "number"},
+            "description": (
+                "[rebalance] Per-layer-tap gains (12 for Krea). Default "
+                "preset: [1,1,1,1,1,1,1,2.5,5,1.1,4,1]."
+            ),
+        },
         "loras": {
             "type": "array",
             "items": {
@@ -1355,7 +1380,7 @@ async def _handle_generate(
     # Component overrides vae/text_encoder are removed from the MCP surface
     # (OQ-A) -> always "" here. Operator-tuning knobs (precision/offload/...)
     # are spawn-time concerns, not agent-facing — hard-coded defaults.
-    from comfyless.generate import generate
+    from comfyless.generate import generate, KREA_REBALANCE_DEFAULT_MULT
     cached = _get_or_load_cached_pipeline(
         model_abs,
         transformer_abs,
@@ -1386,6 +1411,9 @@ async def _handle_generate(
         offload_vae=False,
         attention_slicing=False,
         sequential_offload=False,
+        rebalance=bool(payload.get("rebalance")),
+        rebalance_mult=payload.get("rebalance_mult", KREA_REBALANCE_DEFAULT_MULT),
+        rebalance_weights=payload.get("rebalance_weights"),
         transformer_path=transformer_abs,
         vae_path="",
         text_encoder_path="",

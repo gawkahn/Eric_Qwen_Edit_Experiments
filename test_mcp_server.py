@@ -1000,6 +1000,52 @@ check("N14: cascade handler no longer emits the slice-1 PathAllowlist agent erro
       "PathAllowlist" not in _cascade_src and "HFCacheMiss" not in _cascade_src)
 
 
+# --- Krea rebalance: schema exposes the knobs + handler passes them through. ---
+check("rebalance: schema has rebalance / rebalance_mult / rebalance_weights",
+      all(k in _props for k in ("rebalance", "rebalance_mult", "rebalance_weights")))
+check("rebalance: schema rebalance_weights is an array of numbers",
+      _props["rebalance_weights"].get("type") == "array")
+
+mb, out, _inside, cfg = _setup_mb_and_out()
+_rb_cap: dict = {}
+
+
+def _mock_generate_capture(*, model_path, prompt, output_path, **kw):
+    _rb_cap.clear()
+    _rb_cap.update(kw)
+    Image.new("RGB", (8, 8), "white").save(output_path)
+    return {"prompt": prompt, "model": model_path, "seed": kw.get("seed", 1),
+            "loras": list(kw.get("loras") or []), "elapsed_seconds": 0.01}
+
+
+with unittest.mock.patch.object(sys, "stderr", io.StringIO()), \
+     unittest.mock.patch.object(gen_mod, "_load_pipeline", _mock_load_pipeline), \
+     unittest.mock.patch.object(gen_mod, "generate", _mock_generate_capture):
+    _run(mcps._call_tool_impl(cfg, "generate", {
+        "prompt": "p", "model": "qwen-image",
+        "rebalance": True, "rebalance_mult": 2.0,
+        "rebalance_weights": [1.0, 2.0, 3.0],
+    }))
+check("rebalance: handler forwards rebalance=True to generate()",
+      _rb_cap.get("rebalance") is True)
+check("rebalance: handler forwards rebalance_mult",
+      _rb_cap.get("rebalance_mult") == 2.0)
+check("rebalance: handler forwards rebalance_weights",
+      _rb_cap.get("rebalance_weights") == [1.0, 2.0, 3.0])
+
+# Negative: omitting rebalance → generate gets rebalance=False + preset mult.
+with unittest.mock.patch.object(sys, "stderr", io.StringIO()), \
+     unittest.mock.patch.object(gen_mod, "_load_pipeline", _mock_load_pipeline), \
+     unittest.mock.patch.object(gen_mod, "generate", _mock_generate_capture):
+    _run(mcps._call_tool_impl(cfg, "generate", {"prompt": "p", "model": "qwen-image"}))
+check("rebalance: omitted → generate gets rebalance=False",
+      _rb_cap.get("rebalance") is False)
+check("rebalance: omitted → rebalance_mult defaults to the node preset",
+      _rb_cap.get("rebalance_mult") == gen_mod.KREA_REBALANCE_DEFAULT_MULT)
+check("rebalance: omitted → rebalance_weights is None (generate applies preset)",
+      _rb_cap.get("rebalance_weights") is None)
+
+
 # ════════════════════════════════════════════════════════════════════════
 print("\n== Step 2: audit-line success path (N12) + traceback strip (N31) ==")
 # ════════════════════════════════════════════════════════════════════════
