@@ -11,7 +11,10 @@
 # for a detached service. Every var below can be overridden from the environment.
 set -euo pipefail
 
-REPO="${REPO:-/home/gawkahn/projects/ai-lab/code/Eric_Qwen_Edit_Experiments}"
+# Default to the worktree this script lives in, so running it from any worktree
+# (e.g. a branch with a different .venv) uses that worktree's code AND its
+# .venv/bin/python3 — not a hardcoded path. Override REPO to point elsewhere.
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 # hf-local (not its parent .../models): the parent also walks the HF hub cache,
 # surfacing snapshot-hash-named dirs as catalog entries. hf-local is the curated
 # set with human-readable names (Grant, 2026-06-26).
