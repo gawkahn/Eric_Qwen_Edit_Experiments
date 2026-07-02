@@ -189,10 +189,16 @@ def _validate_scale(name: str, t: torch.Tensor) -> None:
             f"scale {_safe_name(name)} has dtype {t.dtype} — F32 required (F3)"
         )
     v = t.item()
-    if not (v > 0.0) or v != v or v == float("inf"):  # NaN fails v==v
+    # Reject non-finite, non-positive, AND subnormal values (reviewer
+    # finding: F2 lists denormals alongside 0/NaN/Inf — a subnormal scale
+    # feeding _scaled_mm flushes to zero on most tensor-core paths).
+    _F32_MIN_NORMAL = 1.1754943508222875e-38
+    if (not (v > 0.0) or v != v or v == float("inf")
+            or v < _F32_MIN_NORMAL):
         raise ScaledFp8FormatError(
-            f"scale {_safe_name(name)} value {v!r} is not finite-and-positive "
-            f"— refusing to load (silent numerical corruption guard, F2)"
+            f"scale {_safe_name(name)} value {v!r} is not finite-positive-"
+            f"normal — refusing to load (silent numerical corruption "
+            f"guard, F2)"
         )
 
 
@@ -221,10 +227,14 @@ class ScaledFp8Linear(nn.Module):
         self.register_buffer("weight_scale", weight_scale.to(torch.float32))
         self.register_buffer("input_scale", input_scale.to(torch.float32))
         if bias is not None:
-            self.bias = nn.Parameter(bias, requires_grad=False)
+            # Pre-cast to bf16 once (reviewer finding 7 — a per-forward
+            # .to() allocated a fresh tensor every step).
+            self.bias = nn.Parameter(bias.to(torch.bfloat16),
+                                     requires_grad=False)
         else:
             self.bias = None
         self._warned_fallback = False
+        self._fallback_weight = None  # dequant cache, populated on first fallback
 
     def _apply(self, fn, recurse=True):
         # Detect dtype-converting fns (module.to(bf16), .half(), ...) via a
@@ -256,21 +266,32 @@ class ScaledFp8Linear(nn.Module):
             out = torch._scaled_mm(
                 xq, self.weight.t(),
                 scale_a=self.input_scale, scale_b=self.weight_scale,
-                bias=self.bias.to(torch.bfloat16) if self.bias is not None else None,
+                bias=self.bias if self.bias is not None else None,
                 out_dtype=torch.bfloat16,
             )
             if pad:
                 out = out[:m]
-        except Exception as e:  # noqa: BLE001 — fall back, never crash mid-gen
+        except RuntimeError as e:
+            # Narrow catch (reviewer finding 6): RuntimeError covers the
+            # legitimate fallback cases (unsupported _scaled_mm layout /
+            # CPU execution / cuda OOM, which subclasses RuntimeError);
+            # anything else propagates rather than silently degrading.
             if not self._warned_fallback:
                 print(f"[EricDiffusion-fp8] WARNING: _scaled_mm failed "
                       f"({type(e).__name__}: {e}) — falling back to "
                       f"dequantized matmul for this layer (slower, "
                       f"same numerics)")
                 self._warned_fallback = True
-            w = (self.weight.to(torch.float32) * self.weight_scale).to(in_dtype)
+            if (self._fallback_weight is None
+                    or self._fallback_weight.device != x2d.device):
+                # Cache the dequantized weight so the persistent-fallback
+                # case doesn't rebuild it every denoising step.
+                self._fallback_weight = (
+                    self.weight.to(torch.float32) * self.weight_scale
+                ).to(in_dtype)
             out = torch.nn.functional.linear(
-                x2d, w, self.bias.to(in_dtype) if self.bias is not None else None)
+                x2d, self._fallback_weight.to(in_dtype),
+                self.bias.to(in_dtype) if self.bias is not None else None)
         return out.reshape(*lead_shape, self.out_features).to(in_dtype)
 
     def extra_repr(self) -> str:
@@ -317,18 +338,31 @@ def load_scaled_fp8_component(component_class, weights_path: str, dtype,
     """
     from safetensors.torch import load_file as st_load
 
+    if not weights_path.lower().endswith(".safetensors"):
+        # F10: the scaled-fp8 loader parses safetensors only. Pickle-format
+        # files never enter (the classifier returns None for them), but if
+        # a caller routes one here directly, refuse loudly.
+        raise ScaledFp8FormatError(
+            f"scaled-fp8 loading requires a .safetensors file, got "
+            f"{_safe_name(os.path.basename(weights_path))} — re-save the "
+            f"checkpoint in safetensors format"
+        )
+
     suffixes = _CA_SUFFIXES if variant == "ca" else _CB_SUFFIXES
     w_sfx = suffixes["weight_scale"]
     i_sfx = suffixes["input_scale"]
 
     sd = st_load(weights_path)
-    sd.pop("scaled_fp8", None)  # C-b global marker tensor — metadata, not a weight
     if strip_prefix:
         # Same dominant-prefix handling as the standard single-file path
         # (model.diffusion_model. etc.) — mechanical rename BEFORE pairing,
         # so scale↔weight binding operates on the stripped names throughout.
         sd = {(k[len(strip_prefix):] if k.startswith(strip_prefix) else k): v
               for k, v in sd.items()}
+    # C-b global marker tensor — metadata, not a weight. Popped AFTER the
+    # prefix strip so prefixed layouts (model.diffusion_model.scaled_fp8)
+    # are caught too (reviewer finding 3).
+    sd.pop("scaled_fp8", None)
 
     # ── 1. Pair + validate (source-key binding, never re-keyed) ─────────
     for k in sd:
@@ -411,12 +445,16 @@ def load_scaled_fp8_component(component_class, weights_path: str, dtype,
 
     swapped = 0
     unmatched = []
+    claimed: set = set()  # model slots already swapped (reviewer finding 2:
+    # two sources with byte-identical dequant values must not double-bind
+    # one Linear — the second silently overwriting the first's scales)
     parent_cache = dict(model.named_modules())
     for base, (w_fp8, ws, i_s) in fp8_entries.items():
         deq = (w_fp8.to(torch.float32) * ws).to(dtype)
         shape, sample = _fingerprint(deq)
         cands = [(n, m) for (n, m, s) in by_fp.get(shape, [])
-                 if torch.equal(s, sample)
+                 if n not in claimed
+                 and torch.equal(s, sample)
                  and torch.equal(m.weight.data, deq)]
         if len(cands) != 1:
             unmatched.append(base)
@@ -428,6 +466,7 @@ def load_scaled_fp8_component(component_class, weights_path: str, dtype,
             w_fp8, ws, i_s,
             mod.bias.data.clone() if mod.bias is not None else None)
         setattr(parent, child, new)
+        claimed.add(name)
         swapped += 1
 
     total = len(fp8_entries)

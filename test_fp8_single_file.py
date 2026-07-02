@@ -202,6 +202,34 @@ for i, (val, label) in enumerate([(0.0, "zero"), (-1.0, "negative"),
     _expect_reject(f"scale value {label} rejected at load (F2 NEGATIVE)",
                    lambda p=p: _load(p), "finite")
 
+# Subnormal scale (reviewer finding 1 — F2 lists denormals explicitly).
+p = _mk("subnormal.safetensors", {
+    "a.weight": _fp8((16, 16)),
+    "a.weight_scale": _scalar(1e-40),
+    "a.input_scale": _scalar(0.5),
+})
+_expect_reject("subnormal scale value rejected at load (F2 NEGATIVE)",
+               lambda p=p: _load(p), "normal")
+
+# Non-safetensors path routed directly to the loader (reviewer finding 4 /
+# F10): loud reject, message points at re-saving.
+_expect_reject(
+    "loader refuses non-.safetensors path outright (F10 NEGATIVE)",
+    lambda: fp8ops.load_scaled_fp8_component(
+        None, "/nonexistent/model.pt", torch.bfloat16, "", "ca"),
+    "safetensors")
+
+# A scale-suffixed key carrying an fp8 tensor (name/dtype confusion —
+# reviewer finding 5's adapted collision property: a "scale" can never be
+# smuggled as a weight or vice versa; the F32 dtype gate rejects it).
+_expect_reject(
+    "fp8-dtype tensor under a scale-suffix name rejected (F1-adapted NEGATIVE)",
+    _mk("fp8scale.safetensors", {
+        "a.weight": _fp8((16, 16)),
+        "a.weight_scale": _fp8((1,), seed=2).reshape(()),
+        "a.input_scale": _scalar(0.5),
+    }), "F32")
+
 p = _mk("missingscale.safetensors", {
     "a.weight": _fp8((16, 16)),
     "a.weight_scale": _scalar(0.01),
@@ -297,12 +325,20 @@ except RuntimeError as e:
 # ──────────────────────────────────────────────────────────────────────
 print("── real-collection spot checks (skip-as-pass if absent) ───────")
 
+# Full Vision-§0 survey coverage (reviewer finding 9): every documented
+# variant, the prefix case, a C-c control, a bf16 control, and the nvfp4
+# header reject.
+_CMFY = "/home/gawkahn/projects/ai-lab/ai-base/models/comfyui/models"
 _REAL = [
-    ("/home/gawkahn/projects/ai-lab/ai-base/models/comfyui/models/"
-     "diffusion_models/Flux.2-Klein-9B-base/flux-2-klein-base-9b-fp8.safetensors",
-     "ca"),
-    ("/home/gawkahn/projects/ai-lab/ai-base/models/comfyui/models/"
-     "diffusion_models/wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors", "cb"),
+    (f"{_CMFY}/diffusion_models/Flux.2-Klein-9B-base/"
+     f"flux-2-klein-base-9b-fp8.safetensors", "ca"),
+    (f"{_CMFY}/checkpoints/ltx-2-19b-distilled-fp8.safetensors", "ca"),
+    (f"{_CMFY}/diffusion_models/wan2.2_t2v_low_noise_14B_fp8_scaled"
+     f".safetensors", "cb"),
+    (f"{_CMFY}/checkpoints/Flux.1-dev/"
+     f"colossusProjectFlux_v12HephaistosFP8UNET.safetensors", "cc"),
+    (f"{_CMFY}/diffusion_models/Flux.2-Klein-9B-base/"
+     f"flux-2-klein-base-9b.safetensors", None),
 ]
 for rp, want in _REAL:
     if os.path.exists(rp):
@@ -312,6 +348,13 @@ for rp, want in _REAL:
     else:
         check(f"real file {os.path.basename(rp)} → {want} "
               f"(SKIPPED: not present)", True)
+
+_NVFP4 = (f"{_CMFY}/diffusion_models/ZImageTurbo/base model/"
+          f"ZImageTurbo-nvfp4_FP32.safetensors")
+if os.path.exists(_NVFP4):
+    _expect_reject("real nvfp4 file rejected at header", _NVFP4, "nvfp4")
+else:
+    check("real nvfp4 file rejected at header (SKIPPED: not present)", True)
 
 
 # ──────────────────────────────────────────────────────────────────────

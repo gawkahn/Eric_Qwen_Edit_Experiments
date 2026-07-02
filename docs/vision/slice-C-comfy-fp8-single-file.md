@@ -54,4 +54,17 @@ May change: `nodes/eric_diffusion_utils.py` (detection flip at `_diagnose_slot_m
 
 ## 5. Gates
 
+**Changelog note (post-implementation review, 2026-07-02):** Req-9's two
+name-canonicalization negatives ("duplicate canonical scale targets" and
+"scale name collides with remapped weight name") are MOOT BY CONSTRUCTION —
+the implementation binds scales to weights by source-key pairing + value
+fingerprint and never re-keys a scale by name, so the crafted inputs those
+tests describe cannot reach a re-attachment step. The adapted property IS
+tested (an fp8 tensor under a scale-suffix name rejects on the F32 dtype
+gate; dangling scales reject; double-bind of one model slot is prevented by
+a claimed-set in the fingerprint swap). Reviewer accepted the deviation
+("legitimate structural closure of F1"). Finding 8 (module-hook footgun in
+`_apply`'s zero-probe) documented as accepted risk — `.to()`/`.cuda()`
+/`.half()` all behave identically on zero-element probes.
+
 `security-auditor` on THIS DESIGN before code — **DONE 2026-07-02**: `docs/security/review-slice-C-fp8-single-file-2026-07-02.md` (4 HIGH / 5 MED / 3 LOW, all with mitigations). Its "Requirements for implementation" list (10 points: safe_open-only inspection, names+dtypes-only classification, scalar-F32 shape/dtype asserts, finite-and-positive scale validation at load, collision-safe strip/remap/re-attach, sanitized tensor names, isinstance-walker guard extension, doc amendments, per-finding negative tests) is BINDING on the coding phase. Then `code-reviewer` on the diff before commit, per slice-A pattern.
