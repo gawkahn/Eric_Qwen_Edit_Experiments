@@ -118,6 +118,10 @@ _generate_canonical = {
         "output_path", "precision", "device", "offload_vae",
         "attention_slicing", "sequential_offload", "allow_hf_download",
         "_cached_pipeline",
+        # Quantize-on-load knobs (ADR-019 slice A): runtime-class like
+        # precision — hardware/VRAM tradeoffs, declared in _RUNTIME_KIND,
+        # not sidecar-persisted.
+        "quant", "quant_skip", "quant_only",
         # MCP-internal call-shape flag; signals _save_with_metadata to apply
         # invariant-12 PNG redaction. Not user-facing; not a sidecar param.
         "mcp_caller",

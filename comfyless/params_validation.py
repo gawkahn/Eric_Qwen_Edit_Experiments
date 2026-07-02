@@ -73,6 +73,14 @@ _RUNTIME_KIND = types.MappingProxyType({
     "attention_slicing":  _KIND_BOOL,
     "sequential_offload": _KIND_BOOL,
     "savepath":           _KIND_STR,
+    # Quantize-on-load (ADR-019 slice A). Runtime knobs like `precision` —
+    # hardware/VRAM tradeoffs, not sidecar-persisted image parameters.
+    # quant_skip/quant_only entries are component SLOT names (e.g.
+    # "text_encoder"), never paths — validate_machine_request enforces that
+    # per entry.
+    "quant":              _KIND_STR,
+    "quant_skip":         _KIND_LIST,
+    "quant_only":         _KIND_LIST,
 })
 
 
@@ -282,5 +290,29 @@ def validate_machine_request(payload: Any) -> ValidationResult:
                 return lora_result
             cleaned_loras.append(lora_result.payload)
         validated["loras"] = cleaned_loras
+
+    # quant_skip / quant_only entries are component slot names from
+    # model_index.json ("transformer", "text_encoder", ...). Slot names are
+    # bare identifiers — reject anything path-shaped or NUL-carrying so these
+    # lists can never smuggle filesystem strings across the machine boundary
+    # (ADR-012 hygiene; ADR-019 slice A).
+    for list_field in ("quant_skip", "quant_only"):
+        if list_field in validated and isinstance(validated[list_field], list):
+            for i, entry in enumerate(validated[list_field]):
+                if not isinstance(entry, str):
+                    return _make_err(
+                        "invalid_type", f"{list_field}[{i}]",
+                        f"expected str, got {type(entry).__name__}",
+                    )
+                if "\x00" in entry:
+                    return _make_err(
+                        "invalid_value", f"{list_field}[{i}]",
+                        "NUL byte not allowed",
+                    )
+                if "/" in entry or "\\" in entry:
+                    return _make_err(
+                        "invalid_value", f"{list_field}[{i}]",
+                        "component slot names are bare identifiers, not paths",
+                    )
 
     return ValidationResult(ok=True, payload=validated)
