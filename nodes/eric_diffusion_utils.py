@@ -1444,9 +1444,22 @@ def is_quantized_module(module) -> bool:
     if module is None:
         return False
     # Scaled-fp8 modules (ADR-019 slice C) store plain fp8 tensors, not
-    # torchao subclasses — explicit isinstance walker FIRST (security
-    # review F8: a parameter-type sniff alone would miss them and let
-    # tier-3 merges write into fp8 buffers).
+    # torchao subclasses (security review F8: a parameter-type sniff alone
+    # would miss them and let tier-3 merges write into fp8 buffers).
+    # Detection is STRUCTURAL — any module whose weight buffer is an fp8
+    # dtype is unsafe to merge into, full stop. This is stronger than the
+    # isinstance walker the review suggested: it survives test harnesses
+    # that spec-load modules (breaking class identity) and catches any
+    # future fp8-resident module, not just ScaledFp8Linear.
+    try:
+        for mod in module.modules():
+            w = getattr(mod, "weight", None)
+            if (isinstance(w, torch.Tensor)
+                    and w.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)):
+                return True
+    except (AttributeError, TypeError):
+        pass
+    # isinstance walker retained as the explicit, documented path (F8).
     try:
         from .eric_diffusion_fp8_ops import contains_scaled_fp8
         if contains_scaled_fp8(module):
