@@ -1427,6 +1427,30 @@ def is_quantized_module(module) -> bool:
     return False
 
 
+def guard_direct_merge(module, log_prefix: str = "[LoRA]",
+                       merge_kind: str = "this adapter") -> None:
+    """Refuse direct weight merges into a quantized base (ADR-019 §4).
+
+    Direct merge mutates ``param.data`` in place — impossible on a torchao
+    tensor subclass (``Float8Tensor``): at best it crashes deep in dispatch,
+    at worst it corrupts the quantized weights.  Called at the entry of every
+    direct-merge path; PEFT adapter paths (unfused) are unaffected and remain
+    the supported way to run LoRAs on a quantized base.
+
+    Raises RuntimeError with an actionable message.  Callers that treat LoRA
+    failures as non-fatal (comfyless _apply_loras) surface it as a loud
+    warning and generate without the adapter.
+    """
+    if is_quantized_module(module):
+        raise RuntimeError(
+            f"{log_prefix} {merge_kind} requires the direct-merge path, "
+            f"which is incompatible with a quantized base model (--quant): "
+            f"bf16 deltas cannot be merged into quantized tensors in place. "
+            f"Options: load without --quant, or use a PEFT-loadable version "
+            f"of this LoRA. See ADR-019 §4."
+        )
+
+
 def quant_cache_fragment(quant_mode: str, skip: tuple = (), only: tuple = ()) -> str:
     """Cache-key fragment so quant state discriminates cached pipelines.
 
