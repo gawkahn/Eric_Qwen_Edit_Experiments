@@ -258,6 +258,31 @@ leave garbage in the converted dict. Should gracefully skip with a warning.
 Queued in Backlog.
 *Resolved: 2026-04-22 — filter against `named_parameters()` in `load_converted_lora` before `pipe.load_lora_weights`.*
 
+**Daemon LoRA lifecycle: merged adapters never unload; weight-only changes ignored** *(2026-07-02)*
+Two defects in `comfyless/server.py`'s LoRA diff (`_handle_generate` ~392-444),
+confirmed read-only during the krea-testing "regression" investigation:
+(1) Dropped LoRAs are removed via `pipe.delete_adapters(adapter_name)` — fine
+for PEFT-registered adapters, but tier-3 direct-merge LoRAs baked their delta
+into `param.data` and register only a cosmetic `peft_config` entry;
+`delete_adapters` strips the registration and reports success while the
+merged weights persist in the model. The restoration backups
+(`_lokr_backup_*` / `_loha_backup_*` / `_lora_backup_*` /
+`_converted_lora_backup_*`) exist but the daemon never restores from them.
+(2) The diff keys on `path` only — re-requesting the same LoRA at a
+different weight hits `path in loaded_paths → continue`, silently keeping
+the old weight.
+Both push users into restart-the-daemon-between-runs (Grant's actual habit
+during LoRA testing). Related: LoRA load failures are non-fatal warnings
+that land only in the daemon log — the client CLI never sees them, so
+"LoRA failed but run reported success" has now bitten twice (MCP: fixed
+28fea0b; daemon log: 2026-07-02 incident).
+Why not now: `comfyless/server.py` is a §12 security-review surface; the
+fix (restore-from-backup on removal or evict-on-merged-adapter-drop; weight
+in the diff key; client-side warning relay) is its own gated slice.
+Trigger: the next server.py slice (e.g. quant-over-daemon, same file), OR
+LoRA A/B testing friction getting raised again.
+See `project_krea_lora_regression.md` memory.
+
 **Tier-3 (direct-merge) LoRAs incompatible with `--quant`** *(2026-07-02)*
 Under a torchao-quantized base (`Float8Tensor` / `NVFP4Tensor` weights), the LoRA
 loader's tier-3 fallback (direct state-dict merge into `weight.data`) cannot run —
