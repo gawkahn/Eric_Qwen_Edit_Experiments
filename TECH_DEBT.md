@@ -184,6 +184,58 @@ both smoke-tested generating coherent images. This pin must NOT be merged to
 `Krea2Pipeline` (still the trigger above for the real, mergeable bump). The
 branch exists precisely to test Krea without an unreleased pin reaching main.
 
+**NVFP4 quantize-on-load blocked on a stable torch/torchao/mslk triad** *(2026-07-02)*
+NVFP4 quantize-on-load for diffusion (ADR-019 slice A, nvfp4 half) is officially
+supported and works — PyTorch's "Faster Diffusion on Blackwell" blog + diffusers
+`TorchAoConfig` + the `sayakpaul/diffusers-blackwell-quants` recipes cover
+QwenImage specifically (1.39–1.49× over bf16 at batch 1–8, 62→52 GB peak). But it
+runs **only on the nightly triad**: torch `2.12.0.dev` + torchao `0.17.0.dev` +
+mslk `2026.3.15`, all `cu130`. Our stack is torch `2.11.0` **stable**. The
+2026-07-02 fp8 spike used stable torchao 0.17.0 installed `--no-deps`; the fast
+`to_nvfp4` quantizer (routed through the MSLK kernel, pytorch/ao PR #4031) needs
+the `mslk` wheel, which is nightly-only and version-locked to nightly torch/torchao.
+**`mslk` IS a pip wheel** (`--pre --index-url .../whl/nightly/cu130`), NOT a
+source build — so building/pinning our own kernel is unnecessary *and* wrong: there
+is nothing to build, and self-maintaining it would just be nightly-equivalent code
+under a different name, not a path to a stable pin.
+Why not now: pinning the nightly triad drags torch 2.11 stable → 2.12 nightly across
+the **whole** stack (every model + all 1412 tests), violates §11 exact-release-pin,
+and crosses the same no-nightly-pin line as the Krea-2 entry above. This is the
+identical situation, not a "maybe never" — the format/hardware are >1yr old but the
+diffusers-eager + torchao + MSLK software integration is landing *now* on the
+nightly→stable pipeline. Also gated on quality: nvfp4 needs `torch.compile` and
+QwenImage is more quant-sensitive than Flux (LPIPS 0.41 vs 0.44) — a
+measure-carefully feature, not a free win. Stable fp8 (proven, 40→20 GB) is the
+near-term path.
+Trigger: a stable torch ≥2.12/cu130 **and** matching stable torchao **and** stable
+mslk all released (watch `pytorch/ao` releases + the stable cu130 wheel index). When
+met: a slice pins the triad, `uv lock`, updates `requirements.txt` + `pyproject.toml`
+together, adds `--quant nvfp4`, and smoke-tests QwenImage quality vs fp8.
+See `docs/decisions/ADR-019-native-quantization-support.md` §Deferred,
+`project_native_quant_support.md` memory.
+
+**Daemon socket silently drops `quant` from hand-crafted clients** *(2026-07-02)*
+Slice A registered `quant`/`quant_skip`/`quant_only` in `_RUNTIME_KIND`, so the
+canonical validator type-accepts them on every machine boundary — including the
+Unix-socket daemon, whose handler (`comfyless/server.py`) neither consumes nor
+rejects them. The shipped CLI is covered (`generate.py` skips daemon delegation
+when `--quant` is set, with a log line), but a hand-rolled socket client sending
+`{"type": "generate", "quant": "fp8", ...}` validates cleanly and generates
+UNQUANTIZED with no signal back to the caller. Surfaced by slice-A code-reviewer
+F2 (MED).
+Why not now: the fix is in `comfyless/server.py` — a project-mandated
+security-review surface and an explicit STOP boundary for the slice-A autonomous
+run (Vision §2). Rejecting or supporting quant at the daemon dispatch entry is
+the same slice as wiring quant through the daemon protocol + cache key, which
+needs its own `security-auditor` pass.
+Trigger: the "quant over daemon" slice (protocol + cache key + explicit
+reject-or-support at dispatch), OR any report of a socket client using quant.
+Fix shape: daemon dispatch rejects `quant != "none"` with an explicit
+"daemon does not support quant; run in-process" error until the protocol
+carries it end-to-end.
+See `docs/decisions/ADR-019-native-quantization-support.md`,
+`docs/vision/slice-A-fp8-quant-load.md` §2.
+
 ---
 
 ## Sampler Coverage
@@ -213,6 +265,32 @@ Keys like `distilled_guidance_layer` cannot be mapped and currently cause errors
 leave garbage in the converted dict. Should gracefully skip with a warning.
 Queued in Backlog.
 *Resolved: 2026-04-22 — filter against `named_parameters()` in `load_converted_lora` before `pipe.load_lora_weights`.*
+
+**Tier-3 (direct-merge) LoRAs incompatible with `--quant`** *(2026-07-02)*
+Under a torchao-quantized base (`Float8Tensor` / `NVFP4Tensor` weights), the LoRA
+loader's tier-3 fallback (direct state-dict merge into `weight.data`) cannot run —
+you can't in-place-merge a bf16 delta into a quantized tensor subclass. ADR-019 §4
+forces the PEFT adapter path (tiers 1/2, **unfused**; `fuse_lora()` also disabled)
+under quant, and makes tier-3-only LoRAs **fail loud** ("load without `--quant`, or
+use a PEFT-loadable version"). So a LoRA that loads *only* via tier-3 (exotic
+LoKR/LoHa, or prefix layouts PEFT can't ingest) is unusable simultaneously with
+quant.
+Why not now: the PEFT path covers the common case; the real fix (dequantize the
+affected base layers → merge → requantize) is genuine engineering worth deferring
+until we know it's needed.
+**Urgency is gated on a survey** — how many LoRAs in the actual collection need
+tier-3 is unknown. Run the loader's format-detection over the `--lora-path` trees
+and count tier-3 fallbacks: if it's a handful of exotic ones, fail-loud is fine
+indefinitely; if tier-3 is common, promote the dequant→merge→requant path.
+MUST-VERIFY separately (not this debt): that `load_lora_weights` on an fp8 base
+works via the unfused adapter path on our stack — that's a slice-A acceptance check,
+not a deferral.
+Trigger: (a) the survey shows a meaningful fraction of the collection needs tier-3,
+OR (b) a user hits the fail-loud in real use.
+See `docs/decisions/ADR-019-native-quantization-support.md` §4,
+`project_native_quant_support.md` memory. Related: the exotic-format LoRAs that drive
+tier-3 are the same ones behind `project_lokr_alpha_convention.md` /
+`project_civitai_orphaned_files.md`.
 
 ---
 

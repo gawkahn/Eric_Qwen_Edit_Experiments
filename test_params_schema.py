@@ -121,6 +121,10 @@ _generate_canonical = {
         # path), recorded in metadata when active but not sidecar input params.
         "rebalance", "rebalance_mult", "rebalance_weights",
         "_cached_pipeline",
+        # Quantize-on-load knobs (ADR-019 slice A): runtime-class like
+        # precision — hardware/VRAM tradeoffs, declared in _RUNTIME_KIND,
+        # not sidecar-persisted.
+        "quant", "quant_skip", "quant_only",
         # MCP-internal call-shape flag; signals _save_with_metadata to apply
         # invariant-12 PNG redaction. Not user-facing; not a sidecar param.
         "mcp_caller",

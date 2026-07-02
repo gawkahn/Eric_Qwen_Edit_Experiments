@@ -44,7 +44,7 @@ This repo uses two tools deliberately:
 - **Comfyless dev path** — `uv` is the preferred tool for local development, testing, and reproducibility work. `pyproject.toml` is the human-edited source of truth for dep declarations; `uv.lock` is the machine-generated full transitive lock (kept in version control so `uv sync` is reproducible across machines). `.python-version` pins the interpreter.
 
 Rules:
-- **`pyproject.toml` and `requirements.txt` must agree on direct deps at all times** — both list the same 16 top-level pins in the same order (`torch`, `torchvision`, `diffusers`, `transformers`, `accelerate`, `peft`, `safetensors`, `pillow`, `numpy`, `mcp`, `click`, `scipy`, then the tokenizer backends `sentencepiece`, `protobuf`, `tiktoken`, `ftfy`). Any dep bump edits both. `torchvision` must track `torch`'s minor (2.11 ↔ 0.26).
+- **`pyproject.toml` and `requirements.txt` must agree on direct deps at all times** — both list the same 17 top-level pins in the same order (`torch`, `torchvision`, `torchao`, `diffusers`, `transformers`, `accelerate`, `peft`, `safetensors`, `pillow`, `numpy`, `mcp`, `click`, `scipy`, then the tokenizer backends `sentencepiece`, `protobuf`, `tiktoken`, `ftfy`). Any dep bump edits both. `torchvision` must track `torch`'s minor (2.11 ↔ 0.26).
 - **`uv.lock` is regenerated whenever `pyproject.toml` changes** — `uv lock` after the edit, then commit pyproject + requirements + lock together in one slice.
 - **Do NOT edit `uv.lock` by hand.** It's machine output.
 - Fresh dev setup: `uv sync` (creates `.venv` matching the lock). ComfyUI install still uses pip as before — no change for downstream users.
@@ -65,8 +65,9 @@ python3 test_iterate.py                     #  92 tests: comfyless --iterate (AD
 python3 test_samplers.py                    #  41 tests: custom schedulers / sampler swap
 python3 test_server_robustness.py           #  14 tests: comfyless IPC timeouts + BrokenPipe survival
 python3 test_mcp_server.py                  # 534 tests: comfyless MCP server (ADR-011 slice 1 + ADR-015 slice 2 catalog/list_models/list_loras + slice 2b list_transformers + slice 3 generate catalog-name migration + slice 3b cascade catalog-name migration)
+python3 test_quant.py                       #  88 tests: fp8 quantize-on-load (ADR-019 slice A) — eligibility policy, cache-key discrimination, LoRA merge guard, boundary hygiene
 ```
-All nine suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 1412 unit tests; expect 0 failures.
+All ten suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 1500 unit tests; expect 0 failures.
 
 `test_flux2.py` is a live GPU smoke test that performs an actual Flux.2 generation — separate from the unit suites above. Run only when you need to verify end-to-end Flux.2 behavior.
 

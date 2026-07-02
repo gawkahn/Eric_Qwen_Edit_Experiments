@@ -45,8 +45,11 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from nodes.eric_diffusion_utils import (
+    QUANT_MODES,
+    build_quant_config,
     detect_pipeline_class,
     detect_load_variant,
+    quantize_module,
     read_guidance_embeds,
     read_model_index,
     resolve_component_class,
@@ -749,11 +752,18 @@ def _load_pipeline(
     attention_slicing: bool = False,
     sequential_offload: bool = False,
     allow_hf_download: bool = False,
+    quant: str = "none",
+    quant_skip: tuple = (),
+    quant_only: tuple = (),
 ):
     """Load, place, and configure a diffusers pipeline.
 
     Returns (pipe, model_family, guidance_embeds).
     Called by generate() for one-shot use and by the server to populate its cache.
+
+    quant/quant_skip/quant_only (ADR-019 slice A): fp8 quantize-on-load over
+    the role-based eligible component set. Warn-and-fall-back on unsupported
+    hardware or missing torchao — the load itself never fails because of quant.
     """
     model_path = resolve_hf_path(model_path, allow_download=allow_hf_download)
     _log(f"[comfyless] Loading model: {model_path}")
@@ -853,7 +863,35 @@ def _load_pipeline(
         load_kwargs["variant"] = variant
         _log(f"[comfyless] Detected weight variant: {variant}")
 
+    # ── Quantize-on-load (ADR-019 slice A) ────────────────────────────────
+    # Standard components quantize during from_pretrained (shard-by-shard,
+    # low peak memory). Override components (comp_kwargs) were instantiated
+    # above and bypass quantization_config — they get in-place quantize_
+    # after load if their slot is in the eligible set.
+    quant_selected: dict = {}
+    if quant != "none":
+        if sequential_offload:
+            _log("[comfyless] WARNING: quant + sequential_offload is "
+                 "untested together — proceeding with both")
+        quant_config, quant_selected, _ = build_quant_config(
+            model_path, quant, skip=tuple(quant_skip), only=tuple(quant_only),
+            device=device, log_prefix="[comfyless]",
+        )
+        if quant_config is not None:
+            # Slots passed in as pre-built modules skip from_pretrained's
+            # loader, so drop them from the mapping (quantized below instead).
+            for slot in comp_kwargs:
+                quant_config.quant_mapping.pop(slot, None)
+            if quant_config.quant_mapping:
+                load_kwargs["quantization_config"] = quant_config
+
     pipe = pipeline_class.from_pretrained(model_path, **load_kwargs)
+
+    for slot, component in comp_kwargs.items():
+        if slot in quant_selected and hasattr(component, "parameters"):
+            if quantize_module(component, quant, log_prefix="[comfyless]"):
+                _log(f"[comfyless] quant: override component {slot!r} "
+                     f"quantized in place ({quant})")
 
     if sequential_offload:
         _log("[comfyless] Enabling sequential CPU offload")
@@ -947,6 +985,9 @@ def generate(
     rebalance: bool = False,
     rebalance_mult: float = KREA_REBALANCE_DEFAULT_MULT,
     rebalance_weights: Optional[List[float]] = None,
+    quant: str = "none",
+    quant_skip: tuple = (),
+    quant_only: tuple = (),
     _cached_pipeline: Optional[Dict[str, Any]] = None,
     mcp_caller: bool = False,
 ) -> Dict[str, Any]:
@@ -996,6 +1037,7 @@ def generate(
             text_encoder_path=text_encoder_path, text_encoder_2_path=text_encoder_2_path,
             vae_from_transformer=vae_from_transformer, attention_slicing=attention_slicing,
             sequential_offload=sequential_offload, allow_hf_download=allow_hf_download,
+            quant=quant, quant_skip=quant_skip, quant_only=quant_only,
         )
 
     # ── Load LoRAs ────────────────────────────────────────────────────
@@ -1165,6 +1207,19 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--vae-from-transformer", action="store_true", default=None,
                    help="Extract VAE from the --transformer AIO checkpoint")
     p.add_argument("--precision", choices=["bf16", "fp16", "fp32"], default="bf16")
+    p.add_argument("--quant", choices=list(QUANT_MODES), default="none",
+                   help="Quantize-on-load (ADR-019): fp8 halves VRAM on the "
+                        "transformer + large text encoders (VAE/CLIP never "
+                        "quantized). Needs compute capability >= 8.9; falls "
+                        "back to bf16 with a warning otherwise.")
+    p.add_argument("--quant-skip", action="append", default=[], metavar="COMPONENT",
+                   help="Exclude a component slot (e.g. text_encoder) from "
+                        "quantization. Repeatable. For isolating quality "
+                        "regressions to one component.")
+    p.add_argument("--quant-only", action="append", default=[], metavar="COMPONENT",
+                   help="Quantize exactly these component slots, overriding "
+                        "the default eligible set. Repeatable. VAE is refused "
+                        "even here.")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--offload-vae", action="store_true")
     p.add_argument("--attention-slicing", action="store_true",
@@ -1892,8 +1947,14 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
         _apply_family_defaults(p_cur, explicit_keys, iterated_axes, idx=idx)
 
         # Delegate to daemon when --savepath or default --output; skip on explicit --output.
+        # quant also skips delegation: the daemon's wire protocol + cache key
+        # (comfyless/server.py — separate security-reviewed surface) don't
+        # carry quant yet; delegating would silently drop the flag (ADR-019).
         using_default_output = args.output == "/tmp/comfyless.png"
-        if args.savepath or using_default_output:
+        if args.quant != "none" and (args.savepath or using_default_output):
+            _log("[comfyless] --quant requested — daemon delegation skipped "
+                 "(daemon protocol doesn't carry quant yet); running in-process")
+        elif args.savepath or using_default_output:
             # Pre-expand iteration tokens client-side so the daemon receives a
             # template it can finish resolving (%seed%, %model%, etc.) without
             # needing to know about iteration at all.
@@ -1959,6 +2020,9 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                 text_encoder_path=p_cur.get("text_encoder_path", ""),
                 text_encoder_2_path=p_cur.get("text_encoder_2_path", ""),
                 vae_from_transformer=p_cur.get("vae_from_transformer", False),
+                quant=args.quant,
+                quant_skip=tuple(args.quant_skip),
+                quant_only=tuple(args.quant_only),
             )
             if iterate_batch_id:
                 metadata["iterate_batch_id"] = iterate_batch_id

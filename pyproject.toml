@@ -33,6 +33,10 @@ dependencies = [
     # path — basic SD generation errors without it. Bumping torchvision drags
     # torch with it, so pin both together.
     "torchvision==0.26.0",
+    # torchao provides the fp8 quantize-on-load backend (ADR-019 slice A):
+    # diffusers TorchAoConfig + Float8DynamicActivationFloat8WeightConfig.
+    # Torch-ecosystem package — keep its pin moving with torch's.
+    "torchao==0.17.0",
     # diffusers: pinned to an unreleased git commit on THIS BRANCH ONLY
     # (krea-testing). Krea2Pipeline / Krea2Transformer2DModel exist only on
     # diffusers `main` — no PyPI release ships them (0.38.x verified without).

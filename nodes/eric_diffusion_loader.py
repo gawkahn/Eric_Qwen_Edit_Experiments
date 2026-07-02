@@ -18,8 +18,11 @@ from typing import Tuple
 
 from .eric_diffusion_utils import (
     DTYPE_MAP,
+    QUANT_MODES,
+    build_quant_config,
     detect_pipeline_class,
     detect_load_variant,
+    quant_cache_fragment,
     read_guidance_embeds,
     get_gen_pipeline_cache,
     clear_gen_pipeline_cache,
@@ -73,6 +76,17 @@ class EricDiffusionLoader:
                     "default": "bf16",
                     "tooltip": "Model precision. bf16 recommended for RTX 40/50 series.",
                 }),
+                "quant": (list(QUANT_MODES), {
+                    "default": "none",
+                    "tooltip": (
+                        "Quantize-on-load (ADR-019). fp8 halves VRAM on the "
+                        "transformer + large text encoders and uses native "
+                        "fp8 tensor cores (Ada/Hopper/Blackwell, compute "
+                        "capability >= 8.9). VAE and CLIP encoders are never "
+                        "quantized. Falls back to bf16 with a console warning "
+                        "on unsupported hardware."
+                    ),
+                }),
                 "device": (available_device_options(), {
                     "default": (
                         "balanced" if "balanced" in available_device_options()
@@ -120,6 +134,7 @@ class EricDiffusionLoader:
         self,
         model_path: str,
         precision: str = "bf16",
+        quant: str = "none",
         device: str = "cuda",
         keep_in_vram: bool = True,
         offload_vae: bool = False,
@@ -128,9 +143,13 @@ class EricDiffusionLoader:
         allow_hf_download: bool = False,
     ) -> Tuple:
         model_path = resolve_hf_path(model_path.strip(), allow_download=allow_hf_download)
+        # quant_cache_fragment is "" for mode 'none' — the default path's
+        # cache key stays byte-identical to pre-quant behavior (invariant 1);
+        # any quant change evicts and reloads (invariant 4).
         cache_key = (
             f"{model_path}_{precision}_{device}_{offload_vae}"
             f"_{attention_slicing}_{sequential_offload}"
+            f"{quant_cache_fragment(quant)}"
         )
         cache = get_gen_pipeline_cache()
 
@@ -162,6 +181,24 @@ class EricDiffusionLoader:
         variant = detect_load_variant(model_path)
         if variant:
             load_kwargs["variant"] = variant
+
+        # ── Quantize-on-load (ADR-019 slice A) ────────────────────────────
+        # build_quant_config warns and returns None on unsupported hardware
+        # or missing torchao — the load proceeds unquantized (never crash).
+        quant_components: dict = {}
+        if quant != "none":
+            if sequential_offload:
+                print("[EricDiffusion] WARNING: quant + sequential_offload "
+                      "is untested together — proceeding with both")
+            if use_device_map:
+                print("[EricDiffusion] WARNING: quant + device_map='balanced' "
+                      "is untested together — proceeding with both")
+            quant_config, quant_components, _ = build_quant_config(
+                model_path, quant, device=device,
+                log_prefix="[EricDiffusion]",
+            )
+            if quant_config is not None:
+                load_kwargs["quantization_config"] = quant_config
 
         pipeline = pipeline_class.from_pretrained(model_path, **load_kwargs)
 
@@ -196,6 +233,13 @@ class EricDiffusionLoader:
             "model_family":    model_family,
             "offload_vae":     offload_vae,
             "guidance_embeds": guidance_embeds,
+            # Effective quant state: mode 'none' when disabled OR when the
+            # hardware/env fallback fired. Downstream (LoRA guard) keys off
+            # the actual pipeline params, but this records intent + outcome.
+            "quant": {
+                "mode": quant if quant_components else "none",
+                "components": quant_components,
+            },
         }
 
         if keep_in_vram:
@@ -206,9 +250,13 @@ class EricDiffusionLoader:
 
         denoiser = getattr(pipeline, "transformer", None) or getattr(pipeline, "unet", None)
         params_b = sum(p.numel() for p in denoiser.parameters()) / 1e9 if denoiser else 0.0
+        quant_note = (
+            f", quant={quant}({'+'.join(sorted(quant_components))})"
+            if quant_components else ""
+        )
         print(
             f"[EricDiffusion] Loaded — {params_b:.2f}B denoiser params, "
-            f"guidance_embeds={guidance_embeds}"
+            f"guidance_embeds={guidance_embeds}{quant_note}"
         )
 
         return (pipeline_dict,)

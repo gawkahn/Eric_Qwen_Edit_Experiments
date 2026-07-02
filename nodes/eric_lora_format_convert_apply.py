@@ -514,6 +514,8 @@ def _apply_converted_lora_as_delta(
     runtime weight changes for guaranteed correctness — same compromise
     the existing _load_lokr_adapter_direct path makes.
     """
+    from .eric_diffusion_utils import guard_direct_merge
+    guard_direct_merge(transformer, log_prefix, "converted adapter")
     model_sd = dict(transformer.named_parameters())
     modules: Dict[str, Dict[str, "torch.Tensor"]] = {}
     for k, v in state_dict.items():

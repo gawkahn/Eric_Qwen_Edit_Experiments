@@ -17,6 +17,9 @@ torch==2.11.0
 # torchvision must match torch's minor (2.11 ↔ 0.26); required by the
 # diffusers SD image-transform path — basic SD generation errors without it.
 torchvision==0.26.0
+# torchao provides the fp8 quantize-on-load backend (ADR-019 slice A).
+# Torch-ecosystem package — keep its pin moving with torch's.
+torchao==0.17.0
 # diffusers: git-pinned to an unreleased commit on the krea-testing branch ONLY
 # (Krea2Pipeline is main-only; no PyPI release ships it). Exact pin = commit rev.
 # Do NOT merge this line to main — main stays on the last tagged release.

@@ -403,6 +403,38 @@ _GENERATE_INPUT_SCHEMA: dict[str, Any] = {
                 "dispatch handler; slice 1 ships the schema slot."
             ),
         },
+        "quant": {
+            "type": "string",
+            "enum": ["none", "fp8"],
+            "description": (
+                "Quantize-on-load (ADR-019). fp8 halves VRAM on the "
+                "transformer + large text encoders using native fp8 tensor "
+                "cores; VAE and CLIP encoders are never quantized. Falls "
+                "back to unquantized with a warning on unsupported "
+                "hardware. Non-cascade models only (ignored for cascade). "
+                "Default none."
+            ),
+        },
+        "quant_skip": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 32,
+            "description": (
+                "Component slot names (e.g. 'text_encoder') to exclude "
+                "from quantization. For isolating quality regressions. "
+                "Slot names only — never paths."
+            ),
+        },
+        "quant_only": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 32,
+            "description": (
+                "Quantize exactly these component slots, overriding the "
+                "default eligible set. 'vae' is refused even here. Slot "
+                "names only — never paths."
+            ),
+        },
     },
 }
 
@@ -1109,13 +1141,18 @@ def _pipeline_cache_key(
     transformer_abs: str,
     vae_from_transformer: bool,
     loras_resolved: list,
+    quant: str = "none",
+    quant_skip: tuple = (),
+    quant_only: tuple = (),
 ) -> tuple:
     """Hashable key over the full effective config that varies in the MCP path.
 
     precision/device/offload and the vae/text-encoder component overrides are
     hard-coded constants in `_handle_generate`, so they cannot vary and are not
     part of the key. The LoRA set IS part of the key (path + weight, in order),
-    so any LoRA change is a cache miss → evict + reload + re-apply.
+    so any LoRA change is a cache miss → evict + reload + re-apply. The quant
+    triple is likewise keyed (ADR-019 invariant 4): an fp8→none switch must
+    evict, never reuse the quantized pipeline.
     """
     lora_key = tuple(
         (str(spec.get("path", "")), float(spec.get("weight", 1.0)))
@@ -1126,7 +1163,10 @@ def _pipeline_cache_key(
     # fold it out of the key when no transformer is set — avoids a spurious
     # miss + full reload when the flag toggles with no transformer.
     vft = bool(vae_from_transformer and transformer_abs)
-    return (model_abs, transformer_abs, vft, lora_key)
+    quant_key = (str(quant or "none"),
+                 tuple(sorted(quant_skip or ())),
+                 tuple(sorted(quant_only or ())))
+    return (model_abs, transformer_abs, vft, lora_key, quant_key)
 
 
 def _get_or_load_cached_pipeline(
@@ -1134,6 +1174,9 @@ def _get_or_load_cached_pipeline(
     transformer_abs: str,
     vae_from_transformer: bool,
     loras_resolved: list,
+    quant: str = "none",
+    quant_skip: tuple = (),
+    quant_only: tuple = (),
 ) -> dict:
     """Return the cached pipeline dict for this config, loading on a miss.
 
@@ -1143,7 +1186,8 @@ def _get_or_load_cached_pipeline(
     the {pipeline, model_family, guidance_embeds} keys generate() consumes.
     """
     from comfyless.generate import _load_pipeline, _apply_loras, _log
-    key = _pipeline_cache_key(model_abs, transformer_abs, vae_from_transformer, loras_resolved)
+    key = _pipeline_cache_key(model_abs, transformer_abs, vae_from_transformer,
+                              loras_resolved, quant, quant_skip, quant_only)
     if _PIPELINE_CACHE.get("pipeline") is not None and _PIPELINE_CACHE.get("key") == key:
         _log("[comfyless-mcp] Reusing cached pipeline (config unchanged)")
         return _PIPELINE_CACHE
@@ -1161,6 +1205,9 @@ def _get_or_load_cached_pipeline(
         attention_slicing=False,
         sequential_offload=False,
         allow_hf_download=False,
+        quant=quant,
+        quant_skip=tuple(quant_skip or ()),
+        quant_only=tuple(quant_only or ()),
     )
     lora_warnings = _apply_loras(pipe, loras_resolved)
     _PIPELINE_CACHE.update({
@@ -1381,11 +1428,17 @@ async def _handle_generate(
     # (OQ-A) -> always "" here. Operator-tuning knobs (precision/offload/...)
     # are spawn-time concerns, not agent-facing — hard-coded defaults.
     from comfyless.generate import generate, KREA_REBALANCE_DEFAULT_MULT
+    # quant fields were type-validated in step 1 (validate_machine_request:
+    # str mode + list-of-bare-slot-names, path shapes rejected). They carry no
+    # filesystem strings and feed only build_quant_config's eligibility policy.
     cached = _get_or_load_cached_pipeline(
         model_abs,
         transformer_abs,
         bool(payload.get("vae_from_transformer")),
         loras_resolved or [],
+        quant=str(payload.get("quant") or "none"),
+        quant_skip=tuple(payload.get("quant_skip") or ()),
+        quant_only=tuple(payload.get("quant_only") or ()),
     )
     # NOTE: cached["lora_warnings"] are logged operator-side by _apply_loras but
     # are NOT surfaced in `notices` — they embed the absolute LoRA path, which
@@ -1552,6 +1605,15 @@ async def _handle_generate_cascade(
     # by cascade.build_pipelines, and never agent-affectable.
     from comfyless.catalog import resolve_reference
     notices: list = []
+    # quant is a non-cascade knob (ADR-019 slice A): the cascade path has its
+    # own stage loaders that don't take quantization_config. Ignore loudly —
+    # never silently — so an agent setting quant on cascade learns why the
+    # VRAM didn't change.
+    if arguments.get("quant") and arguments.get("quant") != "none":
+        notices.append(
+            "INFO: quant is not supported for Stable Cascade dispatch — "
+            "ignored (generation proceeds unquantized)"
+        )
     resolved_cc = dict(cfg_cc)
     stage_names: dict = {}
     for stage in ("stage_c", "stage_b", "stage_a"):

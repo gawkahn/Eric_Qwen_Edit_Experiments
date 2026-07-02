@@ -354,8 +354,10 @@ def _load_lokr_adapter_direct(pipe, state_dict: dict, adapter_name: str,
     single re-merge at changed weight.
     """
     import math, re
+    from .eric_diffusion_utils import guard_direct_merge
 
     transformer = getattr(pipe, "transformer", None) or getattr(pipe, "unet", None)
+    guard_direct_merge(transformer, log_prefix, "LoKR adapter")
     model_sd = dict(transformer.named_parameters())
 
     # Group state dict keys by module path
@@ -530,7 +532,10 @@ def _load_loha_adapter_direct(pipe, state_dict: dict, adapter_name: str,
     LoHa delta = ``(w1_a @ w1_b) * (w2_a @ w2_b) * (alpha / r) * weight``.
     When *alpha* is absent, scale defaults to ``1.0``.
     """
+    from .eric_diffusion_utils import guard_direct_merge
+
     transformer = getattr(pipe, "transformer", None) or getattr(pipe, "unet", None)
+    guard_direct_merge(transformer, log_prefix, "LoHa adapter")
     model_sd = dict(transformer.named_parameters())
 
     # Group state dict keys by module path
@@ -959,7 +964,10 @@ def _load_lora_adapter_direct(pipe, state_dict: dict, adapter_name: str,
     The user *weight* is baked in at merge time.  ``set_adapters()`` will
     not be able to change it afterwards (a limitation of direct merge).
     """
+    from .eric_diffusion_utils import guard_direct_merge
+
     transformer = getattr(pipe, "transformer", None) or getattr(pipe, "unet", None)
+    guard_direct_merge(transformer, log_prefix, "this LoRA")
     model_sd = dict(transformer.named_parameters())
 
     modules: dict[str, dict] = {}
