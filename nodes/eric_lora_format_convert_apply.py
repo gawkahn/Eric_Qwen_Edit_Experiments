@@ -387,6 +387,7 @@ def convert_state_dict(
 
     out: Dict[str, "torch.Tensor"] = {}
     n_lokr_qkv = n_lokr_single = n_lora_qkv = n_lora_pass = n_skipped = 0
+    n_bias_dropped = 0
     skipped_samples: List[str] = []
 
     for base, parts in modules.items():
@@ -400,6 +401,13 @@ def convert_state_dict(
         # Emit .diff (full merged delta) — see convert_state_dict
         # docstring for the "why direct merge instead of SVD" rationale.
         if ".lokr_w1" in parts and ".lokr_w2" in parts:
+            # Defensive: a real LoKR never also ships a pre-baked .diff for
+            # the same module.  If both appear, the LoKR path wins below and
+            # the .diff would be lost — surface it rather than drop silently.
+            if ".diff" in parts:
+                n_bias_dropped += 1  # reuse the loud-drop counter
+                print(f"{log_prefix} note: module {base!r} has both a LoKR "
+                      f"factorization and a .diff — using LoKR, ignoring .diff")
             delta = reconstruct_lokr_delta(
                 parts[".lokr_w1"], parts[".lokr_w2"], parts.get(".alpha"),
             )
@@ -465,6 +473,35 @@ def convert_state_dict(
                 n_lora_pass += 1
             continue
 
+        # ── Pre-baked delta (.diff) — pass through as-is ─────────────
+        # Some surgical LoRAs ship a fully-materialized weight delta rather
+        # than a low-rank factorization (e.g. Krea's txtfusion.projector
+        # bypass, a lone `.diff`).  The rename already retargeted the base;
+        # re-emit the delta at the target path so the direct-merge loader
+        # (which already understands `.diff`) can apply it.  Mirrors the
+        # LoKR branch's qkv-split handling for full generality.
+        if ".diff" in parts:
+            delta = parts[".diff"]
+            if qkv_spec:
+                dims = _resolve_split_dims(qkv_spec, delta.shape[0], base, "diff")
+                offset = 0
+                for tgt, d in zip(qkv_spec.targets, dims):
+                    out_base = base.replace(qkv_spec.pattern, tgt)
+                    out[out_base + ".diff"] = delta[offset:offset + d].contiguous()
+                    offset += d
+                n_lokr_qkv += 1
+            else:
+                out[base + ".diff"] = delta.contiguous()
+                n_lokr_single += 1
+            # The direct-merge loader applies weight deltas only; a co-shipped
+            # bias delta (.diff_b) would be dropped.  Surface it loudly rather
+            # than lose it silently (reviewer finding).
+            if ".diff_b" in parts:
+                n_bias_dropped += 1
+                if len(skipped_samples) < 3:
+                    skipped_samples.append(base + " (.diff_b bias delta)")
+            continue
+
         # ── Unsupported (LoHa, etc.) ─────────────────────────────────
         n_skipped += 1
         if len(skipped_samples) < 3:
@@ -482,12 +519,68 @@ def convert_state_dict(
             "LoHa or unsupported adapter format; standard-LoRA paths "
             "still apply for these modules.)"
         )
+    if n_bias_dropped:
+        print(
+            f"{log_prefix} WARNING: {n_bias_dropped} module(s) shipped a bias "
+            "delta (.diff_b) or a redundant .diff that the direct-merge loader "
+            "does not apply — weight deltas were applied, these were not."
+        )
     return out
 
 
 # ════════════════════════════════════════════════════════════════════════
 #  Loader: apply a converted state dict to a pipeline
 # ════════════════════════════════════════════════════════════════════════
+
+def resolve_merge_target(param_names, base: str) -> Optional[str]:
+    """Return the real parameter key a converted module's delta merges into.
+
+    Makes direct-merge order-insensitive w.r.t. PEFT wrapping.  When an
+    earlier LoRA in the same run was injected via PEFT
+    (``inject_adapter_in_model`` / ``load_lora_weights``), it wraps the
+    target ``nn.Linear`` in a PEFT ``LoraLayer`` and the frozen weight moves
+    from ``<base>.weight`` to ``<base>.base_layer.weight`` — the bare
+    ``<base>.weight`` key disappears.  A subsequent direct-merge LoRA that
+    only looked for ``<base>.weight`` would find nothing and silently skip
+    every module (the "realism sticks only if it loads first" bug).
+
+    Merging into ``base_layer.weight`` is correct and composes either way:
+    it is the real frozen weight, so ``(W0 + delta)·x + peft_adapter(x)``
+    holds regardless of which adapter landed first.
+
+    Resolution order (first hit wins):
+        <base>.weight              — unwrapped module (common case)
+        <base>                     — parameter without a .weight suffix
+        <base>.base_layer.weight   — PEFT-wrapped module
+    Returns None when the module has no counterpart in the model.
+    """
+    for cand in (base + ".weight", base, base + ".base_layer.weight"):
+        if cand in param_names:
+            return cand
+    return None
+
+
+def resolve_restore_target(param_names, backup_key: str) -> Optional[str]:
+    """Map a stored backup key to the param that currently holds that weight.
+
+    Direct-merge backups are keyed by the param name that existed at merge
+    time.  Between merge and unload, PEFT wrapping can be added OR removed by
+    other adapters, moving the weight between ``<base>.weight`` and
+    ``<base>.base_layer.weight``.  Restoring by the stale key would silently
+    no-op and leave the merged delta baked in.  Re-resolve through the
+    current wrapping state so the original weights are always restored.
+
+    Exact key first (common case), else strip the known weight suffix to a
+    base and re-run ``resolve_merge_target``.
+    """
+    if backup_key in param_names:
+        return backup_key
+    for sfx in (".base_layer.weight", ".weight"):
+        if backup_key.endswith(sfx):
+            return resolve_merge_target(param_names, backup_key[: -len(sfx)])
+    # Bare module path (parameter without a .weight suffix).
+    return resolve_merge_target(param_names, backup_key)
+
 
 def _apply_converted_lora_as_delta(
     transformer,
@@ -530,10 +623,10 @@ def _apply_converted_lora_as_delta(
 
     applied_diff = applied_lora = skipped = 0
     for base, parts in modules.items():
-        target_key = base + ".weight"
-        if target_key not in model_sd:
-            target_key = base  # rare: parameter without .weight suffix
-        if target_key not in model_sd:
+        # Resolve through PEFT wrapping so a direct-merge LoRA applies
+        # regardless of whether a PEFT LoRA wrapped these modules first.
+        target_key = resolve_merge_target(model_sd, base)
+        if target_key is None:
             skipped += 1
             continue
         param = model_sd[target_key]
@@ -649,7 +742,9 @@ def load_converted_lora(
     dropped_bases: set = set()
     for k, v in converted_state_dict.items():
         base, _ = split_state_key(k)
-        if base + ".weight" in param_names or base + ".bias" in param_names:
+        # base_layer.weight covers modules a prior PEFT LoRA already wrapped.
+        if (resolve_merge_target(param_names, base) is not None
+                or base + ".bias" in param_names):
             valid_converted[k] = v
         else:
             dropped_bases.add(base)

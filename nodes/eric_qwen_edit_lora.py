@@ -1079,10 +1079,15 @@ def unload_adapters(pipe, adapter_names, log_prefix: str = "[LoRA]") -> None:
             backup_key = f"_{adapter_family}_backup_{adapter_name}"
             backup = getattr(transformer, backup_key, None)
             if backup:
+                from .eric_lora_format_convert_apply import resolve_restore_target
                 model_sd = dict(transformer.named_parameters())
                 restored = 0
                 for target_key, original_tensor in backup.items():
-                    param = model_sd.get(target_key)
+                    # Re-resolve through any PEFT wrapping added/removed since
+                    # merge, so a stale .weight ↔ .base_layer.weight move
+                    # doesn't leave the delta baked in.
+                    live_key = resolve_restore_target(model_sd, target_key)
+                    param = model_sd.get(live_key) if live_key else None
                     if param is not None:
                         param.data.copy_(original_tensor.to(
                             dtype=param.dtype, device=param.device,
