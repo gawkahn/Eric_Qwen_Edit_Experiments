@@ -53,6 +53,7 @@ from nodes.eric_diffusion_utils import (
     read_guidance_embeds,
     read_model_index,
     resolve_component_class,
+    resolve_override_component_class,
     detect_component_format,
     load_component,
     resolve_hf_path,
@@ -742,9 +743,19 @@ def _load_pipeline(
 
     if vae_path:
         _log(f"[comfyless] VAE override: {vae_path!r}")
-        cls_, cname = resolve_component_class(model_index, "vae")
+        base_cls, base_name = resolve_component_class(model_index, "vae")
+        # Prefer the override's OWN class when it declares one — lets a
+        # latent-compatible but differently-classed VAE (e.g. AutoencoderKLWan
+        # onto a Qwen-latent model like Krea-2) load instead of failing the
+        # base class's key-match guard at 0%.
+        cls_, cname = resolve_override_component_class(
+            vae_path, "vae", base_cls, base_name)
         if cls_ is None:
             raise ValueError(f"VAE class '{cname}' not found in diffusers.")
+        if base_name and cname != base_name:
+            _log(f"[comfyless] VAE override declares its own class {cname!r} "
+                 f"(base model VAE is {base_name!r}) — instantiating {cname!r}; "
+                 f"latent-space compatibility is the caller's responsibility")
         comp_kwargs["vae"] = load_component(
             cls_, vae_path, dtype,
             base_path=model_path, subfolder_hint="vae",

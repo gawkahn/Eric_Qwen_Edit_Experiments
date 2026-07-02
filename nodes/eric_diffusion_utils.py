@@ -203,6 +203,76 @@ def resolve_component_class(model_index: dict, component: str):
     return None, class_name
 
 
+def resolve_override_component_class(override_path: str, subfolder_hint: str,
+                                     base_class, base_name: str):
+    """Pick the class to instantiate for a component *override* checkpoint.
+
+    The default component-override path forces the BASE model's class onto
+    the override (``resolve_component_class`` reads the base
+    ``model_index.json``).  That is correct when the override is the same
+    architecture as the base, but wrong when the override is a different —
+    yet latent-space-compatible — architecture.  The motivating case: a
+    Wan2.1 VAE (``AutoencoderKLWan``) swapped onto a model whose own VAE is
+    ``AutoencoderKLQwenImage`` (Krea-2, Qwen-Image).  Both consume the same
+    16-channel latents, but their state-dict keys differ, so loading the Wan
+    weights into the base class yields a 0% key match.
+
+    This helper prefers the override checkpoint's OWN ``config.json``
+    ``_class_name`` when one exists, so the right class is instantiated.  It
+    only reads config — latent-space compatibility remains the caller's
+    responsibility (the key-match guard in ``_load_single_weights`` still
+    catches a genuine architecture mismatch).
+
+    Resolution order for the config:
+        <override_path>/config.json            (bare diffusers component repo)
+        <override_path>/<subfolder_hint>/config.json  (full model dir)
+
+    Single-file overrides (a lone ``.safetensors``) carry no config, so the
+    base class is returned unchanged — same as the pre-existing behavior.
+
+    Returns ``(class, class_name)``.  Falls back to ``(base_class,
+    base_name)`` when no override config is found or the declared class is
+    not importable from the installed diffusers (with a loud warning in the
+    latter case — an unknown class name is more likely a typo/version skew
+    than an intended base-class load).
+    """
+    try:
+        resolved = resolve_component_path(override_path.strip())
+    except Exception:
+        return base_class, base_name
+
+    candidates = [os.path.join(resolved, "config.json")]
+    if subfolder_hint:
+        candidates.append(os.path.join(resolved, subfolder_hint, "config.json"))
+
+    for cfg_path in candidates:
+        if not os.path.isfile(cfg_path):
+            continue
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            continue
+        class_name = cfg.get("_class_name")
+        if not class_name:
+            continue
+        import diffusers
+        cls = getattr(diffusers, class_name, None)
+        # Require an actual class: a non-class attribute (submodule, function,
+        # version string) would only fail confusingly at instantiation.
+        if not isinstance(cls, type):
+            print(
+                f"[EricDiffusion] WARNING: override at {resolved!r} declares "
+                f"class {class_name!r}, which does not resolve to a model class "
+                f"in the installed diffusers — falling back to base class "
+                f"{base_name!r}. (Version skew or typo?)"
+            )
+            return base_class, base_name
+        return cls, class_name
+
+    return base_class, base_name
+
+
 def read_model_index(model_path: str) -> dict:
     """Load and return model_index.json from a model directory."""
     index_path = os.path.join(model_path, "model_index.json")
