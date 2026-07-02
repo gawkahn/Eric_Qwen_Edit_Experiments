@@ -33,6 +33,10 @@ dependencies = [
     # path — basic SD generation errors without it. Bumping torchvision drags
     # torch with it, so pin both together.
     "torchvision==0.26.0",
+    # torchao provides the fp8 quantize-on-load backend (ADR-019 slice A):
+    # diffusers TorchAoConfig + Float8DynamicActivationFloat8WeightConfig.
+    # Torch-ecosystem package — keep its pin moving with torch's.
+    "torchao==0.17.0",
     "diffusers==0.37.1",
     "transformers==5.5.3",
     "accelerate==1.13.0",
