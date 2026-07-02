@@ -11,10 +11,10 @@ Three fp8 single-file variants exist on disk; "ComfyUI scaled-fp8" is not one fo
 
 | Variant | Example file | Layout |
 |---|---|---|
-| **C-a: scaled, `weight_scale` suffixes** | `Flux.2-Klein-9B-base/flux-2-klein-base-9b-fp8.safetensors` (the file whose KeyError motivated this) | per-Linear `weight` F8_E4M3 `[out,in]` + `weight_scale` F32 scalar + `input_scale` F32 scalar; BFL key layout (`double_blocks.*`) |
+| **C-a: scaled, `weight_scale` suffixes** | `Flux.2-Klein-9B-base/flux-2-klein-base-9b-fp8.safetensors` (the file whose KeyError motivated this); also `ltx-2-19b-distilled-fp8.safetensors` (same layout under a `model.diffusion_model.` prefix — *corrected 2026-07-02: initial survey misread its markers as comfy_quant*) | per-Linear `weight` F8_E4M3 `[out,in]` + `weight_scale` F32 scalar + `input_scale` F32 scalar; BFL key layout (`double_blocks.*`) |
 | **C-b: scaled, `scale_weight` suffixes** | `wan2.2_t2v_*_14B_fp8_scaled.safetensors` | per-Linear `weight` F8_E4M3 + `scale_weight`/`scale_input` F32 scalars + global `scaled_fp8` marker tensor; biases f16 |
-| **C-c: plain fp8 cast (no scales)** | most civitai Flux.1 fp8 checkpoints (`colossusProject…FP8UNET`, etc.) | fp8 tensors, no scale keys — storage compression only |
-| (observed, out of scope) | `ZImageTurbo-nvfp4_FP32.safetensors` | nvfp4-labeled with scale markers — log-and-reject with a clear message; nvfp4 single-file is ADR-019-deferred |
+| **C-c: plain fp8 cast (no scales)** | most civitai Flux.1 fp8 checkpoints (`colossusProject…FP8UNET`, etc.) | fp8 tensors, no scale keys — storage compression only; already loads via the standard path + dtype upcast (no new code) |
+| (observed, out of scope) | `ZImageTurbo-nvfp4_FP32.safetensors` | nvfp4 block layout: `weight` U8 packed + `weight_scale` F8_E4M3 `[out,blocks]` + `weight_scale_2` F32 scalar — header-time reject on the `.weight_scale_2` signature; ADR-019-deferred |
 
 Semantics (matches ComfyUI fp8_ops): `W ≈ W_fp8 · weight_scale`; forward computes fp8 GEMM with per-tensor scales. **This maps directly onto `torch._scaled_mm(x_fp8, W_fp8.T, scale_a=input_scale, scale_b=weight_scale)`** — the native fp8 tensor-core op on sm89+. The "ops port" is therefore ONE custom Linear, not a kernel port.
 

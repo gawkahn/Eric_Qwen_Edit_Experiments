@@ -355,23 +355,21 @@ def _diagnose_slot_mismatch(ckpt_keys: set, target_slot: str) -> str:
     )
     if is_comfy_fp8:
         return (
-            f"\n\nThis is a ComfyUI FP8-quantized checkpoint (detected "
-            f".comfy_quant / .weight_scale / .input_scale markers).  "
-            f"Our loader + diffusers' converters don't support ComfyUI's "
-            f"FP8 format — the quantized tensors need to be dequantized "
-            f"back to bf16 before the single-file loading path can "
-            f"handle them.\n\n"
+            f"\n\nThis checkpoint carries ComfyUI FP8 markers "
+            f"(.comfy_quant / .weight_scale / .input_scale).  Scaled-fp8 "
+            f"checkpoints are normally routed to the native scaled-fp8 "
+            f"loader BEFORE reaching this point (ADR-019 slice C) — if "
+            f"you are seeing this error, the classifier declined the "
+            f"file (unsupported layout, e.g. comfy_quant metadata blobs "
+            f"or nvfp4 block format) or the load failed after routing.\n\n"
             f"Options:\n"
-            f"  1. Use the un-quantized version of this checkpoint if "
-            f"one is available (civitai uploaders often have both).\n"
-            f"  2. Use ComfyUI's native UNETLoader or CheckpointLoaderSimple "
-            f"with the standard KSampler workflow — ComfyUI can consume "
-            f"its own FP8 format directly.  You lose access to this "
-            f"node pack's Advanced Generate/Multistage/Edit features "
-            f"for this model, but the checkpoint will run.\n"
-            f"  3. A dequantize_comfy.py standalone tool is on the "
-            f"backlog but not yet implemented — analogous to the "
-            f"existing dequantize_nf4.py for bitsandbytes."
+            f"  1. Check the log above for the specific scaled-fp8 "
+            f"rejection reason.\n"
+            f"  2. Use the un-quantized version of this checkpoint if "
+            f"one is available (civitai uploaders often have both), "
+            f"optionally with --quant fp8 to re-quantize natively.\n"
+            f"  3. nvfp4-format files are deferred — see ADR-019 "
+            f"§Deferred and TECH_DEBT.md."
         )
 
     # ── Check 2: Full-pipeline CivitAI-style checkpoint ─────────────────
@@ -545,6 +543,33 @@ def _load_single_weights(component_class, weights_path: str, dtype,
         return None
 
     detected_prefix = _peek_dominant_prefix(weights_path)
+
+    # ── ComfyUI scaled-fp8 routing (ADR-019 slice C) ─────────────────────
+    # Header-only classification (safe_open, names + dtypes only). Variants:
+    #   ca/cb — scaled fp8 → native loader (weights stay fp8-resident)
+    #   cc    — plain fp8 cast → standard path below upcasts it already
+    #   None  — not fp8 → standard path, byte-identical (invariant 2)
+    # ScaledFp8FormatError (mixed conventions, comfy_quant/nvfp4 layouts,
+    # control-char names, malformed scales) propagates as a LOUD reject —
+    # falling through would reproduce the historical converter KeyError.
+    # SECURITY: this branch + eric_diffusion_fp8_ops parse caller-supplied
+    # file CONTENT — Review bar surface, security-auditor-gated. See
+    # docs/security/review-slice-C-fp8-single-file-2026-07-02.md.
+    from .eric_diffusion_fp8_ops import (
+        classify_fp8_single_file, load_scaled_fp8_component,
+    )
+    _fp8_variant, _fp8_info = classify_fp8_single_file(weights_path)
+    if _fp8_variant in ("ca", "cb"):
+        print(f"[EricDiffusion] Detected ComfyUI scaled-fp8 checkpoint "
+              f"(variant {_fp8_variant}, {_fp8_info.get('n_fp8', '?')} fp8 "
+              f"tensors) — native scaled-fp8 loader")
+        return load_scaled_fp8_component(
+            component_class, weights_path, dtype, config_path,
+            _fp8_variant, strip_prefix=detected_prefix,
+        )
+    if _fp8_variant == "cc":
+        print(f"[EricDiffusion] Plain fp8-cast checkpoint (no scales) — "
+              f"standard path upcasts to {dtype}")
 
     def _load_stripped_in_memory(src_path: str, prefix: str, target_dtype, cfg_path: str):
         """Load weights into RAM, strip the dominant prefix, and instantiate the
@@ -1418,6 +1443,16 @@ def is_quantized_module(module) -> bool:
     """
     if module is None:
         return False
+    # Scaled-fp8 modules (ADR-019 slice C) store plain fp8 tensors, not
+    # torchao subclasses — explicit isinstance walker FIRST (security
+    # review F8: a parameter-type sniff alone would miss them and let
+    # tier-3 merges write into fp8 buffers).
+    try:
+        from .eric_diffusion_fp8_ops import contains_scaled_fp8
+        if contains_scaled_fp8(module):
+            return True
+    except ImportError:
+        pass
     try:
         for p in module.parameters():
             if type(p.data).__module__.startswith("torchao"):
