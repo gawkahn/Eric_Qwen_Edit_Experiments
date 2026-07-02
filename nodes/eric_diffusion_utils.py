@@ -1147,6 +1147,299 @@ def load_component(component_class, path: str, dtype, base_path: str = None,
     )
 
 
+# ── fp8 quantize-on-load (ADR-019 slice A) ───────────────────────────────────
+#
+# Quantization is decided per component ROLE, not per file.  Roles are
+# classified from model_index.json (name + class), so eligibility is known
+# before any weights load:
+#   denoiser  — transformer / unet / prior (large Linear stacks) → quantize
+#   lm        — large-LM text encoders (Qwen2.5-VL, Mistral, T5-XXL, Qwen3)
+#               → quantize IF the on-disk weights exceed _QUANT_TE_MIN_BYTES
+#               (separates Flux's 9 GB T5-XXL from Hunyuan's tiny ByT5, which
+#               shares the T5EncoderModel class name)
+#   clip      — CLIP text/vision encoders → excluded by default (tiny VRAM
+#               win, measurable prompt-adherence shift); opt-in via only=
+#   vae       — NEVER quantized (visible decode artifacts); not overridable
+#   other     — schedulers, tokenizers, processors, guiders → not applicable
+#
+# See docs/decisions/ADR-019-native-quantization-support.md.
+
+QUANT_MODES = ("none", "fp8")
+
+#: Text encoders below this on-disk weight size are excluded from the default
+#: quant set (CLIP-G is ~1.4 GB, ByT5-small ~1.2 GB; T5-XXL / Qwen2.5-VL /
+#: Mistral3 / Qwen3 are all well above).
+_QUANT_TE_MIN_BYTES = 2 * 1024**3
+
+
+def classify_quant_role(component_name: str, class_name: str | None) -> str:
+    """Map a model_index.json component entry to a quantization role.
+
+    Returns one of: 'denoiser', 'lm', 'clip', 'vae', 'other'.
+    Pure function — unit-testable without torch or weights.
+    """
+    if not class_name:
+        return "other"
+    # VAE-role first: catches 'vae' (AutoencoderKL*) and Stable Cascade's
+    # 'vqgan' (PaellaVQModel) regardless of slot name.
+    if ("Autoencoder" in class_name or "VQModel" in class_name
+            or component_name == "vae"):
+        return "vae"
+    if "CLIPText" in class_name or "CLIPVision" in class_name:
+        return "clip"
+    # Denoisers by class: FluxTransformer2DModel, QwenImageTransformer2DModel,
+    # UNet2DConditionModel, StableCascadeUNet ('UNet' substring), PriorTransformer.
+    if ("Transformer2DModel" in class_name or "UNet" in class_name
+            or "PriorTransformer" in class_name):
+        return "denoiser"
+    # Any non-CLIP text encoder slot is a language model (T5, UMT5,
+    # Qwen2.5-VL, Qwen3, Mistral3, ...).  Size gate applied separately.
+    if component_name.startswith("text_encoder"):
+        return "lm"
+    return "other"
+
+
+def component_weight_bytes(model_path: str, component_name: str) -> int | None:
+    """Sum the on-disk weight-file sizes of a component subfolder.
+
+    Returns None when the subfolder or weight files can't be found (variant
+    layouts, overrides) — callers should treat None as 'unknown, assume large'
+    so a layout quirk never silently drops a text encoder from the quant set.
+    """
+    comp_dir = os.path.join(model_path, component_name)
+    if not os.path.isdir(comp_dir):
+        return None
+    total = 0
+    try:
+        for entry in os.scandir(comp_dir):
+            if entry.is_file() and entry.name.endswith(
+                    (".safetensors", ".bin", ".pt", ".pth")):
+                total += entry.stat().st_size
+    except OSError:
+        return None
+    return total if total > 0 else None
+
+
+def resolve_quant_components(
+    model_path: str,
+    model_index: dict,
+    *,
+    skip: tuple = (),
+    only: tuple = (),
+) -> tuple[dict, list]:
+    """Decide which pipeline components get quantized.
+
+    Returns ({component_name: role}, notices).  Policy:
+      default  → denoisers + large LMs
+      only=    → exactly those names (roles denoiser/lm/clip addressable;
+                 'vae' is refused loudly — invariant: VAE is never quantized)
+      skip=    → removed from whichever set applies
+    """
+    notices: list = []
+    roles: dict = {}
+    for name, entry in model_index.items():
+        if name.startswith("_") or not isinstance(entry, list):
+            continue
+        class_name = entry[1] if len(entry) > 1 else None
+        roles[name] = classify_quant_role(name, class_name)
+
+    if only:
+        selected: dict = {}
+        for name in only:
+            role = roles.get(name)
+            if role is None:
+                notices.append(f"quant-only: unknown component {name!r} — ignored")
+            elif role == "vae":
+                notices.append(
+                    f"quant-only: {name!r} is a VAE — VAE is NEVER quantized "
+                    f"(visible decode artifacts); ignored"
+                )
+            elif role == "other":
+                notices.append(
+                    f"quant-only: {name!r} is not a quantizable module "
+                    f"(role: {role}) — ignored"
+                )
+            else:
+                selected[name] = role
+    else:
+        selected = {}
+        for name, role in roles.items():
+            if role == "denoiser":
+                selected[name] = role
+            elif role == "lm":
+                size = component_weight_bytes(model_path, name)
+                if size is not None and size < _QUANT_TE_MIN_BYTES:
+                    notices.append(
+                        f"quant: text encoder {name!r} is small "
+                        f"({size / 1024**3:.1f} GB < 2 GB) — left in full "
+                        f"precision (use quant-only to force)"
+                    )
+                else:
+                    selected[name] = role
+            elif role == "clip":
+                notices.append(
+                    f"quant: CLIP-class encoder {name!r} excluded by default "
+                    f"(quality-sensitive, negligible VRAM win; use quant-only "
+                    f"to force)"
+                )
+
+    for name in skip:
+        if name in selected:
+            del selected[name]
+        elif name not in roles:
+            notices.append(f"quant-skip: unknown component {name!r} — ignored")
+    return selected, notices
+
+
+def _torchao_fp8_config():
+    """The single fp8 recipe used everywhere (spike-verified on sm_120)."""
+    from torchao.quantization import Float8DynamicActivationFloat8WeightConfig
+    return Float8DynamicActivationFloat8WeightConfig()
+
+
+def quant_hardware_ok(quant_mode: str, device: str) -> tuple[bool, str]:
+    """Check the target device can run the requested quant mode.
+
+    Returns (ok, reason).  fp8 dynamic-activation GEMM (_scaled_mm) needs
+    CUDA compute capability >= 8.9 (Ada/Hopper/Blackwell).
+    """
+    if quant_mode == "none":
+        return True, ""
+    if device == "cpu" or not torch.cuda.is_available():
+        return False, "fp8 quantization requires a CUDA device"
+    try:
+        idx = 0
+        if ":" in str(device):
+            idx = int(str(device).split(":")[1])
+        cap = torch.cuda.get_device_capability(idx)
+    except Exception as e:  # noqa: BLE001 — any probe failure → fall back
+        return False, f"could not probe CUDA capability ({e})"
+    if cap < (8, 9):
+        return False, (
+            f"fp8 GEMM needs compute capability >= 8.9, device has "
+            f"{cap[0]}.{cap[1]}"
+        )
+    return True, ""
+
+
+def build_quant_config(
+    model_path: str,
+    quant_mode: str,
+    *,
+    skip: tuple = (),
+    only: tuple = (),
+    device: str = "cuda",
+    log_prefix: str = "[EricDiffusion]",
+):
+    """Build the diffusers PipelineQuantizationConfig for quantize-on-load.
+
+    Returns (pipeline_quant_config | None, quant_components: dict, notices).
+    None config means 'load unquantized' — either mode is 'none' or a loud
+    warn-and-fall-back (missing torchao, unsupported hardware).  Never raises
+    for environment problems (invariant 6: warn, don't block).
+    """
+    notices: list = []
+    if not quant_mode or quant_mode == "none":
+        return None, {}, notices
+    if quant_mode not in QUANT_MODES:
+        raise ValueError(
+            f"Unknown quant mode {quant_mode!r}; valid: {', '.join(QUANT_MODES)}"
+        )
+
+    ok, reason = quant_hardware_ok(quant_mode, device)
+    if not ok:
+        msg = f"quant: {reason} — FALLING BACK to unquantized load"
+        print(f"{log_prefix} WARNING: {msg}")
+        notices.append(msg)
+        return None, {}, notices
+
+    try:
+        from diffusers import TorchAoConfig as _DiffusersTorchAoConfig
+        from diffusers.quantizers import PipelineQuantizationConfig
+        from transformers import TorchAoConfig as _TransformersTorchAoConfig
+        ao_config = _torchao_fp8_config()
+    except ImportError as e:
+        msg = (f"quant: torchao/quant configs unavailable ({e}) — "
+               f"FALLING BACK to unquantized load")
+        print(f"{log_prefix} WARNING: {msg}")
+        notices.append(msg)
+        return None, {}, notices
+
+    model_index = read_model_index(model_path)
+    selected, sel_notices = resolve_quant_components(
+        model_path, model_index, skip=skip, only=only)
+    notices.extend(sel_notices)
+    for n in sel_notices:
+        print(f"{log_prefix} {n}")
+
+    if not selected:
+        msg = "quant: no eligible components after policy/overrides — unquantized"
+        print(f"{log_prefix} WARNING: {msg}")
+        notices.append(msg)
+        return None, {}, notices
+
+    quant_mapping = {}
+    for name in selected:
+        library = (model_index.get(name) or [None])[0]
+        if library == "transformers":
+            quant_mapping[name] = _TransformersTorchAoConfig(quant_type=ao_config)
+        else:
+            quant_mapping[name] = _DiffusersTorchAoConfig(quant_type=ao_config)
+    print(f"{log_prefix} quant: {quant_mode} on {sorted(selected)} "
+          f"(roles: {selected})")
+    return PipelineQuantizationConfig(quant_mapping=quant_mapping), selected, notices
+
+
+def quantize_module(module, quant_mode: str, log_prefix: str = "[EricDiffusion]"):
+    """In-place torchao quantization of an already-instantiated component.
+
+    Used for component overrides (e.g. --transformer-path single-file loads),
+    which bypass from_pretrained's quantization_config path.  Warn-and-skip on
+    failure, never raise (invariant 6).  Returns True if quantized.
+    """
+    if not quant_mode or quant_mode == "none":
+        return False
+    try:
+        from torchao.quantization import quantize_
+        quantize_(module, _torchao_fp8_config())
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"{log_prefix} WARNING: quant: in-place quantization of "
+              f"{type(module).__name__} failed ({e}) — component left "
+              f"unquantized")
+        return False
+
+
+def is_quantized_module(module) -> bool:
+    """True if any parameter is a torchao-quantized tensor subclass.
+
+    Used by the LoRA path to detect a quantized base (ADR-019 §4: PEFT
+    adapter path only; direct merge / fuse are disabled under quant).
+    """
+    if module is None:
+        return False
+    try:
+        for p in module.parameters():
+            if type(p.data).__module__.startswith("torchao"):
+                return True
+    except Exception:  # noqa: BLE001 — exotic modules without .parameters()
+        return False
+    return False
+
+
+def quant_cache_fragment(quant_mode: str, skip: tuple = (), only: tuple = ()) -> str:
+    """Cache-key fragment so quant state discriminates cached pipelines.
+
+    Empty string for mode 'none' — the default path's cache key is
+    byte-identical to pre-quant behavior (invariant 1).
+    """
+    if not quant_mode or quant_mode == "none":
+        return ""
+    return (f"_quant={quant_mode}"
+            f"|skip={','.join(sorted(skip))}"
+            f"|only={','.join(sorted(only))}")
+
+
 # ── Generic pipeline cache ───────────────────────────────────────────────────
 
 _GEN_PIPELINE_CACHE: dict = {
