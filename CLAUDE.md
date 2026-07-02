@@ -130,6 +130,7 @@ The global `Git Commit Discipline` rule "Never push to remote without explicit u
 | Unix socket IPC server | `comfyless/server.py` | IPC (Unix sockets) |
 | HF repo ID resolution + download | `nodes/eric_diffusion_utils.py` `resolve_hf_path` | Loading model weights from caller-supplied paths |
 | `--json` stdin/stdout bridge | `comfyless/generate.py` `_run_json_mode` | Machine-facing interface; future LLM agent tool surface |
+| Scaled-fp8 file-content parser (ADR-019 slice C) | `nodes/eric_diffusion_fp8_ops.py` + slice-C detection/remap in `eric_diffusion_utils.py` | Custom parsing of caller-supplied weight-file CONTENT (header key patterns, scale tensors) fed into compute ops — see `docs/security/review-slice-C-fp8-single-file-2026-07-02.md` F4 |
 
 **Debt:** No ADR or security review exists for `comfyless/server.py` (IPC) or `resolve_hf_path` (caller-supplied model loading). These should have had §12 reviews before the code landed. Backlogged — when either surface is next modified, write the missing review before touching the code.
 
