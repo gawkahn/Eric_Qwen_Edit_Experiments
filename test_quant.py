@@ -385,6 +385,12 @@ check("quant_only NUL entry rejected (NEGATIVE)",
       not r.ok and "NUL" in r.error["reason"], f"{r.error}")
 r = validate_machine_request({**_REQ, "quant_skip": ["b\\c"]})
 check("quant_skip backslash entry rejected (NEGATIVE)", not r.ok, f"{r.error}")
+r = validate_machine_request({**_REQ, "quant_skip": [f"s{i}" for i in range(33)]})
+check("quant_skip >32 entries rejected (NEGATIVE, reviewer F3)",
+      not r.ok and "too many" in r.error["reason"], f"{r.error}")
+r = validate_machine_request({**_REQ, "quant_only": [f"s{i}" for i in range(32)]})
+check("quant_only exactly 32 entries accepted (cap boundary)", r.ok,
+      f"{r.error}")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -400,6 +406,9 @@ check("MCP schema declares quant_skip as string array",
       _props.get("quant_skip", {}).get("items", {}).get("type") == "string")
 check("MCP schema declares quant_only as string array",
       _props.get("quant_only", {}).get("items", {}).get("type") == "string")
+check("MCP schema bounds quant lists (maxItems, reviewer F3)",
+      _props["quant_skip"].get("maxItems") == 32
+      and _props["quant_only"].get("maxItems") == 32)
 check("MCP schema still rejects unknown fields",
       _GENERATE_INPUT_SCHEMA["additionalProperties"] is False)
 

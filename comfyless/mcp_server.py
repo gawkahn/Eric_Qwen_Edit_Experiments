@@ -393,6 +393,7 @@ _GENERATE_INPUT_SCHEMA: dict[str, Any] = {
         "quant_skip": {
             "type": "array",
             "items": {"type": "string"},
+            "maxItems": 32,
             "description": (
                 "Component slot names (e.g. 'text_encoder') to exclude "
                 "from quantization. For isolating quality regressions. "
@@ -402,6 +403,7 @@ _GENERATE_INPUT_SCHEMA: dict[str, Any] = {
         "quant_only": {
             "type": "array",
             "items": {"type": "string"},
+            "maxItems": 32,
             "description": (
                 "Quantize exactly these component slots, overriding the "
                 "default eligible set. 'vae' is refused even here. Slot "

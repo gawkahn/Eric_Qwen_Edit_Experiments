@@ -1422,7 +1422,11 @@ def is_quantized_module(module) -> bool:
         for p in module.parameters():
             if type(p.data).__module__.startswith("torchao"):
                 return True
-    except Exception:  # noqa: BLE001 — exotic modules without .parameters()
+    except (AttributeError, TypeError):
+        # Exotic objects without a .parameters() iterator. Deliberately
+        # NARROW (reviewer F1): a broad except would fail open and let
+        # guard_direct_merge permit a merge into a module it couldn't
+        # inspect — the silent-corruption path the guard exists to stop.
         return False
     return False
 
@@ -1440,6 +1444,12 @@ def guard_direct_merge(module, log_prefix: str = "[LoRA]",
     Raises RuntimeError with an actionable message.  Callers that treat LoRA
     failures as non-fatal (comfyless _apply_loras) surface it as a loud
     warning and generate without the adapter.
+
+    Coverage boundary (reviewer F4): this guards the DIRECT-MERGE paths
+    only.  ``fuse_lora()`` — the other in-place mutation — is prevented by
+    not calling it: the repo has zero fuse_lora call sites.  Do not
+    introduce a ``pipe.fuse_lora()`` call anywhere the base may be
+    quantized without adding an equivalent guard first.
     """
     if is_quantized_module(module):
         raise RuntimeError(

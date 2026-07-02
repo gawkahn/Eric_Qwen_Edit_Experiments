@@ -206,6 +206,28 @@ together, adds `--quant nvfp4`, and smoke-tests QwenImage quality vs fp8.
 See `docs/decisions/ADR-019-native-quantization-support.md` §Deferred,
 `project_native_quant_support.md` memory.
 
+**Daemon socket silently drops `quant` from hand-crafted clients** *(2026-07-02)*
+Slice A registered `quant`/`quant_skip`/`quant_only` in `_RUNTIME_KIND`, so the
+canonical validator type-accepts them on every machine boundary — including the
+Unix-socket daemon, whose handler (`comfyless/server.py`) neither consumes nor
+rejects them. The shipped CLI is covered (`generate.py` skips daemon delegation
+when `--quant` is set, with a log line), but a hand-rolled socket client sending
+`{"type": "generate", "quant": "fp8", ...}` validates cleanly and generates
+UNQUANTIZED with no signal back to the caller. Surfaced by slice-A code-reviewer
+F2 (MED).
+Why not now: the fix is in `comfyless/server.py` — a project-mandated
+security-review surface and an explicit STOP boundary for the slice-A autonomous
+run (Vision §2). Rejecting or supporting quant at the daemon dispatch entry is
+the same slice as wiring quant through the daemon protocol + cache key, which
+needs its own `security-auditor` pass.
+Trigger: the "quant over daemon" slice (protocol + cache key + explicit
+reject-or-support at dispatch), OR any report of a socket client using quant.
+Fix shape: daemon dispatch rejects `quant != "none"` with an explicit
+"daemon does not support quant; run in-process" error until the protocol
+carries it end-to-end.
+See `docs/decisions/ADR-019-native-quantization-support.md`,
+`docs/vision/slice-A-fp8-quant-load.md` §2.
+
 ---
 
 ## Sampler Coverage
