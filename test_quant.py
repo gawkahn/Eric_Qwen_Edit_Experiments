@@ -208,6 +208,35 @@ with tempfile.TemporaryDirectory() as tmp:
           "transformer" in sel and any("nonexistent" in n for n in notes),
           f"sel {sel} notes {notes}")
 
+# Non-component top-level lists in model_index.json (Krea-2 regression:
+# text_encoder_select_layers is a list of ints and crashed classification).
+_KREA2_INDEX = {
+    "_class_name": "Krea2Pipeline",
+    "scheduler": ["diffusers", "FlowMatchEulerDiscreteScheduler"],
+    "text_encoder": ["transformers", "Qwen3VLModel"],
+    "text_encoder_select_layers": [2, 5, 8, 11],
+    "tokenizer": ["transformers", "Qwen2Tokenizer"],
+    "transformer": ["diffusers", "Krea2Transformer2DModel"],
+    "vae": ["diffusers", "AutoencoderKLQwenImage"],
+    "is_distilled": True,
+    "patch_size": 2,
+}
+
+with tempfile.TemporaryDirectory() as tmp:
+    mp = _mk_model_dir(tmp, _KREA2_INDEX)
+    sel, notes = edu.resolve_quant_components(mp, _KREA2_INDEX)
+    check("Krea-2 index: int-list entry skipped, no crash",
+          sel == {"transformer": "denoiser", "text_encoder": "lm"},
+          f"got {sel}")
+    check("Krea-2 index: select_layers never classified",
+          "text_encoder_select_layers" not in sel, f"got {sel}")
+    # Null class_name in a component pair (optional components like
+    # safety_checker ship as [null, null]) stays non-crashing → 'other'.
+    _NULLCOMP = dict(_FLUX_INDEX, safety_checker=[None, None])
+    sel, _ = edu.resolve_quant_components(mp, _NULLCOMP)
+    check("null-class component pair tolerated, not selected",
+          "safety_checker" not in sel and "transformer" in sel, f"got {sel}")
+
 
 # ──────────────────────────────────────────────────────────────────────
 print("── build_quant_config (mode gate + hardware fallback) ─────────")
