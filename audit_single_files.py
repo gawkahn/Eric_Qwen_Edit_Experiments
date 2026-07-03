@@ -76,7 +76,9 @@ def _read_tiny_tensor(path: str, hdr_len: int, info: dict, cap: int = 256) -> by
     lo, hi = info["data_offsets"]
     with open(path, "rb") as fh:
         fh.seek(8 + hdr_len + lo)
-        return fh.read(min(hi - lo, cap))
+        # max(0, ...): a hostile/corrupt header with hi < lo would make
+        # read(negative) slurp to EOF — gigabytes (reviewer finding 1).
+        return fh.read(max(0, min(hi - lo, cap)))
 
 
 def _guess_family(keys) -> str:
@@ -104,10 +106,16 @@ def audit_file(path: str) -> dict:
     rec["family"] = _guess_family(keys)
 
     # ── Quant-format signatures, most specific first ─────────────────────
-    if any(".quant_state." in k or ".absmax" in k or k.endswith(".SCB")
+    # Mirrors the loader's own bnb detection in _diagnose_slot_mismatch
+    # (all five markers — reviewer finding 2: a narrower set here would
+    # report HI-PREC for a file the loader will reject). .SCB is bnb Int8,
+    # so the verdict is BNB, not NF4-specific.
+    if any(".quant_state." in k or ".absmax" in k or ".bitsandbytes" in k
+           or k.endswith(".SCB") or k.endswith(".weight_format")
            for k in keys):
-        rec.update(verdict="BNB-NF4",
-                   detail="bitsandbytes 4-bit — unsupported (ADR-019 dropped NF4)")
+        rec.update(verdict="BNB",
+                   detail="bitsandbytes NF4/Int8 — unsupported "
+                          "(ADR-019 dropped bnb)")
         return rec
 
     if any(k.endswith((".qweight", ".wscales")) for k in keys):
@@ -196,7 +204,7 @@ def main() -> int:
     by_verdict = collections.defaultdict(list)
     for r in records:
         by_verdict[r["verdict"]].append(r)
-    order = ["BNB-NF4", "SVDQ", "NVFP4", "AIO", "UNREADABLE"]
+    order = ["BNB", "SVDQ", "NVFP4", "AIO", "UNREADABLE"]
     order += sorted(v for v in by_verdict
                     if v.startswith("CQ-") and v != "CQ-FP8")
     order += ["CQ-FP8", "SCALED", "PLAINFP8", "HI-PREC"]

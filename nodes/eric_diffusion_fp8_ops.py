@@ -400,7 +400,11 @@ class ScaledFp8Linear(nn.Module):
     def _dequant_linear(self, x2d: torch.Tensor, in_dtype) -> torch.Tensor:
         """Shared dequant-matmul path: weight-only mode + _scaled_mm fallback."""
         if (self._fallback_weight is None
-                or self._fallback_weight.device != x2d.device):
+                or self._fallback_weight.device != x2d.device
+                or self._fallback_weight.dtype != in_dtype):
+            # Keyed on (device, dtype) — reviewer finding 3: a dtype change
+            # mid-run (bf16 → fp16 caller) must recompute from the fp8
+            # source, not chain-cast through the stale cache.
             self._fallback_weight = (
                 self.weight.to(torch.float32) * self.weight_scale
             ).to(in_dtype)
