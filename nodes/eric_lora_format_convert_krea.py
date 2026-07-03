@@ -30,12 +30,30 @@ Key correspondence (source → diffusers target; the loader prepends the
   .mlp.{gate,up,down}                          → .ff.{gate,up,down}
                                                  (Krea2SwiGLU)
 
+Standalone (non-block) modules — the source trainer stores these under
+abbreviated ``nn.Sequential``-style indices; distillation LoRAs (e.g.
+krea2_turbo_lora_rank_64) train them and their payload is precisely the
+step-distilled behavior, so dropping them wrecks output quality:
+
+  diffusion_model.first                        → img_in
+  diffusion_model.last.linear                  → final_layer.linear
+  diffusion_model.tmlp.{0,2}                   → time_embed.linear_{1,2}
+  diffusion_model.tproj.1                      → time_mod_proj
+  diffusion_model.txtmlp.{1,3}                 → txt_in.linear_{1,2}
+  (txtfusion.projector is covered by the txtfusion prefix rule)
+
 Ground truth confirmed by inspecting:
   - diffusers Krea2Transformer2DModel / Krea2Attention / Krea2SwiGLU /
     Krea2TextFusion parameters (transformer_krea2.py)
   - MysticXXX_KREA2_v1.safetensors (real ai-toolkit Krea-2 LoRA,
     ss_base_model_version=krea2; 512 keys, separate wq/wk/wv, no .alpha
     tensors → trainer alpha==rank, runtime scale 1.0)
+  - krea2_turbo_lora_rank_64_bf16.safetensors (distill LoRA; 535 keys —
+    adds the standalone modules above plus per-module .diff_b bias deltas)
+  - diffusers 0.39.0 _convert_non_diffusers_krea2_lora_to_diffusers
+    (lora_conversion_utils.py, PR #14074) — its standalone_map matches the
+    table above one-for-one. (That upstream converter raises on .diff_b
+    leftovers, so krea-native distill LoRAs still need THIS plan.)
 
 Author: Eric Hiss (GitHub: EricRollei)
 """
@@ -71,7 +89,22 @@ _KREA_PLAN = ConversionPlan(
         RenameRule(".attn.gate", ".attn.to_gate"),
 
         # ── Feed-forward (SwiGLU): mlp.{gate,up,down} → ff.{gate,up,down} ──
+        # (safe w.r.t. tmlp/txtmlp below: those lack the leading dot)
         RenameRule(".mlp.", ".ff."),
+
+        # ── Standalone modules (trainer's nn.Sequential indices) ──
+        # Trained by distillation LoRAs (turbo); mapping verified against
+        # diffusers 0.39.0's krea2 standalone_map (PR #14074). Rules apply
+        # to the BASE module path (suffix already split off), so these are
+        # exact-anchored regexes — the whole base either is the module or
+        # isn't.
+        RenameRule(r"^diffusion_model\.first$",        "img_in",              regex=True),
+        RenameRule(r"^diffusion_model\.last\.linear$", "final_layer.linear",  regex=True),
+        RenameRule(r"^diffusion_model\.tmlp\.0$",      "time_embed.linear_1", regex=True),
+        RenameRule(r"^diffusion_model\.tmlp\.2$",      "time_embed.linear_2", regex=True),
+        RenameRule(r"^diffusion_model\.tproj\.1$",     "time_mod_proj",       regex=True),
+        RenameRule(r"^diffusion_model\.txtmlp\.1$",    "txt_in.linear_1",     regex=True),
+        RenameRule(r"^diffusion_model\.txtmlp\.3$",    "txt_in.linear_2",     regex=True),
     ],
     qkv_splits=[],  # Krea-2 stores separate wq/wk/wv — nothing to split.
     # `to_gate` (gated attention) is unique to Krea2 among the families

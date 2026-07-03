@@ -447,6 +447,14 @@ def convert_state_dict(
             else:
                 _emit_lora_module(out, base, A, B, alpha)
                 n_lora_pass += 1
+            # Distill LoRAs (e.g. krea2 turbo) co-ship a bias delta with the
+            # low-rank pair; neither the PEFT path nor the direct-merge
+            # loader applies it.  Surface loudly rather than lose silently
+            # (mirrors the LoKR branch).
+            if ".diff_b" in parts:
+                n_bias_dropped += 1
+                if len(skipped_samples) < 3:
+                    skipped_samples.append(base + " (.diff_b bias delta)")
             continue
 
         # ── lora_down/lora_up convention (older format) ──────────────
@@ -471,6 +479,10 @@ def convert_state_dict(
             else:
                 _emit_lora_module(out, base, A, B, alpha)
                 n_lora_pass += 1
+            if ".diff_b" in parts:
+                n_bias_dropped += 1
+                if len(skipped_samples) < 3:
+                    skipped_samples.append(base + " (.diff_b bias delta)")
             continue
 
         # ── Pre-baked delta (.diff) — pass through as-is ─────────────
@@ -522,8 +534,9 @@ def convert_state_dict(
     if n_bias_dropped:
         print(
             f"{log_prefix} WARNING: {n_bias_dropped} module(s) shipped a bias "
-            "delta (.diff_b) or a redundant .diff that the direct-merge loader "
-            "does not apply — weight deltas were applied, these were not."
+            "delta (.diff_b) or a redundant .diff that this conversion path "
+            "does not apply — weight deltas were applied, these were NOT "
+            "(bias deltas: see TECH_DEBT.md 'Krea2 distill LoRA bias deltas')."
         )
     return out
 

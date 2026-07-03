@@ -210,6 +210,25 @@ Related cosmetic issue, no action: under quantization_config diffusers skips
 "Mismatch dtype ... Cannot dispatch to fused implementation" once per run;
 the norm computes fp32 and casts back either way — output unaffected.
 
+**Krea2 distill LoRA bias deltas (.diff_b) not applied** *(2026-07-03)*
+krea-native distillation LoRAs (krea2_turbo_lora_rank_64_bf16: 535 keys)
+co-ship a `.diff_b` bias delta alongside each standalone module's lora_A/B
+pair (img_in, final_layer.linear, time_embed.linear_{1,2}, time_mod_proj,
+txt_in.linear_{1,2}). The conversion path applies the weight deltas (PEFT)
+but no loader applies bias deltas — they are now dropped LOUDLY (was:
+silent on the lora branch; the LoKR branch already warned). Measured on the
+turbo file: |mean| ~5e-4, max 0.026 (time_mod_proj) — small corrections,
+plausibly negligible next to the weight deltas that were the 2026-07-03
+"terrible results" root cause (7 standalone modules unmapped; fixed).
+Upstream diffusers 0.39.0's #14074 converter doesn't handle .diff_b either
+(raises on leftovers).
+Why not now: applying bias deltas means a hybrid path — PEFT for the
+low-rank pairs plus a direct bias add with backup/restore + unload
+semantics; its own slice if quality demands it.
+Trigger: raw+turbo-LoRA output still visibly trails the dedicated Turbo
+checkpoint (or ComfyUI's rendering of the same file) AFTER the standalone
+weight-delta fix — that gap would implicate the biases.
+
 **NVFP4 quantize-on-load blocked on a stable torch/torchao/mslk triad** *(2026-07-02)*
 NVFP4 quantize-on-load for diffusion (ADR-019 slice A, nvfp4 half) is officially
 supported and works — PyTorch's "Faster Diffusion on Blackwell" blog + diffusers
