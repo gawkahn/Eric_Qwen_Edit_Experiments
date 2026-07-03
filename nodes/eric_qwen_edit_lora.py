@@ -1090,15 +1090,16 @@ def unload_adapters(pipe, adapter_names, log_prefix: str = "[LoRA]") -> None:
             adapter_family = cfg.get("_type", "").replace("_direct", "")
             backup_key = f"_{adapter_family}_backup_{adapter_name}"
             backup = getattr(transformer, backup_key, None)
+            # LIFO guard + ledger pop (DMR req 25) runs regardless of backup
+            # presence so the ledger stays authoritative even if a backup was
+            # manually removed (final code-review finding 1).
+            from .eric_diffusion_fp8_ops import warn_non_lifo_unload
+            warn_non_lifo_unload(transformer, adapter_name, log_prefix)
             if backup:
                 from .eric_lora_format_convert_apply import resolve_restore_target
                 from .eric_diffusion_fp8_ops import (
                     merge_resolution_map, restore_merge_backup,
-                    warn_non_lifo_unload,
                 )
-                # LIFO guard (DMR req 25): restoring a non-latest direct
-                # merge reverts later adapters' deltas on shared layers.
-                warn_non_lifo_unload(transformer, adapter_name, log_prefix)
                 # Same map as merge time: .weight buffers included so
                 # quantized (ScaledFp8Linear) targets resolve.
                 model_sd = merge_resolution_map(transformer)

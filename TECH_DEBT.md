@@ -258,6 +258,22 @@ leave garbage in the converted dict. Should gracefully skip with a warning.
 Queued in Backlog.
 *Resolved: 2026-04-22 — filter against `named_parameters()` in `load_converted_lora` before `pipe.load_lora_weights`.*
 
+**DMR partial-merge state on mid-loop raise** *(2026-07-03)*
+apply_merge_delta's per-target raise paths (non-finite delta, orphan fp8,
+torchao all-zero, requant-scale validation) can fire mid-loop, leaving backup
+entries for the successfully-merged prefix while `peft_config[adapter]` and
+the LIFO ledger were never written (both happen after the loop). The orphan
+backup dict is then invisible to unload_adapters — recovery is a pipeline
+reload. Only reachable on adversarial/degenerate adapters (normal LoRAs never
+fire these raises), and the pre-DMR behavior for the same inputs was a
+whole-adapter refusal, so nothing regressed — but the failure state is
+messier. Surfaced by the DMR code-review (finding 3, advisory).
+Why not now: requires transactional merge (apply to a staging list, commit
+after the loop) — real restructuring for an adversarial-only path.
+Trigger: extending the DMR surface (new quantized reps), OR a real user
+report of a partially-merged adapter.
+See `docs/security/review-slice-DMR-quantized-merge-2026-07-03.md`.
+
 **Daemon LoRA lifecycle: merged adapters never unload; weight-only changes ignored** *(2026-07-02)*
 Two defects in `comfyless/server.py`'s LoRA diff (`_handle_generate` ~392-444),
 confirmed read-only during the krea-testing "regression" investigation:
