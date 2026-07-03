@@ -65,12 +65,12 @@ python3 test_iterate.py                     #  92 tests: comfyless --iterate (AD
 python3 test_samplers.py                    #  41 tests: custom schedulers / sampler swap
 python3 test_server_robustness.py           #  14 tests: comfyless IPC timeouts + BrokenPipe survival
 python3 test_mcp_server.py                  # 534 tests: comfyless MCP server (ADR-011 slice 1 + ADR-015 slice 2 catalog/list_models/list_loras + slice 2b list_transformers + slice 3 generate catalog-name migration + slice 3b cascade catalog-name migration)
-python3 test_quant.py                       #  96 tests: fp8 quantize-on-load (ADR-019 slice A) — eligibility policy, cache-key discrimination, DMR dispatcher routing, boundary hygiene
+python3 test_quant.py                       #  99 tests: fp8 quantize-on-load (ADR-019 slice A) — eligibility policy, cache-key discrimination, DMR dispatcher routing, boundary hygiene
 python3 test_fp8_single_file.py             #  85 tests: ComfyUI scaled-fp8 single-file loader + DMR merge (ADR-019 slices C/C-d/DMR) — classifier variants, security-review negatives, ScaledFp8Linear numerics, dequant->merge->requant dispatcher
 python3 test_lora_order_insensitive.py      #  13 tests: direct-merge LoRAs order-insensitive to PEFT wrapping (cherry-picked from krea-testing c3461aa)
 python3 test_vae_override_class.py          #  10 tests: --vae override honors the checkpoint's own VAE class (cherry-picked from krea-testing ad6689e)
 ```
-All thirteen suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 1616 unit tests; expect 0 failures.
+All thirteen suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 1619 unit tests; expect 0 failures.
 
 `test_flux2.py` is a live GPU smoke test that performs an actual Flux.2 generation — separate from the unit suites above. Run only when you need to verify end-to-end Flux.2 behavior.
 

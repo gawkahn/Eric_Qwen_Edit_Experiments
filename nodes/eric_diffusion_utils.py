@@ -1336,6 +1336,11 @@ def resolve_quant_components(
         if name.startswith("_") or not isinstance(entry, list):
             continue
         class_name = entry[1] if len(entry) > 1 else None
+        if class_name is not None and not isinstance(class_name, str):
+            # Not a [library, class] component entry — some model_index files
+            # carry config lists at top level (Krea-2's
+            # text_encoder_select_layers is a list of ints).
+            continue
         roles[name] = classify_quant_role(name, class_name)
 
     if only:
