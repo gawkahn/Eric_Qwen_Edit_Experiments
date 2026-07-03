@@ -266,6 +266,66 @@ leave garbage in the converted dict. Should gracefully skip with a warning.
 Queued in Backlog.
 *Resolved: 2026-04-22 — filter against `named_parameters()` in `load_converted_lora` before `pipe.load_lora_weights`.*
 
+**DMR partial-merge state on mid-loop raise** *(2026-07-03)*
+apply_merge_delta's per-target raise paths (non-finite delta, orphan fp8,
+torchao all-zero, requant-scale validation) can fire mid-loop, leaving backup
+entries for the successfully-merged prefix while `peft_config[adapter]` and
+the LIFO ledger were never written (both happen after the loop). The orphan
+backup dict is then invisible to unload_adapters — recovery is a pipeline
+reload. Only reachable on adversarial/degenerate adapters (normal LoRAs never
+fire these raises), and the pre-DMR behavior for the same inputs was a
+whole-adapter refusal, so nothing regressed — but the failure state is
+messier. Surfaced by the DMR code-review (finding 3, advisory).
+Why not now: requires transactional merge (apply to a staging list, commit
+after the loop) — real restructuring for an adversarial-only path.
+Trigger: extending the DMR surface (new quantized reps), OR a real user
+report of a partially-merged adapter.
+See `docs/security/review-slice-DMR-quantized-merge-2026-07-03.md`.
+
+**Daemon LoRA lifecycle: merged adapters never unload; weight-only changes ignored** *(2026-07-02)*
+Two defects in `comfyless/server.py`'s LoRA diff (`_handle_generate` ~392-444),
+confirmed read-only during the krea-testing "regression" investigation:
+(1) Dropped LoRAs are removed via `pipe.delete_adapters(adapter_name)` — fine
+for PEFT-registered adapters, but tier-3 direct-merge LoRAs baked their delta
+into `param.data` and register only a cosmetic `peft_config` entry;
+`delete_adapters` strips the registration and reports success while the
+merged weights persist in the model. The restoration backups
+(`_lokr_backup_*` / `_loha_backup_*` / `_lora_backup_*` /
+`_converted_lora_backup_*`) exist but the daemon never restores from them.
+(2) The diff keys on `path` only — re-requesting the same LoRA at a
+different weight hits `path in loaded_paths → continue`, silently keeping
+the old weight.
+Both push users into restart-the-daemon-between-runs (Grant's actual habit
+during LoRA testing). Related: LoRA load failures are non-fatal warnings
+that land only in the daemon log — the client CLI never sees them, so
+"LoRA failed but run reported success" has now bitten twice (MCP: fixed
+28fea0b; daemon log: 2026-07-02 incident).
+Why not now: `comfyless/server.py` is a §12 security-review surface; the
+fix (restore-from-backup on removal or evict-on-merged-adapter-drop; weight
+in the diff key; client-side warning relay) is its own gated slice.
+Trigger: the next server.py slice (e.g. quant-over-daemon, same file), OR
+LoRA A/B testing friction getting raised again.
+See `project_krea_lora_regression.md` memory.
+
+**bnb NF4 single-file support dropped — revisit trigger + pure-torch path** *(2026-07-02)*
+ADR-019 dropped NF4 single-file consumption (near-zero collection volume). The
+2026-07-02 collection audit found exactly TWO NF4 files, both the same model
+(`projectGaiaFlux1D_v20NF4*`), which Grant is genuinely interested in but
+agrees doesn't justify the slice alone.
+Why not now: one model; the heavyweight path (bitsandbytes runtime) needs a
+new dep, and the lightweight path needs careful verification.
+**Cheap path when triggered:** NF4 is a fixed 16-value codebook + per-64-block
+absmax (usually double-quantized). A pure-torch dequant-at-load is ~50 lines,
+NO new dependency — in-memory NF4→bf16 feeding the standard loader (the
+ADR-blessed "upcast on load" shim, NOT the dead offline-script direction).
+CAUTION: the old `dequantize_nf4.py` failed for undiagnosed reasons; any
+implementation needs a numeric cross-check against bitsandbytes' own
+dequantize (one-off scratch install, not a pinned dep) before trusting it.
+Trigger: a second wanted NF4 model appears, OR projectGaia becomes a model
+Grant actually reaches for.
+See `docs/decisions/ADR-019-native-quantization-support.md`,
+`audit_single_files.py` (finds NF4 files by .quant_state/.absmax markers).
+
 **Tier-3 (direct-merge) LoRAs incompatible with `--quant`** *(2026-07-02)*
 Under a torchao-quantized base (`Float8Tensor` / `NVFP4Tensor` weights), the LoRA
 loader's tier-3 fallback (direct state-dict merge into `weight.data`) cannot run —
@@ -291,6 +351,14 @@ See `docs/decisions/ADR-019-native-quantization-support.md` §4,
 `project_native_quant_support.md` memory. Related: the exotic-format LoRAs that drive
 tier-3 are the same ones behind `project_lokr_alpha_convention.md` /
 `project_civitai_orphaned_files.md`.
+**Resolved: 2026-07-03 — trigger (b) fired** (Grant's Krea filter-bypass/.diff and
+snofs/LoKR adapters are direct-merge-only AND he needs --quant fp8 for OOM relief).
+Slice DMR shipped the dequant→merge→requant path: apply_merge_delta dispatcher in
+eric_diffusion_fp8_ops covers plain params (byte-identical), torchao Float8Tensor
+params (requant + Parameter swap), and ScaledFp8Linear buffers (per-tensor requant +
+cache invalidation), with kind-tagged exact-restore backups and a LIFO unload guard.
+Security-gated: docs/security/review-slice-DMR-quantized-merge-2026-07-03.md
+(requirements 21-30). ADR-019 §4 amended in its Changelog.
 
 ---
 
