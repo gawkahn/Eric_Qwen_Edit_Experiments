@@ -398,7 +398,10 @@ import argparse as _ap
 _args_q = _ap.Namespace(precision="bf16", device="cuda", offload_vae=False,
                         attention_slicing=False, sequential_offload=False,
                         savepath=None, quant="fp8",
-                        quant_skip=["text_encoder"], quant_only=[])
+                        quant_skip=["text_encoder"], quant_only=[],
+                        # krea-testing's builder also reads the rebalance
+                        # fields; inert extras on main (attributes unread).
+                        rebalance=False, rebalance_mult=4.0)
 _wire = _gen._build_server_request(_args_q, {"model": "/m", "prompt": "p"}, [])
 check("wire request carries quant", _wire.get("quant") == "fp8",
       f"got {_wire.get('quant')!r}")

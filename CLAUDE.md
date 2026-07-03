@@ -264,4 +264,4 @@ The MCP server (`comfyless/mcp_server.py`) caches one pipeline in-process and ev
 - All model loading uses `local_files_only=True` — no internet access during inference.
 - Dimension alignment is 32px throughout; violating this causes transformer shape errors.
 - `pipeline.vae.enable_tiling()` is always called on generation pipelines — required for >2 MP decode without OOM.
-- The Edit pipeline takes a `Qwen2VLProcessor` (vision-language processor); the Generation pipeline does **not** — it uses only a tokenize
+- The Edit pipeline takes a `Qwen2VLProcessor` (vision-language processor); the Generation pipeline does **not** — it uses only a tokenizer
