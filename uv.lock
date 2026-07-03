@@ -277,7 +277,7 @@ dependencies = [
 requires-dist = [
     { name = "accelerate", specifier = "==1.13.0" },
     { name = "click", specifier = "==8.3.2" },
-    { name = "diffusers", git = "https://github.com/huggingface/diffusers.git?rev=29a59fd96063e302c9f016ae86f5da0d0212cf97" },
+    { name = "diffusers", specifier = "==0.39.0" },
     { name = "ftfy", specifier = "==6.3.1" },
     { name = "mcp", specifier = "==1.27.0" },
     { name = "numpy", specifier = "==2.4.4" },
@@ -426,8 +426,8 @@ nvtx = [
 
 [[package]]
 name = "diffusers"
-version = "0.39.0.dev0"
-source = { git = "https://github.com/huggingface/diffusers.git?rev=29a59fd96063e302c9f016ae86f5da0d0212cf97#29a59fd96063e302c9f016ae86f5da0d0212cf97" }
+version = "0.39.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "filelock" },
     { name = "httpx" },
@@ -438,6 +438,10 @@ dependencies = [
     { name = "regex" },
     { name = "requests" },
     { name = "safetensors" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1a/81/6095237b86a3116c4789f28c4435d5296c00c0fc74ffde99008fd6b3a36c/diffusers-0.39.0.tar.gz", hash = "sha256:14bb1d98c85a0e463d734c99aaa73b480a7bc9bad22af30fbf730ef8f09c1d67", size = 4651240, upload-time = "2026-07-03T08:48:47.904Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3f/3f/7469c46e9d22307ea686bab687d70e6bf328722952f9d10339f5e913e608/diffusers-0.39.0-py3-none-any.whl", hash = "sha256:912aca51b5787365110806e984d5555735bf8a461073bb8459029d0bca7870ef", size = 5631176, upload-time = "2026-07-03T08:48:45.337Z" },
 ]
 
 [[package]]
