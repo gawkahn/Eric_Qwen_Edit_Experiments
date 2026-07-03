@@ -277,6 +277,89 @@ try:
           _captured.get("rebalance_mult") == _gen.KREA_REBALANCE_DEFAULT_MULT)
     check("daemon: omitted rebalance_weights -> None (generate applies preset)",
           _captured.get("rebalance_weights") is None)
+
+    # 4. Device is PINNED to the daemon's --device; the request payload's
+    #    `device` is ignored (security review Finding 2). A daemon on cuda:1
+    #    must run on cuda:1 even when the caller asks for cuda:0.
+    _captured.clear()
+    _state = {}
+    srv._handle_generate(
+        {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "a cat",
+         "device": "cuda:0"},
+        _outdir, _outdir, "cuda:1", "bf16", _state,
+    )
+    check("daemon: payload device cuda:0 IGNORED; runs on pinned cuda:1",
+          _captured.get("device") == "cuda:1", f"got {_captured.get('device')!r}")
+
+    # 5. A mismatched payload device is warned (not silently redirected).
+    _orig_log = srv._log
+    _warns: list = []
+    srv._log = lambda m: _warns.append(m)
+    try:
+        _state = {}
+        srv._handle_generate(
+            {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "a cat",
+             "device": "cuda:0"},
+            _outdir, _outdir, "cuda:1", "bf16", _state,
+        )
+    finally:
+        srv._log = _orig_log
+    check("daemon: mismatched payload device logs a warning",
+          any("ignored" in m and "cuda:1" in m for m in _warns), f"warns={_warns!r}")
+
+    # 6. 'cuda' and 'cuda:0' are the same physical device -> no warning.
+    _warns = []
+    srv._log = lambda m: _warns.append(m)
+    try:
+        _state = {}
+        srv._handle_generate(
+            {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "a cat",
+             "device": "cuda"},
+            _outdir, _outdir, "cuda:0", "bf16", _state,
+        )
+    finally:
+        srv._log = _orig_log
+    check("daemon: payload 'cuda' vs pinned 'cuda:0' -> no mismatch warning",
+          not any("ignored" in m for m in _warns), f"warns={_warns!r}")
+
+    # 7. Varying payload device does NOT evict — the pinned device keeps the
+    #    cache_key stable (isolation: one daemon, one GPU, one cached pipeline).
+    _state = {}
+    srv._handle_generate(
+        {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "a cat",
+         "device": "cuda:0"},
+        _outdir, _outdir, "cuda:1", "bf16", _state,
+    )
+    _pipe_first = _state.get("pipeline")
+    srv._handle_generate(
+        {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "a cat",
+         "device": "cuda:5"},
+        _outdir, _outdir, "cuda:1", "bf16", _state,
+    )
+    check("daemon: varying payload device does NOT evict (same pinned device)",
+          _pipe_first is not None and _state.get("pipeline") is _pipe_first)
+
+    # 8. A truthy NON-STRING payload device must not crash the handler — the
+    #    boundary validator passes `device` through un-type-checked, so the
+    #    advisory slug compare must absorb a TypeError, not let it escape to the
+    #    accept loop. (Regression: security review Slice-2 pass.)
+    _captured.clear()
+    _state = {}
+    _crashed = None
+    try:
+        _resp8 = srv._handle_generate(
+            {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "a cat",
+             "device": 123},
+            _outdir, _outdir, "cuda:1", "bf16", _state,
+        )
+    except Exception as _e:  # must NOT happen — a raise here would kill the daemon
+        _crashed = _e
+        _resp8 = None
+    check("daemon: non-string payload device does not crash handler",
+          _crashed is None, f"raised {_crashed!r}")
+    check("daemon: non-string payload device still succeeds on pinned device",
+          _resp8 is not None and _resp8.get("status") == "ok"
+          and _captured.get("device") == "cuda:1", f"resp={_resp8!r}")
 finally:
     _gen._load_pipeline = _orig_load
     _gen.generate = _orig_generate

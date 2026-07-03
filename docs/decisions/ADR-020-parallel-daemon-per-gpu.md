@@ -183,6 +183,17 @@ TCP localhost is reachable by any process in the network namespace.
   (ADR-001 §6 preserved); device-scoped `--unload`. Security review:
   `docs/security/review-parallel-daemon-2026-07-03.md`. Vision:
   `docs/vision/slice-parallel-daemon-per-gpu.md`.
+- 2026-07-03 (slice 1): device-keyed `socket_path` + client routing landed
+  (`2212062`). Security review Finding 3 baked in (`_device_socket_slug`:
+  `re.fullmatch(..., re.ASCII)` on the raw device string, then integer
+  canonicalization). Verified by a second security-auditor pass (verdict: ship).
+- 2026-07-03 (slice 2, closes Finding 2): `_handle_generate` now pins the device
+  to the daemon's launch `--device` and ignores the request payload's `device`
+  (was `req_device = req.get("device") or device`, now `req_device = device`). A
+  daemon can no longer be induced to run on a GPU another daemon owns. A
+  mis-routed/stale caller asking for a different device is warned (not silently
+  redirected), per the project's warn-don't-block preference; `cuda` vs `cuda:0`
+  is treated as a match and does not warn.
 
 ## AI-Disclosure
 

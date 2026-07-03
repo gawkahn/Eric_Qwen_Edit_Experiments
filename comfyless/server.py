@@ -374,7 +374,30 @@ def _handle_generate(
     from nodes.eric_qwen_edit_lora import load_lora_with_key_fix
 
     req_precision = req.get("precision") or precision
-    req_device    = req.get("device")    or device
+
+    # This daemon owns exactly one GPU (ADR-020, design A): the launch --device.
+    # The request payload's `device` is IGNORED — honoring it would let a daemon
+    # pinned to cuda:N run on another GPU that belongs to a different daemon,
+    # re-introducing the cross-GPU eviction thrash ADR-020 exists to remove.
+    # Closes security review Finding 2 (review-parallel-daemon-2026-07-03). A
+    # correctly-routed client already sends its own device; warn (don't silently
+    # redirect) only when a mis-routed/stale caller asks for a different one.
+    req_device = device
+    _payload_device = req.get("device")
+    if _payload_device:
+        try:
+            _mismatch = _device_socket_slug(_payload_device) != _device_socket_slug(device)
+        except (ValueError, TypeError):
+            # ValueError: unparseable string. TypeError: non-string payload
+            # device (e.g. 123, ["cuda:0"]) — `device` is an unknown key at the
+            # boundary validator and passes through un-type-checked, so this
+            # advisory compare must not let a malformed value crash the accept
+            # loop (matches the daemon's "malformed request never kills me"
+            # invariant). Either way: treat as a mismatch, warn, and ignore it.
+            _mismatch = True
+        if _mismatch:
+            _log(f"[server] request device {_payload_device!r} ignored; this "
+                 f"daemon is pinned to {device!r}")
 
     # Cache key covers everything that affects pipeline shape; LoRAs are tracked
     # separately so they can be diffed incrementally.
