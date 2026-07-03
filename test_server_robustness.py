@@ -360,6 +360,95 @@ try:
     check("daemon: non-string payload device still succeeds on pinned device",
           _resp8 is not None and _resp8.get("status") == "ok"
           and _captured.get("device") == "cuda:1", f"resp={_resp8!r}")
+
+    # ── Finding 1: atomic auto-numbered output reservation ──────────────
+    # _fake_generate does not write output_path, so the only file that can
+    # exist is the 0-byte reservation placeholder — exactly what these probe.
+    import os as _os
+
+    # 9. The name is atomically RESERVED, not exists()-checked: a second request
+    #    cannot re-pick the same counter even before the first has written its
+    #    image. Under the old exists()-then-write code both calls would pick
+    #    comfyless0001.png (nothing was written between them); the reservation is
+    #    what makes the second advance to 0002.
+    _num_dir = tempfile.mkdtemp()
+    _state = {}
+    _r9a = srv._handle_generate(
+        {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "a"},
+        _num_dir, _num_dir, "cuda", "bf16", _state,
+    )
+    _state = {}
+    _r9b = srv._handle_generate(
+        {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "b"},
+        _num_dir, _num_dir, "cuda", "bf16", _state,
+    )
+    check("daemon: first auto-numbered output is comfyless0001.png",
+          _r9a.get("output_path", "").endswith("comfyless0001.png"), f"{_r9a!r}")
+    check("daemon: reservation holds — second is comfyless0002.png (no collision)",
+          _r9b.get("output_path", "").endswith("comfyless0002.png"), f"{_r9b!r}")
+    check("daemon: 0001 placeholder reserved on disk after first call",
+          _os.path.exists(_os.path.join(_num_dir, "comfyless0001.png")))
+
+    # 10. A pre-existing file is skipped (O_EXCL fails -> next counter).
+    _num_dir2 = tempfile.mkdtemp()
+    open(_os.path.join(_num_dir2, "comfyless0001.png"), "w").close()
+    _state = {}
+    _r10 = srv._handle_generate(
+        {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "a"},
+        _num_dir2, _num_dir2, "cuda", "bf16", _state,
+    )
+    check("daemon: pre-existing comfyless0001.png skipped -> 0002",
+          _r10.get("output_path", "").endswith("comfyless0002.png"), f"{_r10!r}")
+
+    # 11. On generation failure the reserved placeholder is removed (no orphan,
+    #     counter not burned) — the next run reuses 0001.
+    _num_dir3 = tempfile.mkdtemp()
+    def _raising_generate(**kw):
+        raise RuntimeError("boom")
+    _gen.generate = _raising_generate
+    try:
+        _state = {}
+        _r11 = srv._handle_generate(
+            {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "a"},
+            _num_dir3, _num_dir3, "cuda", "bf16", _state,
+        )
+    finally:
+        _gen.generate = _fake_generate
+    check("daemon: generation failure returns InferenceError",
+          _r11.get("error_type") == "InferenceError", f"{_r11!r}")
+    check("daemon: failed run leaves NO orphan placeholder",
+          not _os.path.exists(_os.path.join(_num_dir3, "comfyless0001.png")))
+    _state = {}
+    _r11b = srv._handle_generate(
+        {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "a"},
+        _num_dir3, _num_dir3, "cuda", "bf16", _state,
+    )
+    check("daemon: counter not burned by failure -> next run reuses 0001",
+          _r11b.get("output_path", "").endswith("comfyless0001.png"), f"{_r11b!r}")
+
+    # 12. A non-EEXIST OSError from the reservation os.open (here: an unwritable
+    #     output_dir -> EACCES) must return a structured error, NOT escape and
+    #     kill the accept loop. os.path.exists() never raised; the atomic-open
+    #     path must preserve the daemon-survival promise. (code-review slice 3.)
+    _ro_dir = tempfile.mkdtemp()
+    _os.chmod(_ro_dir, 0o500)  # r-x, no write: O_CREAT will EACCES for the owner
+    _crash12 = None
+    _r12 = None
+    try:
+        _state = {}
+        try:
+            _r12 = srv._handle_generate(
+                {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "a"},
+                _ro_dir, _ro_dir, "cuda", "bf16", _state,
+            )
+        except Exception as _e:  # a raise here would kill the daemon
+            _crash12 = _e
+    finally:
+        _os.chmod(_ro_dir, 0o700)  # restore so the tempdir can be cleaned up
+    check("daemon: unwritable output_dir does not crash handler (OSError caught)",
+          _crash12 is None, f"raised {_crash12!r}")
+    check("daemon: unwritable output_dir -> structured error response",
+          _r12 is not None and _r12.get("status") == "error", f"{_r12!r}")
 finally:
     _gen._load_pipeline = _orig_load
     _gen.generate = _orig_generate

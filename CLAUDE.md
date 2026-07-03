@@ -63,11 +63,11 @@ python3 test_cascade.py                     # 129 tests: comfyless Stable Cascad
 python3 test_machine_boundary_validator.py  # 122 tests: machine-boundary validator (ADR-012)
 python3 test_iterate.py                     #  92 tests: comfyless --iterate (ADR-008)
 python3 test_samplers.py                    #  41 tests: custom schedulers / sampler swap
-python3 test_server_robustness.py           #  54 tests: comfyless IPC timeouts + BrokenPipe survival + device-keyed socket routing + server-side device pinning (ADR-020)
+python3 test_server_robustness.py           #  63 tests: comfyless IPC timeouts + BrokenPipe survival + device-keyed socket routing + server-side device pinning + atomic output reservation (ADR-020)
 python3 test_mcp_server.py                  # 534 tests: comfyless MCP server (ADR-011 slice 1 + ADR-015 slice 2 catalog/list_models/list_loras + slice 2b list_transformers + slice 3 generate catalog-name migration + slice 3b cascade catalog-name migration)
 python3 test_quant.py                       #  88 tests: fp8 quantize-on-load (ADR-019 slice A) — eligibility policy, cache-key discrimination, LoRA merge guard, boundary hygiene
 ```
-All ten suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 1575 unit tests; expect 0 failures.
+All ten suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 1584 unit tests; expect 0 failures.
 
 `test_flux2.py` is a live GPU smoke test that performs an actual Flux.2 generation — separate from the unit suites above. Run only when you need to verify end-to-end Flux.2 behavior.
 

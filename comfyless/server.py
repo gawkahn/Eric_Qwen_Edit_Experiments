@@ -524,6 +524,10 @@ def _handle_generate(
             lora_warnings.append(msg)
 
     # ── Resolve output path (server owns this; client template is just a hint) ──
+    # _reserved holds a 0-byte placeholder path when the auto-numbered branch
+    # atomically claims a name (Finding 1); it is unlinked if generation fails so
+    # a failed run does not leave an orphan file that also burns a counter slot.
+    _reserved: Optional[str] = None
     savepath = req.get("savepath")
     if savepath:
         # Strip leading slashes so template can't escape output_dir.
@@ -551,13 +555,32 @@ def _handle_generate(
         except Exception as e:
             return {"status": "error", "error_type": "PathError", "error": str(e)}
     else:
+        # Atomic reservation, not exists()-then-write: O_EXCL makes the create
+        # fail if the name is taken, so two daemons sharing --output-dir (the
+        # canonical parallel setup in ADR-020) can never both pick
+        # comfyless0001.png and silently overwrite each other. Closes security
+        # review Finding 1 (review-parallel-daemon-2026-07-03). The 0-byte
+        # placeholder holds the name for the whole generation; generate()
+        # overwrites it with the real PNG.
         counter = 1
         while True:
             candidate = str(Path(output_dir) / f"comfyless{counter:04d}.png")
-            if not os.path.exists(candidate):
-                output_path = candidate
-                break
-            counter += 1
+            try:
+                _fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                counter += 1
+                continue
+            except OSError as e:
+                # Any non-EEXIST error (disk full, EACCES, read-only fs) must
+                # return a structured error, never escape and kill the accept
+                # loop: os.path.exists() never raised, so the atomic-open path
+                # has to preserve the daemon-survival promise. (code-review,
+                # slice 3 — same class as the slice-2 TypeError regression.)
+                return {"status": "error", "error_type": "IOError", "error": str(e)}
+            os.close(_fd)
+            output_path = candidate
+            _reserved = candidate
+            break
 
     # Belt-and-suspenders: re-verify the final resolved path.
     if not _within(output_path, output_dir):
@@ -603,6 +626,13 @@ def _handle_generate(
         )
     except Exception as e:
         import traceback
+        # No image was written — drop the reserved 0-byte placeholder so a failed
+        # run neither litters output_dir nor permanently consumes its counter.
+        if _reserved is not None:
+            try:
+                os.unlink(_reserved)
+            except OSError:
+                pass
         return {
             "status":     "error",
             "error_type": "InferenceError",

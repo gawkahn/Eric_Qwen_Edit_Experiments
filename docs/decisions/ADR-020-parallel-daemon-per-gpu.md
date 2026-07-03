@@ -193,7 +193,20 @@ TCP localhost is reachable by any process in the network namespace.
   daemon can no longer be induced to run on a GPU another daemon owns. A
   mis-routed/stale caller asking for a different device is warned (not silently
   redirected), per the project's warn-don't-block preference; `cuda` vs `cuda:0`
-  is treated as a match and does not warn.
+  is treated as a match and does not warn. The slice-2 security-auditor pass
+  caught a regression in the new warn block (a non-string payload `device` raised
+  an uncaught `TypeError` that would escape to the accept loop and kill the
+  daemon); fixed by catching `(ValueError, TypeError)` so a malformed device is
+  absorbed and warned, preserving the "malformed request never kills the daemon"
+  invariant (`c99303b`).
+- 2026-07-03 (slice 3, closes Finding 1): auto-numbered output now uses an atomic
+  `os.open(O_CREAT|O_EXCL)` reservation instead of `os.path.exists()`-then-write,
+  so two daemons sharing `--output-dir` cannot both select `comfyless0001.png`
+  and overwrite each other. The 0-byte placeholder holds the name through
+  generation (`generate()` overwrites it); on generation failure the placeholder
+  is unlinked so a failed run leaves no orphan and does not burn a counter slot.
+  The savepath-template branch is unchanged (user-controlled naming; out of
+  Finding 1's scope).
 
 ## AI-Disclosure
 

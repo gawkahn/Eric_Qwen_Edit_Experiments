@@ -436,3 +436,17 @@ ADR-010's "Deferred / Out of Scope" section formally declares the following non-
 - **What:** Three deferred items from the rebalance daemon/MCP wiring reviews (see `docs/security/review-rebalance-daemon-mcp-2026-06-27.md`): (1) `rebalance_weights` is validated as `_KIND_LIST` only — a list of non-numbers or wrong length passes the machine boundary and only fails deep in `_apply_krea_rebalance` (`torch.tensor`) as a caught `InferenceError`, less precise than `loras`' per-entry validation; (2) `rebalance_mult`/`rebalance_weights` accept NaN/Inf (Python `json.loads` allows them), yielding a degenerate image; (3) the client-side omit-`rebalance_weights`-when-None branch in `_delegate_to_server` has no test (no harness exists for the client delegate path).
 - **Why not now:** All three fail closed / are self-inflicted, consistent with the project's warn/contain-don't-pre-block footgun-tolerance posture (`security-auditor` + `code-reviewer` both rated them INFO/nit, no blocking). Adding the client-delegate test needs a new socket-mock harness for a trivial branch.
 - **Trigger:** A dedicated list-of-float validator kind being added (would naturally cover element-type + finiteness), OR the next change to `_delegate_to_server` (add the omission test then), OR an observed bad-input report.
+
+---
+
+## Parallel daemon (ADR-020)
+
+### [Code] Hard-crash orphans burn auto-number counter slots *(2026-07-03)*
+- **What:** The atomic auto-number reservation (`comfyless/server.py` `_handle_generate`, Finding 1 fix) leaves a 0-byte `comfylessNNNN.png` placeholder if the daemon dies **uncatchably** mid-generation (SIGKILL / OOM-kill) — `except Exception` cannot clean those up. The orphan permanently reserves that counter slot across restarts; repeated hard crashes make the counter creep upward and litter 0-byte PNGs.
+- **Why not now:** Fail-safe in direction (never overwrites real data), bounded by crash count, and the orphans are visually obvious (0-byte files). The caught-failure path already cleans up. Out of scope for the Finding 1 slice.
+- **Trigger:** Observed orphan accumulation in practice, OR any startup-sequence work on `run_server` — at which point a one-line sweep (`unlink` 0-byte `comfyless*.png` in `output_dir` before the accept loop) closes it. Flagged by the slice-3 `security-auditor` pass (`docs/security/review-parallel-daemon-2026-07-03.md`).
+
+### [Code] savepath-template branch retains the concurrent-collision class *(2026-07-03)*
+- **What:** Finding 1's atomic reservation covers only the **auto-number** branch. The `if savepath:` branch (user-supplied template) still resolves a path and hands it to `generate()` with no atomic reservation, so two daemons sharing `--output-dir` with the *same template and same params* (a template lacking `%seed%`/timestamp entropy) TOCTOU-overwrite each other exactly as Finding 1 described.
+- **Why not now:** Naming here is user-controlled (add entropy or per-device templates); Finding 1 explicitly scoped only the auto-number counter; this slice did not touch the branch. Recorded so "auto-number is atomic" is not mistaken for "all output paths are collision-safe."
+- **Trigger:** A user hitting template-collision in a parallel setup, OR extending atomic reservation to the template branch (would need to reserve the resolved path the same way, handling the template's own dir creation). Flagged by the slice-3 `security-auditor` pass.
