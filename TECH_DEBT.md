@@ -227,6 +227,14 @@ Fix shape: daemon dispatch rejects `quant != "none"` with an explicit
 carries it end-to-end.
 See `docs/decisions/ADR-019-native-quantization-support.md`,
 `docs/vision/slice-A-fp8-quant-load.md` §2.
+Resolved: 2026-07-03 — slice DQ carries quant end-to-end over the daemon:
+wire request sends the triple, `_validate_request` semantically rejects
+unknown modes (light `QUANT_MODES` constant in `params_validation.py`, no
+torch on the accept-loop path), `_request_cache_key` discriminates on the
+triple and on the LoRA set when quant is active (quantized pipelines always
+evict+reload on LoRA change — direct merges can't be removed incrementally),
+and the client delegation-skip is gone. Security review:
+`docs/security/review-slice-DQ-daemon-quant-2026-07-03.md`.
 
 ---
 
@@ -298,6 +306,15 @@ in the diff key; client-side warning relay) is its own gated slice.
 Trigger: the next server.py slice (e.g. quant-over-daemon, same file), OR
 LoRA A/B testing friction getting raised again.
 See `project_krea_lora_regression.md` memory.
+Update 2026-07-03 (explicit re-deferral, not resolution): the trigger fired
+(slice DQ touched server.py) and was consciously deferred as out of scope
+(`docs/vision/slice-DQ-daemon-quant.md` §Out of scope). Slice DQ SIDESTEPS
+both defects for QUANTIZED pipelines only — the LoRA (path, weight) set
+joins the cache key when quant is active, so any LoRA change (including
+weight-only) evicts and reloads instead of taking the broken diff path.
+Unquantized daemon behavior is unchanged; both defects remain open there.
+New trigger: next server.py slice that isn't already at capacity, OR
+unquantized LoRA A/B friction raised again.
 
 **bnb NF4 single-file support dropped — revisit trigger + pure-torch path** *(2026-07-02)*
 ADR-019 dropped NF4 single-file consumption (near-zero collection volume). The
@@ -413,6 +430,7 @@ Security-gated: docs/security/review-slice-DMR-quantized-merge-2026-07-03.md
 - **Suggested fix:** call `d.lstat()` first and reject if `stat.S_ISLNK(st.st_mode)` before the existing uid/mode checks on `d.stat()`. Two-line change.
 - **Trigger:** Next non-trivial commit touching `comfyless/server.py` or any scope change to shared-machine deployment.
 - **Priority:** Low (Medium on shared-machine scope change)
+- **Resolved: 2026-07-03** — landed with slice DQ (the trigger fired: server-touching commit). `_socket_dir` raises `RuntimeError` on a symlinked `/tmp/comfyless-$UID` before the uid/mode checks; negative test in `test_server_robustness.py` plants a symlink for a fake uid and asserts refusal. Flagged by slice-DQ review F8 so the deferral wouldn't roll forward again.
 
 ### [Code] `loras[i]["weight"]` not type-checked in `_validate_request` (H-3)
 - **Location:** `comfyless/server.py` `_validate_request` loras loop

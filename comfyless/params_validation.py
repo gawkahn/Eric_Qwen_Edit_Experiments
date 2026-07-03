@@ -83,6 +83,13 @@ _RUNTIME_KIND = types.MappingProxyType({
     "quant_only":         _KIND_LIST,
 })
 
+# Allowed quant modes at the machine boundary. Deliberately duplicated from
+# nodes.eric_diffusion_utils.QUANT_MODES: that module's import graph pulls
+# torch, and the daemon's request-validation path must stay light and
+# non-raising (slice-DQ security review F1 — a heavy import there is an
+# accept-loop-kill hazard). test_quant.py asserts the two stay in sync.
+QUANT_MODES = ("none", "fp8")
+
 
 # MCP-surface transport-control fields (ADR-017). Neither sidecar-shaped
 # (not in COMFYLESS_SCHEMA — they do not round-trip through replayable
