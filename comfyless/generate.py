@@ -1450,15 +1450,17 @@ def _run_serve_mode(args: argparse.Namespace) -> int:
         return 1
 
 
-def _send_server_command(req: dict) -> Optional[dict]:
-    """Connect to the running server, send one request, return the response.
+def _send_server_command(req: dict, device: str = "cuda") -> Optional[dict]:
+    """Connect to the running server for `device`, send one request, return the response.
 
     Returns None if the socket doesn't exist or the connection is refused.
+    The socket is device-keyed (ADR-020): one daemon per GPU, so the caller's
+    device selects which daemon to reach.
     Local import keeps server.py off the critical import path.
     """
     import socket as _socket
     from .server import socket_path, _send, _recv, _CLIENT_RECV_TIMEOUT_SEC
-    sock_p = socket_path()
+    sock_p = socket_path(device)
     if not sock_p.exists():
         return None
     conn = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
@@ -1474,9 +1476,14 @@ def _send_server_command(req: dict) -> Optional[dict]:
         conn.close()
 
 
-def _send_unload() -> int:
-    """Send an unload command to the running server."""
-    resp = _send_server_command({"type": "unload"})
+def _send_unload(device: str = "cuda") -> int:
+    """Send an unload command to the running server for `device`.
+
+    Device-scoped (ADR-020): '--unload --device cuda:1' stops only the cuda:1
+    daemon; bare '--unload' (default 'cuda' -> 'cuda:0') stops the cuda:0 daemon.
+    Stopping every daemon means unloading each device.
+    """
+    resp = _send_server_command({"type": "unload"}, device)
     if resp is None:
         print("No server found (socket missing or connection refused).", file=sys.stderr)
         return 1
@@ -1506,7 +1513,7 @@ def _delegate_to_server(
     Use --savepath for naming control when a server is running.
     """
     from .server import socket_path
-    if not socket_path().exists():
+    if not socket_path(args.device).exists():
         return None
 
     # Resolve all path fields to absolute before sending. The server runs
@@ -1556,7 +1563,7 @@ def _delegate_to_server(
     if _rb_weights is not None:
         req["rebalance_weights"] = _rb_weights
 
-    resp = _send_server_command(req)
+    resp = _send_server_command(req, args.device)
     if resp is None:
         _log("[comfyless] Server socket found but connection failed — running in-process")
         return None
@@ -2158,7 +2165,7 @@ def main() -> int:
     if args.serve:
         return _run_serve_mode(args)
     if args.unload:
-        return _send_unload()
+        return _send_unload(args.device)
     return _run_cli_mode(args)
 
 

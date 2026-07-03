@@ -83,9 +83,45 @@ def _socket_dir() -> Path:
     return d
 
 
-def socket_path() -> Path:
-    """Return the Unix socket path for this user's comfyless server."""
-    return _socket_dir() / "comfyless.sock"
+# Device strings that may be turned into a socket filename. Anchored full-match
+# (fullmatch, not match+$: '$' also matches before a trailing '\n', which would
+# smuggle a newline into the socket name). re.ASCII keeps \d to [0-9] so the
+# regex — not the later int() fold — is the sole gate (rejects unicode digits
+# outright); the (?:...) group keeps the alternation anchored if this is ever
+# switched to .match()/.search(). See ADR-020 §3 and
+# docs/security/review-parallel-daemon-2026-07-03.md Finding 3.
+_DEVICE_RE = re.compile(r"(?:cpu|cuda(:\d+)?)", re.ASCII)
+
+
+def _device_socket_slug(device: str) -> str:
+    """Map a device string to a canonical socket-name slug.
+
+    One daemon serves one GPU (ADR-020, design A); the socket name is keyed by
+    device so daemons for different GPUs coexist in the same 0700 dir. The
+    whitelist runs on the RAW input first (never on a pre-normalized string, or
+    a crafted value could be massaged past the filter); only survivors — already
+    restricted to {cpu, cuda, cuda:<digits>} — are canonicalized. The integer is
+    parsed so 'cuda', 'cuda:0', 'cuda:00', 'cuda:007' all fold to the same slug
+    ('cuda0'/'cuda7') and can never carry a non-[a-z0-9] byte into the filename.
+    """
+    if _DEVICE_RE.fullmatch(device) is None:
+        raise ValueError(
+            f"unsupported device for socket routing: {device!r} "
+            f"(expected 'cpu', 'cuda', or 'cuda:<n>')"
+        )
+    if device == "cpu":
+        return "cpu"
+    idx = int(device.split(":", 1)[1]) if ":" in device else 0
+    return f"cuda{idx}"
+
+
+def socket_path(device: str = "cuda") -> Path:
+    """Return the Unix socket path for this user's comfyless server on `device`.
+
+    Device-keyed so one daemon per GPU can run concurrently (ADR-020). 'cuda'
+    and 'cuda:0' name the same physical device and resolve to the same socket.
+    """
+    return _socket_dir() / f"comfyless-{_device_socket_slug(device)}.sock"
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -578,7 +614,7 @@ def run_server(
     if not os.path.isdir(model_base):
         raise FileNotFoundError(f"--model-base not found: {model_base}")
 
-    sock_path = socket_path()
+    sock_path = socket_path(device)
     if sock_path.exists():
         sock_path.unlink()
 

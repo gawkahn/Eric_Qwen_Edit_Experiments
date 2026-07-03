@@ -283,6 +283,82 @@ finally:
 
 
 # ──────────────────────────────────────────────────────────────────────
+print("\n── device-keyed socket routing (ADR-020) ──────────────────────")
+
+# _device_socket_slug is the pure normalization+whitelist core; socket_path
+# wraps it with the 0700 socket dir. See docs/security/
+# review-parallel-daemon-2026-07-03.md Finding 3.
+
+def _slug(d):
+    return srv._device_socket_slug(d)
+
+def _rejects(d):
+    try:
+        srv._device_socket_slug(d)
+        return False
+    except ValueError:
+        return True
+
+def _rejects_path(d):
+    try:
+        srv.socket_path(d)
+        return False
+    except ValueError:
+        return True
+
+# ── canonicalization (invariant 3 + Finding 3.3 integer folding) ──
+check("cuda -> cuda0 slug", _slug("cuda") == "cuda0", f"got {_slug('cuda')!r}")
+check("cuda:0 -> cuda0 slug", _slug("cuda:0") == "cuda0")
+check("cuda == cuda:0 (same physical device -> same slug)",
+      _slug("cuda") == _slug("cuda:0"))
+check("cuda:00 folds to cuda0 (leading-zero canon, Finding 3.3)",
+      _slug("cuda:00") == "cuda0", f"got {_slug('cuda:00')!r}")
+check("cuda:007 folds to cuda7 (leading-zero canon)",
+      _slug("cuda:007") == "cuda7", f"got {_slug('cuda:007')!r}")
+check("cpu -> cpu slug", _slug("cpu") == "cpu")
+
+# ── distinctness (invariant 2) ──
+check("cuda:0 and cuda:1 are DISTINCT slugs",
+      _slug("cuda:0") != _slug("cuda:1"))
+check("cuda:1 -> cuda1 slug", _slug("cuda:1") == "cuda1")
+check("cpu and cuda0 are distinct", _slug("cpu") != _slug("cuda:0"))
+
+# ── whitelist rejection (invariant 4 + Finding 3.1/3.2) ──
+check("rejects trailing newline 'cuda:0\\n' (fullmatch, not $; Finding 3.2)",
+      _rejects("cuda:0\n"))
+check("rejects path traversal '../../etc/x'", _rejects("../../etc/x"))
+check("rejects embedded slash 'cuda:0/../y'", _rejects("cuda:0/../y"))
+check("rejects NUL byte 'cuda:0\\x00'", _rejects("cuda:0\x00"))
+check("rejects non-numeric index 'cuda:abc'", _rejects("cuda:abc"))
+check("rejects bare 'cuda:' (no index)", _rejects("cuda:"))
+check("rejects empty string", _rejects(""))
+check("rejects 'gpu0'", _rejects("gpu0"))
+check("rejects leading space ' cuda:0'", _rejects(" cuda:0"))
+check("rejects 'mps' (not whitelisted)", _rejects("mps"))
+check("rejects unicode digit 'cuda:\\u0660' (re.ASCII gate, not int() fold)",
+      _rejects("cuda:٠"))  # ARABIC-INDIC ZERO
+
+# ── full socket_path shape ──
+_p0 = srv.socket_path("cuda:0")
+_p1 = srv.socket_path("cuda:1")
+_pc = srv.socket_path("cpu")
+check("socket_path cuda:0 basename is comfyless-cuda0.sock",
+      _p0.name == "comfyless-cuda0.sock", f"got {_p0.name!r}")
+check("socket_path cuda:1 basename is comfyless-cuda1.sock",
+      _p1.name == "comfyless-cuda1.sock")
+check("socket_path cpu basename is comfyless-cpu.sock",
+      _pc.name == "comfyless-cpu.sock")
+check("socket_path cuda == cuda:0 (same path)",
+      srv.socket_path("cuda") == _p0)
+check("socket_path cuda:0 != cuda:1 (distinct paths)", _p0 != _p1)
+check("all device sockets share one 0700 dir",
+      _p0.parent == _p1.parent == _pc.parent)
+check("socket_path default arg is 'cuda' (-> cuda0)",
+      srv.socket_path().name == "comfyless-cuda0.sock")
+check("socket_path propagates whitelist rejection", _rejects_path("../../x"))
+
+
+# ──────────────────────────────────────────────────────────────────────
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print("──────────────────────────────────────────────────")
