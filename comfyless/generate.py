@@ -917,11 +917,26 @@ def _load_pipeline(
         pipe.vae.enable_tiling()
 
     if attention_slicing:
-        try:
-            pipe.enable_attention_slicing(slice_size="auto")
-            _log("[comfyless] Attention slicing enabled")
-        except Exception as e:
-            _log(f"[comfyless] Attention slicing not available: {e}")
+        # enable_attention_slicing only drives components that implement
+        # set_attention_slice — i.e. UNet models (sd1/sdxl).  Modern DiT
+        # transformers (Flux/Flux2/Qwen-Image/Chroma/Krea2) route attention
+        # through dispatch_attention_fn (SDPA/flash), which never materializes
+        # the N^2 score matrix — there is nothing to slice, and the pipeline
+        # call is a silent no-op.  Detect that and tell the truth instead of
+        # logging "enabled" when nothing happened.
+        denoiser = getattr(pipe, "unet", None) or getattr(pipe, "transformer", None)
+        if denoiser is not None and hasattr(denoiser, "set_attention_slice"):
+            try:
+                pipe.enable_attention_slicing(slice_size="auto")
+                _log("[comfyless] Attention slicing enabled")
+            except Exception as e:
+                _log(f"[comfyless] Attention slicing not available: {e}")
+        else:
+            _log("[comfyless] WARNING: --attention-slicing has NO EFFECT on this "
+                 "model — its denoiser does not support attention slicing (modern "
+                 "DiT transformers use flash/SDPA attention, which has no N^2 score "
+                 "matrix to slice). Ignoring. For OOM relief use --quant (weights "
+                 "are the driver, not attention) or --offload-vae.")
 
     guidance_embeds = read_guidance_embeds(pipe)
     _log(f"[comfyless] Ready — family={model_family}, guidance_embeds={guidance_embeds}")
