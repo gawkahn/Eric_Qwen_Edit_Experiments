@@ -283,6 +283,25 @@ Trigger: the next server.py slice (e.g. quant-over-daemon, same file), OR
 LoRA A/B testing friction getting raised again.
 See `project_krea_lora_regression.md` memory.
 
+**bnb NF4 single-file support dropped — revisit trigger + pure-torch path** *(2026-07-02)*
+ADR-019 dropped NF4 single-file consumption (near-zero collection volume). The
+2026-07-02 collection audit found exactly TWO NF4 files, both the same model
+(`projectGaiaFlux1D_v20NF4*`), which Grant is genuinely interested in but
+agrees doesn't justify the slice alone.
+Why not now: one model; the heavyweight path (bitsandbytes runtime) needs a
+new dep, and the lightweight path needs careful verification.
+**Cheap path when triggered:** NF4 is a fixed 16-value codebook + per-64-block
+absmax (usually double-quantized). A pure-torch dequant-at-load is ~50 lines,
+NO new dependency — in-memory NF4→bf16 feeding the standard loader (the
+ADR-blessed "upcast on load" shim, NOT the dead offline-script direction).
+CAUTION: the old `dequantize_nf4.py` failed for undiagnosed reasons; any
+implementation needs a numeric cross-check against bitsandbytes' own
+dequantize (one-off scratch install, not a pinned dep) before trusting it.
+Trigger: a second wanted NF4 model appears, OR projectGaia becomes a model
+Grant actually reaches for.
+See `docs/decisions/ADR-019-native-quantization-support.md`,
+`audit_single_files.py` (finds NF4 files by .quant_state/.absmax markers).
+
 **Tier-3 (direct-merge) LoRAs incompatible with `--quant`** *(2026-07-02)*
 Under a torchao-quantized base (`Float8Tensor` / `NVFP4Tensor` weights), the LoRA
 loader's tier-3 fallback (direct state-dict merge into `weight.data`) cannot run —

@@ -181,6 +181,155 @@ for i, bad in enumerate(["a\x00b.weight", "a\x1b[31m.weight", "a\nb.weight"]):
 
 
 # ──────────────────────────────────────────────────────────────────────
+print("── comfy_quant descriptors (slice C-d, delta reqs 11-19) ──────")
+
+
+def _desc(obj_or_bytes):
+    """Build a U8 descriptor tensor from a JSON-able object or raw bytes."""
+    raw = obj_or_bytes if isinstance(obj_or_bytes, bytes) \
+        else json.dumps(obj_or_bytes).encode()
+    return torch.frombuffer(bytearray(raw), dtype=torch.uint8).clone()
+
+
+import json  # noqa: E402
+
+_CQA = {
+    "a.weight": _fp8((16, 16)),
+    "a.weight_scale": _scalar(0.01),
+    "a.input_scale": _scalar(0.5),
+    "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+}
+v, info = _classify(_mk("cqa.safetensors", _CQA))
+check("cq-a classified (descriptor + both scales)", v == "cq-a", f"got {v}")
+
+_CQW = {
+    "a.weight": _fp8((16, 16)),
+    "a.weight_scale": _scalar(0.01),
+    "a.comfy_quant": _desc({"format": "float8_e4m3fn",
+                            "full_precision_matrix_mult": True}),
+}
+v, _ = _classify(_mk("cqw.safetensors", _CQW))
+check("cq-w classified (descriptor + weight_scale only)", v == "cq-w",
+      f"got {v}")
+
+# Two different allowlisted formats — allowed by design (delta req 19).
+v, _ = _classify(_mk("cq2fmt.safetensors", {
+    "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+    "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+    "b.weight": _fp8((16, 16), seed=1), "b.weight_scale": _scalar(0.01),
+    "b.comfy_quant": _desc({"format": "float8_e5m2"}),
+}))
+check("two allowlisted formats in one file accepted", v == "cq-w", f"got {v}")
+
+# Unknown JSON field: logs once, does not reject (D5 telemetry).
+v, _ = _classify(_mk("cqxtra.safetensors", {
+    "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+    "a.comfy_quant": _desc({"format": "float8_e4m3fn", "surprise": 1}),
+}))
+check("unknown descriptor field logged, not rejected", v == "cq-w", f"got {v}")
+
+for label, desc in [
+    ("non-string format", {"format": 123}),
+    ("list JSON root", ["float8_e4m3fn"]),
+    ("null JSON root", None),
+    ("scalar JSON root", 7),
+    ("unknown format fp4", {"format": "fp4"}),
+    ("unknown format nvfp4", {"format": "nvfp4"}),
+    ("unknown format e4m3fnuz", {"format": "float8_e4m3fnuz"}),
+    ("trailing garbage", b'{"format": "float8_e4m3fn"} x'),
+    ("invalid UTF-8", b"\xff\xfe\xfd\xfc"),
+]:
+    _expect_reject(
+        f"descriptor {label} rejected (D4 NEGATIVE)",
+        _mk(f"cqbad_{label.replace(' ', '_')}.safetensors", {
+            "a.weight": _fp8((16, 16)),
+            "a.weight_scale": _scalar(0.01),
+            "a.comfy_quant": _desc(desc),
+        }))
+
+_expect_reject(
+    "empty descriptor tensor rejected (D2/D4 NEGATIVE)",
+    _mk("cqempty.safetensors", {
+        "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+        "a.comfy_quant": torch.zeros(0, dtype=torch.uint8),
+    }), "1-D U8")
+
+_expect_reject(
+    "oversize descriptor rejected from header, unread (D2 NEGATIVE)",
+    _mk("cqhuge.safetensors", {
+        "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+        "a.comfy_quant": torch.zeros(5000, dtype=torch.uint8),
+    }), "without reading")
+
+_expect_reject(
+    "non-U8 descriptor dtype rejected (D2 NEGATIVE)",
+    _mk("cqf32.safetensors", {
+        "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+        "a.comfy_quant": torch.zeros(8, dtype=torch.float32),
+    }), "U8")
+
+_expect_reject(
+    "dangling descriptor on bf16 layer rejected (D1 NEGATIVE)",
+    _mk("cqdangle.safetensors", {
+        "a.weight": torch.randn(16, 16, dtype=torch.bfloat16),
+        "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+        "b.weight": _fp8((16, 16)), "b.weight_scale": _scalar(0.01),
+        "b.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+    }), "dangling")
+
+_expect_reject(
+    "mixed descriptor/plain fp8 layers rejected (D3 NEGATIVE)",
+    _mk("cqmixed.safetensors", {
+        "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+        "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+        "b.weight": _fp8((16, 16), seed=1), "b.weight_scale": _scalar(0.01),
+    }), "mixes")
+
+_expect_reject(
+    "cq + C-b marker co-presence rejected (D3 NEGATIVE)",
+    _mk("cqcb.safetensors", {
+        "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+        "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+        "scaled_fp8": torch.zeros(2, dtype=torch.float8_e4m3fn),
+    }))
+
+_expect_reject(
+    "mixed input_scale coverage in cq file rejected (D6 NEGATIVE)",
+    _mk("cqmixin.safetensors", {
+        "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+        "a.input_scale": _scalar(0.5),
+        "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+        "b.weight": _fp8((16, 16), seed=1), "b.weight_scale": _scalar(0.01),
+        "b.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+    }), "all-or-none")
+
+# Weight-only ScaledFp8Linear: numerics match the dequant reference and the
+# scaled path is never entered (input_scale is None by construction).
+_w8 = _fp8((32, 16), seed=5)
+_ws = _scalar(0.02)
+_wo = fp8ops.ScaledFp8Linear(_w8, _ws, None, None)
+_x = torch.randn(3, 16, dtype=torch.bfloat16)
+_yref = nn.functional.linear(
+    _x, (_w8.to(torch.float32) * _ws).to(torch.bfloat16), None)
+check("weight-only forward == dequant reference",
+      torch.allclose(_wo(_x).float(), _yref.float(), rtol=1e-2, atol=1e-2))
+check("weight-only mode reported in extra_repr",
+      "weight-only" in _wo.extra_repr())
+
+# Loader-level D6: cq-w variant with an input_scale present in the dict.
+p = _mk("cqw_withinput.safetensors", {
+    "a.weight": _fp8((16, 16)),
+    "a.weight_scale": _scalar(0.01),
+    "a.input_scale": _scalar(0.5),
+    "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+})
+_expect_reject(
+    "loader rejects cq-w variant when input_scale exists (D6 NEGATIVE)",
+    lambda p=p: fp8ops.load_scaled_fp8_component(
+        None, p, torch.bfloat16, "", "cq-w"), "inconsistent")
+
+
+# ──────────────────────────────────────────────────────────────────────
 print("── loader: scale validation rejects (F2/F6 negatives) ─────────")
 
 
@@ -339,6 +488,11 @@ _REAL = [
      f"colossusProjectFlux_v12HephaistosFP8UNET.safetensors", "cc"),
     (f"{_CMFY}/diffusion_models/Flux.2-Klein-9B-base/"
      f"flux-2-klein-base-9b.safetensors", None),
+    (f"{_CMFY}/checkpoints/Flux.2-Klein-9B-base/sexy/"
+     f"pornmasterFlux2Klein_v2.safetensors", "cq-a"),
+    (f"{_CMFY}/checkpoints/Krea/krea2TurboUncensored_v1.safetensors", "cq-w"),
+    (f"{_CMFY}/checkpoints/Qwen/absoluteRealismV01_qwenV10.safetensors",
+     "cq-w"),
 ]
 for rp, want in _REAL:
     if os.path.exists(rp):

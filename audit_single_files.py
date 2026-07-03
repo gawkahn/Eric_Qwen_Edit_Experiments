@@ -130,10 +130,11 @@ def audit_file(path: str) -> dict:
         if "float8" in str(fmt):
             has_in = any(k.endswith((".input_scale", ".scale_input"))
                          for k in keys)
-            mode = "C-a-equal (both scales)" if has_in \
-                else "weight-only (no input_scale)"
+            mode = "cq-a (both scales)" if has_in \
+                else "cq-w (weight-only)"
             rec.update(verdict="CQ-FP8",
-                       detail=f"comfy_quant float8, {mode} — slice C-d")
+                       detail=f"comfy_quant float8, {mode} — native loader "
+                              f"since slice C-d")
         else:
             rec.update(verdict=f"CQ-{str(fmt)[:12]}",
                        detail=f"comfy_quant format {fmt!r} — unsupported")
