@@ -784,6 +784,56 @@ check("rebalance: 3-D embeds → ValueError (fail loud)", _raised)
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Krea2 attention-backend pin (_pin_krea_attention_backend): diffusers
+# 0.39.0's Krea2AttnProcessor passes bool mask + enable_gqa, which knocks
+# SDPA onto the math backend (S^2 materialization → OOM at high res);
+# comfyless pins the transformer to cuDNN for the krea families.
+print("\n── krea attention-backend pin ─────────────────────────────────")
+
+
+class _FakeBackendTransformer:
+    def __init__(self, raise_on_set=False):
+        self.backend = None
+        self._raise = raise_on_set
+
+    def set_attention_backend(self, name):
+        if self._raise:
+            raise ValueError("no such backend")
+        self.backend = name
+
+
+class _FakeBackendPipe:
+    def __init__(self, transformer):
+        if transformer is not None:
+            self.transformer = transformer
+
+
+_t = _FakeBackendTransformer()
+check("krea family pins cuDNN backend",
+      g._pin_krea_attention_backend(_FakeBackendPipe(_t), "krea") is True
+      and _t.backend == "_native_cudnn", f"backend={_t.backend!r}")
+_t = _FakeBackendTransformer()
+check("krea-turbo family pins cuDNN backend",
+      g._pin_krea_attention_backend(_FakeBackendPipe(_t), "krea-turbo") is True
+      and _t.backend == "_native_cudnn", f"backend={_t.backend!r}")
+_t = _FakeBackendTransformer()
+check("non-krea family left untouched (NEGATIVE)",
+      g._pin_krea_attention_backend(_FakeBackendPipe(_t), "flux2") is False
+      and _t.backend is None, f"backend={_t.backend!r}")
+check("pipe without transformer → no-op, no raise",
+      g._pin_krea_attention_backend(_FakeBackendPipe(None), "krea") is False)
+check("set_attention_backend failure → warn + False, never raises",
+      g._pin_krea_attention_backend(
+          _FakeBackendPipe(_FakeBackendTransformer(raise_on_set=True)),
+          "krea") is False)
+# The pinned name must exist in the installed diffusers backend registry —
+# catches an upstream rename breaking the pin silently.
+from diffusers.models.attention_dispatch import AttentionBackendName
+check("'_native_cudnn' exists in diffusers backend registry",
+      "_native_cudnn" in {x.value for x in AttentionBackendName.__members__.values()})
+
+
+# ──────────────────────────────────────────────────────────────────────
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print("──────────────────────────────────────────────────")

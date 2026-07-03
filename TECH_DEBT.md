@@ -183,6 +183,32 @@ both smoke-tested generating coherent images. This pin must NOT be merged to
 `main` — `main` stays on the last tagged release until a PyPI build exports
 `Krea2Pipeline` (still the trigger above for the real, mergeable bump). The
 branch exists precisely to test Krea without an unreleased pin reaching main.
+Resolved: 2026-07-03 (fully) — diffusers 0.39.0 released with Krea2 and
+pinned (9e4a2f2): git pin + [tool.uv.sources] removed, manifests are
+main-mergeable, 13 suites green on the release, Krea-2-Turbo live smoke OK.
+The original trigger fired; nothing remains of this entry.
+
+**Krea2 attention-backend pin — upstream workaround** *(2026-07-03)*
+diffusers 0.39.0's `Krea2AttnProcessor` passes a bool key-padding mask
+together with `enable_gqa=True` (48 q heads / 12 kv heads). PyTorch's fused
+SDPA kernels reject that combination (flash: no arbitrary masks;
+mem-efficient: no GQA), so backend auto-select silently falls back to MATH
+and materializes the full S^2 attention matrix — measured ~91 GB of
+transients at 2560x1440 (14912 tokens): instant OOM, quant-independent
+(originally misattributed to --quant + direct-merge LoRAs). comfyless works
+around it in `_pin_krea_attention_backend` (generate.py): krea/krea-turbo
+transformers get `set_attention_backend("_native_cudnn")` — cuDNN runs the
+same shapes fused at ~0.17 GB; verified end-to-end 2560x1440 x8 steps with
+quant fp8 + 4-LoRA stack, peak 44.3 GB. A registry test in
+test_params_schema.py catches an upstream rename of `_native_cudnn`.
+Why not now (the real fix): the processor should expand kv heads or diffusers
+should prefer cuDNN when a mask disqualifies flash — that's upstream's call.
+Trigger: upstream fix to Krea2AttnProcessor (or attention auto-select)
+lands in a pinned diffusers release → remove the pin helper + tests.
+Related cosmetic issue, no action: under quantization_config diffusers skips
+`_keep_in_fp32_modules`, so Krea2RMSNorm weights load bf16 and torch warns
+"Mismatch dtype ... Cannot dispatch to fused implementation" once per run;
+the norm computes fp32 and casts back either way — output unaffected.
 
 **NVFP4 quantize-on-load blocked on a stable torch/torchao/mslk triad** *(2026-07-02)*
 NVFP4 quantize-on-load for diffusion (ADR-019 slice A, nvfp4 half) is officially

@@ -739,6 +739,37 @@ def _apply_krea_rebalance(
 #  Pipeline loader (extracted so the server can cache the result)
 # ════════════════════════════════════════════════════════════════════════
 
+def _pin_krea_attention_backend(pipe, model_family: str) -> bool:
+    """Pin the Krea2 transformer's attention backend to cuDNN.
+
+    diffusers 0.39.0's Krea2AttnProcessor passes a bool key-padding mask
+    together with enable_gqa=True (48 q heads / 12 kv heads). PyTorch's
+    fused SDPA kernels reject that combination (flash: no arbitrary masks;
+    mem-efficient: no GQA), so auto-select silently falls back to the MATH
+    backend and materializes the full S^2 attention matrix — ~91 GB of
+    transients at 2560x1440 (14912 tokens), an instant OOM. cuDNN handles
+    GQA + bool mask fused (measured 0.17 GB for the same shapes), so pin it
+    for the Krea transformer. Upstream bug; remove when Krea2AttnProcessor
+    stops disqualifying the fused kernels. Returns True when pinned.
+    """
+    if model_family not in ("krea", "krea-turbo"):
+        return False
+    transformer = getattr(pipe, "transformer", None)
+    if transformer is None:
+        return False
+    try:
+        transformer.set_attention_backend("_native_cudnn")
+    except Exception as e:
+        _log(f"[comfyless] WARNING: could not pin Krea2 attention backend "
+             f"to cuDNN ({e}) — high-resolution generation may OOM in the "
+             f"SDPA math-backend fallback")
+        return False
+    _log("[comfyless] Krea2 attention backend pinned to cuDNN (avoids SDPA "
+         "math-backend fallback: bool mask + GQA disqualify flash/efficient "
+         "— full S^2 materialization OOMs at high resolution)")
+    return True
+
+
 def _load_pipeline(
     model_path: str,
     *,
@@ -937,6 +968,8 @@ def _load_pipeline(
                  "DiT transformers use flash/SDPA attention, which has no N^2 score "
                  "matrix to slice). Ignoring. For OOM relief use --quant (weights "
                  "are the driver, not attention) or --offload-vae.")
+
+    _pin_krea_attention_backend(pipe, model_family)
 
     guidance_embeds = read_guidance_embeds(pipe)
     _log(f"[comfyless] Ready — family={model_family}, guidance_embeds={guidance_embeds}")
