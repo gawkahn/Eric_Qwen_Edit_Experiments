@@ -607,9 +607,15 @@ def _apply_converted_lora_as_delta(
     runtime weight changes for guaranteed correctness — same compromise
     the existing _load_lokr_adapter_direct path makes.
     """
-    from .eric_diffusion_utils import guard_direct_merge
-    guard_direct_merge(transformer, log_prefix, "converted adapter")
-    model_sd = dict(transformer.named_parameters())
+    from .eric_diffusion_fp8_ops import (
+        apply_merge_delta, merge_resolution_map, record_direct_merge,
+    )
+    # Slice DMR: quantized bases merge via dequant->merge->requant;
+    # apply_merge_delta owns the raise for unmergeable reps. The resolution
+    # map's .weight-only buffer filter is BINDING (security review DMR-3:
+    # an adversarial `foo.weight_scale.diff` key must never resolve onto a
+    # ScaledFp8Linear scale buffer).
+    model_sd = merge_resolution_map(transformer)
     modules: Dict[str, Dict[str, "torch.Tensor"]] = {}
     for k, v in state_dict.items():
         base, sfx = split_state_key(k)
@@ -655,15 +661,17 @@ def _apply_converted_lora_as_delta(
                 skipped += 1
                 continue
 
-        # Snapshot original weights so unload_adapters can restore them
-        if target_key not in backup:
-            backup[target_key] = param.data.clone()
-
-        param.data.add_(delta.to(dtype=param.dtype, device=param.device))
+        # Backup + merge via the DMR dispatcher (exact-restore backups for
+        # quantized targets; byte-identical legacy path for plain params)
+        apply_merge_delta(transformer, target_key, delta, backup,
+                          log_prefix=log_prefix)
         if applied_kind == "diff":
             applied_diff += 1
         else:
             applied_lora += 1
+
+    if applied_diff or applied_lora:
+        record_direct_merge(transformer, adapter_name)  # LIFO ledger (req 25)
 
     # Mark the adapter so set_adapters() can find it (matches how
     # _load_lokr_adapter_direct registers its direct-merge adapters).

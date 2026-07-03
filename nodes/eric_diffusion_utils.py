@@ -1553,6 +1553,13 @@ def guard_direct_merge(module, log_prefix: str = "[LoRA]",
                        merge_kind: str = "this adapter") -> None:
     """Refuse direct weight merges into a quantized base (ADR-019 §4).
 
+    SLICE DMR (2026-07-03): the four merge sites NO LONGER call this at
+    entry — they route every per-target write through
+    ``eric_diffusion_fp8_ops.apply_merge_delta``, which merges supported
+    quantized reps via dequant→merge→requant and owns the loud raise for
+    unmergeable ones. Retained for external/legacy callers needing the old
+    all-or-nothing check.
+
     Direct merge mutates ``param.data`` in place — impossible on a torchao
     tensor subclass (``Float8Tensor``): at best it crashes deep in dispatch,
     at worst it corrupts the quantized weights.  Called at the entry of every

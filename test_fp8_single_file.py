@@ -472,6 +472,141 @@ except RuntimeError as e:
 
 
 # ──────────────────────────────────────────────────────────────────────
+print("── slice DMR: dequant→merge→requant (security reqs 21-30) ─────")
+
+
+class _DMRHost(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.plain = nn.Linear(8, 8, bias=False)
+        self.plain.weight.data = self.plain.weight.data.to(torch.bfloat16)
+        self.q = fp8ops.ScaledFp8Linear(
+            _fp8((8, 8)), _scalar(0.02), _scalar(0.5), None)
+        self.qw = fp8ops.ScaledFp8Linear(
+            _fp8((8, 8), seed=1), _scalar(0.02), None, None)
+
+
+_h = _DMRHost()
+_bk = {}
+_d = torch.randn(8, 8, dtype=torch.bfloat16) * 0.01
+
+# Invariant 1: plain path byte-identical to legacy clone+add_.
+_pw = _h.plain.weight.data.clone()
+check("DMR plain merge kind",
+      fp8ops.apply_merge_delta(_h, "plain.weight", _d, _bk) == "plain")
+check("DMR plain backup is a raw tensor clone (legacy shape)",
+      isinstance(_bk["plain.weight"], torch.Tensor)
+      and torch.equal(_bk["plain.weight"], _pw))
+check("DMR plain merge result == legacy add_",
+      torch.equal(_h.plain.weight.data, _pw + _d.to(torch.bfloat16)))
+
+# Invariant 3: ScaledFp8Linear requant within one fp8 step of exact merge.
+_qw0 = _h.q.weight.clone()
+_qs0 = _h.q.weight_scale.clone()
+_h.q._fallback_weight = torch.zeros(8, 8)  # simulate stale cache
+_exact = _h.q.weight.to(torch.float32) * _h.q.weight_scale + _d.float()
+check("DMR scaled_fp8 merge kind",
+      fp8ops.apply_merge_delta(_h, "q.weight", _d, _bk) == "scaled_fp8")
+_got = _h.q.weight.to(torch.float32) * _h.q.weight_scale
+_rel = ((_got - _exact).abs().max() / _exact.abs().max()).item()
+check("DMR requant error within one e4m3 step", _rel < 0.08, f"rel={_rel:.4f}")
+check("DMR merge invalidates dequant cache (invariant 6)",
+      _h.q._fallback_weight is None)
+check("DMR weight-only module merges too",
+      fp8ops.apply_merge_delta(_h, "qw.weight", _d, _bk) == "scaled_fp8")
+
+# Invariant 2: exact restore (bit-equal) + cache/warn reset (req 29).
+_h.q._fallback_weight = torch.ones(8, 8)
+_h.q._warned_fallback = True
+check("DMR restore succeeds",
+      fp8ops.restore_merge_backup(_h, "q.weight", _bk["q.weight"]) is True)
+check("DMR restore is bit-exact (weight + scale)",
+      torch.equal(_h.q.weight, _qw0)
+      and torch.equal(_h.q.weight_scale, _qs0))
+check("DMR restore resets cache and warn latch (req 29 NEGATIVE)",
+      _h.q._fallback_weight is None and _h.q._warned_fallback is False)
+
+# req 21: non-finite delta rejected before any dispatch.
+try:
+    fp8ops.apply_merge_delta(_h, "plain.weight",
+                             torch.full((8, 8), float("nan")), {})
+    check("DMR non-finite delta rejected (req 21 NEGATIVE)", False, "no raise")
+except RuntimeError as e:
+    check("DMR non-finite delta rejected (req 21 NEGATIVE)",
+          "non-finite" in str(e))
+
+# req 22: all-zero merged tensor → sentinel scale, no div-by-zero.
+_h2 = _DMRHost()
+_dz = -(_h2.q.weight.to(torch.float32) * _h2.q.weight_scale)
+fp8ops.apply_merge_delta(_h2, "q.weight", _dz, {})
+check("DMR zero-amax sentinel scale (req 22 NEGATIVE)",
+      _h2.q.weight_scale.item() == 1.0
+      and _h2.q.weight.to(torch.float32).abs().max().item() == 0.0)
+
+# req 24: orphan fp8 tensor (not a ScaledFp8Linear) must raise, never
+# take the plain path.
+class _Orphan(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("weight", _fp8((4, 4)))
+
+
+_o = nn.Module()
+_o.orphan = _Orphan()
+try:
+    fp8ops.apply_merge_delta(_o, "orphan.weight", torch.randn(4, 4), {})
+    check("DMR orphan fp8 raises (req 24 NEGATIVE)", False, "merged!")
+except RuntimeError as e:
+    check("DMR orphan fp8 raises (req 24 NEGATIVE)",
+          "not owned by a ScaledFp8Linear" in str(e))
+
+# req 23: resolution map exposes .weight buffers ONLY — scale buffers and
+# descriptors are invisible so adversarial LoRA keys cannot target them.
+_mm = fp8ops.merge_resolution_map(_h)
+check("DMR resolution map: fp8 .weight buffer visible", "q.weight" in _mm)
+check("DMR resolution map: scale buffers INVISIBLE (req 23 NEGATIVE)",
+      "q.weight_scale" not in _mm and "q.input_scale" not in _mm)
+
+# req 23 through the REAL path: a crafted .diff key aimed at a scale
+# buffer must not write (resolves to None → skipped), and the scale
+# must be unchanged. comfyless import installs the folder_paths shims the
+# nodes package needs (established suite pattern).
+import comfyless.generate  # noqa: F401,E402 — shims
+from nodes.eric_lora_format_convert_apply import _apply_converted_lora_as_delta  # noqa: E402
+_h3 = _DMRHost()
+_s_before = _h3.q.weight_scale.clone()
+_apply_converted_lora_as_delta(
+    _h3, {"q.weight_scale.diff": torch.full((), 999.0)}, "evil", 1.0, "[t]")
+check("DMR adversarial .weight_scale.diff does NOT write (DMR-3 NEGATIVE)",
+      torch.equal(_h3.q.weight_scale, _s_before))
+
+# req 25: LIFO ledger warns on out-of-order unload and pops correctly.
+fp8ops.record_direct_merge(_h, "adapterA")
+fp8ops.record_direct_merge(_h, "adapterB")
+fp8ops.warn_non_lifo_unload(_h, "adapterA", "[t]")
+check("DMR LIFO ledger pops the unloaded adapter (req 25)",
+      _h._eric_direct_merge_order == ["adapterB"])
+
+# req 28: PEFT-wrapped bf16 + ScaledFp8Linear coexistence resolves each
+# correctly through the merged map.
+from nodes.eric_lora_format_convert_apply import resolve_merge_target  # noqa: E402
+class _Wrapped(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.base_layer = nn.Linear(8, 8, bias=False)
+
+
+_h4 = nn.Module()
+_h4.a = _Wrapped()      # PEFT-wrapped plain: resolves via .base_layer.weight
+_h4.b = fp8ops.ScaledFp8Linear(_fp8((8, 8)), _scalar(0.02), _scalar(0.5), None)
+_m4 = fp8ops.merge_resolution_map(_h4)
+check("DMR coexistence: wrapped plain resolves to base_layer.weight (req 28)",
+      resolve_merge_target(_m4, "a") == "a.base_layer.weight")
+check("DMR coexistence: ScaledFp8Linear resolves to its buffer (req 28)",
+      resolve_merge_target(_m4, "b") == "b.weight")
+
+
+# ──────────────────────────────────────────────────────────────────────
 print("── real-collection spot checks (skip-as-pass if absent) ───────")
 
 # Full Vision-§0 survey coverage (reviewer finding 9): every documented

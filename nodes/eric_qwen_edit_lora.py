@@ -354,11 +354,16 @@ def _load_lokr_adapter_direct(pipe, state_dict: dict, adapter_name: str,
     single re-merge at changed weight.
     """
     import math, re
-    from .eric_diffusion_utils import guard_direct_merge
+    from .eric_diffusion_fp8_ops import (
+        apply_merge_delta, merge_resolution_map, record_direct_merge,
+    )
 
     transformer = getattr(pipe, "transformer", None) or getattr(pipe, "unet", None)
-    guard_direct_merge(transformer, log_prefix, "LoKR adapter")
-    model_sd = dict(transformer.named_parameters())
+    # Slice DMR: quantized bases merge via dequant->merge->requant instead
+    # of raising; apply_merge_delta owns the loud raise for unmergeable
+    # reps. merge_resolution_map includes .weight-named buffers (BINDING —
+    # security review DMR-3/8) so ScaledFp8Linear targets resolve.
+    model_sd = merge_resolution_map(transformer)
 
     # Group state dict keys by module path
     modules: dict[str, dict] = {}  # module_path -> {"lokr_w1": ..., ...}
@@ -413,17 +418,18 @@ def _load_lokr_adapter_direct(pipe, state_dict: dict, adapter_name: str,
                 skipped += 1
                 continue
 
-        # Store original weights for potential unloading
+        # Backup + merge via the DMR dispatcher (plain path byte-identical;
+        # quantized paths dequant->merge->requant with exact-restore backups)
         backup_key = f"_lokr_backup_{adapter_name}"
         if not hasattr(transformer, backup_key):
             setattr(transformer, backup_key, {})
         backup = getattr(transformer, backup_key)
-        if target_key not in backup:
-            backup[target_key] = param.data.clone()
-
-        # Apply delta
-        param.data.add_(delta.to(dtype=param.dtype, device=param.device))
+        apply_merge_delta(transformer, target_key, delta, backup,
+                          log_prefix=log_prefix)
         applied += 1
+
+    if applied:
+        record_direct_merge(transformer, adapter_name)  # LIFO ledger (req 25)
 
     # Register in peft_config for set_adapters() discovery
     if not hasattr(transformer, "peft_config"):
@@ -532,11 +538,13 @@ def _load_loha_adapter_direct(pipe, state_dict: dict, adapter_name: str,
     LoHa delta = ``(w1_a @ w1_b) * (w2_a @ w2_b) * (alpha / r) * weight``.
     When *alpha* is absent, scale defaults to ``1.0``.
     """
-    from .eric_diffusion_utils import guard_direct_merge
+    from .eric_diffusion_fp8_ops import (
+        apply_merge_delta, merge_resolution_map, record_direct_merge,
+    )
 
     transformer = getattr(pipe, "transformer", None) or getattr(pipe, "unet", None)
-    guard_direct_merge(transformer, log_prefix, "LoHa adapter")
-    model_sd = dict(transformer.named_parameters())
+    # Slice DMR — see _load_lokr_adapter_direct for the dispatcher rationale.
+    model_sd = merge_resolution_map(transformer)
 
     # Group state dict keys by module path
     modules: dict[str, dict] = {}
@@ -591,11 +599,12 @@ def _load_loha_adapter_direct(pipe, state_dict: dict, adapter_name: str,
         if not hasattr(transformer, backup_key):
             setattr(transformer, backup_key, {})
         backup = getattr(transformer, backup_key)
-        if target_key not in backup:
-            backup[target_key] = param.data.clone()
-
-        param.data.add_(delta.to(dtype=param.dtype, device=param.device))
+        apply_merge_delta(transformer, target_key, delta, backup,
+                          log_prefix=log_prefix)
         applied += 1
+
+    if applied:
+        record_direct_merge(transformer, adapter_name)  # LIFO ledger (req 25)
 
     if not hasattr(transformer, "peft_config"):
         transformer.peft_config = {}
@@ -964,11 +973,13 @@ def _load_lora_adapter_direct(pipe, state_dict: dict, adapter_name: str,
     The user *weight* is baked in at merge time.  ``set_adapters()`` will
     not be able to change it afterwards (a limitation of direct merge).
     """
-    from .eric_diffusion_utils import guard_direct_merge
+    from .eric_diffusion_fp8_ops import (
+        apply_merge_delta, merge_resolution_map, record_direct_merge,
+    )
 
     transformer = getattr(pipe, "transformer", None) or getattr(pipe, "unet", None)
-    guard_direct_merge(transformer, log_prefix, "this LoRA")
-    model_sd = dict(transformer.named_parameters())
+    # Slice DMR — see _load_lokr_adapter_direct for the dispatcher rationale.
+    model_sd = merge_resolution_map(transformer)
 
     modules: dict[str, dict] = {}
     for k, v in state_dict.items():
@@ -1017,16 +1028,17 @@ def _load_lora_adapter_direct(pipe, state_dict: dict, adapter_name: str,
                 skipped += 1
                 continue
 
-        # Backup for unloading
+        # Backup + merge via the DMR dispatcher
         backup_key = f"_lora_backup_{adapter_name}"
         if not hasattr(transformer, backup_key):
             setattr(transformer, backup_key, {})
         backup = getattr(transformer, backup_key)
-        if target_key not in backup:
-            backup[target_key] = param.data.clone()
-
-        param.data.add_(delta.to(dtype=param.dtype, device=param.device))
+        apply_merge_delta(transformer, target_key, delta, backup,
+                          log_prefix=log_prefix)
         applied += 1
+
+    if applied:
+        record_direct_merge(transformer, adapter_name)  # LIFO ledger (req 25)
 
     # Register in peft_config for adapter discovery
     if not hasattr(transformer, "peft_config"):
@@ -1080,14 +1092,32 @@ def unload_adapters(pipe, adapter_names, log_prefix: str = "[LoRA]") -> None:
             backup = getattr(transformer, backup_key, None)
             if backup:
                 from .eric_lora_format_convert_apply import resolve_restore_target
-                model_sd = dict(transformer.named_parameters())
+                from .eric_diffusion_fp8_ops import (
+                    merge_resolution_map, restore_merge_backup,
+                    warn_non_lifo_unload,
+                )
+                # LIFO guard (DMR req 25): restoring a non-latest direct
+                # merge reverts later adapters' deltas on shared layers.
+                warn_non_lifo_unload(transformer, adapter_name, log_prefix)
+                # Same map as merge time: .weight buffers included so
+                # quantized (ScaledFp8Linear) targets resolve.
+                model_sd = merge_resolution_map(transformer)
                 restored = 0
                 for target_key, original_tensor in backup.items():
                     # Re-resolve through any PEFT wrapping added/removed since
                     # merge, so a stale .weight ↔ .base_layer.weight move
                     # doesn't leave the delta baked in.
                     live_key = resolve_restore_target(model_sd, target_key)
-                    param = model_sd.get(live_key) if live_key else None
+                    if live_key is None:
+                        continue
+                    # Kind-tagged quantized backups (slice DMR) restore by
+                    # verbatim swap; plain tensors keep the legacy copy_.
+                    if isinstance(original_tensor, dict):
+                        if restore_merge_backup(transformer, live_key,
+                                                original_tensor, log_prefix):
+                            restored += 1
+                        continue
+                    param = model_sd.get(live_key)
                     if param is not None:
                         param.data.copy_(original_tensor.to(
                             dtype=param.dtype, device=param.device,

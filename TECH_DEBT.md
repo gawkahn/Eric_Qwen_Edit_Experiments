@@ -327,6 +327,14 @@ See `docs/decisions/ADR-019-native-quantization-support.md` §4,
 `project_native_quant_support.md` memory. Related: the exotic-format LoRAs that drive
 tier-3 are the same ones behind `project_lokr_alpha_convention.md` /
 `project_civitai_orphaned_files.md`.
+**Resolved: 2026-07-03 — trigger (b) fired** (Grant's Krea filter-bypass/.diff and
+snofs/LoKR adapters are direct-merge-only AND he needs --quant fp8 for OOM relief).
+Slice DMR shipped the dequant→merge→requant path: apply_merge_delta dispatcher in
+eric_diffusion_fp8_ops covers plain params (byte-identical), torchao Float8Tensor
+params (requant + Parameter swap), and ScaledFp8Linear buffers (per-tensor requant +
+cache invalidation), with kind-tagged exact-restore backups and a LIFO unload guard.
+Security-gated: docs/security/review-slice-DMR-quantized-merge-2026-07-03.md
+(requirements 21-30). ADR-019 §4 amended in its Changelog.
 
 ---
 

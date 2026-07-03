@@ -342,8 +342,11 @@ except RuntimeError as e:
           "--quant" in msg and "PEFT" in msg and "ADR-019" in msg,
           f"msg: {msg[:120]}")
 
-# The four direct-merge functions all call the guard at entry — verify by
-# source inspection so a refactor can't silently drop a call site.
+# Slice DMR (ADR-019 §4 amendment): the four direct-merge functions route
+# EVERY weight write through the apply_merge_delta dispatcher, which owns
+# the raise for unmergeable quantized reps — the entry-guard protection
+# MOVED into the dispatcher (Vision invariant 7 / security review req 24).
+# Source inspection so a refactor can't silently reintroduce a raw write.
 _lora_src = (Path(__file__).parent / "nodes" / "eric_qwen_edit_lora.py").read_text()
 _conv_src = (Path(__file__).parent / "nodes"
              / "eric_lora_format_convert_apply.py").read_text()
@@ -352,8 +355,12 @@ for fn, src in [("_load_lokr_adapter_direct", _lora_src),
                 ("_load_lora_adapter_direct", _lora_src),
                 ("_apply_converted_lora_as_delta", _conv_src)]:
     body = src.split(f"def {fn}(")[1].split("\ndef ")[0]
-    check(f"{fn} calls guard_direct_merge before merging",
-          "guard_direct_merge(" in body)
+    check(f"{fn} routes merges through apply_merge_delta (DMR)",
+          "apply_merge_delta(" in body)
+    check(f"{fn} has no direct param.data.add_ (req 24 NEGATIVE)",
+          "param.data.add_" not in body)
+    check(f"{fn} uses the filtered merge_resolution_map (req 23)",
+          "merge_resolution_map(" in body)
 
 
 # ──────────────────────────────────────────────────────────────────────

@@ -668,6 +668,298 @@ def load_scaled_fp8_component(component_class, weights_path: str, dtype,
     return model
 
 
+# ════════════════════════════════════════════════════════════════════════
+#  Slice DMR — dequant→merge→requant (ADR-019 §4 amendment, 2026-07-03)
+#  Security contract: docs/security/review-slice-DMR-quantized-merge-2026-07-03.md
+#  requirements 21-30. Direct-merge adapters (LoKR/LoHa direct, converted
+#  .diff, tier-3 LoRA) now apply onto quantized bases instead of raising.
+# ════════════════════════════════════════════════════════════════════════
+
+_E5M2_MAX = 57344.0
+
+_PLAIN_MERGE_DTYPES = (torch.bfloat16, torch.float16, torch.float32,
+                       torch.float64)
+
+
+def _fp8_max_for(dtype) -> float:
+    return _E4M3_MAX if dtype == torch.float8_e4m3fn else _E5M2_MAX
+
+
+def _owner_of(root, target_key: str):
+    """Resolve (owner_module, leaf_name) for a dotted target key."""
+    owner_path, _, leaf = target_key.rpartition(".")
+    try:
+        owner = root.get_submodule(owner_path) if owner_path else root
+    except AttributeError:
+        return None, leaf
+    return owner, leaf
+
+
+def merge_resolution_map(root) -> dict:
+    """name→tensor map for direct-merge target resolution.
+
+    Parameters first, then `.weight`-named buffers override (delta review
+    DMR-8: the merge order is BINDING). The `.weight`-only filter is a
+    security control, not a convenience (DMR-3 / req 23): unfiltered
+    buffers would let an adversarial LoRA key like `foo.weight_scale.diff`
+    resolve onto a ScaledFp8Linear SCALE buffer and silently poison the
+    layer's quantization via the plain merge path.
+    """
+    m = dict(root.named_parameters())
+    m.update({k: v for k, v in root.named_buffers()
+              if k.endswith(".weight")})
+    return m
+
+
+def apply_merge_delta(root, target_key: str, delta: torch.Tensor,
+                      backup: dict, log_prefix: str = "[LoRA]") -> str:
+    """Merge a weight delta into ANY supported base representation.
+
+    The single write path for direct-merge adapters (req 24: every merge
+    site routes through here; none touch param.data directly). Returns the
+    kind applied: "plain" | "torchao" | "scaled_fp8". Raises RuntimeError
+    (actionable, ADR-019 §4 wording) for representations it cannot merge —
+    the fail-loud NARROWS, it never lapses (Vision invariant 4/7).
+
+    Backup entries: plain targets keep the legacy raw bf16 clone (so
+    existing restore code is untouched); quantized targets store
+    kind-tagged dicts holding the ORIGINAL representation verbatim for
+    exact restore (Vision invariant 2).
+    """
+    # req 21 — a non-finite delta on a quantized path would poison the
+    # PERSISTED scale (NaN amax → NaN weight_scale → whole tensor gone);
+    # gate before any dispatch.
+    if not torch.isfinite(delta).all():
+        bad = (~torch.isfinite(delta)).sum().item()
+        raise RuntimeError(
+            f"{log_prefix} adapter delta for {_safe_name(target_key)} "
+            f"contains {bad} non-finite value(s) — refusing to merge "
+            f"(scale-poisoning guard, DMR review req 21)"
+        )
+
+    owner, leaf = _owner_of(root, target_key)
+    if owner is None:
+        raise RuntimeError(
+            f"{log_prefix} cannot resolve owner module for "
+            f"{_safe_name(target_key)} — refusing to merge"
+        )
+
+    # ── req 24 precedence: positive matches, then explicit raise ────────
+    # (a) ScaledFp8Linear fp8 weight buffer
+    if isinstance(owner, ScaledFp8Linear) and leaf == "weight":
+        return _merge_into_scaled_fp8(owner, target_key, delta, backup,
+                                      log_prefix)
+
+    t = getattr(owner, leaf, None)
+    if t is None:
+        raise RuntimeError(
+            f"{log_prefix} no tensor at {_safe_name(target_key)} — "
+            f"refusing to merge"
+        )
+    data = t.data if isinstance(t, nn.Parameter) else t
+
+    # (b) torchao-quantized Parameter
+    if (isinstance(t, nn.Parameter)
+            and type(data).__module__.startswith("torchao")):
+        return _merge_into_torchao(root, owner, leaf, t, target_key, delta,
+                                   backup, log_prefix)
+
+    # (c) orphan fp8 tensor — a rep we don't own; plain add_ would corrupt
+    if isinstance(data, torch.Tensor) and data.dtype in _TORCH_FP8:
+        raise RuntimeError(
+            f"{log_prefix} {_safe_name(target_key)} is an fp8 tensor not "
+            f"owned by a ScaledFp8Linear — unsupported quantized "
+            f"representation; refusing to merge (ADR-019 §4 / DMR-4)"
+        )
+
+    # (d) plain high-precision tensor — byte-identical legacy behavior
+    if isinstance(data, torch.Tensor) and data.dtype in _PLAIN_MERGE_DTYPES:
+        if target_key not in backup:
+            backup[target_key] = data.clone()
+        data.add_(delta.to(dtype=data.dtype, device=data.device))
+        return "plain"
+
+    # (e) anything else — explicit raise, never a fallthrough
+    raise RuntimeError(
+        f"{log_prefix} {_safe_name(target_key)} has unsupported dtype "
+        f"{getattr(data, 'dtype', type(data))} for direct merge — "
+        f"refusing (ADR-019 §4 / DMR-4)"
+    )
+
+
+def _merge_into_scaled_fp8(owner: "ScaledFp8Linear", target_key: str,
+                           delta: torch.Tensor, backup: dict,
+                           log_prefix: str) -> str:
+    if target_key not in backup:
+        backup[target_key] = {
+            "kind": "scaled_fp8",
+            "weight": owner.weight.detach().clone(),
+            "weight_scale": owner.weight_scale.detach().clone(),
+        }
+    dev = owner.weight.device
+    W = (owner.weight.to(torch.float32) * owner.weight_scale
+         + delta.to(device=dev, dtype=torch.float32))
+    if not torch.isfinite(W).all():
+        raise RuntimeError(
+            f"{log_prefix} merged weights for {_safe_name(target_key)} are "
+            f"non-finite (overflow in base+delta) — refusing (req 21/30)"
+        )
+    fp8_max = _fp8_max_for(owner.weight.dtype)
+    amax = W.abs().amax()
+    if amax.item() == 0.0:
+        # req 22 — all-zero merged tensor: sentinel scale, zero content,
+        # loud log; never divide by zero.
+        print(f"{log_prefix} WARNING: merged weights for "
+              f"{_safe_name(target_key)} are ALL ZERO — storing sentinel "
+              f"scale 1.0 (req 22); the adapter or base is degenerate")
+        new_scale = torch.tensor(1.0, dtype=torch.float32, device=dev)
+        wq = torch.zeros_like(owner.weight)
+    else:
+        new_scale = (amax / fp8_max).to(torch.float32)
+        # req 30 — the requant OUTPUT scale passes the same
+        # finite-positive-normal policy as load-time scales. Nothing has
+        # been persisted yet, so a failure here is a clean raise.
+        _validate_scale(f"{target_key} [requant]", new_scale)
+        old = owner.weight_scale.item()
+        ratio = new_scale.item() / old if old > 0 else float("inf")
+        if ratio > 1000:
+            print(f"{log_prefix} WARNING: adapter coarsens "
+                  f"{_safe_name(target_key)} quantization scale {ratio:.0f}x "
+                  f"— adapter likely corrupt or crafted; proceeding "
+                  f"(operator-initiated; req 27)")
+        elif ratio > 2:
+            print(f"{log_prefix} note: {_safe_name(target_key)} requant "
+                  f"scale coarsened {ratio:.1f}x by the merge (amax grew)")
+        wq = (W / new_scale).clamp(-fp8_max, fp8_max).to(owner.weight.dtype)
+    owner.weight = wq
+    owner.weight_scale = new_scale
+    owner._fallback_weight = None  # req 29 sibling: stale cache = corruption
+    return "scaled_fp8"
+
+
+def _merge_into_torchao(root, owner, leaf: str, p: nn.Parameter,
+                        target_key: str, delta: torch.Tensor, backup: dict,
+                        log_prefix: str) -> str:
+    if target_key not in backup:
+        # The ORIGINAL Parameter object, retained verbatim — exact restore
+        # by swap (Vision invariant 2). fp8-sized, cheaper than bf16 clones.
+        backup[target_key] = {"kind": "torchao_param", "param": p}
+    data = p.data
+    W = data.dequantize() if hasattr(data, "dequantize") \
+        else data.to(torch.float32)
+    merged = W.to(torch.float32) + delta.to(device=W.device,
+                                            dtype=torch.float32)
+    if not torch.isfinite(merged).all():
+        raise RuntimeError(
+            f"{log_prefix} merged weights for {_safe_name(target_key)} are "
+            f"non-finite (overflow in base+delta) — refusing (req 21/30)"
+        )
+    if merged.abs().amax().item() == 0.0:
+        # req 22 defensive posture for case 2: torchao owns its scale
+        # internally, so the sentinel-scale trick isn't expressible here.
+        # An all-zero merged layer is degenerate either way — raise loud.
+        raise RuntimeError(
+            f"{log_prefix} merged weights for {_safe_name(target_key)} are "
+            f"ALL ZERO — refusing to requantize a degenerate layer (req 22)"
+        )
+    from torchao.quantization import quantize_
+    try:
+        # Source of truth: the slice-A quantize-on-load recipe, so merged
+        # layers match the surrounding quantization scheme exactly.
+        from .eric_diffusion_utils import _torchao_fp8_config
+        _cfg = _torchao_fp8_config()
+    except ImportError:
+        # Spec-loaded contexts (test harnesses load this module by file
+        # path, no package). MUST stay in sync with
+        # eric_diffusion_utils._torchao_fp8_config.
+        from torchao.quantization import (
+            Float8DynamicActivationFloat8WeightConfig,
+        )
+        _cfg = Float8DynamicActivationFloat8WeightConfig()
+    out_f, in_f = merged.shape
+    tmp = nn.Linear(in_f, out_f, bias=False, device=merged.device,
+                    dtype=torch.bfloat16)
+    tmp.weight = nn.Parameter(merged.to(torch.bfloat16),
+                              requires_grad=False)
+    quantize_(tmp, _cfg)
+    new_p = tmp.weight
+    setattr(owner, leaf, new_p)
+    # req 26 — post-swap aliasing assert: the key must resolve to the NEW
+    # object; a stale reachable object means tied weights or an offload
+    # hook holds the old one (documented unsupported assumption).
+    live = dict(root.named_parameters()).get(target_key)
+    if live is not new_p:
+        raise RuntimeError(
+            f"{log_prefix} Parameter swap for {_safe_name(target_key)} did "
+            f"not take effect — an alias (weight tying / offload hook) "
+            f"still holds the old Parameter (DMR-6); model state is "
+            f"inconsistent, reload the pipeline"
+        )
+    return "torchao"
+
+
+def restore_merge_backup(root, live_key: str, entry: dict,
+                         log_prefix: str = "[LoRA]") -> bool:
+    """Restore a kind-tagged quantized backup — verbatim swap (exact)."""
+    owner, leaf = _owner_of(root, live_key)
+    if owner is None:
+        print(f"{log_prefix} WARNING: cannot resolve {_safe_name(live_key)} "
+              f"for quantized-backup restore — skipped")
+        return False
+    kind = entry.get("kind")
+    if kind == "scaled_fp8":
+        if not isinstance(owner, ScaledFp8Linear):
+            print(f"{log_prefix} WARNING: {_safe_name(live_key)} owner is "
+                  f"no longer a ScaledFp8Linear — restore skipped")
+            return False
+        dev = owner.weight.device
+        owner.weight = entry["weight"].to(dev)
+        owner.weight_scale = entry["weight_scale"].to(dev)
+        # req 29 — a stale dequant cache would keep serving MERGED weights
+        # after "restore"; invalidate both cache and its warn latch.
+        owner._fallback_weight = None
+        owner._warned_fallback = False
+        return True
+    if kind == "torchao_param":
+        old_p = entry["param"]
+        cur = getattr(owner, leaf, None)
+        if cur is not None and old_p.device != cur.device:
+            old_p = nn.Parameter(old_p.data.to(cur.device),
+                                 requires_grad=False)
+        setattr(owner, leaf, old_p)
+        return True
+    print(f"{log_prefix} WARNING: unknown backup kind {kind!r} for "
+          f"{_safe_name(live_key)} — restore skipped")
+    return False
+
+
+def record_direct_merge(root, adapter_name: str) -> None:
+    """Append to the transformer's merge-order ledger (LIFO guard, req 25)."""
+    if not hasattr(root, "_eric_direct_merge_order"):
+        root._eric_direct_merge_order = []
+    root._eric_direct_merge_order.append(adapter_name)
+
+
+def warn_non_lifo_unload(root, adapter_name: str,
+                         log_prefix: str = "[LoRA]") -> None:
+    """Warn (don't block) when direct-merge unload order isn't LIFO (req 25).
+
+    Direct-merge backups snapshot the state at merge time; restoring adapter
+    A while a later adapter B is still merged reverts B's delta on shared
+    layers. That was always true of the plain-path backups — the ledger just
+    makes the footgun LOUD.
+    """
+    order = getattr(root, "_eric_direct_merge_order", None)
+    if not order or adapter_name not in order:
+        return
+    if order[-1] != adapter_name:
+        print(f"{log_prefix} WARNING: unloading direct-merge adapter "
+              f"{adapter_name!r} out of LIFO order (most recent is "
+              f"{order[-1]!r}) — later adapters' deltas on shared layers "
+              f"will be reverted too (req 25)")
+    order.remove(adapter_name)
+
+
 def contains_scaled_fp8(module) -> bool:
     """isinstance walker for the LoRA guard (security review F8)."""
     if module is None:
