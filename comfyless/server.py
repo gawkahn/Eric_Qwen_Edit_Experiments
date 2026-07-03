@@ -38,7 +38,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from comfyless.params_validation import validate_machine_request
+from comfyless.params_validation import QUANT_MODES, validate_machine_request
 
 
 # Wire-protocol guardrails (see docs/security/review-comfyless-server-2026-04-23.md)
@@ -74,6 +74,11 @@ def _socket_dir() -> Path:
         return Path(xdg)
     d = Path(f"/tmp/comfyless-{os.getuid()}")
     d.mkdir(mode=0o700, exist_ok=True)
+    # A pre-planted symlink at this sticky-/tmp name would redirect the socket
+    # into an attacker-chosen directory; d.stat() below follows symlinks so it
+    # can't catch this on its own (hardening review H-1).
+    if d.is_symlink():
+        raise RuntimeError(f"socket dir {d} is a symlink — refusing")
     # mkdir(exist_ok=True) does not re-apply mode on existing dirs; enforce it.
     st = d.stat()
     if st.st_uid != os.getuid():
@@ -170,6 +175,17 @@ def _validate_request(req: Any) -> Optional[str]:
         return "Missing required field: 'model'"
     if "prompt" not in req:
         return "Missing required field: 'prompt'"
+
+    # quant-mode allowed-value check (slice DQ; mirrors the type-tag semantic
+    # check above — the canonical validator type-checks 'quant' as a string
+    # but does not enforce the value set). QUANT_MODES comes from
+    # params_validation, NOT nodes.eric_diffusion_utils: this path runs
+    # unguarded in the accept loop and must never trigger a torch import
+    # (security review slice-DQ F1).
+    q = req.get("quant")
+    if q not in (None, "") and q not in QUANT_MODES:
+        return (f"Field 'quant': unknown mode {q!r}. "
+                f"Expected: {' | '.join(QUANT_MODES)}")
 
     # Null-byte path defense. Kept server-specific rather than migrated into
     # the canonical validator (option discussed in the step-1 security
@@ -352,6 +368,45 @@ def _handle_connection(
     return True
 
 
+def _request_cache_key(req: dict, precision: str, device: str) -> tuple:
+    """Pipeline cache key for a validated generate request.
+
+    Covers everything that affects pipeline shape. The quant triple is always
+    present (constant ("none", (), ()) for unquantized requests). When quant
+    is active, the requested LoRA (path, weight) set ALSO joins the key so a
+    quantized pipeline is evicted and reloaded on ANY LoRA change instead of
+    taking the incremental delete_adapters/add path — direct-merge adapters
+    merge into requantized weights (ADR-019 slice DMR) and cannot be removed
+    incrementally. Unquantized requests keep the existing LoRA-diff semantics
+    (LoRA set deliberately NOT in the key). Paths are client abspaths, not
+    realpaths — over-eviction on symlink aliases is accepted by design.
+    See docs/security/review-slice-DQ-daemon-quant-2026-07-03.md (F2/F3/F4).
+    """
+    quant = str(req.get("quant") or "none")
+    key = (
+        req["model"],
+        precision,
+        device,
+        req.get("transformer_path",    "") or "",
+        req.get("vae_path",            "") or "",
+        req.get("text_encoder_path",   "") or "",
+        req.get("text_encoder_2_path", "") or "",
+        bool(req.get("vae_from_transformer")),
+        bool(req.get("offload_vae")),
+        bool(req.get("attention_slicing")),
+        bool(req.get("sequential_offload")),
+        quant,
+        tuple(sorted(req.get("quant_skip") or ())),
+        tuple(sorted(req.get("quant_only") or ())),
+    )
+    if quant != "none":
+        key += (tuple(sorted(
+            (l["path"], float(l.get("weight", 1.0)))
+            for l in (req.get("loras") or [])
+        )),)
+    return key
+
+
 def _handle_generate(
     req: dict,
     output_dir: str,
@@ -399,21 +454,15 @@ def _handle_generate(
             _log(f"[server] request device {_payload_device!r} ignored; this "
                  f"daemon is pinned to {device!r}")
 
-    # Cache key covers everything that affects pipeline shape; LoRAs are tracked
-    # separately so they can be diffed incrementally.
-    cache_key = (
-        req["model"],
-        req_precision,
-        req_device,
-        req.get("transformer_path",    "") or "",
-        req.get("vae_path",            "") or "",
-        req.get("text_encoder_path",   "") or "",
-        req.get("text_encoder_2_path", "") or "",
-        bool(req.get("vae_from_transformer")),
-        bool(req.get("offload_vae")),
-        bool(req.get("attention_slicing")),
-        bool(req.get("sequential_offload")),
-    )
+    req_quant      = str(req.get("quant") or "none")
+    req_quant_skip = tuple(req.get("quant_skip") or ())
+    req_quant_only = tuple(req.get("quant_only") or ())
+
+    # Cache key covers everything that affects pipeline shape; for unquantized
+    # requests LoRAs are tracked separately so they can be diffed
+    # incrementally, while quant requests key on the LoRA set too (full evict
+    # on any change — see _request_cache_key).
+    cache_key = _request_cache_key(req, req_precision, req_device)
 
     # ── Evict on config change ────────────────────────────────────────
     if server_state.get("cache_key") != cache_key and "pipeline" in server_state:
@@ -437,6 +486,9 @@ def _handle_generate(
                 vae_from_transformer=bool(req.get("vae_from_transformer")),
                 attention_slicing=bool(req.get("attention_slicing")),
                 sequential_offload=bool(req.get("sequential_offload")),
+                quant=req_quant,
+                quant_skip=req_quant_skip,
+                quant_only=req_quant_only,
             )
         except Exception as e:
             return {"status": "error", "error_type": "LoadError", "error": str(e)}
@@ -482,6 +534,9 @@ def _handle_generate(
                     vae_from_transformer=bool(req.get("vae_from_transformer")),
                     attention_slicing=bool(req.get("attention_slicing")),
                     sequential_offload=bool(req.get("sequential_offload")),
+                    quant=req_quant,
+                    quant_skip=req_quant_skip,
+                    quant_only=req_quant_only,
                 )
             except Exception as e2:
                 return {"status": "error", "error_type": "LoadError", "error": str(e2)}
@@ -622,6 +677,9 @@ def _handle_generate(
             text_encoder_path=req.get("text_encoder_path",   "") or "",
             text_encoder_2_path=req.get("text_encoder_2_path", "") or "",
             vae_from_transformer=bool(req.get("vae_from_transformer")),
+            quant=req_quant,
+            quant_skip=req_quant_skip,
+            quant_only=req_quant_only,
             _cached_pipeline=cached,
         )
     except Exception as e:

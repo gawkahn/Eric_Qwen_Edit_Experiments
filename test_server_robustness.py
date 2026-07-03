@@ -454,6 +454,207 @@ finally:
     _gen.generate = _orig_generate
 
 
+# ══════════════════════════════════════════════════════════════════════
+# Slice DQ — daemon quant carriage (ADR-019).
+# Binding requirements from docs/security/review-slice-DQ-daemon-quant-2026-07-03.md.
+print("\n── slice DQ: quant request validation (review F1) ─────────────")
+
+_base_req = {"type": "generate", "model": "/m", "prompt": "p"}
+
+for _q in (None, "none", "fp8"):
+    _r = dict(_base_req)
+    if _q is not None:
+        _r["quant"] = _q
+    _err = srv._validate_request(_r)
+    check(f"quant={_q!r} passes validation", _err is None, f"err={_err!r}")
+
+_err = srv._validate_request(dict(_base_req, quant="int4"))
+check("bogus quant mode -> ValidationError, no raise",
+      _err is not None and "quant" in _err, f"err={_err!r}")
+_err = srv._validate_request(dict(_base_req, quant=5))
+check("non-str quant type-rejected by canonical validator (no raise)",
+      _err is not None and "quant" in _err, f"err={_err!r}")
+_err = srv._validate_request(dict(_base_req, quant="fp8", quant_only=["a/b"]))
+check("path-shaped quant_only entry rejected", _err is not None, f"err={_err!r}")
+_err = srv._validate_request(dict(_base_req, quant="fp8", quant_skip=["a\x00b"]))
+check("NUL quant_skip entry rejected", _err is not None, f"err={_err!r}")
+_err = srv._validate_request(
+    dict(_base_req, quant="fp8", quant_only=[f"c{i}" for i in range(33)]))
+check("oversized quant_only (>32) rejected", _err is not None, f"err={_err!r}")
+
+# F1 structural: the validation path must never trigger a torch import.
+# Match import STATEMENTS only — comments referencing the module are fine.
+import inspect as _inspect
+import re as _re
+_vsrc = _inspect.getsource(srv._validate_request)
+check("_validate_request imports no torch-heavy module (review F1)",
+      not _re.search(r"^\s*(from|import)\s+\S*(eric_diffusion_utils|torch)",
+                     _vsrc, _re.M))
+
+
+print("\n── slice DQ: cache-key discrimination (review F2/F3) ──────────")
+
+_K = srv._request_cache_key
+_r0 = {"model": "/m",
+       "loras": [{"path": "/l/a.safetensors", "weight": 1.0},
+                 {"path": "/l/b.safetensors", "weight": 0.8}]}
+
+_k_none = _K(dict(_r0), "bf16", "cuda")
+_k_fp8  = _K(dict(_r0, quant="fp8"), "bf16", "cuda")
+check("quant fp8 vs none discriminates (N1)", _k_none != _k_fp8)
+check("explicit quant='none' key equals absent-quant key",
+      _K(dict(_r0, quant="none"), "bf16", "cuda") == _k_none)
+check("quant_skip discriminates under fp8",
+      _K(dict(_r0, quant="fp8", quant_skip=["text_encoder"]), "bf16", "cuda")
+      != _k_fp8)
+check("quant_only discriminates under fp8",
+      _K(dict(_r0, quant="fp8", quant_only=["transformer"]), "bf16", "cuda")
+      != _k_fp8)
+check("quant_skip order-insensitive in key",
+      _K(dict(_r0, quant="fp8", quant_skip=["a", "b"]), "bf16", "cuda")
+      == _K(dict(_r0, quant="fp8", quant_skip=["b", "a"]), "bf16", "cuda"))
+
+# N4 NEGATIVE: unquantized LoRA change must NOT change the key — the
+# incremental diff path stays in charge.
+_r_swap = dict(_r0, loras=[{"path": "/l/c.safetensors", "weight": 1.0}])
+check("unquantized LoRA change keeps key (N4 NEGATIVE)",
+      _K(_r_swap, "bf16", "cuda") == _k_none)
+
+# N2: quantized pipelines evict on ANY LoRA change.
+check("quant LoRA-set change changes key (N2)",
+      _K(dict(_r_swap, quant="fp8"), "bf16", "cuda") != _k_fp8)
+_r_wt = dict(_r0, loras=[{"path": "/l/a.safetensors", "weight": 1.0},
+                         {"path": "/l/b.safetensors", "weight": 0.9}])
+check("quant weight-only change changes key (N2 / review F3)",
+      _K(dict(_r_wt, quant="fp8"), "bf16", "cuda") != _k_fp8)
+_r_rev = dict(_r0, loras=list(reversed(_r0["loras"])))
+check("quant LoRA reorder keeps key (no spurious evict)",
+      _K(dict(_r_rev, quant="fp8"), "bf16", "cuda") == _k_fp8)
+check("quant int weight normalizes to float in key (review F3)",
+      _K(dict(_r0, quant="fp8",
+              loras=[{"path": "/l/a.safetensors", "weight": 1}]),
+         "bf16", "cuda")
+      == _K(dict(_r0, quant="fp8",
+                 loras=[{"path": "/l/a.safetensors", "weight": 1.0}]),
+            "bf16", "cuda"))
+check("cache key contains no realpath call (review F4: abspaths verbatim)",
+      "/l/a.safetensors" in repr(_k_fp8))
+
+
+print("\n── slice DQ: daemon quant forwarding + eviction ───────────────")
+
+_load_captured: dict = {}
+
+
+def _fake_load_q(model_path, **kw):
+    _load_captured.clear()
+    _load_captured.update(kw)
+    return object(), "krea-turbo", False
+
+
+_gen._load_pipeline = _fake_load_q
+_gen.generate = _fake_generate
+try:
+    _outdir2 = tempfile.mkdtemp()
+    _state_q: dict = {}
+    _req_q = {"type": "generate", "model": "/fake/M", "prompt": "p",
+              "quant": "fp8", "quant_skip": ["text_encoder"], "quant_only": []}
+    _resp = srv._handle_generate(_req_q, _outdir2, _outdir2,
+                                 "cuda", "bf16", _state_q)
+    check("daemon: quant request succeeds", _resp.get("status") == "ok",
+          f"resp={_resp!r}")
+    check("daemon: quant forwarded to _load_pipeline",
+          _load_captured.get("quant") == "fp8",
+          f"got {_load_captured.get('quant')!r}")
+    check("daemon: quant_skip forwarded as tuple",
+          _load_captured.get("quant_skip") == ("text_encoder",),
+          f"got {_load_captured.get('quant_skip')!r}")
+    check("daemon: quant forwarded to generate()",
+          _captured.get("quant") == "fp8", f"got {_captured.get('quant')!r}")
+
+    _load_captured.clear()
+    srv._handle_generate(dict(_req_q, prompt="p2"), _outdir2, _outdir2,
+                         "cuda", "bf16", _state_q)
+    check("daemon: identical quant request hits warm cache (no reload)",
+          not _load_captured, f"reloaded with {_load_captured!r}")
+
+    _load_captured.clear()
+    srv._handle_generate(
+        dict(_req_q, prompt="p3",
+             loras=[{"path": "/fake/l.safetensors", "weight": 0.5}]),
+        _outdir2, _outdir2, "cuda", "bf16", _state_q)
+    check("daemon: LoRA change under quant evicts + reloads (N2)",
+          _load_captured.get("quant") == "fp8",
+          "no reload happened — incremental diff taken on quant pipeline")
+finally:
+    _gen._load_pipeline = _orig_load
+    _gen.generate = _orig_generate
+
+
+print("\n── slice DQ: client wire request carries the triple ───────────")
+
+import argparse as _ap
+
+_args_q = _ap.Namespace(precision="bf16", device="cuda", offload_vae=False,
+                        attention_slicing=False, sequential_offload=False,
+                        savepath=None, quant="fp8",
+                        quant_skip=["text_encoder"], quant_only=[])
+_wire = _gen._build_server_request(_args_q, {"model": "/m", "prompt": "p"}, [])
+check("wire request carries quant", _wire.get("quant") == "fp8",
+      f"got {_wire.get('quant')!r}")
+check("wire request carries quant_skip",
+      _wire.get("quant_skip") == ["text_encoder"],
+      f"got {_wire.get('quant_skip')!r}")
+check("wire request carries quant_only", _wire.get("quant_only") == [],
+      f"got {_wire.get('quant_only')!r}")
+check("wire request passes server validation end-to-end",
+      srv._validate_request(dict(_wire)) is None,
+      f"err={srv._validate_request(dict(_wire))!r}")
+
+_gen_src = Path(_gen.__file__).read_text()
+check("delegation-skip branch removed from generate.py",
+      "daemon delegation skipped" not in _gen_src)
+# Positive property (review N-2): the delegation guard exists and no longer
+# consults args.quant anywhere.
+check("delegation guard present and quant-free",
+      "if args.savepath or using_default_output:" in _gen_src
+      and 'args.quant != "none" and (args.savepath' not in _gen_src)
+
+
+print("\n── H-1: _socket_dir symlink rejection ─────────────────────────")
+
+# _socket_dir honors XDG_RUNTIME_DIR first; force the /tmp branch and plant
+# a symlink at the expected name for a fake uid. srv.os IS the global os
+# module, so patch/restore getuid around the single call under test.
+import os as _os
+_xdg_saved = _os.environ.pop("XDG_RUNTIME_DIR", None)
+_orig_getuid = _os.getuid
+_fakeuid = 900000 + (_os.getpid() % 10000)
+_link = Path(f"/tmp/comfyless-{_fakeuid}")
+_target = Path(tempfile.mkdtemp())
+try:
+    if _link.is_symlink() or _link.exists():
+        _link.unlink()
+    _link.symlink_to(_target)
+    _os.getuid = lambda: _fakeuid
+    _h1_err = None
+    try:
+        srv._socket_dir()
+    except RuntimeError as e:
+        _h1_err = e
+    check("_socket_dir refuses symlinked socket dir (H-1)",
+          _h1_err is not None and "symlink" in str(_h1_err),
+          f"err={_h1_err!r}")
+finally:
+    _os.getuid = _orig_getuid
+    if _xdg_saved is not None:
+        _os.environ["XDG_RUNTIME_DIR"] = _xdg_saved
+    try:
+        _link.unlink()
+    except OSError:
+        pass
+
+
 # ──────────────────────────────────────────────────────────────────────
 print("\n── device-keyed socket routing (ADR-020) ──────────────────────")
 

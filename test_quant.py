@@ -237,6 +237,24 @@ with tempfile.TemporaryDirectory() as tmp:
     check("null-class component pair tolerated, not selected",
           "safety_checker" not in sel and "transformer" in sel, f"got {sel}")
 
+# Slice DQ (daemon quant carriage): the machine boundary duplicates
+# QUANT_MODES in params_validation so the daemon's validation path never
+# imports this torch-heavy module (security review slice-DQ F1). Pin the sync.
+from comfyless.params_validation import QUANT_MODES as _PV_QUANT_MODES
+check("QUANT_MODES boundary constant in sync with eric_diffusion_utils",
+      tuple(_PV_QUANT_MODES) == tuple(edu.QUANT_MODES),
+      f"params_validation {_PV_QUANT_MODES!r} vs utils {edu.QUANT_MODES!r}")
+
+# Slice DQ review F5: a separatorless '..' slips the slot-name validator but
+# must stay inert — dict miss with an unknown-component notice, never a
+# filesystem path.
+with tempfile.TemporaryDirectory() as tmp:
+    mp = _mk_model_dir(tmp, _FLUX_INDEX)
+    sel, notes = edu.resolve_quant_components(mp, _FLUX_INDEX, only=("..",))
+    check("quant_only='..' inert: nothing selected, unknown-component notice",
+          sel == {} and any(".." in n and "unknown" in n for n in notes),
+          f"sel {sel} notes {notes}")
+
 
 # ──────────────────────────────────────────────────────────────────────
 print("── build_quant_config (mode gate + hardware fallback) ─────────")

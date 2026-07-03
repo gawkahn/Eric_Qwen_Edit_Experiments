@@ -1494,31 +1494,19 @@ def _send_unload(device: str = "cuda") -> int:
     return 1
 
 
-def _delegate_to_server(
+def _build_server_request(
     args: argparse.Namespace,
     p: dict,
     loras: list,
     *,
-    iterate_batch_id: Optional[str] = None,
     savepath_override: Optional[str] = None,
-) -> Optional[int]:
-    """Try to send this generation request to the running server.
+) -> Dict[str, Any]:
+    """Build the daemon wire request for one generation (pure; no I/O).
 
-    Returns an int exit code when the server handled it (success or error).
-    Returns None when the server is unreachable — caller falls through to
-    in-process generation.
-
-    Delegation is skipped when --output is set explicitly: the server owns
-    path resolution and cannot write to an arbitrary caller-supplied path.
-    Use --savepath for naming control when a server is running.
+    Resolves all path fields to absolute before sending. The server runs
+    in its own CWD and calls os.path.realpath() for validation — relative
+    paths sent from the client would resolve differently there.
     """
-    from .server import socket_path
-    if not socket_path(args.device).exists():
-        return None
-
-    # Resolve all path fields to absolute before sending. The server runs
-    # in its own CWD and calls os.path.realpath() for validation — relative
-    # paths sent from the client would resolve differently there.
     def _abspath(v: str) -> str:
         return os.path.abspath(v) if v else v
 
@@ -1550,12 +1538,44 @@ def _delegate_to_server(
         "text_encoder_path":   _abspath(p.get("text_encoder_path", "")),
         "text_encoder_2_path": _abspath(p.get("text_encoder_2_path", "")),
         "vae_from_transformer": p.get("vae_from_transformer", False),
+        # Quantize-on-load triple (ADR-019 slice DQ). Slot names, not paths —
+        # the canonical validator enforces that server-side per entry.
+        "quant":               args.quant,
+        "quant_skip":          list(args.quant_skip),
+        "quant_only":          list(args.quant_only),
     }
     # Pre-expanded template (iteration tokens resolved client-side) takes
     # precedence over args.savepath when provided.
     wire_savepath = savepath_override if savepath_override is not None else args.savepath
     if wire_savepath:
         req["savepath"] = wire_savepath
+    return req
+
+
+def _delegate_to_server(
+    args: argparse.Namespace,
+    p: dict,
+    loras: list,
+    *,
+    iterate_batch_id: Optional[str] = None,
+    savepath_override: Optional[str] = None,
+) -> Optional[int]:
+    """Try to send this generation request to the running server.
+
+    Returns an int exit code when the server handled it (success or error).
+    Returns None when the server is unreachable — caller falls through to
+    in-process generation.
+
+    Delegation is skipped when --output is set explicitly: the server owns
+    path resolution and cannot write to an arbitrary caller-supplied path.
+    Use --savepath for naming control when a server is running.
+    """
+    from .server import socket_path
+    if not socket_path(args.device).exists():
+        return None
+
+    req = _build_server_request(args, p, loras,
+                                savepath_override=savepath_override)
 
     # Per-layer weights: omit when unset so the daemon's _KIND_LIST validator
     # never sees a null (it defaults to the node preset server-side).
@@ -1980,14 +2000,11 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
         _apply_family_defaults(p_cur, explicit_keys, iterated_axes, idx=idx)
 
         # Delegate to daemon when --savepath or default --output; skip on explicit --output.
-        # quant also skips delegation: the daemon's wire protocol + cache key
-        # (comfyless/server.py — separate security-reviewed surface) don't
-        # carry quant yet; delegating would silently drop the flag (ADR-019).
+        # quant delegates too since slice DQ: the wire request carries the
+        # quant triple and the daemon keys its pipeline cache on it (see
+        # docs/security/review-slice-DQ-daemon-quant-2026-07-03.md).
         using_default_output = args.output == "/tmp/comfyless.png"
-        if args.quant != "none" and (args.savepath or using_default_output):
-            _log("[comfyless] --quant requested — daemon delegation skipped "
-                 "(daemon protocol doesn't carry quant yet); running in-process")
-        elif args.savepath or using_default_output:
+        if args.savepath or using_default_output:
             # Pre-expand iteration tokens client-side so the daemon receives a
             # template it can finish resolving (%seed%, %model%, etc.) without
             # needing to know about iteration at all.
