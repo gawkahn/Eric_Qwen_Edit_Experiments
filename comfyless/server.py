@@ -88,9 +88,45 @@ def _socket_dir() -> Path:
     return d
 
 
-def socket_path() -> Path:
-    """Return the Unix socket path for this user's comfyless server."""
-    return _socket_dir() / "comfyless.sock"
+# Device strings that may be turned into a socket filename. Anchored full-match
+# (fullmatch, not match+$: '$' also matches before a trailing '\n', which would
+# smuggle a newline into the socket name). re.ASCII keeps \d to [0-9] so the
+# regex — not the later int() fold — is the sole gate (rejects unicode digits
+# outright); the (?:...) group keeps the alternation anchored if this is ever
+# switched to .match()/.search(). See ADR-020 §3 and
+# docs/security/review-parallel-daemon-2026-07-03.md Finding 3.
+_DEVICE_RE = re.compile(r"(?:cpu|cuda(:\d+)?)", re.ASCII)
+
+
+def _device_socket_slug(device: str) -> str:
+    """Map a device string to a canonical socket-name slug.
+
+    One daemon serves one GPU (ADR-020, design A); the socket name is keyed by
+    device so daemons for different GPUs coexist in the same 0700 dir. The
+    whitelist runs on the RAW input first (never on a pre-normalized string, or
+    a crafted value could be massaged past the filter); only survivors — already
+    restricted to {cpu, cuda, cuda:<digits>} — are canonicalized. The integer is
+    parsed so 'cuda', 'cuda:0', 'cuda:00', 'cuda:007' all fold to the same slug
+    ('cuda0'/'cuda7') and can never carry a non-[a-z0-9] byte into the filename.
+    """
+    if _DEVICE_RE.fullmatch(device) is None:
+        raise ValueError(
+            f"unsupported device for socket routing: {device!r} "
+            f"(expected 'cpu', 'cuda', or 'cuda:<n>')"
+        )
+    if device == "cpu":
+        return "cpu"
+    idx = int(device.split(":", 1)[1]) if ":" in device else 0
+    return f"cuda{idx}"
+
+
+def socket_path(device: str = "cuda") -> Path:
+    """Return the Unix socket path for this user's comfyless server on `device`.
+
+    Device-keyed so one daemon per GPU can run concurrently (ADR-020). 'cuda'
+    and 'cuda:0' name the same physical device and resolve to the same socket.
+    """
+    return _socket_dir() / f"comfyless-{_device_socket_slug(device)}.sock"
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -386,11 +422,38 @@ def _handle_generate(
     """
     # Local imports — avoids circular dependency at module level (generate.py
     # will import server.socket_path; server imports generate.* only inside here).
-    from .generate import _load_pipeline, _expand_savepath_template, _resolve_savepath, generate
+    from .generate import (
+        _load_pipeline, _expand_savepath_template, _resolve_savepath, generate,
+        KREA_REBALANCE_DEFAULT_MULT,
+    )
     from nodes.eric_qwen_edit_lora import load_lora_with_key_fix
 
-    req_precision  = req.get("precision") or precision
-    req_device     = req.get("device")    or device
+    req_precision = req.get("precision") or precision
+
+    # This daemon owns exactly one GPU (ADR-020, design A): the launch --device.
+    # The request payload's `device` is IGNORED — honoring it would let a daemon
+    # pinned to cuda:N run on another GPU that belongs to a different daemon,
+    # re-introducing the cross-GPU eviction thrash ADR-020 exists to remove.
+    # Closes security review Finding 2 (review-parallel-daemon-2026-07-03). A
+    # correctly-routed client already sends its own device; warn (don't silently
+    # redirect) only when a mis-routed/stale caller asks for a different one.
+    req_device = device
+    _payload_device = req.get("device")
+    if _payload_device:
+        try:
+            _mismatch = _device_socket_slug(_payload_device) != _device_socket_slug(device)
+        except (ValueError, TypeError):
+            # ValueError: unparseable string. TypeError: non-string payload
+            # device (e.g. 123, ["cuda:0"]) — `device` is an unknown key at the
+            # boundary validator and passes through un-type-checked, so this
+            # advisory compare must not let a malformed value crash the accept
+            # loop (matches the daemon's "malformed request never kills me"
+            # invariant). Either way: treat as a mismatch, warn, and ignore it.
+            _mismatch = True
+        if _mismatch:
+            _log(f"[server] request device {_payload_device!r} ignored; this "
+                 f"daemon is pinned to {device!r}")
+
     req_quant      = str(req.get("quant") or "none")
     req_quant_skip = tuple(req.get("quant_skip") or ())
     req_quant_only = tuple(req.get("quant_only") or ())
@@ -516,6 +579,10 @@ def _handle_generate(
             lora_warnings.append(msg)
 
     # ── Resolve output path (server owns this; client template is just a hint) ──
+    # _reserved holds a 0-byte placeholder path when the auto-numbered branch
+    # atomically claims a name (Finding 1); it is unlinked if generation fails so
+    # a failed run does not leave an orphan file that also burns a counter slot.
+    _reserved: Optional[str] = None
     savepath = req.get("savepath")
     if savepath:
         # Strip leading slashes so template can't escape output_dir.
@@ -543,13 +610,32 @@ def _handle_generate(
         except Exception as e:
             return {"status": "error", "error_type": "PathError", "error": str(e)}
     else:
+        # Atomic reservation, not exists()-then-write: O_EXCL makes the create
+        # fail if the name is taken, so two daemons sharing --output-dir (the
+        # canonical parallel setup in ADR-020) can never both pick
+        # comfyless0001.png and silently overwrite each other. Closes security
+        # review Finding 1 (review-parallel-daemon-2026-07-03). The 0-byte
+        # placeholder holds the name for the whole generation; generate()
+        # overwrites it with the real PNG.
         counter = 1
         while True:
             candidate = str(Path(output_dir) / f"comfyless{counter:04d}.png")
-            if not os.path.exists(candidate):
-                output_path = candidate
-                break
-            counter += 1
+            try:
+                _fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                counter += 1
+                continue
+            except OSError as e:
+                # Any non-EEXIST error (disk full, EACCES, read-only fs) must
+                # return a structured error, never escape and kill the accept
+                # loop: os.path.exists() never raised, so the atomic-open path
+                # has to preserve the daemon-survival promise. (code-review,
+                # slice 3 — same class as the slice-2 TypeError regression.)
+                return {"status": "error", "error_type": "IOError", "error": str(e)}
+            os.close(_fd)
+            output_path = candidate
+            _reserved = candidate
+            break
 
     # Belt-and-suspenders: re-verify the final resolved path.
     if not _within(output_path, output_dir):
@@ -583,6 +669,9 @@ def _handle_generate(
             offload_vae=bool(req.get("offload_vae")),
             attention_slicing=bool(req.get("attention_slicing")),
             sequential_offload=bool(req.get("sequential_offload")),
+            rebalance=bool(req.get("rebalance")),
+            rebalance_mult=req.get("rebalance_mult", KREA_REBALANCE_DEFAULT_MULT),
+            rebalance_weights=req.get("rebalance_weights"),
             transformer_path=req.get("transformer_path",    "") or "",
             vae_path=req.get("vae_path",            "") or "",
             text_encoder_path=req.get("text_encoder_path",   "") or "",
@@ -595,6 +684,13 @@ def _handle_generate(
         )
     except Exception as e:
         import traceback
+        # No image was written — drop the reserved 0-byte placeholder so a failed
+        # run neither litters output_dir nor permanently consumes its counter.
+        if _reserved is not None:
+            try:
+                os.unlink(_reserved)
+            except OSError:
+                pass
         return {
             "status":     "error",
             "error_type": "InferenceError",
@@ -629,7 +725,7 @@ def run_server(
     if not os.path.isdir(model_base):
         raise FileNotFoundError(f"--model-base not found: {model_base}")
 
-    sock_path = socket_path()
+    sock_path = socket_path(device)
     if sock_path.exists():
         sock_path.unlink()
 

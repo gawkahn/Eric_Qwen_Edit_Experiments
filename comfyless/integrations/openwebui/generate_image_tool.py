@@ -1,7 +1,7 @@
 """
 title: Comfyless Image Generation
 author: Grant Kahn
-version: 0.2.2
+version: 0.2.3
 required_open_webui_version: 0.5.0
 requirements: aiohttp
 license: MIT
@@ -102,6 +102,33 @@ def _safe_token(value: Any, fallback: str = "img") -> str:
     """Filesystem-safe short token for a generated filename component."""
     token = re.sub(r"[^A-Za-z0-9_-]", "", str(value))[:32]
     return token or fallback
+
+
+def _parse_weights_csv(s: str) -> list[float]:
+    """Parse a comma/semicolon-separated float list. Raises ValueError on a
+    non-numeric token so the caller can surface a clear chat error."""
+    parts = [p for p in s.replace(";", ",").split(",") if p.strip() != ""]
+    return [float(p) for p in parts]
+
+
+def _parse_loras(s: str) -> list[dict]:
+    """Parse 'name:weight,name2' into [{name, weight}, ...]. Weight is optional
+    (default 1.0). Raises ValueError on an empty name or non-numeric weight."""
+    out: list[dict] = []
+    for entry in s.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        name, sep, weight = entry.rpartition(":")
+        if sep:  # had a ':' — left side is the name, right side the weight
+            name = name.strip()
+            w = float(weight.strip())
+        else:    # no ':' — the whole token is the name, default weight
+            name, w = entry, 1.0
+        if not name:
+            raise ValueError(f"lora entry missing a name: {entry!r}")
+        out.append({"name": name, "weight": w})
+    return out
 
 
 class Tools:
@@ -231,6 +258,10 @@ class Tools:
         height: int = 0,
         seed: int = -1,
         steps: int = 0,
+        loras: str = "",
+        rebalance: bool = False,
+        rebalance_mult: float = 0.0,
+        rebalance_weights: str = "",
         __user__: Optional[dict] = None,
         __request__: Optional[Request] = None,
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
@@ -245,6 +276,10 @@ class Tools:
         :param height: Optional height in pixels (0 = model default).
         :param seed: Optional seed for reproducibility (-1 = random).
         :param steps: Optional number of sampling steps (0 = model default).
+        :param loras: Optional LoRA(s) by catalog name (discover via list_loras), comma-separated, each optionally "name:weight" (default weight 1.0). E.g. "MysticXXX_KREA2_v1:0.8". If a name itself contains a ':', always give an explicit ":weight" so it isn't mis-split. Empty = none.
+        :param rebalance: Krea-2 only: set true to boost detail / bypass the safety filter's quality dilution. Ignored by non-Krea models.
+        :param rebalance_mult: Optional rebalance strength (0 = server default 4.0; try 1.5–2.0 for a gentler effect). Only used when rebalance is true.
+        :param rebalance_weights: Optional 12 comma-separated per-layer-tap gains for expert rebalance tuning (e.g. "1,1,1,1,1,1,1,2.5,5,1.1,4,1"). Empty = server default preset. Only used when rebalance is true.
         :return: A short confirmation string. The image is rendered inline; do not attempt to read its bytes.
         """
         user = __user__ or {}
@@ -284,6 +319,22 @@ class Tools:
             payload["seed"] = int(seed)
         if steps and steps > 0:
             payload["steps"] = int(steps)
+        if loras and loras.strip():
+            try:
+                parsed_loras = _parse_loras(loras)
+            except ValueError as exc:
+                return f"Error: could not parse loras {loras!r}: {exc}."
+            if parsed_loras:
+                payload["loras"] = parsed_loras
+        if rebalance:
+            payload["rebalance"] = True
+            if rebalance_mult and rebalance_mult > 0:
+                payload["rebalance_mult"] = float(rebalance_mult)
+            if rebalance_weights and rebalance_weights.strip():
+                try:
+                    payload["rebalance_weights"] = _parse_weights_csv(rebalance_weights)
+                except ValueError as exc:
+                    return f"Error: could not parse rebalance_weights {rebalance_weights!r}: {exc}."
 
         await emit_status(f"Generating image (model={chosen_model or 'default'})…")
 

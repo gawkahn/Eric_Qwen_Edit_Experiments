@@ -175,6 +175,59 @@ Trigger: a tagged diffusers release exporting `Krea2Pipeline` (watch 0.39.0).
 When met: a separate slice pins the new diffusers (+ matching torchvision if
 needed), runs `uv lock`, updates `requirements.txt` + `pyproject.toml`
 together, and smoke-tests Raw/Turbo generation.
+Resolved: 2026-06-27 (krea-testing branch ONLY) — diffusers git-pinned to
+`main` @ 29a59fd (0.39.0.dev0) via `[tool.uv.sources]`; safetensors bumped
+0.7.0→0.8.0 (diffusers main requires >=0.8.0). §11 exact-pin satisfied by the
+commit rev. Krea-2-Turbo (8 steps) and Krea-2-Raw (CFG + negative prompt)
+both smoke-tested generating coherent images. This pin must NOT be merged to
+`main` — `main` stays on the last tagged release until a PyPI build exports
+`Krea2Pipeline` (still the trigger above for the real, mergeable bump). The
+branch exists precisely to test Krea without an unreleased pin reaching main.
+Resolved: 2026-07-03 (fully) — diffusers 0.39.0 released with Krea2 and
+pinned (9e4a2f2): git pin + [tool.uv.sources] removed, manifests are
+main-mergeable, 13 suites green on the release, Krea-2-Turbo live smoke OK.
+The original trigger fired; nothing remains of this entry.
+
+**Krea2 attention-backend pin — upstream workaround** *(2026-07-03)*
+diffusers 0.39.0's `Krea2AttnProcessor` passes a bool key-padding mask
+together with `enable_gqa=True` (48 q heads / 12 kv heads). PyTorch's fused
+SDPA kernels reject that combination (flash: no arbitrary masks;
+mem-efficient: no GQA), so backend auto-select silently falls back to MATH
+and materializes the full S^2 attention matrix — measured ~91 GB of
+transients at 2560x1440 (14912 tokens): instant OOM, quant-independent
+(originally misattributed to --quant + direct-merge LoRAs). comfyless works
+around it in `_pin_krea_attention_backend` (generate.py): krea/krea-turbo
+transformers get `set_attention_backend("_native_cudnn")` — cuDNN runs the
+same shapes fused at ~0.17 GB; verified end-to-end 2560x1440 x8 steps with
+quant fp8 + 4-LoRA stack, peak 44.3 GB. A registry test in
+test_params_schema.py catches an upstream rename of `_native_cudnn`.
+Why not now (the real fix): the processor should expand kv heads or diffusers
+should prefer cuDNN when a mask disqualifies flash — that's upstream's call.
+Trigger: upstream fix to Krea2AttnProcessor (or attention auto-select)
+lands in a pinned diffusers release → remove the pin helper + tests.
+Related cosmetic issue, no action: under quantization_config diffusers skips
+`_keep_in_fp32_modules`, so Krea2RMSNorm weights load bf16 and torch warns
+"Mismatch dtype ... Cannot dispatch to fused implementation" once per run;
+the norm computes fp32 and casts back either way — output unaffected.
+
+**Krea2 distill LoRA bias deltas (.diff_b) not applied** *(2026-07-03)*
+krea-native distillation LoRAs (krea2_turbo_lora_rank_64_bf16: 535 keys)
+co-ship a `.diff_b` bias delta alongside each standalone module's lora_A/B
+pair (img_in, final_layer.linear, time_embed.linear_{1,2}, time_mod_proj,
+txt_in.linear_{1,2}). The conversion path applies the weight deltas (PEFT)
+but no loader applies bias deltas — they are now dropped LOUDLY (was:
+silent on the lora branch; the LoKR branch already warned). Measured on the
+turbo file: |mean| ~5e-4, max 0.026 (time_mod_proj) — small corrections,
+plausibly negligible next to the weight deltas that were the 2026-07-03
+"terrible results" root cause (7 standalone modules unmapped; fixed).
+Upstream diffusers 0.39.0's #14074 converter doesn't handle .diff_b either
+(raises on leftovers).
+Why not now: applying bias deltas means a hybrid path — PEFT for the
+low-rank pairs plus a direct bias add with backup/restore + unload
+semantics; its own slice if quality demands it.
+Trigger: raw+turbo-LoRA output still visibly trails the dedicated Turbo
+checkpoint (or ComfyUI's rendering of the same file) AFTER the standalone
+weight-delta fix — that gap would implicate the biases.
 
 **NVFP4 quantize-on-load blocked on a stable torch/torchao/mslk triad** *(2026-07-02)*
 NVFP4 quantize-on-load for diffusion (ADR-019 slice A, nvfp4 half) is officially
@@ -509,3 +562,22 @@ ADR-010's "Deferred / Out of Scope" section formally declares the following non-
 - **What:** When a LoRA fails to apply over MCP, the warning is logged operator-side only (it embeds an absolute path, which must not cross the boundary per ADR-015); the agent gets no signal that a requested LoRA didn't apply.
 - **Why not now:** Surfacing it needs name-based redaction of the warning; out of scope for the OOM/LoRA-apply fix.
 - **Trigger:** An agent/UX need for LoRA application status, or the LoRA-catalog integration above.
+
+### [Code] rebalance_weights boundary validation is listness-only + client-omission untested *(2026-06-27)*
+- **What:** Three deferred items from the rebalance daemon/MCP wiring reviews (see `docs/security/review-rebalance-daemon-mcp-2026-06-27.md`): (1) `rebalance_weights` is validated as `_KIND_LIST` only — a list of non-numbers or wrong length passes the machine boundary and only fails deep in `_apply_krea_rebalance` (`torch.tensor`) as a caught `InferenceError`, less precise than `loras`' per-entry validation; (2) `rebalance_mult`/`rebalance_weights` accept NaN/Inf (Python `json.loads` allows them), yielding a degenerate image; (3) the client-side omit-`rebalance_weights`-when-None branch in `_delegate_to_server` has no test (no harness exists for the client delegate path).
+- **Why not now:** All three fail closed / are self-inflicted, consistent with the project's warn/contain-don't-pre-block footgun-tolerance posture (`security-auditor` + `code-reviewer` both rated them INFO/nit, no blocking). Adding the client-delegate test needs a new socket-mock harness for a trivial branch.
+- **Trigger:** A dedicated list-of-float validator kind being added (would naturally cover element-type + finiteness), OR the next change to `_delegate_to_server` (add the omission test then), OR an observed bad-input report.
+
+---
+
+## Parallel daemon (ADR-020)
+
+### [Code] Hard-crash orphans burn auto-number counter slots *(2026-07-03)*
+- **What:** The atomic auto-number reservation (`comfyless/server.py` `_handle_generate`, Finding 1 fix) leaves a 0-byte `comfylessNNNN.png` placeholder if the daemon dies **uncatchably** mid-generation (SIGKILL / OOM-kill) — `except Exception` cannot clean those up. The orphan permanently reserves that counter slot across restarts; repeated hard crashes make the counter creep upward and litter 0-byte PNGs.
+- **Why not now:** Fail-safe in direction (never overwrites real data), bounded by crash count, and the orphans are visually obvious (0-byte files). The caught-failure path already cleans up. Out of scope for the Finding 1 slice.
+- **Trigger:** Observed orphan accumulation in practice, OR any startup-sequence work on `run_server` — at which point a one-line sweep (`unlink` 0-byte `comfyless*.png` in `output_dir` before the accept loop) closes it. Flagged by the slice-3 `security-auditor` pass (`docs/security/review-parallel-daemon-2026-07-03.md`).
+
+### [Code] savepath-template branch retains the concurrent-collision class *(2026-07-03)*
+- **What:** Finding 1's atomic reservation covers only the **auto-number** branch. The `if savepath:` branch (user-supplied template) still resolves a path and hands it to `generate()` with no atomic reservation, so two daemons sharing `--output-dir` with the *same template and same params* (a template lacking `%seed%`/timestamp entropy) TOCTOU-overwrite each other exactly as Finding 1 described.
+- **Why not now:** Naming here is user-controlled (add entropy or per-device templates); Finding 1 explicitly scoped only the auto-number counter; this slice did not touch the branch. Recorded so "auto-number is atomic" is not mistaken for "all output paths are collision-safe."
+- **Trigger:** A user hitting template-collision in a parallel setup, OR extending atomic reservation to the template branch (would need to reserve the resolved path the same way, handling the template's own dir creation). Flagged by the slice-3 `security-auditor` pass.

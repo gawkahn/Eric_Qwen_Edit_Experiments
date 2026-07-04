@@ -112,7 +112,10 @@ from comfyless.params_schema import COMFYLESS_SCHEMA, _CLI_TO_CANONICAL  # noqa:
 # metrics don't leak into the next run.  Strictly narrower than the schema
 # filter — these are known-and-intentional non-params, not "unknown to us".
 _SKIP_SIDECAR_KEYS = {"timestamp", "elapsed_seconds", "contract_version",
-                      "lora_warnings", "model_family"}
+                      "lora_warnings", "model_family",
+                      # rebalance is a runtime CLI flag, not a schema param;
+                      # recorded for provenance but re-pass --rebalance to replay.
+                      "rebalance"}
 
 
 def _type_name(t) -> str:
@@ -656,8 +659,116 @@ def _build_call_kwargs(
 
 
 # ════════════════════════════════════════════════════════════════════════
+#  Krea conditioning rebalance (ports nova452/ComfyUI-Conditioning-Rebalance)
+# ════════════════════════════════════════════════════════════════════════
+
+# Krea-2's text encoder emits a stack of Qwen3-VL layer-taps; the pipeline
+# exposes them as prompt_embeds of shape (batch, seq, n_layers, dim). The
+# rebalance scales each tap by a per-layer gain, then the whole tensor by a
+# global multiplier — boosting detail and (per the source node) bypassing the
+# safety filter's quality dilution. The preset below is the node's default,
+# which boosts taps 8/9/11 (0-based 7/8/10).
+KREA_REBALANCE_DEFAULT_MULT = 4.0
+KREA_REBALANCE_DEFAULT_WEIGHTS = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+                                  2.5, 5.0, 1.1, 4.0, 1.0]
+
+
+def _parse_rebalance_weights(s: Optional[str]) -> Optional[List[float]]:
+    """Parse comma/semicolon-separated per-layer gains. None if empty.
+
+    Raises ValueError on non-numeric input so the CLI fails loud rather than
+    silently dropping a malformed preset (matches warn-don't-block: this is a
+    typo in the user's own argument, not a recoverable runtime condition).
+    """
+    if not s or not s.strip():
+        return None
+    vals = [x for x in s.replace(";", ",").split(",") if x.strip() != ""]
+    try:
+        return [float(x) for x in vals]
+    except ValueError as e:
+        raise ValueError(f"--rebalance-weights must be comma-separated floats: {e}")
+
+
+def _apply_krea_rebalance(
+    pipe,
+    call_kwargs: dict,
+    multiplier: float,
+    per_layer_weights: Optional[List[float]],
+    max_sequence_length: int,
+    exec_device,
+) -> dict:
+    """Replace the positive `prompt` in call_kwargs with rebalanced embeds.
+
+    Pre-encodes the prompt to (batch, seq, n_layers, dim), scales each layer-tap
+    by its gain and the whole tensor by `multiplier`, then swaps `prompt` for
+    `prompt_embeds`/`prompt_embeds_mask`. A negative_prompt (Raw with CFG) is
+    left as a string for the pipeline to encode normally — only the positive
+    conditioning is rebalanced, matching the source node.
+    """
+    prompt = call_kwargs.pop("prompt")
+    prompt_embeds, prompt_embeds_mask = pipe.encode_prompt(
+        prompt, device=exec_device, max_sequence_length=max_sequence_length,
+    )
+    # Krea2 stacks the layer-taps as a 4-D (batch, seq, n_layers, dim) tensor.
+    # Guard so a variant returning 3-D embeds fails loud rather than silently
+    # scaling the sequence axis.
+    if prompt_embeds.ndim != 4:
+        raise ValueError(
+            f"--rebalance expects layer-tap-stacked prompt_embeds "
+            f"(batch, seq, n_layers, dim); got {prompt_embeds.ndim}-D "
+            f"shape {tuple(prompt_embeds.shape)}"
+        )
+    n_layers = prompt_embeds.shape[-2]
+    if per_layer_weights is not None and len(per_layer_weights) != n_layers:
+        raise ValueError(
+            f"--rebalance-weights expects {n_layers} values (one per "
+            f"text-encoder layer-tap for this model), got {len(per_layer_weights)}"
+        )
+    orig_dtype = prompt_embeds.dtype
+    t = prompt_embeds.float()
+    if per_layer_weights is not None:
+        gains = torch.tensor(per_layer_weights, dtype=t.dtype, device=t.device)
+        t = t * gains.view(1, 1, n_layers, 1)
+    t = t.to(orig_dtype) * multiplier
+    call_kwargs["prompt_embeds"] = t
+    call_kwargs["prompt_embeds_mask"] = prompt_embeds_mask
+    return call_kwargs
+
+
+# ════════════════════════════════════════════════════════════════════════
 #  Pipeline loader (extracted so the server can cache the result)
 # ════════════════════════════════════════════════════════════════════════
+
+def _pin_krea_attention_backend(pipe, model_family: str) -> bool:
+    """Pin the Krea2 transformer's attention backend to cuDNN.
+
+    diffusers 0.39.0's Krea2AttnProcessor passes a bool key-padding mask
+    together with enable_gqa=True (48 q heads / 12 kv heads). PyTorch's
+    fused SDPA kernels reject that combination (flash: no arbitrary masks;
+    mem-efficient: no GQA), so auto-select silently falls back to the MATH
+    backend and materializes the full S^2 attention matrix — ~91 GB of
+    transients at 2560x1440 (14912 tokens), an instant OOM. cuDNN handles
+    GQA + bool mask fused (measured 0.17 GB for the same shapes), so pin it
+    for the Krea transformer. Upstream bug; remove when Krea2AttnProcessor
+    stops disqualifying the fused kernels. Returns True when pinned.
+    """
+    if model_family not in ("krea", "krea-turbo"):
+        return False
+    transformer = getattr(pipe, "transformer", None)
+    if transformer is None:
+        return False
+    try:
+        transformer.set_attention_backend("_native_cudnn")
+    except Exception as e:
+        _log(f"[comfyless] WARNING: could not pin Krea2 attention backend "
+             f"to cuDNN ({e}) — high-resolution generation may OOM in the "
+             f"SDPA math-backend fallback")
+        return False
+    _log("[comfyless] Krea2 attention backend pinned to cuDNN (avoids SDPA "
+         "math-backend fallback: bool mask + GQA disqualify flash/efficient "
+         "— full S^2 materialization OOMs at high resolution)")
+    return True
+
 
 def _load_pipeline(
     model_path: str,
@@ -837,11 +948,28 @@ def _load_pipeline(
         pipe.vae.enable_tiling()
 
     if attention_slicing:
-        try:
-            pipe.enable_attention_slicing(slice_size="auto")
-            _log("[comfyless] Attention slicing enabled")
-        except Exception as e:
-            _log(f"[comfyless] Attention slicing not available: {e}")
+        # enable_attention_slicing only drives components that implement
+        # set_attention_slice — i.e. UNet models (sd1/sdxl).  Modern DiT
+        # transformers (Flux/Flux2/Qwen-Image/Chroma/Krea2) route attention
+        # through dispatch_attention_fn (SDPA/flash), which never materializes
+        # the N^2 score matrix — there is nothing to slice, and the pipeline
+        # call is a silent no-op.  Detect that and tell the truth instead of
+        # logging "enabled" when nothing happened.
+        denoiser = getattr(pipe, "unet", None) or getattr(pipe, "transformer", None)
+        if denoiser is not None and hasattr(denoiser, "set_attention_slice"):
+            try:
+                pipe.enable_attention_slicing(slice_size="auto")
+                _log("[comfyless] Attention slicing enabled")
+            except Exception as e:
+                _log(f"[comfyless] Attention slicing not available: {e}")
+        else:
+            _log("[comfyless] WARNING: --attention-slicing has NO EFFECT on this "
+                 "model — its denoiser does not support attention slicing (modern "
+                 "DiT transformers use flash/SDPA attention, which has no N^2 score "
+                 "matrix to slice). Ignoring. For OOM relief use --quant (weights "
+                 "are the driver, not attention) or --offload-vae.")
+
+    _pin_krea_attention_backend(pipe, model_family)
 
     guidance_embeds = read_guidance_embeds(pipe)
     _log(f"[comfyless] Ready — family={model_family}, guidance_embeds={guidance_embeds}")
@@ -913,6 +1041,9 @@ def generate(
     attention_slicing: bool = False,
     sequential_offload: bool = False,
     allow_hf_download: bool = False,
+    rebalance: bool = False,
+    rebalance_mult: float = KREA_REBALANCE_DEFAULT_MULT,
+    rebalance_weights: Optional[List[float]] = None,
     quant: str = "none",
     quant_skip: tuple = (),
     quant_only: tuple = (),
@@ -989,6 +1120,19 @@ def generate(
         true_cfg_scale, max_sequence_length, generator,
     )
 
+    # ── Krea conditioning rebalance (optional) ────────────────────────
+    if rebalance and model_family in ("krea", "krea-turbo"):
+        weights = rebalance_weights if rebalance_weights is not None \
+            else KREA_REBALANCE_DEFAULT_WEIGHTS
+        _log(f"[comfyless] Krea rebalance: mult={rebalance_mult}, weights={weights}")
+        call_kwargs = _apply_krea_rebalance(
+            pipe, call_kwargs, rebalance_mult, weights,
+            max_sequence_length, exec_device,
+        )
+    elif rebalance:
+        print(f"[comfyless] WARNING: --rebalance ignored — only applies to "
+              f"krea/krea-turbo (model_family={model_family!r})", file=sys.stderr)
+
     _log(f"[comfyless] Generating: {width}x{height}, "
          f"steps={steps}, cfg={cfg_scale}, seed={seed}, sampler={sampler}")
 
@@ -1046,6 +1190,12 @@ def generate(
     }
     if lora_warnings:
         metadata["lora_warnings"] = lora_warnings
+    if rebalance and model_family in ("krea", "krea-turbo"):
+        metadata["rebalance"] = {
+            "mult": rebalance_mult,
+            "weights": rebalance_weights if rebalance_weights is not None
+                       else KREA_REBALANCE_DEFAULT_WEIGHTS,
+        }
 
     # ── Save PNG with embedded metadata ──────────────────────────────
     pil_image = result.images[0]
@@ -1135,6 +1285,16 @@ def _parse_args() -> argparse.Namespace:
                    help="Trade speed for lower peak VRAM")
     p.add_argument("--sequential-offload", action="store_true",
                    help="Extreme VRAM savings via sequential CPU offload — very slow")
+    # ── Krea conditioning rebalance (ports ComfyUI-Conditioning-Rebalance) ──
+    p.add_argument("--rebalance", action="store_true",
+                   help="Krea only: rebalance Qwen3-VL conditioning layer-taps to "
+                        "boost detail / bypass the safety filter's quality dilution. "
+                        "Requires the in-process path (use --output, not --savepath).")
+    p.add_argument("--rebalance-mult", type=float, default=KREA_REBALANCE_DEFAULT_MULT,
+                   help="[--rebalance] Global conditioning multiplier (default 4.0).")
+    p.add_argument("--rebalance-weights", type=str, default=None, metavar="W1,...",
+                   help="[--rebalance] Comma-separated per-layer-tap gains (12 for "
+                        "Krea). Default preset: 1,1,1,1,1,1,1,2.5,5,1.1,4,1.")
     p.add_argument("--allow-hf-download", action="store_true", default=False,
                    help="Allow downloading models from HuggingFace if not in local cache. "
                         "By default only the local cache is used (no network access)")
@@ -1323,15 +1483,17 @@ def _run_serve_mode(args: argparse.Namespace) -> int:
         return 1
 
 
-def _send_server_command(req: dict) -> Optional[dict]:
-    """Connect to the running server, send one request, return the response.
+def _send_server_command(req: dict, device: str = "cuda") -> Optional[dict]:
+    """Connect to the running server for `device`, send one request, return the response.
 
     Returns None if the socket doesn't exist or the connection is refused.
+    The socket is device-keyed (ADR-020): one daemon per GPU, so the caller's
+    device selects which daemon to reach.
     Local import keeps server.py off the critical import path.
     """
     import socket as _socket
     from .server import socket_path, _send, _recv, _CLIENT_RECV_TIMEOUT_SEC
-    sock_p = socket_path()
+    sock_p = socket_path(device)
     if not sock_p.exists():
         return None
     conn = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
@@ -1347,9 +1509,14 @@ def _send_server_command(req: dict) -> Optional[dict]:
         conn.close()
 
 
-def _send_unload() -> int:
-    """Send an unload command to the running server."""
-    resp = _send_server_command({"type": "unload"})
+def _send_unload(device: str = "cuda") -> int:
+    """Send an unload command to the running server for `device`.
+
+    Device-scoped (ADR-020): '--unload --device cuda:1' stops only the cuda:1
+    daemon; bare '--unload' (default 'cuda' -> 'cuda:0') stops the cuda:0 daemon.
+    Stopping every daemon means unloading each device.
+    """
+    resp = _send_server_command({"type": "unload"}, device)
     if resp is None:
         print("No server found (socket missing or connection refused).", file=sys.stderr)
         return 1
@@ -1397,6 +1564,8 @@ def _build_server_request(
         "offload_vae":         args.offload_vae,
         "attention_slicing":   args.attention_slicing,
         "sequential_offload":  args.sequential_offload,
+        "rebalance":           args.rebalance,
+        "rebalance_mult":      args.rebalance_mult,
         "transformer_path":    _abspath(p.get("transformer_path", "")),
         "vae_path":            _abspath(p.get("vae_path", "")),
         "text_encoder_path":   _abspath(p.get("text_encoder_path", "")),
@@ -1435,13 +1604,19 @@ def _delegate_to_server(
     Use --savepath for naming control when a server is running.
     """
     from .server import socket_path
-    if not socket_path().exists():
+    if not socket_path(args.device).exists():
         return None
 
     req = _build_server_request(args, p, loras,
                                 savepath_override=savepath_override)
 
-    resp = _send_server_command(req)
+    # Per-layer weights: omit when unset so the daemon's _KIND_LIST validator
+    # never sees a null (it defaults to the node preset server-side).
+    _rb_weights = _parse_rebalance_weights(args.rebalance_weights)
+    if _rb_weights is not None:
+        req["rebalance_weights"] = _rb_weights
+
+    resp = _send_server_command(req, args.device)
     if resp is None:
         _log("[comfyless] Server socket found but connection failed — running in-process")
         return None
@@ -1920,6 +2095,9 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                 attention_slicing=args.attention_slicing,
                 sequential_offload=args.sequential_offload,
                 allow_hf_download=args.allow_hf_download,
+                rebalance=args.rebalance,
+                rebalance_mult=args.rebalance_mult,
+                rebalance_weights=_parse_rebalance_weights(args.rebalance_weights),
                 transformer_path=p_cur.get("transformer_path", ""),
                 vae_path=p_cur.get("vae_path", ""),
                 text_encoder_path=p_cur.get("text_encoder_path", ""),
@@ -2037,7 +2215,7 @@ def main() -> int:
     if args.serve:
         return _run_serve_mode(args)
     if args.unload:
-        return _send_unload()
+        return _send_unload(args.device)
     return _run_cli_mode(args)
 
 

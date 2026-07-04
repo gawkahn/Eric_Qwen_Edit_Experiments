@@ -37,11 +37,17 @@ dependencies = [
     # diffusers TorchAoConfig + Float8DynamicActivationFloat8WeightConfig.
     # Torch-ecosystem package — keep its pin moving with torch's.
     "torchao==0.17.0",
-    "diffusers==0.37.1",
+    # diffusers 0.39.0 (released 2026-07-03) is the first PyPI release with
+    # Krea2Pipeline / Krea2Transformer2DModel — replaces the krea-testing git
+    # pin (was rev 29a59fd9, 0.39.0.dev0). This pin is what ends the branch's
+    # reason to exist; it merges to main with the krea support.
+    "diffusers==0.39.0",
     "transformers==5.5.3",
     "accelerate==1.13.0",
     "peft==0.18.1",
-    "safetensors==0.7.0",
+    # safetensors 0.8.0: required by diffusers>=0.39.0 (release bumped its
+    # floor); keep in lockstep with the diffusers pin.
+    "safetensors==0.8.0",
     "pillow==12.2.0",
     "numpy==2.4.4",
     "mcp==1.27.0",

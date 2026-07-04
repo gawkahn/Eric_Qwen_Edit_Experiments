@@ -46,6 +46,11 @@ import torch
 # (family_name, list of substrings; ANY match → this family wins).
 # Order matters — the first matching family is returned.
 _FORMAT_MARKERS: List[Tuple[str, List[str]]] = [
+    # Krea-2 ai-toolkit/ComfyUI-native layout. Distinctive tokens absent
+    # from every other family: `txtfusion` (the text-fusion stack) and the
+    # short `wq` attention-projection name. Checked first; its markers don't
+    # collide with the bfl/diffusers/sd substrings below.
+    ("krea_native",   ["txtfusion", ".attn.wq"]),
     # Original BFL: shared between Flux.1, Flux.2, Klein, and Chroma.
     # Slices 3/5 distinguish them downstream from the model side.
     ("bfl_original",  ["double_blocks.", "single_blocks."]),
@@ -66,7 +71,8 @@ def detect_lora_format(lora_keys: Iterable[str]) -> str:
             (the function searches by substring, so suffixes don't matter).
 
     Returns:
-        One of: 'bfl_original', 'diffusers_dit', 'sd_unet', 'unknown'.
+        One of: 'krea_native', 'bfl_original', 'diffusers_dit', 'sd_unet',
+        'unknown'.
     """
     keys = list(lora_keys)
     for family, patterns in _FORMAT_MARKERS:
@@ -450,3 +456,4 @@ def decode_kohya_to_bfl(
 # be fully defined before they execute.
 from . import eric_lora_format_convert_flux    # noqa: E402, F401  (registers Klein/Flux2)
 from . import eric_lora_format_convert_chroma  # noqa: E402, F401  (registers Chroma)
+from . import eric_lora_format_convert_krea    # noqa: E402, F401  (registers Krea-2)

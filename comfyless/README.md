@@ -799,7 +799,16 @@ $PY -m comfyless.generate --serve \
 
 The server prints its socket path and config to stderr, then blocks waiting for requests. Run it in a background shell or a tmux pane — it logs to stderr.
 
-**Socket location:** `$XDG_RUNTIME_DIR/comfyless.sock` when systemd has set `XDG_RUNTIME_DIR` (typical on Linux desktop); otherwise `/tmp/comfyless-$UID/comfyless.sock`. The directory is created at mode `0700`; the socket at `0600` — inaccessible to other users.
+**Socket location:** the socket name is **device-keyed** — `comfyless-cuda0.sock`, `comfyless-cuda1.sock`, `comfyless-cpu.sock` (`--device cuda` and `--device cuda:0` share the `cuda0` socket) — in `$XDG_RUNTIME_DIR` when systemd has set it (typical on Linux desktop), otherwise `/tmp/comfyless-$UID/`. The directory is created at mode `0700`; each socket at `0600` — inaccessible to other users. See [ADR-020](../docs/decisions/ADR-020-parallel-daemon-per-gpu.md).
+
+**Parallel generation, one daemon per GPU:** start a separate server per device and each auto-detects independently — a `--device cuda:0` client reaches the `cuda:0` daemon, a `--device cuda:1` client reaches the `cuda:1` daemon, and the two run concurrently on their own GPUs with no cross-talk:
+
+```bash
+$PY -m comfyless.generate --serve --device cuda:0 --model-base /path/to/models --output-dir /home/gawkahn/gen-output &
+$PY -m comfyless.generate --serve --device cuda:1 --model-base /path/to/models --output-dir /home/gawkahn/gen-output &
+```
+
+`--unload` is device-scoped: `--unload --device cuda:1` stops only the cuda:1 daemon.
 
 ### Using the server (auto-detect)
 

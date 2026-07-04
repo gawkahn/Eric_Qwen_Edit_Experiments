@@ -73,6 +73,13 @@ _RUNTIME_KIND = types.MappingProxyType({
     "attention_slicing":  _KIND_BOOL,
     "sequential_offload": _KIND_BOOL,
     "savepath":           _KIND_STR,
+    # Krea conditioning rebalance — runtime knobs (not sidecar-shaped).
+    # Type-checked here so a malformed mult/weights is rejected before the
+    # expensive generate path. rebalance_weights is a list of floats (or
+    # omitted); callers omit it rather than send null.
+    "rebalance":          _KIND_BOOL,
+    "rebalance_mult":     _KIND_FLOAT,
+    "rebalance_weights":  _KIND_LIST,
     # Quantize-on-load (ADR-019 slice A). Runtime knobs like `precision` —
     # hardware/VRAM tradeoffs, not sidecar-persisted image parameters.
     # quant_skip/quant_only entries are component SLOT names (e.g.

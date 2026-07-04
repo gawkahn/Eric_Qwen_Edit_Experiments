@@ -117,6 +117,9 @@ _generate_canonical = {
         # Runtime-only params, not sidecar-shaped; documented in schema comment.
         "output_path", "precision", "device", "offload_vae",
         "attention_slicing", "sequential_offload", "allow_hf_download",
+        # Krea conditioning rebalance — runtime-only CLI flags (in-process
+        # path), recorded in metadata when active but not sidecar input params.
+        "rebalance", "rebalance_mult", "rebalance_weights",
         "_cached_pipeline",
         # Quantize-on-load knobs (ADR-019 slice A): runtime-class like
         # precision — hardware/VRAM tradeoffs, declared in _RUNTIME_KIND,
@@ -688,6 +691,146 @@ check("krea routing: negative_prompt dropped when pipe doesn't accept it",
       "negative_prompt" not in _kw)
 check("krea routing: max_sequence_length dropped when pipe doesn't accept it",
       "max_sequence_length" not in _kw)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n── Krea rebalance: _parse_rebalance_weights ───────────────────")
+
+check("parse comma list", g._parse_rebalance_weights("1,2,3") == [1.0, 2.0, 3.0])
+check("parse semicolons normalized to commas",
+      g._parse_rebalance_weights("1;2;3") == [1.0, 2.0, 3.0])
+check("parse skips empty fields",
+      g._parse_rebalance_weights("1, ,2") == [1.0, 2.0])
+check("parse empty string → None", g._parse_rebalance_weights("") is None)
+check("parse whitespace-only → None", g._parse_rebalance_weights("   ") is None)
+check("parse None → None", g._parse_rebalance_weights(None) is None)
+check("parse the shipped default preset (12 values)",
+      g._parse_rebalance_weights("1,1,1,1,1,1,1,2.5,5,1.1,4,1")
+      == [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.5, 5.0, 1.1, 4.0, 1.0])
+
+# Negative case: malformed (non-numeric) input fails loud, not silent.
+_raised = False
+try:
+    g._parse_rebalance_weights("1,x,3")
+except ValueError:
+    _raised = True
+check("parse malformed → ValueError (fail loud)", _raised)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n── Krea rebalance: _apply_krea_rebalance gain math ────────────")
+
+import torch  # noqa: E402
+
+
+class _FakeEncodePipe:
+    """Minimal pipe exposing encode_prompt → (4-D embeds, mask)."""
+    def __init__(self, embeds, mask):
+        self._embeds, self._mask = embeds, mask
+        self.seen = {}
+
+    def encode_prompt(self, prompt, device=None, max_sequence_length=512):
+        self.seen = {"prompt": prompt, "device": device,
+                     "max_sequence_length": max_sequence_length}
+        return self._embeds, self._mask
+
+
+# (batch=1, seq=2, n_layers=3, dim=4) of ones → easy to verify per-layer gains.
+_embeds = torch.ones(1, 2, 3, 4)
+_mask = torch.ones(1, 2, dtype=torch.long)
+
+# Per-layer weights [1,2,3] × global mult 2.0 → layers scale to 2,4,6.
+_pipe = _FakeEncodePipe(_embeds, _mask)
+_ck = g._apply_krea_rebalance(_pipe, {"prompt": "x", "height": 1024},
+                              2.0, [1.0, 2.0, 3.0], 512, "cpu")
+_out = _ck["prompt_embeds"]
+check("rebalance: prompt popped from call_kwargs", "prompt" not in _ck)
+check("rebalance: prompt_embeds set", "prompt_embeds" in _ck)
+check("rebalance: mask passed through", _ck["prompt_embeds_mask"] is _mask)
+check("rebalance: prompt forwarded to encode_prompt", _pipe.seen["prompt"] == "x")
+check("rebalance: layer 0 gain 1×mult2 → 2", bool(torch.allclose(_out[:, :, 0, :], torch.full((1, 2, 4), 2.0))))
+check("rebalance: layer 1 gain 2×mult2 → 4", bool(torch.allclose(_out[:, :, 1, :], torch.full((1, 2, 4), 4.0))))
+check("rebalance: layer 2 gain 3×mult2 → 6", bool(torch.allclose(_out[:, :, 2, :], torch.full((1, 2, 4), 6.0))))
+
+# No per-layer weights → just the global multiplier, all layers equal.
+_pipe2 = _FakeEncodePipe(torch.ones(1, 2, 3, 4), _mask)
+_ck2 = g._apply_krea_rebalance(_pipe2, {"prompt": "y"}, 3.0, None, 512, "cpu")
+check("rebalance: multiplier-only scales uniformly by 3",
+      bool(torch.allclose(_ck2["prompt_embeds"], torch.full((1, 2, 3, 4), 3.0))))
+
+# dtype is preserved across the float() round-trip.
+_pipe3 = _FakeEncodePipe(torch.ones(1, 2, 3, 4, dtype=torch.bfloat16), _mask)
+_ck3 = g._apply_krea_rebalance(_pipe3, {"prompt": "z"}, 1.0, [1.0, 1.0, 1.0], 512, "cpu")
+check("rebalance: output dtype preserved (bfloat16)",
+      _ck3["prompt_embeds"].dtype == torch.bfloat16)
+
+# Negative case: wrong-length weights → ValueError.
+_raised = False
+try:
+    g._apply_krea_rebalance(_FakeEncodePipe(torch.ones(1, 2, 3, 4), _mask),
+                            {"prompt": "x"}, 1.0, [1.0, 2.0], 512, "cpu")
+except ValueError:
+    _raised = True
+check("rebalance: wrong-length weights → ValueError", _raised)
+
+# Negative case: 3-D embeds (no layer axis) → ValueError, not silent miss-scale.
+_raised = False
+try:
+    g._apply_krea_rebalance(_FakeEncodePipe(torch.ones(1, 2, 4), _mask),
+                            {"prompt": "x"}, 1.0, None, 512, "cpu")
+except ValueError:
+    _raised = True
+check("rebalance: 3-D embeds → ValueError (fail loud)", _raised)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Krea2 attention-backend pin (_pin_krea_attention_backend): diffusers
+# 0.39.0's Krea2AttnProcessor passes bool mask + enable_gqa, which knocks
+# SDPA onto the math backend (S^2 materialization → OOM at high res);
+# comfyless pins the transformer to cuDNN for the krea families.
+print("\n── krea attention-backend pin ─────────────────────────────────")
+
+
+class _FakeBackendTransformer:
+    def __init__(self, raise_on_set=False):
+        self.backend = None
+        self._raise = raise_on_set
+
+    def set_attention_backend(self, name):
+        if self._raise:
+            raise ValueError("no such backend")
+        self.backend = name
+
+
+class _FakeBackendPipe:
+    def __init__(self, transformer):
+        if transformer is not None:
+            self.transformer = transformer
+
+
+_t = _FakeBackendTransformer()
+check("krea family pins cuDNN backend",
+      g._pin_krea_attention_backend(_FakeBackendPipe(_t), "krea") is True
+      and _t.backend == "_native_cudnn", f"backend={_t.backend!r}")
+_t = _FakeBackendTransformer()
+check("krea-turbo family pins cuDNN backend",
+      g._pin_krea_attention_backend(_FakeBackendPipe(_t), "krea-turbo") is True
+      and _t.backend == "_native_cudnn", f"backend={_t.backend!r}")
+_t = _FakeBackendTransformer()
+check("non-krea family left untouched (NEGATIVE)",
+      g._pin_krea_attention_backend(_FakeBackendPipe(_t), "flux2") is False
+      and _t.backend is None, f"backend={_t.backend!r}")
+check("pipe without transformer → no-op, no raise",
+      g._pin_krea_attention_backend(_FakeBackendPipe(None), "krea") is False)
+check("set_attention_backend failure → warn + False, never raises",
+      g._pin_krea_attention_backend(
+          _FakeBackendPipe(_FakeBackendTransformer(raise_on_set=True)),
+          "krea") is False)
+# The pinned name must exist in the installed diffusers backend registry —
+# catches an upstream rename breaking the pin silently.
+from diffusers.models.attention_dispatch import AttentionBackendName
+check("'_native_cudnn' exists in diffusers backend registry",
+      "_native_cudnn" in {x.value for x in AttentionBackendName.__members__.values()})
 
 
 # ──────────────────────────────────────────────────────────────────────
