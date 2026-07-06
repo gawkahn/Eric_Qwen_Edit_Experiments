@@ -1,7 +1,7 @@
 # ADR-022: LoRA/transformer catalog service — SQLite metadata layer, 4-tier enrichment, search
 
 **Date:** 2026-07-05
-**Status:** proposed (S1 implementation gated by `code-reviewer`; S3/S4/S5 additionally by `security-auditor` — untrusted web text + MCP surface)
+**Status:** accepted (2026-07-06 — all six slices shipped; reviews: S1/S2 code-reviewer, S3/S4/S5 + security-auditor, records under docs/security/review-catalog-*.md; production catalog live: 954 entries, 202+16 candidates, 184 civitai enrichments)
 **Risk:** L3 baseline; Red-Zone-adjacent at two seams named in §7.
 **Related:** ADR-014/ADR-021 (audit manifests this ingests), ADR-015 (name-only reference resolution — the serving contract this must NOT disturb), ADR-018 (multi-root scan — shared name/stem policy), ADR-017 (OpenWebUI consumer), ADR-019 (quant verdicts in prognosis data).
 **Vision:** `docs/vision/slice-catalog-service.md` (approved 2026-07-05).

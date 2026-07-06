@@ -611,6 +611,59 @@ with tempfile.TemporaryDirectory() as td:
 
 
 # ════════════════════════════════════════════════════════════════════════
+print("\n== connect_readonly (ADR-022 S5 MCP accessor) ==")
+# ════════════════════════════════════════════════════════════════════════
+
+with tempfile.TemporaryDirectory() as td:
+    dbp = os.path.join(td, "cat.sqlite")
+    conn = cdb.connect(dbp)
+    eid = cdb.upsert_entry(conn, name="ro_test", kind="lora",
+                           abs_path="/x/ro.safetensors")
+    conn.commit()
+    conn.close()
+
+    ro = cdb.connect_readonly(dbp)
+    row = ro.execute("SELECT name FROM entries WHERE id=?",
+                     (eid,)).fetchone()
+    check("S5 ro: reads work", row is not None and row["name"] == "ro_test")
+    _raised = None
+    try:
+        ro.execute("UPDATE entries SET name='hacked' WHERE id=?", (eid,))
+    except sqlite3.OperationalError as e:
+        _raised = str(e)
+    check("S5 ro: writes structurally impossible (mode=ro)",
+          _raised is not None and "readonly" in _raised.lower(),
+          detail=repr(_raised))
+    ro.close()
+
+    _assert_raises("S5 ro: missing file",
+                   lambda: cdb.connect_readonly(os.path.join(td, "nope.db")),
+                   cdb.CatalogDBError, contains="not found")
+    badp = os.path.join(td, "badver.sqlite")
+    c = sqlite3.connect(badp)
+    c.execute("PRAGMA user_version = 99")
+    c.commit()
+    c.close()
+    _assert_raises("S5 ro: schema version mismatch",
+                   lambda: cdb.connect_readonly(badp),
+                   cdb.CatalogDBError, contains="schema version")
+
+    # URI-quoting property (review checkpoint 4): a path with a space and
+    # '?' must not terminate/fragment the mode=ro URI
+    weird_dir = os.path.join(td, "odd dir?x")
+    os.makedirs(weird_dir)
+    weird = os.path.join(weird_dir, "cat.sqlite")
+    c = cdb.connect(weird)
+    cdb.upsert_entry(c, name="q", kind="lora", abs_path="/x/q.safetensors")
+    c.commit()
+    c.close()
+    ro = cdb.connect_readonly(weird)
+    check("S5 ro: URI quoting survives space + '?' in the path",
+          ro.execute("SELECT COUNT(*) FROM entries").fetchone()[0] == 1)
+    ro.close()
+
+
+# ════════════════════════════════════════════════════════════════════════
 print("\n== S3: civitai enrichment (mocked network) ==")
 # ════════════════════════════════════════════════════════════════════════
 

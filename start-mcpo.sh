@@ -26,6 +26,9 @@ MODEL_BASE="${MODEL_BASE:-/home/gawkahn/projects/ai-lab/ai-base/models/hf-local}
 LORA_PATH="${LORA_PATH:-/home/gawkahn/projects/ai-lab/ai-base/models/comfyui/models/loras}"
 TRANSFORMER_PATH_CKPT="${TRANSFORMER_PATH_CKPT:-/home/gawkahn/projects/ai-lab/ai-base/models/comfyui/models/checkpoints}"
 TRANSFORMER_PATH_DIFF="${TRANSFORMER_PATH_DIFF:-/home/gawkahn/projects/ai-lab/ai-base/models/comfyui/models/diffusion_models}"
+# ADR-022 S5: metadata DB enables the `search` tool + model_family filters.
+# Read-only from the MCP server; lives OFF mergerfs (SQLite locking).
+CATALOG_DB="${CATALOG_DB:-$HOME/.local/share/comfyless/catalog.sqlite}"
 OUTPUT_DIR="${OUTPUT_DIR:-/home/gawkahn/gen-output}"
 HOST="${MCPO_HOST:-172.17.0.1}"   # docker bridge gateway: reachable from host + containers, not the wider LAN
 PORT="${MCPO_PORT:-8090}"
@@ -44,10 +47,21 @@ echo "[start-mcpo] lora-path=${LORA_PATH}"
 echo "[start-mcpo] transformer-paths=${TRANSFORMER_PATH_CKPT} ${TRANSFORMER_PATH_DIFF}"
 echo "[start-mcpo] output-dir=${OUTPUT_DIR}"
 
+# --catalog-db only if the DB exists (spawn is fail-closed on a bad path;
+# a fresh machine without a built catalog still gets a working server).
+CATALOG_DB_ARGS=()
+if [ -f "$CATALOG_DB" ]; then
+  CATALOG_DB_ARGS=(--catalog-db "$CATALOG_DB")
+  echo "[start-mcpo] catalog-db=${CATALOG_DB}"
+else
+  echo "[start-mcpo] catalog-db absent (${CATALOG_DB}) — search tool disabled"
+fi
+
 exec uvx mcpo --host "$HOST" --port "$PORT" -- \
   "$REPO/.venv/bin/python3" -m comfyless.mcp_server \
     --model-base "$MODEL_BASE" \
     --lora-path "$LORA_PATH" \
     --transformer-path "$TRANSFORMER_PATH_CKPT" \
     --transformer-path "$TRANSFORMER_PATH_DIFF" \
+    "${CATALOG_DB_ARGS[@]}" \
     --output-dir "$OUTPUT_DIR"

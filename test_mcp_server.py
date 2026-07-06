@@ -267,11 +267,12 @@ with tempfile.TemporaryDirectory() as tmp_out, \
     check("Invariant 8: 'list_loras' tool description names target_family",
           _tools_by_name["list_loras"].description
           and "target_family" in _tools_by_name["list_loras"].description)
-    check("Slice-2b invariant 1: 'list_transformers' tool description names "
-          "transformer + empty inputSchema",
+    check("Slice-2b invariant 1 (S5-amended): 'list_transformers' tool "
+          "description names transformer; schema = model_family only",
           _tools_by_name["list_transformers"].description
           and "transformer" in _tools_by_name["list_transformers"].description
-          and _tools_by_name["list_transformers"].inputSchema.get("properties") == {}
+          and set(_tools_by_name["list_transformers"].inputSchema.get(
+              "properties", {})) == {"model_family"}
           and _tools_by_name["list_transformers"].inputSchema.get(
               "additionalProperties") is False)
 
@@ -3016,11 +3017,15 @@ with tempfile.TemporaryDirectory() as tmp_out, \
           "(empty properties + additionalProperties=False)",
           by_name["list_models"].inputSchema.get("properties") == {}
           and by_name["list_models"].inputSchema.get("additionalProperties") is False)
-    check("N20: 'list_loras' inputSchema accepts no inputs",
-          by_name["list_loras"].inputSchema.get("properties") == {}
+    # S5 (ADR-022): list_loras/list_transformers accept ONLY the optional
+    # model_family filter; still additionalProperties: false.
+    check("N20/S5: 'list_loras' inputSchema accepts only model_family",
+          set(by_name["list_loras"].inputSchema.get("properties", {}))
+          == {"model_family"}
           and by_name["list_loras"].inputSchema.get("additionalProperties") is False)
-    check("N20: 'list_transformers' inputSchema accepts no inputs (slice-2b)",
-          by_name["list_transformers"].inputSchema.get("properties") == {}
+    check("N20/S5: 'list_transformers' inputSchema accepts only model_family",
+          set(by_name["list_transformers"].inputSchema.get("properties", {}))
+          == {"model_family"}
           and by_name["list_transformers"].inputSchema.get(
               "additionalProperties") is False)
     check("N20: 'list_loras'/'list_models' descriptions are byte-identical to "
@@ -4124,6 +4129,178 @@ with tempfile.TemporaryDirectory() as _td18:
           not cat_mod._same_file_content(_sa, os.path.join(_td18, "nope")))
     check("ADR-018: _file_sha256 None on unreadable path",
           cat_mod._file_sha256(os.path.join(_td18, "nope")) is None)
+
+
+# ════════════════════════════════════════════════════════════════════════
+print("\n== ADR-022 S5: catalog-db search tool + family filters ==")
+# ════════════════════════════════════════════════════════════════════════
+
+import comfyless.catalog_db as _cdb  # noqa: E402
+import sqlite3 as _sqlite3  # noqa: E402
+
+
+def _mk_s5_db(path: str) -> None:
+    """Fixture metadata DB: 2 qwen loras (1 excluded), 1 flux2 lora,
+    1 transformer, one enriched description."""
+    conn = _cdb.connect(path)
+    e1 = _cdb.upsert_entry(conn, name="neon_qwen", kind="lora",
+                           abs_path="/x/neon_qwen.safetensors")
+    _cdb.set_entry_family(conn, e1, "qwen-image")
+    _cdb.upsert_description(conn, entry_id=e1, source="civitai_api",
+                            model_name="Neon Style",
+                            description="A cinematic neon glow LoRA",
+                            trigger_words=["neonglow"],
+                            strength_rec="0.8")
+    e2 = _cdb.upsert_entry(conn, name="banned_qwen", kind="lora",
+                           abs_path="/x/banned.safetensors")
+    _cdb.set_entry_family(conn, e2, "qwen-image")
+    conn.execute("UPDATE entries SET excluded=1, "
+                 "excluded_reason='operator' WHERE id=?", (e2,))
+    e3 = _cdb.upsert_entry(conn, name="flux_thing", kind="lora",
+                           abs_path="/x/ft.safetensors")
+    _cdb.set_entry_family(conn, e3, "flux2")
+    e4 = _cdb.upsert_entry(conn, name="qwen_ft_transformer",
+                           kind="transformer",
+                           abs_path="/t/qft.safetensors")
+    _cdb.set_entry_family(conn, e4, "qwen-image")
+    _cdb.rebuild_fts(conn)
+    conn.commit()
+    conn.close()
+
+
+def _mk_s5_cfg(tmp_out: str, mb: str, dbp=None):
+    return mcps._StartupConfig(
+        output_dir=tmp_out, model_base=mb, default_model=None,
+        mcp_max_iterations=100,
+        catalog={
+            "neon_qwen": {"abs_path": "/x/neon_qwen.safetensors",
+                          "kind": "lora", "source": "scan",
+                          "model_family": None, "target_family": None},
+            "flux_thing": {"abs_path": "/x/ft.safetensors",
+                           "kind": "lora", "source": "scan",
+                           "model_family": None, "target_family": None},
+            "qwen_ft_transformer": {"abs_path": "/t/qft.safetensors",
+                                    "kind": "transformer",
+                                    "source": "scan",
+                                    "model_family": None,
+                                    "target_family": None},
+        },
+        catalog_db_path=dbp)
+
+
+with tempfile.TemporaryDirectory() as _td:
+    _dbp = os.path.join(_td, "cat.sqlite")
+    _mk_s5_db(_dbp)
+    cfg_db = _mk_s5_cfg(_td, _td, _dbp)
+    cfg_nodb = _mk_s5_cfg(_td, _td, None)
+
+    tools = _run(mcps._list_tools_impl(cfg_db))
+    names5 = [t.name for t in tools]
+    check("S5: search advertised WITH --catalog-db",
+          "search" in names5 and len(names5) == 5)
+    tools = _run(mcps._list_tools_impl(cfg_nodb))
+    check("S5: search NOT advertised without --catalog-db",
+          "search" not in [t.name for t in tools])
+
+    result, count = _run(mcps._handle_search(cfg_db,
+                                             {"query": "cinematic"}))
+    body = _json.loads(result[0].text)
+    check("S5 search: FTS hit via description", count == 1
+          and body[0]["name"] == "neon_qwen", detail=result[0].text[:200])
+    check("S5 search: description block with provenance source",
+          body[0]["description"]["source"] == "civitai_api"
+          and body[0]["description"]["trigger_words"] == ["neonglow"]
+          and body[0]["description"]["strength_rec"] == "0.8")
+    _flat = _json.dumps(body)
+    check("S5 search: NO path-typed fields in the response "
+          "(opaque-handle keystone)",
+          "abs_path" not in _flat and "/x/" not in _flat
+          and "relative_path" not in _flat and '"root"' not in _flat)
+    result, count = _run(mcps._handle_search(cfg_db, {"query": "banned"}))
+    check("S5 search: excluded entries never surface", count == 0)
+    result, count = _run(mcps._handle_search(
+        cfg_db, {"query": "flux", "kind": "lora",
+                 "model_family": "flux2", "limit": 5}))
+    body = _json.loads(result[0].text)
+    check("S5 search: kind+family filters compose",
+          count == 1 and body[0]["name"] == "flux_thing")
+
+    for label, args5 in (
+        ("empty query", {"query": "   "}),
+        ("non-string query", {"query": 7}),
+        ("oversize query", {"query": "x" * 300}),
+        ("bad kind", {"query": "a", "kind": "vae"}),
+        ("bad family type", {"query": "a", "model_family": 3}),
+        ("bad limit", {"query": "a", "limit": 0}),
+        ("bool limit", {"query": "a", "limit": True}),
+    ):
+        try:
+            _run(mcps._handle_search(cfg_db, args5))
+            check(f"S5 search neg: {label} rejected", False,
+                  detail="no exception")
+        except mcps._MCPHandlerError as e:
+            check(f"S5 search neg: {label} rejected",
+                  e.error_class == "ValidationError")
+    try:
+        _run(mcps._handle_search(cfg_nodb, {"query": "a"}))
+        check("S5 search neg: no --catalog-db -> ValidationError", False)
+    except mcps._MCPHandlerError as e:
+        check("S5 search neg: no --catalog-db -> ValidationError",
+              e.error_class == "ValidationError"
+              and "--catalog-db" in e.safe_message)
+
+    result, count = _run(mcps._handle_list_loras(
+        cfg_db, {"model_family": "qwen-image"}))
+    body = _json.loads(result[0].text)
+    check("S5 list_loras: family filter narrows to non-excluded matches",
+          count == 1 and body[0]["name"] == "neon_qwen",
+          detail=result[0].text[:200])
+    result, count = _run(mcps._handle_list_loras(cfg_db, {}))
+    check("S5 list_loras: no filter -> unchanged full listing", count == 2)
+    result, count = _run(mcps._handle_list_loras(cfg_db, None))
+    check("S5 list_loras: None arguments -> unchanged (back-compat)",
+          count == 2)
+    result, count = _run(mcps._handle_list_transformers(
+        cfg_db, {"model_family": "qwen-image"}))
+    body = _json.loads(result[0].text)
+    check("S5 list_transformers: family filter works",
+          count == 1 and body[0]["name"] == "qwen_ft_transformer")
+    try:
+        _run(mcps._handle_list_loras(cfg_nodb, {"model_family": "x"}))
+        check("S5 list_loras neg: family filter without --catalog-db "
+              "rejected", False)
+    except mcps._MCPHandlerError as e:
+        check("S5 list_loras neg: family filter without --catalog-db "
+              "rejected", e.error_class == "ValidationError")
+    try:
+        _run(mcps._handle_list_loras(cfg_db, {"model_family": "  "}))
+        check("S5 list_loras neg: blank family rejected", False)
+    except mcps._MCPHandlerError as e:
+        check("S5 list_loras neg: blank family rejected",
+              e.error_class == "ValidationError")
+
+    with tempfile.TemporaryDirectory() as tmp_out:
+        result5 = runner.invoke(mcps.main, [
+            "--output-dir", tmp_out, "--model-base", tmp_out,
+            "--catalog-db", os.path.join(_td, "nonexistent.sqlite")])
+        check("S5 spawn: missing --catalog-db file -> non-zero exit",
+              result5.exit_code != 0)
+        badp = os.path.join(_td, "badver.sqlite")
+        c5 = _sqlite3.connect(badp)
+        c5.execute("PRAGMA user_version = 99")
+        c5.commit()
+        c5.close()
+        result5 = runner.invoke(mcps.main, [
+            "--output-dir", tmp_out, "--model-base", tmp_out,
+            "--catalog-db", badp])
+        check("S5 spawn: wrong schema version -> non-zero exit",
+              result5.exit_code != 0)
+
+    _gen_src = inspect.getsource(mcps._handle_generate)
+    _casc_src = inspect.getsource(mcps._handle_generate_cascade)
+    check("S5: generate handlers never reference the metadata DB "
+          "(load-plane independence, Vision proof hook)",
+          "catalog_db" not in _gen_src and "catalog_db" not in _casc_src)
 
 
 # ════════════════════════════════════════════════════════════════════════

@@ -284,6 +284,30 @@ def connect(db_path: str = DEFAULT_DB_PATH, *,
     return conn
 
 
+def connect_readonly(db_path: str) -> sqlite3.Connection:
+    """Open an EXISTING catalog DB read-only (sqlite URI mode=ro) —
+    the MCP-surface accessor (ADR-022 S5): a reader that structurally
+    cannot write, never creates files/dirs, and fail-closes on a missing
+    file or schema mismatch."""
+    real = os.path.realpath(db_path)
+    if not os.path.isfile(real):
+        raise CatalogDBError(f"catalog DB not found: {db_path!r}")
+    import urllib.parse
+    uri = "file:" + urllib.parse.quote(real) + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error as e:
+        raise CatalogDBError(f"catalog DB unreadable: {e}") from None
+    conn.row_factory = sqlite3.Row
+    ver = conn.execute("PRAGMA user_version").fetchone()[0]
+    if ver != SCHEMA_VERSION:
+        conn.close()
+        raise CatalogDBError(
+            f"catalog DB schema version {ver} != supported "
+            f"{SCHEMA_VERSION} ({db_path!r})")
+    return conn
+
+
 # ════════════════════════════════════════════════════════════════════════
 #  Upserts (Vision invariants 5, 12)
 # ════════════════════════════════════════════════════════════════════════
