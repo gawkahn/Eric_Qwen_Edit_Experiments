@@ -666,7 +666,7 @@ builder), but the matcher itself is looser than ADR-021 §3's "different DiT
 families differ long before 90%" claim on real data.
 **Why not now:** catalog-side evidence precedence makes the assignment
 correct; the matcher's usable/unconvertable boundary is unaffected for the
-現 population (files matching wrong-family bases also match their own).
+current population (files matching wrong-family bases also match their own).
 **Trigger:** any file whose matched_bases is WRONG-family-only (would
 classify usable against a base it can't load on), or transformer dry-load /
 gen-validation surfacing a load failure on a matched base. Fix directions:
