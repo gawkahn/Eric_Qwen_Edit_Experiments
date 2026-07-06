@@ -869,3 +869,29 @@ native key names). That one model is blocked on TWO fronts; the RedCraft target
 (958009) is likely a more standard base and blocked only on INT8-ConvRot.
 **Trigger:** Grant downloading the files + deciding to invest; re-check whether a
 diffusers/community loader lands first (ComfyUI-core status means momentum).
+
+## 2026-07-06 — CORRECTION (after inspecting a real file): "int8 convrot" targets are actually scaled-fp8; the blocker is Krea keys, not the quant
+
+**What the file actually is:** `redcraft22INT8Convrot_11INT8Native.safetensors`
+(RedCraft, civitai 958009 — downloaded 2026-07-06 into checkpoints/Krea) was
+inspected. **Despite the "INT8 ConvRot" filename, the tensors are plain
+scaled-fp8:** 256 `F8_E4M3` weights + per-tensor F32 `weight_scale` + a
+`comfy_quant` descriptor whose bytes are literally `{"format": "float8_e4m3fn"}`.
+**Zero** int8 tensors, **zero** rotation/convrot/hadamard/smooth tensors. This is
+exactly the **comfy_quant cq-w** variant comfyless ALREADY ships (ADR-019 slice
+C-d) — verified the descriptor passes `_CQ_FORMAT_ALLOWLIST`
+(`{"float8_e4m3fn","float8_e5m2"}`). So the quant is a **non-issue**.
+**The real (and only) blocker:** the keys are **native Krea-2**
+(`model.diffusion_model.blocks.N.attn.wq/wk/wv/wo`, `mlp.gate/up/down`, `mod.lin`,
+`qknorm`) — NOT diffusers Krea2 (`transformer_blocks.N.attn.to_q`). The embedded
+ComfyUI workflow's save-prefix is `Krea2_turbo`, confirming a Krea-2 base. So this
+file is blocked ONLY on the **native-Krea→diffusers key converter** (the entry
+above), same wall as `krea2MuseByStable_v15TurboFp8.safetensors`. comfyless has no
+Krea key remap (verified — only family *detection* exists, no converter).
+**Implication:** the "add INT8-ConvRot support" work is NOT needed for Grant's two
+targets — they're fp8, already handled. **One piece of work — the Krea key
+converter — unblocks the plain Krea fp8 file AND both "int8 convrot" downloads.**
+The generic INT8-ConvRot entry above remains a valid FUTURE item (real int8-convrot
+files exist upstream), but it is decoupled from these specific models. Dark Beast
+(civitai 2242173, "krea2 aggressive", still downloading) to be confirmed — expected
+to be the same Krea-2 + fp8 situation.
