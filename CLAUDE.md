@@ -71,8 +71,9 @@ python3 test_lora_order_insensitive.py      #  13 tests: direct-merge LoRAs orde
 python3 test_vae_override_class.py          #  10 tests: --vae override honors the checkpoint's own VAE class (cherry-picked from krea-testing ad6689e)
 python3 test_lora_audit.py                  # 163 tests: scripts/lora_audit.py classify / manifest / dry-load / convert / delete (ADR-014 S1–S4)
 python3 test_lora_convert_krea.py           #  24 tests: Krea-2 LoRA format-conversion plan (krea_native → diffusers_krea)
+python3 test_catalog_db.py                  #  54 tests: catalog DB metadata plane (ADR-022 S1) — schema, FUSE guard, sanitizer, upsert/stale semantics, manifest kind-branch join, load-plane independence
 ```
-All fifteen suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 1971 unit tests; expect 0 failures.
+All sixteen suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 2025 unit tests; expect 0 failures.
 
 `test_flux2.py` is a live GPU smoke test that performs an actual Flux.2 generation — separate from the unit suites above. Run only when you need to verify end-to-end Flux.2 behavior.
 
