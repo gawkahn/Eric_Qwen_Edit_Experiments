@@ -981,16 +981,23 @@ def _load_pipeline(
     return pipe, model_family, guidance_embeds
 
 
-def _apply_loras(pipe, loras: Optional[List[Dict[str, Any]]]) -> List[str]:
+def _apply_loras(pipe, loras: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     """Apply LoRA specs ({path, weight}) onto an already-loaded pipeline.
 
-    Returns human-readable warnings for skipped/failed LoRAs. Shared by
-    generate()'s one-shot path and the MCP server's cached-pipeline loader so
-    both apply LoRAs identically — the MCP path previously passed a pre-loaded
-    pipeline to generate(), which skips LoRA loading, so LoRAs were silently
-    never applied over MCP.
+    Returns a per-LoRA OUTCOME list — one dict per input spec:
+        {"path": str, "adapter_name": str, "applied": bool,
+         "reason": str | None}
+    `applied` is False when the adapter loaded 0 modules (silent no-op) or
+    raised; `reason` is a short operator-facing cause (may embed the path,
+    so it MUST NOT cross the MCP boundary — callers on the agent surface
+    map path→catalog-name instead; see ADR-015 2026-07-06).
+
+    Shared by generate()'s one-shot path and the MCP server's cached-pipeline
+    loader so both apply LoRAs identically — the MCP path previously passed a
+    pre-loaded pipeline to generate(), which skips LoRA loading, so LoRAs were
+    silently never applied over MCP.
     """
-    warnings: List[str] = []
+    outcomes: List[Dict[str, Any]] = []
     loras = loras or []
     for i, lora_spec in enumerate(loras):
         lora_path = lora_spec["path"]
@@ -1005,14 +1012,74 @@ def _apply_loras(pipe, loras: Optional[List[Dict[str, Any]]]) -> List[str]:
                 weight=lora_weight,
             )
             if not success:
-                msg = f"LoRA skipped (0 modules applied): {lora_path}"
-                _log(f"[comfyless] WARNING: {msg}")
-                warnings.append(msg)
+                _log(f"[comfyless] WARNING: LoRA skipped (0 modules "
+                     f"applied): {lora_path}")
+            outcomes.append({
+                "path": lora_path, "adapter_name": adapter_name,
+                "applied": bool(success),
+                "reason": None if success
+                else "0 modules applied (adapter not active)",
+            })
         except Exception as e:
-            msg = f"LoRA load failed: {lora_path}: {e}"
-            _log(f"[comfyless] WARNING: {msg}")
-            warnings.append(msg)
-    return warnings
+            _log(f"[comfyless] WARNING: LoRA load failed: {lora_path}: {e}")
+            outcomes.append({
+                "path": lora_path, "adapter_name": adapter_name,
+                "applied": False, "reason": f"load error: {e}",
+            })
+    return outcomes
+
+
+def lora_failure_warnings(outcomes: List[Dict[str, Any]]) -> List[str]:
+    """Operator-facing warning strings (one per FAILED LoRA) for the on-disk
+    metadata sidecar / CLI. These embed the LoRA PATH — operator-facing only;
+    they are dropped from the agent surface (ADR-015 MEDIUM-1 / 2026-07-06)."""
+    return [
+        f"LoRA not applied ({o['reason']}): {o['path']}"
+        for o in outcomes if not o.get("applied")
+    ]
+
+
+# Exit code returned when a LoRA silently did not apply but the image WAS
+# still written (ADR-015 2026-07-06). Distinct from 1/2 (hard errors) so
+# scripts can special-case it; the --iterate sweep treats it as NON-FATAL.
+_LORA_SOFT_FAIL_RC = 3
+
+
+def _report_lora_outcome(metadata: Dict[str, Any]) -> int:
+    """CLI: print a prominent banner + return `_LORA_SOFT_FAIL_RC` (3) when
+    any requested LoRA did not apply, else 0. The image was still written
+    (WITHOUT the failed adapter), so exit-3 is the catchable 'not what you
+    asked for' signal — distinct from 1/2 hard errors (ADR-015 2026-07-06).
+    Reads the operator-facing `lora_warnings` strings that both the in-process
+    path and the daemon wire-result carry in metadata."""
+    warnings = metadata.get("lora_warnings") or []
+    if not warnings:
+        return 0
+    bar = "=" * 64
+    print(f"\n{bar}", file=sys.stderr)
+    print(f"⚠️  {len(warnings)} LoRA(s) DID NOT APPLY — image was generated "
+          f"WITHOUT them:", file=sys.stderr)
+    for w in warnings:
+        print(f"   • {w}", file=sys.stderr)
+    print(bar, file=sys.stderr)
+    return _LORA_SOFT_FAIL_RC
+
+
+def _iterate_combo_disposition(rc: int) -> str:
+    """Classify a per-combo `_run_one` return code for the --iterate sweep:
+      'ok'    — rc 0.
+      'soft'  — `_LORA_SOFT_FAIL_RC` (3): the combo's image WAS written but a
+                LoRA didn't apply. Keep sweeping (a bad LoRA in one combo must
+                not kill working combos); report at the end. (ADR-015
+                2026-07-06 — exit-3 is distinct from hard errors, and the
+                fan-out is the one place that distinction must be honored.)
+      'fatal' — anything else: a real error; abort the sweep.
+    """
+    if rc == 0:
+        return "ok"
+    if rc == _LORA_SOFT_FAIL_RC:
+        return "soft"
+    return "fatal"
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1105,13 +1172,13 @@ def generate(
         )
 
     # ── Load LoRAs ────────────────────────────────────────────────────
-    lora_warnings: List[str] = []
+    lora_outcomes: List[Dict[str, Any]] = []
     loras = loras or []
     # When a cached pipeline is provided the caller has already applied LoRAs
     # via _apply_loras (the MCP cached loader does this); skip re-applying but
     # keep the list so it appears correctly in metadata.
     if _cached_pipeline is None:
-        lora_warnings = _apply_loras(pipe, loras)
+        lora_outcomes = _apply_loras(pipe, loras)
 
     # ── Build generator ───────────────────────────────────────────────
     exec_device = getattr(pipe, "_execution_device", None) or device
@@ -1193,6 +1260,7 @@ def generate(
         "elapsed_seconds": round(elapsed, 2),
         "contract_version": CONTRACT_VERSION,
     }
+    lora_warnings = lora_failure_warnings(lora_outcomes)
     if lora_warnings:
         metadata["lora_warnings"] = lora_warnings
     if rebalance and model_family in ("krea", "krea-turbo"):
@@ -1643,7 +1711,9 @@ def _delegate_to_server(
             print(f"[comfyless] Metadata: {sidecar_path}")
         print(f"\nDone. seed={metadata.get('seed', '?')}, "
               f"time={metadata.get('elapsed_seconds', '?')}s")
-        return 0
+        # Daemon already carries lora_warnings in the wire metadata — surface
+        # them loudly client-side (ADR-015 2026-07-06).
+        return _report_lora_outcome(metadata)
 
     err = resp.get("error", "unknown error")
     print(f"Error (server): {err}", file=sys.stderr)
@@ -2121,7 +2191,7 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
             print(f"[comfyless] Metadata: {sidecar_path}")
             print(f"\nDone. seed={metadata['seed']}, "
                   f"time={metadata['elapsed_seconds']}s")
-            return 0
+            return _report_lora_outcome(metadata)
         except FileNotFoundError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 1
@@ -2138,6 +2208,7 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
     # ── Iteration fan-out ─────────────────────────────────────────────────
     t_start = time.monotonic()
     succeeded = 0
+    lora_soft_fail = False
     for idx, patch in enumerate(_iteration_combos(plan), start=1):
         p_iter = dict(p)
         loras_iter = list(base_loras)
@@ -2147,16 +2218,24 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
             else:
                 p_iter[axis_name] = axis_value
         rc = _run_one(p_iter, loras_iter, idx=idx, total=plan["total"])
-        if rc != 0:
+        disposition = _iterate_combo_disposition(rc)
+        if disposition == "fatal":
             print(f"[comfyless] iteration failed at {idx}/{plan['total']} — stopping. "
                   f"batch_id={iterate_batch_id}", file=sys.stderr)
             return rc
+        # 'soft' (rc 3): image written but a LoRA didn't apply — _run_one
+        # already printed the loud banner; keep sweeping, flag for the summary.
+        if disposition == "soft":
+            lora_soft_fail = True
         succeeded += 1
 
     elapsed = time.monotonic() - t_start
     print(f"[comfyless] iterate: {succeeded}/{plan['total']} completed in {elapsed:.1f}s "
           f"(batch_id={iterate_batch_id})", file=sys.stderr)
-    return 0
+    if lora_soft_fail:
+        print(f"[comfyless] iterate: one or more combos were generated WITHOUT a "
+              f"requested LoRA (see the ⚠️  warnings above)", file=sys.stderr)
+    return _LORA_SOFT_FAIL_RC if lora_soft_fail else 0
 
 
 def _split_model_arg(args: argparse.Namespace) -> List[str]:

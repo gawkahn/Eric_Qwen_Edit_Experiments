@@ -4304,6 +4304,81 @@ with tempfile.TemporaryDirectory() as _td:
 
 
 # ════════════════════════════════════════════════════════════════════════
+# LoRA-not-applied notices (ADR-015 2026-07-06) — agent-facing, NAME-BASED,
+# PATH-FREE. The security-load-bearing property: neither the abs_path nor the
+# outcome `reason` (which may embed a path) may ever appear in a notice.
+# ════════════════════════════════════════════════════════════════════════
+print("\n── LoRA-failure notices (name-based, path-free) ──")
+
+_SECRET = "/secret/abs/models/loras/evil-dir/lora-x.safetensors"
+_loras_resolved = [
+    {"path": _SECRET, "weight": 0.8},
+    {"path": "/another/abs/path/good-lora.safetensors", "weight": 1.0},
+]
+_lora_names = ["lora-x", "good-lora"]
+
+# applied=True → no notice.
+_n = mcps._lora_failure_notices(
+    [{"path": _SECRET, "applied": True, "reason": None}],
+    _loras_resolved, _lora_names)
+check("lora-notice: applied LoRA produces no notice", _n == [])
+
+# failed → one WARNING notice naming the CATALOG NAME.
+_n = mcps._lora_failure_notices(
+    [{"path": _SECRET, "applied": False,
+      "reason": f"0 modules applied — {_SECRET}"}],
+    _loras_resolved, _lora_names)
+check("lora-notice: failed LoRA → exactly one notice", len(_n) == 1)
+check("lora-notice: level is WARNING", _n and _n[0]["level"] == "WARNING")
+check("lora-notice: message names the catalog NAME",
+      _n and "lora-x" in _n[0]["message"])
+# THE security assertion: no abs_path (or any component of it) leaks.
+check("lora-notice: message contains NO abs_path (security)",
+      _n and _SECRET not in _n[0]["message"]
+      and "/secret/abs" not in _n[0]["message"]
+      and "evil-dir" not in _n[0]["message"], detail=repr(_n))
+check("lora-notice: message contains NO outcome reason string (may embed path)",
+      _n and "0 modules applied —" not in _n[0]["message"], detail=repr(_n))
+
+# mixed batch: only the failed one produces a notice; applied one silent.
+_n = mcps._lora_failure_notices(
+    [{"path": _SECRET, "applied": False, "reason": "x"},
+     {"path": "/another/abs/path/good-lora.safetensors", "applied": True,
+      "reason": None}],
+    _loras_resolved, _lora_names)
+check("lora-notice: mixed batch → one notice (only the failure)", len(_n) == 1)
+check("lora-notice: mixed batch names the failed one only",
+      _n and "lora-x" in _n[0]["message"] and "good-lora" not in _n[0]["message"])
+
+# unmapped path (not in loras_resolved) → generic, identifier-free notice
+# that still leaks nothing.
+_n = mcps._lora_failure_notices(
+    [{"path": "/unmapped/abs/orphan.safetensors", "applied": False,
+      "reason": "/unmapped/abs/orphan.safetensors"}],
+    _loras_resolved, _lora_names)
+check("lora-notice: unmapped path → one generic notice", len(_n) == 1)
+check("lora-notice: generic notice leaks no path",
+      _n and "/unmapped" not in _n[0]["message"]
+      and "orphan" not in _n[0]["message"], detail=repr(_n))
+
+# empty / None inputs → no notices, no crash.
+check("lora-notice: empty outcomes → []",
+      mcps._lora_failure_notices([], _loras_resolved, _lora_names) == [])
+check("lora-notice: None outcomes → []",
+      mcps._lora_failure_notices(None, _loras_resolved, _lora_names) == [])
+
+# handler wiring: _handle_generate calls _lora_failure_notices on the cached
+# outcomes (source-inspection, mirrors N14's getsource pattern).
+_hg_src = inspect.getsource(mcps._handle_generate)
+check("lora-notice: _handle_generate wires _lora_failure_notices onto notices",
+      "_lora_failure_notices(" in _hg_src and "lora_outcomes" in _hg_src)
+# security-auditor gap-closer: the names fed to the notice builder are the
+# RESOLVED catalog names (rr.name), never the raw agent-supplied reference —
+# so a path-shaped loras[].name cannot inject directory text into a notice.
+check("lora-notice: handler passes resolved lora_names to the notice builder",
+      "lora_names" in _hg_src and "lora_names.append(rr.name)" in _hg_src)
+
+# ════════════════════════════════════════════════════════════════════════
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print("──────────────────────────────────────────────────")

@@ -893,6 +893,60 @@ check("'_native_cudnn' exists in diffusers backend registry",
 
 
 # ──────────────────────────────────────────────────────────────────────
+# ── LoRA outcome plumbing + CLI loud reporting (ADR-015 2026-07-06) ──
+print("\n── LoRA failure surfacing (formatter + CLI reporter) ──")
+
+# lora_failure_warnings: one operator string per FAILED outcome (path-bearing).
+_outcomes = [
+    {"path": "/abs/a.safetensors", "adapter_name": "a", "applied": True,
+     "reason": None},
+    {"path": "/abs/b.safetensors", "adapter_name": "b", "applied": False,
+     "reason": "0 modules applied (adapter not active)"},
+]
+_w = g.lora_failure_warnings(_outcomes)
+check("lora_failure_warnings: one string per FAILED outcome only", len(_w) == 1)
+check("lora_failure_warnings: operator string includes the path (operator-facing)",
+      "/abs/b.safetensors" in _w[0])
+check("lora_failure_warnings: applied outcome produces no warning",
+      all("/abs/a.safetensors" not in s for s in _w))
+check("lora_failure_warnings: all-applied → empty",
+      g.lora_failure_warnings([_outcomes[0]]) == [])
+
+# _report_lora_outcome: exit 3 + banner when warnings present, 0 when absent.
+import io as _io
+import contextlib as _cl
+_buf = _io.StringIO()
+with _cl.redirect_stderr(_buf):
+    _rc = g._report_lora_outcome({"lora_warnings": ["LoRA not applied (x): /p"]})
+check("_report_lora_outcome: returns exit code 3 on failure", _rc == 3)
+check("_report_lora_outcome: prints a prominent banner to stderr",
+      "DID NOT APPLY" in _buf.getvalue())
+_buf2 = _io.StringIO()
+with _cl.redirect_stderr(_buf2):
+    _rc0 = g._report_lora_outcome({"seed": 1})  # no lora_warnings key
+check("_report_lora_outcome: returns 0 when no lora_warnings", _rc0 == 0)
+check("_report_lora_outcome: silent when nothing failed", _buf2.getvalue() == "")
+_rc_empty = g._report_lora_outcome({"lora_warnings": []})
+check("_report_lora_outcome: empty warnings list → 0", _rc_empty == 0)
+
+# _iterate_combo_disposition: the --iterate sweep must treat exit-3 (soft
+# LoRA failure, image written) as NON-FATAL, but abort on real errors
+# (code-review finding 1). Pins the semantics.
+check("iterate-disposition: rc 0 → 'ok' (continue)",
+      g._iterate_combo_disposition(0) == "ok")
+check("iterate-disposition: rc 3 (soft LoRA fail) → 'soft' (continue, flag)",
+      g._iterate_combo_disposition(g._LORA_SOFT_FAIL_RC) == "soft")
+check("iterate-disposition: rc 1 → 'fatal' (abort sweep)",
+      g._iterate_combo_disposition(1) == "fatal")
+check("iterate-disposition: rc 2 → 'fatal' (abort sweep)",
+      g._iterate_combo_disposition(2) == "fatal")
+check("iterate-disposition: exit-3 constant is distinct from hard errors",
+      g._LORA_SOFT_FAIL_RC == 3 and g._LORA_SOFT_FAIL_RC not in (0, 1, 2))
+# _report_lora_outcome returns exactly the soft-fail code (not a bare literal)
+check("_report_lora_outcome: failure code IS _LORA_SOFT_FAIL_RC",
+      g._report_lora_outcome({"lora_warnings": ["x"]}) == g._LORA_SOFT_FAIL_RC)
+
+
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print("──────────────────────────────────────────────────")

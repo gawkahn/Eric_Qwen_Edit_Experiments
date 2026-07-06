@@ -185,16 +185,19 @@ def _resolved_params_as_names(
     out.pop("vae_path", None)
     out.pop("text_encoder_path", None)
     out.pop("text_encoder_2_path", None)
-    # `lora_warnings` strings embed the resolved abs_path (generate.py:
-    # "LoRA skipped ...: <abs_path>"). Drop them from the agent-facing blob —
-    # an abs_path must not cross the boundary (invariant 5). LOAD-BEARING, not
-    # dead code: the MCP cached-pipeline loader (_get_or_load_cached_pipeline)
-    # DOES run the warning-producing loop (_apply_loras) on every cache miss, so
-    # this list can be non-empty; this pop is the enforced boundary that keeps
-    # those abs_paths out of the response. Removing it re-opens the egress
-    # (regression test N11). (security-auditor slice-3 step-2 MEDIUM-1,
-    # 2026-06-02; reaffirmed 2026-06-27 when the cached loader began applying
-    # LoRAs.) The warnings remain on the operator's PNG metadata / stderr.
+    # `lora_warnings` strings embed the resolved abs_path (generate.py
+    # lora_failure_warnings: "LoRA not applied (...): <abs_path>"). Drop them
+    # from the agent-facing blob — an abs_path must not cross the boundary
+    # (invariant 5). LOAD-BEARING defense-in-depth, kept as the enforced
+    # boundary even though the MCP `generate` path now runs generate() with a
+    # cached pipeline (so its metadata carries no lora_warnings): if that ever
+    # changes, this pop keeps the abs_paths out of the response. Removing it
+    # re-opens the egress (regression test N11). The agent-facing signal that a
+    # LoRA silently failed is now the NAME-BASED notice built in
+    # _handle_generate from cached["lora_outcomes"] (ADR-015 2026-07-06) —
+    # never these path-bearing strings. (security-auditor slice-3 step-2
+    # MEDIUM-1, 2026-06-02; reaffirmed 2026-06-27, 2026-07-06.) The path-
+    # bearing warnings remain on the operator's PNG metadata / stderr only.
     out.pop("lora_warnings", None)
     src_loras = metadata.get("loras") or []
     out["loras"] = [
@@ -973,6 +976,47 @@ def _discard_notice(name: str) -> dict:
     }
 
 
+def _lora_failure_notices(
+    lora_outcomes: list, loras_resolved: list, lora_names: list,
+) -> list:
+    """Agent-facing WARNING notices for LoRAs that did not load, NAME-BASED
+    and PATH-FREE (ADR-015 2026-07-06).
+
+    `lora_outcomes` are comfyless.generate._apply_loras outcomes
+    ({path, applied, reason, ...}). Each FAILED outcome's `path` is mapped to
+    its catalog NAME via the parallel `loras_resolved`/`lora_names` request-
+    time lists. **Security-load-bearing:** neither the `path` nor the outcome
+    `reason` (which may embed a path) is EVER placed in a notice — a failed
+    path with no name mapping (should not occur — every applied LoRA came
+    from a resolved reference) yields a generic identifier-free notice rather
+    than leaking the path. Mirrors the _discard_notice name-only discipline.
+    """
+    name_by_path = {
+        spec["path"]: lora_names[i]
+        for i, spec in enumerate(loras_resolved or [])
+        if i < len(lora_names)
+    }
+    out: list = []
+    for o in lora_outcomes or []:
+        if o.get("applied"):
+            continue
+        nm = name_by_path.get(o.get("path"))
+        if nm:
+            out.append({
+                "level": "WARNING",
+                "message": (f"LoRA '{nm}' was requested but did not load "
+                            f"(adapter not active); the image was generated "
+                            f"WITHOUT it."),
+            })
+        else:
+            out.append({
+                "level": "WARNING",
+                "message": ("A requested LoRA did not load (adapter not "
+                            "active); the image was generated without it."),
+            })
+    return out
+
+
 # ════════════════════════════════════════════════════════════════════════
 # Optional base64 image return  (ADR-017)
 # ════════════════════════════════════════════════════════════════════════
@@ -1264,7 +1308,7 @@ _PIPELINE_CACHE: dict = {
     "pipeline": None,
     "model_family": None,
     "guidance_embeds": None,
-    "lora_warnings": [],
+    "lora_outcomes": [],
 }
 
 
@@ -1276,7 +1320,7 @@ def _evict_pipeline_cache() -> None:
     _PIPELINE_CACHE["pipeline"] = None
     _PIPELINE_CACHE["model_family"] = None
     _PIPELINE_CACHE["guidance_embeds"] = None
-    _PIPELINE_CACHE["lora_warnings"] = []
+    _PIPELINE_CACHE["lora_outcomes"] = []
     import gc
     gc.collect()
     try:
@@ -1360,13 +1404,13 @@ def _get_or_load_cached_pipeline(
         quant_skip=tuple(quant_skip or ()),
         quant_only=tuple(quant_only or ()),
     )
-    lora_warnings = _apply_loras(pipe, loras_resolved)
+    lora_outcomes = _apply_loras(pipe, loras_resolved)
     _PIPELINE_CACHE.update({
         "key": key,
         "pipeline": pipe,
         "model_family": model_family,
         "guidance_embeds": guidance_embeds,
-        "lora_warnings": lora_warnings,
+        "lora_outcomes": lora_outcomes,
     })
     return _PIPELINE_CACHE
 
@@ -1591,10 +1635,12 @@ async def _handle_generate(
         quant_skip=tuple(payload.get("quant_skip") or ()),
         quant_only=tuple(payload.get("quant_only") or ()),
     )
-    # NOTE: cached["lora_warnings"] are logged operator-side by _apply_loras but
-    # are NOT surfaced in `notices` — they embed the absolute LoRA path, which
-    # must never cross the MCP boundary (ADR-015 no-abs-path contract). An
-    # agent-facing LoRA-failure signal would need name-based redaction (future).
+    # Surface silently-failed LoRAs to the agent NAME-BASED and PATH-FREE
+    # (ADR-015 2026-07-06). See _lora_failure_notices — the path and the
+    # outcome reason MUST NOT cross the MCP boundary.
+    notices.extend(_lora_failure_notices(
+        cached.get("lora_outcomes", []), loras_resolved or [], lora_names))
+
     metadata = generate(
         model_path=model_abs,
         prompt=payload["prompt"],
