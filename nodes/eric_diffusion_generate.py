@@ -211,10 +211,14 @@ def _build_call_kwargs(
             kwargs["max_sequence_length"] = max_sequence_length
         return kwargs
 
-    if model_family in ("sdxl", "sd3", "sd1", "zimage"):
+    if model_family in ("sdxl", "sd3", "sd1", "zimage", "zimage-turbo"):
         # Classical CFG — two forward passes, negative prompt supported.
         # guidance_scale is the true CFG scale (not a distillation embedding).
         # No T5 encoder; max_sequence_length is not a standard parameter.
+        # zimage-turbo shares this routing (cfg 1.0 → single pass); it MUST
+        # be listed so the shared infer_model_family's new family doesn't
+        # leak to the introspection fallback (ADR-009 2026-07-06,
+        # code-review finding 1).
         kwargs = {**base, "guidance_scale": cfg_scale}
         if negative_prompt:
             kwargs["negative_prompt"] = negative_prompt

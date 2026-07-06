@@ -58,7 +58,7 @@ python -m py_compile nodes/<file>.py   # syntax check a single file
 ```bash
 python3 test_manual_loop.py                 # 186 tests: samplers, manual loop, encode helper, Qwen edit
 python3 test_multistage.py                  # 141 tests: multistage infrastructure
-python3 test_params_schema.py               # 178 tests: comfyless COMFYLESS_SCHEMA + adapters + krea routing/rebalance + Krea2 attention-backend pin
+python3 test_params_schema.py               # 193 tests: comfyless COMFYLESS_SCHEMA + adapters + krea routing/rebalance + Krea2 attention-backend pin + Z-Image base/Turbo name-hint detection & routing (ADR-009)
 python3 test_cascade.py                     # 129 tests: comfyless Stable Cascade dispatch (ADR-010)
 python3 test_machine_boundary_validator.py  # 130 tests: machine-boundary validator (ADR-012)
 python3 test_iterate.py                     #  92 tests: comfyless --iterate (ADR-008)
@@ -73,7 +73,7 @@ python3 test_lora_audit.py                  # 197 tests: scripts/lora_audit.py c
 python3 test_lora_convert_krea.py           #  24 tests: Krea-2 LoRA format-conversion plan (krea_native → diffusers_krea)
 python3 test_catalog_db.py                  # 125 tests: catalog DB metadata plane (ADR-022 S1-S5) — schema, FUSE guard, sanitizer, upsert/stale semantics, manifest kind-branch join, families/sidecar/exclusion/search, civitai enrichment (mocked network), load-plane independence
 ```
-All sixteen suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 2154 unit tests; expect 0 failures.
+All sixteen suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 2169 unit tests; expect 0 failures.
 
 `test_flux2.py` is a live GPU smoke test that performs an actual Flux.2 generation — separate from the unit suites above. Run only when you need to verify end-to-end Flux.2 behavior.
 
@@ -272,7 +272,7 @@ The MCP server (`comfyless/mcp_server.py`) caches one pipeline in-process and ev
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **Eric_Qwen_Edit_Experiments** (4131 symbols, 7537 relationships, 287 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **Eric_Qwen_Edit_Experiments** (4350 symbols, 7840 relationships, 293 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 

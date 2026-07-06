@@ -122,7 +122,12 @@ def scan_model_family(model_dir: str) -> Optional[str]:
     # Krea-2 Raw vs Turbo share `Krea2Pipeline`); pass it so the catalog
     # classifies `krea` vs `krea-turbo` at scan time (no diffusers class
     # import required — same scan-vs-load split documented above).
-    return infer_model_family(class_name, bool(index.get("is_distilled", False)))
+    # `name_hint` = the model dir: Z-Image-Turbo carries no is_distilled
+    # marker, so its "turbo" dir/repo name is the discriminator (scoped to
+    # the zimage family; ADR-009 2026-07-06).
+    return infer_model_family(
+        class_name, bool(index.get("is_distilled", False)),
+        name_hint=model_dir)
 
 
 # ════════════════════════════════════════════════════════════════════════

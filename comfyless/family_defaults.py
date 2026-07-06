@@ -115,9 +115,19 @@ FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
     # Source: SAI SDXL model card; community consensus for fine-tunes.
     "sdxl":       {"cfg_scale": 7.0, "steps": 28},
 
-    # ── zimage ──────────────────────────────────────────────────────────
-    # New family; no published recommendation yet. Holding at flux-like
-    # values until calibration data exists.
-    # Source: placeholder pending empirical sweep.
-    "zimage":     {"cfg_scale": 4.0, "steps": 30},
+    # ── zimage (Z-Image-base) ───────────────────────────────────────────
+    # The full base model. flux-like guidance_scale path. 30 steps / cfg 4.0
+    # confirmed to render cleanly in gen-validation (2026-07-06 Phase A).
+    "zimage":       {"cfg_scale": 4.0, "steps": 30},
+
+    # ── zimage-turbo (Z-Image-Turbo) ────────────────────────────────────
+    # Step-distilled variant. Z-Image ships NO is_distilled marker (unlike
+    # Krea-2), so `infer_model_family` detects Turbo by "turbo" in the model
+    # path (ADR-009 2026-07-06). 8 steps / cfg 1.0 (guidance_scale <= 1.0 →
+    # single forward pass, no CFG). Base defaults (30/4.0) DESTROY this
+    # distill — empirically confirmed: a batch of Turbo LoRAs rendered pure
+    # noise under base params and cleanly at 8/1.0 (gen-validation
+    # 2026-07-06). Routes through the zimage guidance_scale branch in
+    # `_build_call_kwargs`.
+    "zimage-turbo": {"cfg_scale": 1.0, "steps": 8},
 }

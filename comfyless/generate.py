@@ -629,7 +629,12 @@ def _build_call_kwargs(
             kwargs["max_sequence_length"] = max_sequence_length
         return kwargs
 
-    if model_family in ("sdxl", "sd3", "sd1", "zimage"):
+    if model_family in ("sdxl", "sd3", "sd1", "zimage", "zimage-turbo"):
+        # zimage-turbo shares Z-Image's guidance_scale routing; its
+        # FAMILY_DEFAULTS cfg 1.0 collapses CFG to a single forward pass.
+        # It MUST be listed here — the introspection fallback would route
+        # true_cfg_scale (which ZImagePipeline.__call__ rejects) and drop
+        # CFG entirely (ADR-009 2026-07-06).
         kwargs = {**base, "guidance_scale": cfg_scale}
         if negative_prompt:
             kwargs["negative_prompt"] = negative_prompt

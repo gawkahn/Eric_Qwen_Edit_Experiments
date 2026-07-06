@@ -631,6 +631,40 @@ check("krea-turbo: Krea2Pipeline + is_distilled=True → 'krea-turbo'",
 check("krea: is_distilled is a no-op for non-krea classes",
       infer_model_family("FluxPipeline", True) == "flux")
 
+# ── zimage base vs turbo: name-hint discriminator (ADR-009 2026-07-06) ──
+# Z-Image ships NO is_distilled marker; Turbo detected by "turbo" in path.
+check("zimage: ZImagePipeline, no hint → 'zimage' (base)",
+      infer_model_family("ZImagePipeline") == "zimage")
+check("zimage: ZImagePipeline + Z-Image-base path → 'zimage'",
+      infer_model_family("ZImagePipeline", False,
+                         name_hint="/hf-local/Z-Image-base") == "zimage")
+check("zimage-turbo: ZImagePipeline + Z-Image-Turbo path → 'zimage-turbo'",
+      infer_model_family("ZImagePipeline", False,
+                         name_hint="/hf-local/Z-Image-Turbo")
+      == "zimage-turbo")
+check("zimage-turbo: HF snapshot path with 'Turbo' detected",
+      infer_model_family("ZImagePipeline", False,
+                         name_hint="/hub/models--Tongyi--Z-Image-Turbo/"
+                                   "snapshots/abc123") == "zimage-turbo")
+check("zimage-turbo: case-insensitive 'TURBO'",
+      infer_model_family("ZImagePipeline", False,
+                         name_hint="/x/Z-IMAGE-TURBO") == "zimage-turbo")
+# name_hint 'turbo' is scoped to zimage — never flips another family.
+check("name_hint 'turbo' is a no-op for non-zimage classes",
+      infer_model_family("FluxPipeline", False,
+                         name_hint="/x/Flux-Turbo") == "flux")
+check("zimage: empty name_hint (default) → base, never turbo",
+      infer_model_family("ZImagePipeline", False, name_hint="") == "zimage")
+# Family-default values: base holds, turbo is the empirically-validated pair.
+check("zimage: cfg_scale=4.0 (base, Phase-A validated)",
+      FAMILY_DEFAULTS["zimage"].get("cfg_scale") == 4.0)
+check("zimage: steps=30 (base)",
+      FAMILY_DEFAULTS["zimage"].get("steps") == 30)
+check("zimage-turbo: cfg_scale=1.0 (single-pass; base 4.0 destroys distill)",
+      FAMILY_DEFAULTS["zimage-turbo"].get("cfg_scale") == 1.0)
+check("zimage-turbo: steps=8 (distilled)",
+      FAMILY_DEFAULTS["zimage-turbo"].get("steps") == 8)
+
 # Family-default values are the model-card numbers.
 check("krea: cfg_scale=3.5 (Raw model card)",
       FAMILY_DEFAULTS["krea"].get("cfg_scale") == 3.5)
@@ -691,6 +725,31 @@ check("krea routing: negative_prompt dropped when pipe doesn't accept it",
       "negative_prompt" not in _kw)
 check("krea routing: max_sequence_length dropped when pipe doesn't accept it",
       "max_sequence_length" not in _kw)
+
+
+# zimage-turbo routing — the load-bearing check: it MUST route through the
+# guidance_scale branch, NOT the introspection fallback (which would emit
+# true_cfg_scale and drop CFG). Regression guard for ADR-009 2026-07-06.
+class _FakeZImagePipe:
+    def __call__(self, prompt, height, width, num_inference_steps, generator,
+                 guidance_scale=None, negative_prompt=None):
+        pass
+
+
+_kw = g._build_call_kwargs(
+    _FakeZImagePipe(), "zimage-turbo", False, "a cat", "",
+    1024, 1024, 8, 1.0, None, 512, None,
+)
+check("zimage-turbo routing: guidance_scale=1.0 passed (single-pass)",
+      _kw.get("guidance_scale") == 1.0)
+check("zimage-turbo routing: NOT true_cfg_scale (would drop via fallback)",
+      "true_cfg_scale" not in _kw)
+_kw = g._build_call_kwargs(
+    _FakeZImagePipe(), "zimage", False, "a cat", "blurry",
+    1024, 1024, 30, 4.0, None, 512, None,
+)
+check("zimage (base) routing: guidance_scale=4.0 + negative forwarded",
+      _kw.get("guidance_scale") == 4.0 and _kw.get("negative_prompt") == "blurry")
 
 
 # ──────────────────────────────────────────────────────────────────────

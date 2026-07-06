@@ -43,7 +43,8 @@ _FAMILY_PATTERNS = [
 ]
 
 
-def infer_model_family(class_name: str, is_distilled: bool = False) -> str:
+def infer_model_family(class_name: str, is_distilled: bool = False,
+                       name_hint: str = "") -> str:
     """Map a diffusers pipeline class name to a short family string.
 
     ``is_distilled`` lets one pipeline class resolve to two families when the
@@ -53,13 +54,34 @@ def infer_model_family(class_name: str, is_distilled: bool = False) -> str:
     (``is_distilled: true``), which want very different defaults (Raw: 52
     steps / cfg 3.5; Turbo: 8 steps / cfg 0.0). The distilled krea variant
     is reported as ``"krea-turbo"`` so ``FAMILY_DEFAULTS`` can carry both.
-    The single-arg call form is unchanged for every existing caller.
+
+    ``name_hint`` is the model directory / repo path; it exists ONLY for
+    Z-Image, which — unlike Krea-2 — ships **no** ``is_distilled`` marker:
+    Z-Image-base and Z-Image-Turbo are both bare ``ZImagePipeline``,
+    differing only in scheduler ``shift`` (6.0 vs 3.0, a tuning value, not a
+    reliable discriminator). So the Turbo variant is detected by ``"turbo"``
+    appearing in the model path/name — the signal everyone actually uses (HF
+    repo ``Tongyi/Z-Image-Turbo``). Base defaults (30 steps / cfg 4.0)
+    destroy the Turbo distill, which wants 8 steps / cfg 1.0. Scoped to the
+    ``zimage`` family so no other family is affected by a stray ``"turbo"``
+    in a path. See ADR-009 changelog 2026-07-06.
+
+    The single-/two-arg call forms are unchanged for every existing caller.
     """
     lower = class_name.lower().replace("_", "").replace("-", "")
     for substr, family in _FAMILY_PATTERNS:
         if substr in lower:
             if family == "krea" and is_distilled:
                 return "krea-turbo"
+            if family == "zimage" and "turbo" in name_hint.lower():
+                # INFO so a false positive (a base model under a path that
+                # happens to contain "turbo") surfaces in logs rather than
+                # silently getting Turbo defaults (code-review finding 3).
+                print(f"[comfyless] Z-Image Turbo inferred from path "
+                      f"({name_hint!r}) — using zimage-turbo defaults "
+                      f"(8 steps / cfg 1.0). If this is actually the base "
+                      f"model, its path contains 'turbo'.")
+                return "zimage-turbo"
             return family
     return lower  # best-effort fallback for unrecognised models
 
@@ -93,7 +115,13 @@ def detect_pipeline_class(model_path: str):
             f"Try upgrading diffusers: pip install -U diffusers"
         )
 
-    family = infer_model_family(class_name, bool(index.get("is_distilled", False)))
+    # name_hint = the model path: Z-Image-Turbo has no config distill marker,
+    # so the "turbo" in its dir/repo name is the only reliable signal
+    # (ADR-009 2026-07-06). Harmless for every other family (scoped to
+    # `zimage` inside infer_model_family).
+    family = infer_model_family(
+        class_name, bool(index.get("is_distilled", False)),
+        name_hint=model_path)
     return pipeline_class, class_name, family
 
 

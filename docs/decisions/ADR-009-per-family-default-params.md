@@ -217,6 +217,33 @@ them. The dict is therefore designed for one-edit changes:
      diffusers release shipping `Krea2Pipeline` (see `TECH_DEBT.md` →
      Dependencies); classification and defaults work on the current pin.
 
+- **2026-07-06** — Z-Image base/Turbo split (no code to the precedence
+  ladder; a third variant-detection signal). Z-Image ships **two** models
+  under one bare `ZImagePipeline` class — `Z-Image-base` and the
+  step-distilled `Z-Image-Turbo` — but, **unlike Krea-2, carries no
+  `is_distilled` marker** in `model_index.json`. The only structural delta
+  is scheduler `shift` (base 6.0 / Turbo 3.0), a tuning value, not a
+  reliable discriminator. So the Turbo variant is detected by **`"turbo"`
+  in the model dir/repo path** — the signal everyone actually uses (HF
+  `Tongyi/Z-Image-Turbo`). `infer_model_family` gains an optional
+  `name_hint` arg (default `""` → existing 1-/2-arg callers unchanged);
+  `detect_pipeline_class` and `comfyless/catalog.py:scan_model_family` pass
+  the model path. The heuristic is **scoped to the `zimage` family** so a
+  stray `"turbo"` in any other family's path is a no-op. New family
+  `"zimage-turbo"` (8 steps / cfg 1.0) is added to `FAMILY_DEFAULTS` and to
+  the `zimage` `guidance_scale` branch in `_build_call_kwargs` (it MUST be
+  listed there — the introspection fallback would emit `true_cfg_scale`,
+  which `ZImagePipeline.__call__` rejects, and drop CFG entirely). base
+  keeps 30 steps / cfg 4.0. **Empirical basis:** a batch of Turbo-trained
+  LoRAs rendered pure noise under base params (30/4.0) and cleanly at 8/1.0
+  in gen-validation (2026-07-06); resolves the same-day TECH_DEBT entry.
+  **Alternative rejected:** scheduler-`shift` heuristic — it is a tuning
+  value that upstream can change, whereas the repo/dir name is stable and
+  human-authored. **Deferred:** per-*model* default overrides (an operator
+  manifest) would generalize beyond name-heuristics if more no-marker
+  distills appear; not built until a second case exists.
+
 ## AI-Disclosure
 
-Claude (Opus 4.7) authored; Grant reviewed.
+Claude (Opus 4.7) authored; Grant reviewed. 2026-07-06 zimage-turbo
+amendment: Claude (Fable 5) authored; Grant reviewed.
