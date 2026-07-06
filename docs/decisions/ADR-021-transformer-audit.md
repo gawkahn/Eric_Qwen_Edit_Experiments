@@ -1,7 +1,7 @@
 # ADR-021: Transformer audit — `kind:"transformer"` entries in `scripts/lora_audit.py`
 
 **Date:** 2026-07-05
-**Status:** proposed (implementation gated by `code-reviewer` + `security-auditor`, both Opus — same L3 read-surface class as ADR-014)
+**Status:** accepted (2026-07-05 — security-auditor round 2 CLEAN after round-1 fold; `docs/security/review-adr021-transformer-audit-2026-07-05.md`. Implementation slice still runs `code-reviewer` + `security-auditor`, carrying round-2 INFO notes NEW-1..NEW-3.)
 **Risk:** L3 — reads caller-supplied directory trees + bounded content reads of caller-supplied weight files. **No new write/delete surface** (strictly narrower than ADR-014, which this extends).
 **Related:** ADR-014 (LoRA audit tool — the manifest contract, containment policy §6, and the `kind` forward-compat hook this fills), ADR-019 (quant formats whose verdicts this reuses), ADR-018 (multi-root scan for the *serving* side; this ADR is the *audit* side of the same trees).
 **Vision:** `docs/vision/slice-transformer-audit.md` (approved 2026-07-05).
@@ -125,3 +125,5 @@ Transformer entries add to `files[]`:
   - **F-4 (MED)**: §4 — hostile-header guard mandated for the 1-MiB sampled read (`max(0, min(hi-lo, 1 MiB, remaining))`); short/empty/errored read on either side → NOT byte-equal; base-side reads confirmed header-only.
   - **F-6 (LOW/forward)**: Deferred — auto-load-of-unvalidated-usable re-review trigger recorded. F-7/F-8 (INFO): no change required (importlib load side-effect-free; fail-toward-inclusion affirmed sound).
   Re-firing `security-auditor` round 2 on the amended ADR; implementation begins only on `CLEAN`.
+
+- **2026-07-05 (security-auditor round 2 → CLEAN, Status accepted):** All round-1 folds verified ADDRESSED (F-1 across equal/ancestor/descendant; F-2 collision-freedom; F-3 contract sufficiency; F-4 guard formula verified against the safetensors layout). Three INFO notes for the implementation slice: NEW-1 use path-component-boundary disjointness (`os.path.commonpath`-style), NEW-2 inline-comment the hard-block's F-1 rationale so warn-don't-block habit doesn't soften it, NEW-3 deterministic tie-break (tensor key name) for the K=4 sampler. Implementation may begin.

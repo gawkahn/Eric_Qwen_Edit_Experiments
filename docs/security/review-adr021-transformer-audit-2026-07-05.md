@@ -1,6 +1,6 @@
 # Security review — ADR-021 transformer audit (design phase)
 
-**Date:** 2026-07-05 · **Reviewer:** security-auditor (Opus, model pinned at invocation) · **Round 1 verdict: CHANGES REQUIRED** (1 HIGH / 3 MED / 2 LOW / 2 INFO — all folded same-day, see ADR-021 Changelog). Round 2 appended below when complete.
+**Date:** 2026-07-05 · **Reviewer:** security-auditor (Opus, model pinned at invocation) · **Round 1: CHANGES REQUIRED** (1 HIGH / 3 MED / 2 LOW / 2 INFO — all folded same-day) · **Round 2: CLEAN** (all folds ADDRESSED; 3 INFO implementation notes NEW-1..NEW-3 carried into the implementation slice). ADR-021 Status → accepted.
 
 **AI-Disclosure:** Claude (Opus, security-auditor subagent) authored the review; Claude (Fable 5) drove the slice; Grant reviewed.
 
@@ -46,6 +46,34 @@ Remediation: mandate `max(0, min(hi - lo, 1 MiB, remaining_file_bytes))` and spe
 
 ---
 
-## Round 2
+## Round 2 (verbatim)
 
-*(pending — fired on the amended ADR after the round-1 fold-in.)*
+**Date:** 2026-07-05 · **Reviewer:** security-auditor (Opus, model pinned at invocation) · **Round 2 verdict: CLEAN.**
+
+### Per-finding fold verification
+
+**F-1 (HIGH) — root-disjointness startup invariant — ADDRESSED.** §1 rejects every `--transformer-root` that is equal to / ancestor of / descendant of the resolved `--audit-root`, exit 1, naming both paths. The three delete-crossing cases all close: **equal**, **descendant** (`--audit-root /models --transformer-root /models/checkpoints` — the original scenario), and **ancestor** (`--audit-root /models/checkpoints --transformer-root /models` — where a LoRA under audit-root would sit under a transformer root). The check operates on realpaths, and the pre-existing per-entry O_NOFOLLOW realpath-descendancy on the delete path backstops the symlink-nesting variant. The hard-block-over-warn choice is correctly justified by the ADR-014 Alternative D irreversible-deletion precedent (deliberate, documented deviation from warn-don't-block — see NEW-2).
+
+**F-2 (MED) — root_index identity + sort key — ADDRESSED.** Pairwise-disjoint roots guarantee each physical file appears under exactly one root, so `(root_index, relative_path)` is unique; LoRA entries carry `-1` and cannot collide with transformer indices (≥0). CLI order is stable; the key is a total order. Same-basename roots resolve to distinct indices. Vision negative case 9 codifies it.
+
+**F-3 (MED) — kind-branching contract + dual proof hooks — ADDRESSED.** "Consumers MUST branch on `kind`" with two hooks (kind-filtering consumer sees exactly the v1 LoRA view; naive-iterate consumer asserted to misparse). Keeping `audit_version` 1 is defensible on the stated assumption that the only v1 consumer is the in-repo ADR-022 catalog, with the external-consumer escape hatch on record.
+
+**F-4 (MED) — hostile-header guard — ADDRESSED.** Verified `max(0, min(hi - lo, 1 MiB, file_size - (8 + header_len + lo)))` against the safetensors layout: `hi < lo` → floored to 0; `lo` past EOF → 0; hostile `header_len` → 0, with the inherited 100 MB header cap bounding the prefix parse. Empty-equals-empty closed by "short/empty/errored read on EITHER side → NOT byte-equal." Fail-toward-inclusion preserved; base side confirmed header-only. Vision negative case 10 codifies it.
+
+**F-5 (LOW) — pairwise disjointness — ADDRESSED.** Kills duplicate-minting without a dedupe pass; reinforces F-2.
+
+**F-6 (LOW/forward) — auto-load re-review trigger — ADDRESSED.** Deferred section records the trigger (ADR-014 F-10 pattern).
+
+**F-7 / F-8 (INFO)** — no change required, unchanged and still sound.
+
+### New concerns introduced by the folds (all INFO; implementation notes)
+
+**NEW-1 — disjointness predicate mechanism unspecified (prefix vs path-component).** Naive `startswith` over-rejects sibling dirs sharing a name-prefix (`/a/checkpoints` vs `/a/checkpoints_old`) — errs fail-closed, not a hole. Implementation: compare on path-component boundaries (`os.path.commonpath` / `Path.is_relative_to`).
+
+**NEW-2 — hard-block is a deliberate deviation from warn-don't-block.** Correct here (irreversible deletion), but a future maintainer applying the warn-habit could downgrade it and silently reopen F-1. Implementation: inline comment tying the abort to F-1 / Vision invariant 7.
+
+**NEW-3 — "K=4 largest unique-shape tensors" lacks a tie-break** for equal-sized tensors; content comparison converges regardless, so purely a reproducibility note against invariant 10. Implementation: deterministic tie-break (e.g. tensor key name).
+
+### Verdict
+
+**CLEAN.** All round-1 findings folded correctly. The three NEW items are INFO-level implementation-hardening notes. Implementation may proceed; carry NEW-1..NEW-3 into the `code-reviewer` + `security-auditor` pass on the implementation slice, and ensure Vision proof hooks exercise the F-1 ancestor case and the F-4 empty-read path (negative cases 8, 10 already name them).
