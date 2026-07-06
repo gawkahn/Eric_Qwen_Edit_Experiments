@@ -690,3 +690,36 @@ a design slice, not a patch.
 **Trigger:** next zimage-related slice, OR the first user hit of fried
 Z-Image-Turbo output via MCP/OWUI (agents don't pass explicit steps), OR any
 new distilled variant landing in hf-local with the same no-marker problem.
+
+## 2026-07-06 — lora_audit under-reports convertibility: ignores diffusers' built-in Kohya converters
+
+**What:** `scripts/lora_audit.py` classifies a LoRA `convertable` only when
+(a) direct key-match against a base or (b) this repo's `find_matching_plan`
+returns a plan. It does NOT account for **tier-1 of the runtime loader** —
+`pipeline.load_lora_weights()`, which invokes diffusers' OWN Kohya converters
+(`_convert_kohya_flux_lora_to_diffusers`, `_convert_kohya_flux2_lora_to_diffusers`,
+and the SDXL/SD3 non-diffusers paths). Result: legit Kohya-format
+(`lora_unet_*`) LoRAs for diffusers-supported archs are mislabeled
+`unconvertable` and excluded from the catalog.
+**Confirmed 2026-07-06 (CPU proof):** `Flux.1-dev/realistic/Alternative_Girls`
+(912 Kohya keys, base_model=flux1) → `find_matching_plan` None, audit
+`wrong_arch`/excluded — BUT `diffusers._convert_kohya_flux_lora_to_diffusers`
+converts it cleanly to 988 valid `transformer.transformer_blocks...lora_A`
+keys → loads via tier-1. **~54 Flux.1 Kohya LoRAs under loras/Flux.1-dev/**
+are wrongly excluded this way (a large slice of Grant's usable Flux
+collection). SD3.5-Large case (`Photorealistic-SD3.5-Large-LoRA`) is
+adjacent but murkier — generic converter mangles SD3 keys; no dedicated SD3
+Kohya converter in diffusers; needs a runtime load to confirm.
+**Why not now:** correct fix is a design change to the audit's `convertable`
+detection — add a diffusers-native-conversion probe (call the arch-appropriate
+`_convert_kohya_*` on the state dict; if it yields diffusers-shaped keys,
+classify `convertable` with a new reason like `kohya_diffusers_native`).
+That's an ADR-021/ADR-014 amendment + code + review, not a patch. Also wants
+a decision on the SD3 branch and whether to actually run diffusers'
+conversion at catalog-build time vs. record-and-defer-to-runtime.
+**Trigger:** next lora-audit slice, OR Grant wanting the ~54 Flux LoRAs as
+catalog candidates now (interim workaround: they load fine at runtime today
+by absolute path — only the CATALOG candidacy flag is wrong, not the
+loader). Interim manual reclaim: `catalog_cli exclude --clear <name>` won't
+help (audit sets excluded=1 on rebuild); would need an operator-include
+override, which doesn't exist yet.
