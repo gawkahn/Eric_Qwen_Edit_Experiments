@@ -691,6 +691,8 @@ a design slice, not a patch.
 Z-Image-Turbo output via MCP/OWUI (agents don't pass explicit steps), OR any
 new distilled variant landing in hf-local with the same no-marker problem.
 
+**Resolved: 2026-07-06** — `infer_model_family` now detects Z-Image-Turbo by `"turbo"` in the model path (scoped to the zimage family); new `zimage-turbo` FAMILY_DEFAULTS (8 steps / cfg 1.0) + routing in `_build_call_kwargs`. ADR-009 changelog 2026-07-06; tests in test_params_schema.py; verified end-to-end (Z-Image-Turbo → zimage-turbo → 8/1.0).
+
 ## 2026-07-06 — lora_audit under-reports convertibility: ignores diffusers' built-in Kohya converters
 
 **What:** `scripts/lora_audit.py` classifies a LoRA `convertable` only when
@@ -723,3 +725,48 @@ by absolute path — only the CATALOG candidacy flag is wrong, not the
 loader). Interim manual reclaim: `catalog_cli exclude --clear <name>` won't
 help (audit sets excluded=1 on rebuild); would need an operator-include
 override, which doesn't exist yet.
+
+## 2026-07-06 — LoKR LoRAs fail to load on Z-Image (all load paths)
+
+**What:** Standard LoRA (lora_A/B) loads fine on Z-Image; **LoKR (LyCORIS
+Kronecker) does NOT.** Confirmed on 3 files (lora-anal, lora-blowjob2,
+lora-fisting; w1=[4,4], w2=[3840,64]). Failure chain: (1) diffusers' native
+`load_lora_weights` (the fast path that DOES understand Z-Image's key
+mapping) has no LyCORIS/LoKR support — LoKR never uses the working path;
+(2) the PEFT-injection fallback builds the LoKr adapter with a decompose
+factor derived from the target dim, which does NOT match this file's stored
+factorization (built w1=[60,60] vs stored [4,4]) → load_state_dict size
+mismatch; (3) the direct-merge fallback (`reconstruct_lokr_delta`) can't map
+the LoRA's `layers.N.attention.*` names onto Z-Image's actual param layout
+(`all_final_layer.2-1.*`, `all_x_embedder.*`, resolution-keyed) → applied=0,
+adapter NOT active. The failure is **silent** (non-fatal by design: warn +
+generate without adapter).
+**Why not now:** the working LoKR merge in this repo (reconstruct_lokr_delta
++ conversion plans) was built/validated for Flux/Klein arch (klein_snofs,
+Realism_Engine) where w1/w2 are directly stored and the key-mapping is known.
+Z-Image is a newer arch with a different internal param layout not wired into
+the LoKR direct-merge path, AND the small decompose factor (4) isn't handled
+by the PEFT reconstruction. Fixing = extend the LoKR key-mapping/factor
+handling to Z-Image (arch-specific) — a real code slice with its own review.
+**Trigger:** Grant wanting Z-Image LoKR LoRAs usable; OR any new arch that
+ships LoKR LoRAs. Affected entries are marked `gen_tests.verdict='load_failed'`.
+
+## 2026-07-06 — gen-validation judged output images, not adapter application (methodology gap)
+
+**What:** The Phase-A/B/rerun LoRA gen-validation judged the OUTPUT images
+(baseline vs lora) to assign verdicts. Because LoRA load failures are
+**silent** (loader warns + generates WITHOUT the adapter — see the
+LoKR/Z-Image entry above and `project_krea_lora_regression`), a failed load
+produces lora.png ≈ baseline.png, which the harness scored as
+"no_effect"/"inconclusive"/"pass" — masking the failure. 3 LoKR failures were
+mislabeled this way and only caught when Grant hit the error interactively.
+This is the THIRD time silent LoRA-load failure has bitten (MCP: fixed
+28fea0b; daemon log; now gen-validation).
+**Why not now:** the proper fix is to make LoRA load-failure LOUD — either
+the loader/CLI returns a non-zero signal / structured "adapter not active"
+the client surfaces, or the gen-validation harness parses the loader log for
+"0 modules applied / NOT active" before trusting an A/B verdict. The latter
+is a harness fix; the former is the real product fix (surface daemon LoRA
+warnings client-side, already a Backlog candidate per the memory).
+**Trigger:** next gen-validation batch (harness must gate on load success);
+OR wiring the LLM iterative generator (it MUST know if a LoRA applied).
