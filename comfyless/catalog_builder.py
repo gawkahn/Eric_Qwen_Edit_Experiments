@@ -289,13 +289,31 @@ def build(db_path: str,
                 # ── Family resolution, evidence precedence (§5):
                 # audit > sidecar declaration > path hint. Disagreement →
                 # highest wins, losers recorded in family_conflict.
-                ev_audit = next(
-                    (base_family[b] for b in info.get("ok_bases", [])
-                     if b in base_family), None)
                 ev_sidecar = family_from_hint(
                     (sidecar or {}).get("base_model"), known_families)
                 ev_path = family_from_hint(
                     os.path.dirname(e["abs_path"]), known_families)
+                ok_families = [base_family[b]
+                               for b in info.get("ok_bases", [])
+                               if b in base_family]
+                dup_base = info.get("duplicate_of")
+                if dup_base and dup_base in base_family:
+                    # Byte-identity with a base is the strongest possible
+                    # family evidence (real-data fix 2026-07-06: the 5 Qwen
+                    # repackages had picked 'chroma' via alphabetical-first
+                    # matched_bases).
+                    ev_audit = base_family[dup_base]
+                elif ok_families:
+                    # Multi-base audit matches are REAL (Flux.1 LoRAs
+                    # legitimately also pass on Chroma — same arch). Prefer
+                    # the ok-base agreeing with the sidecar declaration,
+                    # then the path hint; alphabetical-first only as the
+                    # last resort.
+                    ev_audit = (ev_sidecar if ev_sidecar in ok_families
+                                else ev_path if ev_path in ok_families
+                                else ok_families[0])
+                else:
+                    ev_audit = None
                 family = ev_audit or ev_sidecar or ev_path
                 conflict = None
                 losers = [

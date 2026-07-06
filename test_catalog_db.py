@@ -377,6 +377,16 @@ with tempfile.TemporaryDirectory() as td:
     with open(os.path.join(lr, "auditwins.metadata.json"), "w") as f:
         json.dump({"base_model": "Flux.2 D",
                    "civitai": {"trainedWords": []}}, f)
+    # multi-base pick: OK on two bases; sidecar-agreeing base must win
+    _mk(os.path.join(lr, "multibase.safetensors"))
+    with open(os.path.join(lr, "multibase.metadata.json"), "w") as f:
+        # sidecar agrees with the alphabetically-SECOND base (synth →
+        # qwen-image): old alphabetical-first would pick flux2 (fluxb) —
+        # review 2026-07-06: the fixture must discriminate the branch
+        json.dump({"base_model": "Qwen",
+                   "civitai": {"trainedWords": []}}, f)
+    # duplicate_of beats alphabetical matched_bases order
+    _mk(os.path.join(tr, "dupfam.safetensors"))
     # finding-4: sidecar family alone, no audit manifest entry → included
     _mk(os.path.join(lr, "sideonly.safetensors"))
     with open(os.path.join(lr, "sideonly.metadata.json"), "w") as f:
@@ -396,8 +406,10 @@ with tempfile.TemporaryDirectory() as td:
         "audit_version": 1,
         "audit_root": lr,
         "transformer_roots": [tr],
-        "bases": {"synth": {
-            "path": os.path.join(mb, "QwenImage", "transformer")}},
+        "bases": {
+            "synth": {"path": os.path.join(mb, "QwenImage", "transformer")},
+            "fluxb": {"path": os.path.join(mb, "Flux2-dev", "transformer")},
+        },
         "files": [
             {"kind": "lora",
              "relative_path": "Qwen/style/neonpunk.safetensors",
@@ -418,6 +430,16 @@ with tempfile.TemporaryDirectory() as td:
              "relative_path": "dupe_of_base.safetensors",
              "classification": "usable", "reason": "prognosis_hi-prec",
              "matched_bases": ["synth"], "duplicate_of": "synth"},
+            {"kind": "lora",
+             "relative_path": "multibase.safetensors",
+             "classification": "usable", "reason": "ok",
+             "verdicts_by_base": {"synth": {"verdict": "OK"},
+                                  "fluxb": {"verdict": "OK"}}},
+            {"kind": "transformer", "root_index": 0,
+             "relative_path": "dupfam.safetensors",
+             "classification": "usable", "reason": "prognosis_hi-prec",
+             "matched_bases": ["fluxb", "synth"],
+             "duplicate_of": "synth"},
         ],
     }
     mpath = os.path.join(td, "lora_audit.json")
@@ -429,7 +451,7 @@ with tempfile.TemporaryDirectory() as td:
                          audit_manifests=(mpath,))
     check("S2 build: families registered from scan models",
           stats["families"] == 2, detail=repr(stats))
-    check("S2 build: sidecars ingested", stats["sidecars"] == 5,
+    check("S2 build: sidecars ingested", stats["sidecars"] == 6,
           detail=repr(stats))
 
     conn = cdb.connect(dbp)
@@ -494,6 +516,20 @@ with tempfile.TemporaryDirectory() as td:
         "SELECT * FROM entries WHERE name='wanderer'").fetchone()
     check("S2 F5: 'wandering_style' path does NOT hint family 'wan'",
           row["model_family"] is None, detail=repr(dict(row)))
+
+    # multi-base pick: sidecar-agreeing base wins over alphabetical-first
+    row = conn.execute(
+        "SELECT * FROM entries WHERE name='multibase'").fetchone()
+    check("S2 pick: multi-base audit match prefers sidecar-agreeing base "
+          "(qwen-image via synth, NOT alphabetical-first fluxb/flux2)",
+          row["model_family"] == "qwen-image", detail=repr(dict(row)))
+    check("S2 pick: agreeing evidence → no conflict recorded",
+          row["family_conflict"] is None)
+    # duplicate_of is definitive family evidence
+    row = conn.execute(
+        "SELECT * FROM entries WHERE name='dupfam'").fetchone()
+    check("S2 pick: duplicate_of base outranks alphabetical matched_bases",
+          row["model_family"] == "qwen-image", detail=repr(dict(row)))
 
     # finding-2: deletable + duplicate exclusion reasons
     row = conn.execute(
