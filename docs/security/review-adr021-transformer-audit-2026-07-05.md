@@ -77,3 +77,25 @@ Remediation: mandate `max(0, min(hi - lo, 1 MiB, remaining_file_bytes))` and spe
 ### Verdict
 
 **CLEAN.** All round-1 findings folded correctly. The three NEW items are INFO-level implementation-hardening notes. Implementation may proceed; carry NEW-1..NEW-3 into the `code-reviewer` + `security-auditor` pass on the implementation slice, and ensure Vision proof hooks exercise the F-1 ancestor case and the F-4 empty-read path (negative cases 8, 10 already name them).
+
+---
+
+## Implementation-phase reviews (2026-07-06)
+
+Both reviewers (Opus, model pinned) ran on the implementation diff; both returned **CHANGES REQUIRED** with complementary findings, all folded same-day; post-fold suite 197/197, full regression 2060 green.
+
+**code-reviewer (CHANGES REQUIRED → folded):**
+- **Finding 1 (MED):** `_base_transformer_index` skipped unreadable base shards per-shard, SHRINKING |B| and INFLATING `|T∩B|/|B|` — the inline comment claimed "conservative," which was inverted; a partial base could manufacture a false `usable`/`duplicate_of`. **Fixed:** any unreadable shard marks the whole base unavailable for transformer matching (empty index → files fall to `no_matching_base`/`format_unknown`, fail-toward-inclusion) + loud per-shard warning + covering test (9a).
+- **Finding 2 (LOW):** `_nested`'s `commonpath` `ValueError` branch was fail-open. **Fixed:** returns True (overlap → abort); unreachable in production but the guard protects a HIGH invariant.
+- Finding 3-8: APPROVED (duplicate-gate fidelity incl. first-byte-equal-base determinism; §2 mapping; §3 math; §4 guard; §5 manifest; §6 delete filter + size-cap exemption + fault isolation). Dead `_T_USABLE_VERDICTS` constant removed.
+- **Finding 9 (LOW):** test gaps — AIO fixture, inconclusive-dup warning, same-basename roots, unreadable-base-shard. **All added** (9a-9d, +6 tests).
+- NEW-1/NEW-2/NEW-3 verified landed.
+
+**security-auditor (CHANGES REQUIRED → folded):**
+- **F-T1 (MED):** the transformer path's 5 GB size-cap exemption reopened an UNBOUNDED header read in `_probe_safetensors_garbage` (`f.read(n)` on a caller-declared uint64 with no upper bound; the LoRA path had been implicitly bounded by the size cap). **Fixed:** 100 MB header cap before the read (mirrors `audit_single_files._header`), > cap → `unparseable_header`; negative test added (crafted 200 MB-declared header classified garbage with no large read); `_classify_transformer` docstring corrected.
+- **F-T2 (INFO):** disjointness predicate is case-sensitive — correct on this ext4/mergerfs deployment; assumption recorded in `_check_root_disjointness` docstring.
+- **F-T3 (INFO):** same fail-open `ValueError` branch as code-review finding 2 — closed by the same fold.
+- **F-T4 (INFO):** malformed `data_offsets` in the dup-checker → per-file `error` entry via fault isolation (contained; no change).
+- Verified: F-1 hard-block symlink/relative/trailing-slash resistant + pre-scan; F-4 formula exact; NEW-3 deterministic; delete kind-filter unreachable for transformers; zero-write property; per-file isolation.
+
+**Post-fold status: both gates satisfied; slice committed.**

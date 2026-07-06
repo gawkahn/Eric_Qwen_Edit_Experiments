@@ -84,7 +84,7 @@ load_lora_with_key_fix = _qwen_mod.load_lora_with_key_fix
 unload_adapters = _qwen_mod.unload_adapters
 
 # ── Tool contract constants ────────────────────────────────────────────
-_TOOL_VERSION = "0.1.0"
+_TOOL_VERSION = "0.2.0"  # 0.2.0: kind:"transformer" entries (ADR-021)
 _AUDIT_VERSION = 1
 
 EXIT_OK = 0
@@ -96,10 +96,11 @@ _BASE_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 _SIZE_CAP_BYTES = 5 * 1024 * 1024 * 1024
 _PATH_FLAG_NAMES = frozenset({
     "--audit-root", "--config", "--base", "--override-base", "-o", "--output",
-    "--output-dir", "--output-allowlist-prefix",
+    "--output-dir", "--output-allowlist-prefix", "--transformer-root",
 })
 
 KIND_LORA = "lora"
+KIND_TRANSFORMER = "transformer"
 CLASS_USABLE = "usable"
 CLASS_CONVERTABLE = "convertable"
 CLASS_UNCONVERTABLE = "unconvertable"
@@ -126,6 +127,25 @@ R_SIZE_CAP_EXCEEDED = "size_cap_exceeded"
 
 # Per-base verdict reason when a base couldn't be classified against
 R_BASE_UNAVAILABLE = "base_unavailable"
+
+# Transformer reason codes (ADR-021 §2 mapping table)
+R_T_AIO_BUNDLE = "aio_bundle"
+R_T_NO_MATCHING_BASE = "no_matching_base"
+# prognosis-based usable reasons are minted as f"prognosis_{verdict.lower()}"
+# (prognosis_hi-prec / prognosis_scaled / prognosis_plainfp8 / prognosis_cq-fp8);
+# unsupported-quant unconvertable reasons as f"quant_unsupported_{verdict.lower()}".
+
+# Transformer matching / duplicate-detection constants (ADR-021 §3/§4)
+_T_MATCH_THRESHOLD = 0.90       # shape-multiset overlap for a base match
+_T_DUP_THRESHOLD = 0.999        # overlap floor before duplicate sampling
+_T_DUP_SAMPLE_K = 4             # unique-shape tensor pairs compared
+_T_DUP_SAMPLE_CAP = 1024 * 1024  # bytes read per tensor per side (1 MiB)
+# Usable prognosis verdicts are the complement of the unsupported set +
+# UNREADABLE (HI-PREC / SCALED / PLAINFP8 / CQ-FP8 / AIO) — enforced by
+# the branch order in _classify_transformer.
+_T_UNSUPPORTED_VERDICTS = ("BNB", "SVDQ", "NVFP4")  # + CQ-<non-fp8> by prefix
+# Warning codes (transformer audit)
+W_DUP_CHECK_INCONCLUSIVE = "dup_check_inconclusive"  # ADR-021 §4 (<2 pairs)
 
 # Convert-path outcome reasons (ADR §8; recorded in FileEntry.convert_reason)
 R_CONVERT_COLLISION = "collision"
@@ -197,9 +217,17 @@ class FileEntry:
     delete_reason: Optional[str] = None  # S4: None | classification_changed |
     #                                      containment_failed | unlink_failed
     error: Optional[str] = None
+    # ADR-021 transformer-entry fields. root_index is the IDENTITY + sort
+    # discriminator (index into the manifest's transformer_roots array;
+    # security F-2 — basename `root` is display-only). LoRA entries keep -1.
+    root_index: int = -1
+    root: Optional[str] = None
+    prognosis: Optional[dict[str, Any]] = None
+    matched_bases: Optional[list[str]] = None
+    duplicate_of: Optional[str] = None
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        out = {
             "classification": self.classification,
             "convert_output": self.convert_output,
             "convert_plan": self.convert_plan,
@@ -214,6 +242,16 @@ class FileEntry:
             "size_bytes": self.size_bytes,
             "verdicts_by_base": self.verdicts_by_base,
         }
+        # Transformer-only keys are emitted only on transformer entries so
+        # kind:"lora" entries stay byte-identical to tool 0.1.0 output
+        # (ADR-021 §5 additivity; consumers branch on kind per F-3).
+        if self.kind == KIND_TRANSFORMER:
+            out["root_index"] = self.root_index
+            out["root"] = self.root
+            out["prognosis"] = self.prognosis
+            out["matched_bases"] = self.matched_bases or []
+            out["duplicate_of"] = self.duplicate_of
+        return out
 
 
 @dataclass
@@ -239,6 +277,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--audit-root", required=True, type=Path,
         help="Root directory of the LoRA tree to scan.",
+    )
+    p.add_argument(
+        "--transformer-root", action="append", type=Path, default=[],
+        dest="transformer_roots",
+        help="Directory tree of single-file transformers to audit as "
+             "kind:'transformer' (ADR-021). Repeatable. Must be disjoint "
+             "from --audit-root and from each other (startup abort "
+             "otherwise). Read-classify-report only: --convert/--delete "
+             "never touch these trees.",
     )
     cfg_grp = p.add_mutually_exclusive_group()
     cfg_grp.add_argument(
@@ -527,6 +574,7 @@ def _build_manifest(
     output_dir: Optional[Path],
     argv: list[str],
     config_path: Optional[Path],
+    transformer_roots: Optional[list[Path]] = None,
 ) -> dict[str, Any]:
     totals = {
         "files_scanned": len(files),
@@ -539,7 +587,15 @@ def _build_manifest(
     for entry in files:
         if entry.classification in totals:
             totals[entry.classification] += 1
-    files_sorted = sorted(files, key=lambda e: e.relative_path)
+    # ADR-021 §5: sort key (root_index_or_-1, relative_path). LoRA entries
+    # carry -1, so their ordering is byte-identical to tool 0.1.0 output;
+    # the index (never the collision-prone basename) discriminates
+    # transformer roots (security F-2).
+    files_sorted = sorted(
+        files,
+        key=lambda e: (e.root_index if e.kind == KIND_TRANSFORMER else -1,
+                       e.relative_path),
+    )
     warnings_sorted = sorted(
         warnings, key=lambda w: ((w.file or ""), w.code)
     )
@@ -567,6 +623,10 @@ def _build_manifest(
     }
     if output_dir is not None:
         manifest["output_dir"] = str(output_dir)
+    if transformer_roots:
+        # Resolved paths, CLI order — root_index on entries indexes into
+        # this array (ADR-021 §5).
+        manifest["transformer_roots"] = [str(t) for t in transformer_roots]
     return manifest
 
 
@@ -664,6 +724,16 @@ def _probe_safetensors_garbage(path: Path, size: int) -> Optional[str]:
             if len(n_bytes) < 8:
                 return R_TRUNCATED_HEADER
             n = struct.unpack("<Q", n_bytes)[0]
+            # 100 MB header cap (mirrors audit_single_files._header /
+            # safetensors' own bound). Without it, a crafted file whose
+            # declared header length is tens of GB (with matching on-disk
+            # padding) makes the f.read(n) below load it all into RAM —
+            # unbounded-read DoS. The LoRA path was implicitly bounded by
+            # the 5 GB size cap; the ADR-021 transformer path EXEMPTS that
+            # cap, so this read needs its own bound (security-audit
+            # 2026-07-06 F-T1). A >100 MB header is garbage regardless.
+            if n > 100_000_000:
+                return R_UNPARSEABLE_HEADER
             if size < 8 + n:
                 return R_TRUNCATED_HEADER
             header_bytes = f.read(n)
@@ -1327,7 +1397,15 @@ def _run_delete(
     a backstop `except` so any unforeseen error still maps to a skip reason and
     the run continues.
     """
-    deletable = [e for e in files if e.classification == CLASS_DELETABLE]
+    # kind == KIND_LORA filter (ADR-021 Vision invariants 7/11): transformer
+    # entries are report-only; even a `deletable`-classified garbage file
+    # under a transformer root must NEVER be unlinked. Belt-and-suspenders
+    # with the §1 root-disjointness startup invariant (a transformer entry's
+    # relative_path is rooted at a DIFFERENT tree, so audit_root/rel would
+    # be wrong anyway — but the explicit kind gate is the contract).
+    deletable = [e for e in files
+                 if e.classification == CLASS_DELETABLE
+                 and e.kind == KIND_LORA]
     by_reason: dict[str, int] = {}
     for e in deletable:
         by_reason[e.reason] = by_reason.get(e.reason, 0) + 1
@@ -1371,6 +1449,367 @@ def _run_delete(
 
 
 # ── Scan loop (Vision invariant 9: per-file fault isolation) ───────────
+# ── Transformer audit (ADR-021) ────────────────────────────────────────
+# Read-classify-report ONLY: no write, no delete, no dry-load on these
+# trees. Prognosis reuses audit_single_files.py (header-only, reviewed
+# under ADR-019 C-d); base matching is a name-agnostic shape-multiset
+# comparison; duplicate detection is bounded sampled reads (§4).
+
+_ASF_MODULE = None  # lazy singleton
+
+
+def _load_audit_single_files():
+    """Load repo-root audit_single_files.py via importlib (ADR-021 §2).
+
+    Import-time execution verified side-effect-free (security F-7): stdlib
+    imports + constants/functions, main() behind __main__ guard.
+    """
+    global _ASF_MODULE
+    if _ASF_MODULE is None:
+        path = _REPO_ROOT / "audit_single_files.py"
+        spec = importlib.util.spec_from_file_location("audit_single_files", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _ASF_MODULE = mod
+    return _ASF_MODULE
+
+
+def _dtype_class(dtype: str) -> str:
+    """Collapse float precisions so bf16/fp16/fp32 variants shape-match;
+    quant dtypes (F8_*, I8, …) keep their identity (ADR-021 §3)."""
+    return "float" if dtype in ("BF16", "F16", "F32", "F64") else dtype
+
+
+def _tensor_nbytes(info: dict) -> int:
+    lo, hi = info.get("data_offsets", (0, 0))
+    return max(0, hi - lo)
+
+
+def _base_transformer_index(base: BaseSpec,
+                            warnings: list[Warning_]) -> dict[str, Any]:
+    """Header-only index of a base's transformer shards (ADR-021 §3/§4).
+
+    Returns {"multiset": {(shape, dtype_class): count},
+             "unique":  {(shape, dtype): (key, shard_path, hdr_len, lo, hi)}
+             — (shape, EXACT dtype) pairs occurring exactly once,
+             "total": int}.
+
+    An unreadable shard marks the WHOLE base unavailable for transformer
+    matching (empty index; files fall to no_matching_base) with a loud
+    warning. Skipping just the shard would SHRINK |B| and INFLATE the
+    overlap ratio |T∩B|/|B| — a partial base could manufacture a false
+    `usable` match or a false `duplicate_of`, the exact outcome ADR §4's
+    fail-toward-inclusion posture forbids (code-review 2026-07-06
+    finding 1: the prior per-shard skip was NOT conservative).
+    """
+    asf = _load_audit_single_files()
+    multiset: dict[tuple, int] = {}
+    seen: dict[tuple, list] = {}
+    total = 0
+    for shard in sorted(Path(base.path).glob("*.safetensors")):
+        try:
+            hdr, hlen = asf._header(str(shard))
+        except Exception as e:  # noqa: BLE001
+            warnings.append(Warning_(
+                None, W_UNREADABLE,
+                f"base {base.name!r} shard {shard.name!r} unreadable "
+                f"({type(e).__name__}); base excluded from transformer "
+                f"matching (partial |B| would inflate overlap)"))
+            return {"multiset": {}, "unique": {}, "total": 0}
+        for k, v in hdr.items():
+            if k == "__metadata__" or not isinstance(v, dict):
+                continue
+            shape = tuple(v.get("shape", ()))
+            dtype = v.get("dtype", "?")
+            lo, hi = v.get("data_offsets", (0, 0))
+            multiset[(shape, _dtype_class(dtype))] = (
+                multiset.get((shape, _dtype_class(dtype)), 0) + 1)
+            seen.setdefault((shape, dtype), []).append(
+                (k, str(shard), hlen, lo, hi))
+            total += 1
+    unique = {sk: entries[0] for sk, entries in seen.items()
+              if len(entries) == 1}
+    return {"multiset": multiset, "unique": unique, "total": total}
+
+
+def _read_tensor_prefix(path: str, hdr_len: int, lo: int, hi: int,
+                        cap: int = _T_DUP_SAMPLE_CAP) -> Optional[bytes]:
+    """Guarded bounded read of a tensor's leading bytes (ADR-021 §4 F-4).
+
+    n = max(0, min(hi - lo, cap, file_size - (8 + hdr_len + lo))) — a
+    crafted data_offsets (hi < lo, offsets past EOF, hostile hdr_len) can
+    never produce a negative/unbounded read. Returns None on ANY short,
+    empty, or errored read; callers treat None as NOT byte-equal (fail
+    toward inclusion).
+    """
+    try:
+        fsize = os.path.getsize(path)
+        n = max(0, min(hi - lo, cap, fsize - (8 + hdr_len + lo)))
+        if n <= 0:
+            return None
+        with open(path, "rb") as f:
+            f.seek(8 + hdr_len + lo)
+            data = f.read(n)
+        return data if len(data) == n else None
+    except OSError:
+        return None
+
+
+def _t_shape_multiset(hdr: dict, dit_only: bool) -> dict[tuple, int]:
+    """Shape multiset of a transformer file's header; for AIO bundles the
+    comparison restricts to the DiT component groups (ADR-021 §3)."""
+    asf = _load_audit_single_files()
+    dit_prefixes = asf._AIO_GROUPS["dit"]
+    out: dict[tuple, int] = {}
+    for k, v in hdr.items():
+        if k == "__metadata__" or not isinstance(v, dict):
+            continue
+        if dit_only and not k.startswith(dit_prefixes):
+            continue
+        shape = tuple(v.get("shape", ()))
+        key = (shape, _dtype_class(v.get("dtype", "?")))
+        out[key] = out.get(key, 0) + 1
+    return out
+
+
+def _multiset_overlap(t_ms: dict, b_ms: dict) -> float:
+    """|T ∩ B| / |B| as multiset intersection (ADR-021 §3)."""
+    total_b = sum(b_ms.values())
+    if total_b == 0:
+        return 0.0
+    inter = sum(min(c, t_ms.get(sk, 0)) for sk, c in b_ms.items())
+    return inter / total_b
+
+
+def _t_duplicate_check(path: str, hdr: dict, hlen: int,
+                       base_idx: dict[str, Any],
+                       warnings: list[Warning_], rel: str) -> bool:
+    """Sampled-content duplicate determination vs one base (ADR-021 §4).
+
+    Unique-(shape, EXACT dtype) pairing sidesteps key-name mapping; K=4
+    largest by tensor size with KEY-NAME tie-break (deterministic — round-2
+    NEW-3); guarded 1-MiB reads on both sides; any None/short read or
+    mismatch → not duplicate (fail toward inclusion).
+    """
+    t_unique: dict[tuple, tuple] = {}
+    t_seen: dict[tuple, list] = {}
+    for k, v in hdr.items():
+        if k == "__metadata__" or not isinstance(v, dict):
+            continue
+        sk = (tuple(v.get("shape", ())), v.get("dtype", "?"))
+        t_seen.setdefault(sk, []).append(
+            (k, v.get("data_offsets", (0, 0))))
+    for sk, entries in t_seen.items():
+        if len(entries) == 1:
+            t_unique[sk] = entries[0]
+
+    pair_keys = [sk for sk in t_unique if sk in base_idx["unique"]]
+    if len(pair_keys) < 2:
+        warnings.append(Warning_(rel, W_DUP_CHECK_INCONCLUSIVE,
+                                 "fewer than 2 unique-shape tensor pairs; "
+                                 "duplicate_of left null (ADR-021 §4)"))
+        return False
+    # K largest by tensor byte-size; tie-break on the TRANSFORMER-side key
+    # name so the sampled set is deterministic (round-2 NEW-3).
+    pair_keys.sort(
+        key=lambda sk: (-(t_unique[sk][1][1] - t_unique[sk][1][0]),
+                        t_unique[sk][0]))
+    for sk in pair_keys[:_T_DUP_SAMPLE_K]:
+        t_key, (t_lo, t_hi) = t_unique[sk]
+        b_key, b_shard, b_hlen, b_lo, b_hi = base_idx["unique"][sk]
+        t_bytes = _read_tensor_prefix(path, hlen, t_lo, t_hi)
+        b_bytes = _read_tensor_prefix(b_shard, b_hlen, b_lo, b_hi)
+        if t_bytes is None or b_bytes is None or t_bytes != b_bytes:
+            return False
+    return True
+
+
+def _classify_transformer(path: Path, rel: str, root_index: int,
+                          root_name: str, bases: list[BaseSpec],
+                          base_indices: dict[str, dict],
+                          warnings: list[Warning_]) -> FileEntry:
+    """Per-file transformer classification (ADR-021 §2 mapping table).
+
+    NOTE: the LoRA 5 GB _SIZE_CAP_BYTES deliberately does NOT apply —
+    transformers are routinely 20-40 GB, the cap existed to bound pickle
+    disk-fill, and transformer roots scan .safetensors only (no pickle
+    surface). Every read on this path is bounded WITHOUT the size cap:
+    _probe_safetensors_garbage + asf._header both cap headers at 100 MB
+    (the former added per security-audit F-T1 — the size cap had been
+    implicitly bounding it on the LoRA path), and content reads are the
+    §4 guarded 1-MiB samples.
+    """
+    asf = _load_audit_single_files()
+    try:
+        size = path.stat().st_size
+    except OSError as e:
+        return FileEntry(relative_path=rel, kind=KIND_TRANSFORMER,
+                         root_index=root_index, root=root_name,
+                         classification=CLASS_ERROR, reason="stat_failed",
+                         error=str(e)[:200])
+
+    deletable_reason = _classify_deletable(path, size)
+    if deletable_reason is not None:
+        # REPORT-ONLY (Vision invariants 7/11): _run_delete filters on
+        # kind == KIND_LORA, so this entry can never be unlinked.
+        return FileEntry(relative_path=rel, kind=KIND_TRANSFORMER,
+                         root_index=root_index, root=root_name,
+                         classification=CLASS_DELETABLE,
+                         reason=deletable_reason, size_bytes=size)
+
+    prognosis = asf.audit_file(str(path))
+    prog_out = {"verdict": prognosis["verdict"],
+                "detail": prognosis["detail"],
+                "family": prognosis["family"],
+                "n_fp8": prognosis["n_fp8"]}
+    verdict = prognosis["verdict"]
+
+    if verdict == "UNREADABLE":
+        return FileEntry(relative_path=rel, kind=KIND_TRANSFORMER,
+                         root_index=root_index, root=root_name,
+                         classification=CLASS_ERROR,
+                         reason="prognosis_unreadable", size_bytes=size,
+                         prognosis=prog_out, error=prognosis["detail"][:200])
+
+    if verdict in _T_UNSUPPORTED_VERDICTS or (
+            verdict.startswith("CQ-") and verdict != "CQ-FP8"):
+        return FileEntry(relative_path=rel, kind=KIND_TRANSFORMER,
+                         root_index=root_index, root=root_name,
+                         classification=CLASS_UNCONVERTABLE,
+                         reason=f"quant_unsupported_{verdict.lower()}",
+                         size_bytes=size, prognosis=prog_out,
+                         matched_bases=[])
+
+    # Shape-fingerprint matching (§3) — dit-keys only for AIO bundles.
+    try:
+        hdr, hlen = asf._header(str(path))
+    except Exception as e:  # noqa: BLE001
+        return FileEntry(relative_path=rel, kind=KIND_TRANSFORMER,
+                         root_index=root_index, root=root_name,
+                         classification=CLASS_ERROR, reason="header_reread",
+                         size_bytes=size, prognosis=prog_out,
+                         error=f"{type(e).__name__}: {str(e)[:160]}")
+    t_ms = _t_shape_multiset(hdr, dit_only=(verdict == "AIO"))
+
+    matched: list[str] = []
+    duplicate_of: Optional[str] = None
+    for b in bases:
+        idx = base_indices.get(b.name)
+        if idx is None or idx["total"] == 0:
+            continue
+        overlap = _multiset_overlap(t_ms, idx["multiset"])
+        if overlap >= _T_MATCH_THRESHOLD:
+            matched.append(b.name)
+            if duplicate_of is None and overlap >= _T_DUP_THRESHOLD:
+                if _t_duplicate_check(str(path), hdr, hlen, idx,
+                                      warnings, rel):
+                    duplicate_of = b.name
+
+    if matched:
+        reason = (R_T_AIO_BUNDLE if verdict == "AIO"
+                  else f"prognosis_{verdict.lower()}")
+        return FileEntry(relative_path=rel, kind=KIND_TRANSFORMER,
+                         root_index=root_index, root=root_name,
+                         classification=CLASS_USABLE, reason=reason,
+                         size_bytes=size, prognosis=prog_out,
+                         matched_bases=sorted(matched),
+                         duplicate_of=duplicate_of)
+
+    reason = (R_FORMAT_UNKNOWN if prognosis["family"] == "?"
+              else R_T_NO_MATCHING_BASE)
+    return FileEntry(relative_path=rel, kind=KIND_TRANSFORMER,
+                     root_index=root_index, root=root_name,
+                     classification=CLASS_UNCONVERTABLE, reason=reason,
+                     size_bytes=size, prognosis=prog_out, matched_bases=[])
+
+
+def _scan_transformer_roots(
+    transformer_roots: list[Path], bases: list[BaseSpec],
+    warnings: list[Warning_],
+) -> tuple[list[FileEntry], bool]:
+    """Scan each transformer root (containment rooted at ITSELF, ADR-021 §1)
+    and classify every .safetensors. Returns (entries, any_error)."""
+    base_indices: dict[str, dict] = {}
+    for b in bases:
+        try:
+            base_indices[b.name] = _base_transformer_index(b, warnings)
+        except Exception as e:  # noqa: BLE001 — a broken base must not
+            warnings.append(Warning_(None, W_UNREADABLE,     # kill the scan
+                                     f"base {b.name} fingerprint failed: "
+                                     f"{type(e).__name__}"))
+
+    entries: list[FileEntry] = []
+    any_error = False
+    for root_index, troot in enumerate(transformer_roots):
+        root_name = troot.name
+        for path in sorted(troot.rglob("*.safetensors")):
+            if not path.is_file() and not path.is_symlink():
+                continue
+            rel = _rel(path, troot)
+            if not _passes_scan_containment(path, troot, warnings):
+                continue
+            if not _open_no_follow(path, troot, warnings):
+                continue
+            try:
+                entry = _classify_transformer(
+                    path, rel, root_index, root_name, bases,
+                    base_indices, warnings)
+            except Exception as e:  # noqa: BLE001 — per-file isolation
+                entry = FileEntry(
+                    relative_path=rel, kind=KIND_TRANSFORMER,
+                    root_index=root_index, root=root_name,
+                    classification=CLASS_ERROR,
+                    reason="exception_during_classify",
+                    error=f"{type(e).__name__}: {str(e)[:200]}")
+            entries.append(entry)
+            if entry.classification == CLASS_ERROR:
+                any_error = True
+    return entries, any_error
+
+
+def _check_root_disjointness(audit_root: Path,
+                             transformer_roots: list[Path]) -> Optional[str]:
+    """ADR-021 §1 startup invariant (security F-1, HIGH): every transformer
+    root must be disjoint from audit_root (not equal / ancestor / descendant)
+    and transformer roots must be pairwise disjoint (F-5).
+
+    HARD BLOCK, deliberately NOT warn-don't-block (round-2 NEW-2): a
+    transformer root nested under audit_root lets a garbage transformer
+    file classify `deletable` as a LoRA and be unlinked by `--delete --yes`
+    — irreversible delete under a transformer root, Vision invariant 7.
+    Comparison is on PATH-COMPONENT boundaries via os.path.commonpath
+    (round-2 NEW-1: /a/checkpoints vs /a/checkpoints_old are siblings, not
+    nested). Returns an error message, or None when all roots are disjoint.
+
+    Assumption (security-audit F-T2): roots live on case-SENSITIVE
+    filesystems (this deployment: ext4/mergerfs). On a case-insensitive
+    mount, /models vs /MODELS would evade the string comparison; an
+    inode-based (samefile-style) check would be needed for portability.
+    """
+    def _nested(a: Path, b: Path) -> bool:
+        try:
+            return os.path.commonpath([str(a), str(b)]) in (str(a), str(b))
+        except ValueError:
+            # Unreachable in production (both sides resolve(strict=True)d
+            # first), but this guard protects a HIGH invariant — fail
+            # CLOSED, treat as overlapping (code-review 2026-07-06
+            # finding 2: returning False here would be fail-open).
+            return True
+
+    for t in transformer_roots:
+        if _nested(audit_root, t):
+            return (f"--transformer-root {t} overlaps --audit-root "
+                    f"{audit_root} (equal/ancestor/descendant) — the delete "
+                    f"path is rooted at --audit-root, so nesting would let "
+                    f"'--delete --yes' unlink under a transformer root")
+    for i, a in enumerate(transformer_roots):
+        for b in transformer_roots[i + 1:]:
+            if _nested(a, b):
+                return (f"--transformer-root values overlap: {a} vs {b} "
+                        f"(pairwise disjointness required)")
+    return None
+
+
 def _scan(
     audit_root: Path, bases: list[BaseSpec], warnings: list[Warning_]
 ) -> tuple[list[FileEntry], int]:
@@ -1480,6 +1919,25 @@ def main(argv: Optional[list[str]] = None) -> int:
         _emit_error(f"audit-root is not a directory: {audit_root}")
         return EXIT_STARTUP_FAIL
 
+    # ADR-021 §1: transformer roots — resolve fail-closed, then enforce
+    # the disjointness startup invariant (security F-1 HIGH; hard block,
+    # see _check_root_disjointness for why warn-don't-block yields here).
+    transformer_roots: list[Path] = []
+    for traw in args.transformer_roots:
+        try:
+            troot = traw.resolve(strict=True)
+        except (FileNotFoundError, OSError) as e:
+            _emit_error(f"transformer-root unresolvable: {e}")
+            return EXIT_STARTUP_FAIL
+        if not troot.is_dir():
+            _emit_error(f"transformer-root is not a directory: {troot}")
+            return EXIT_STARTUP_FAIL
+        transformer_roots.append(troot)
+    disjoint_err = _check_root_disjointness(audit_root, transformer_roots)
+    if disjoint_err is not None:
+        _emit_error(disjoint_err)
+        return EXIT_STARTUP_FAIL
+
     config_path: Optional[Path] = None
     config: dict[str, Any] = {}
     if not args.no_config:
@@ -1533,6 +1991,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     with contextlib.redirect_stdout(io.StringIO()):
         _prepare_bases(bases, warnings)
         files, error_exit = _scan(audit_root, bases, warnings)
+        if transformer_roots:
+            t_entries, t_error = _scan_transformer_roots(
+                transformer_roots, bases, warnings)
+            files.extend(t_entries)
+            if t_error and error_exit == EXIT_OK:
+                error_exit = EXIT_FILE_ERRORS
 
     if args.dry_load:
         # `_load_dry_load_pipeline` invokes diffusers' from_pretrained
@@ -1567,6 +2031,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         output_dir=output_dir,
         argv=argv,
         config_path=config_path,
+        transformer_roots=transformer_roots,
     )
 
     if args.print_manifest:

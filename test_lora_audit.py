@@ -1513,6 +1513,294 @@ def test_delete_per_file_fault_isolation() -> None:
 
 
 # ── Driver ─────────────────────────────────────────────────────────────
+def test_transformer_audit() -> None:
+    """ADR-021: kind:'transformer' entries — disjointness, prognosis
+    mapping, shape matching, duplicate detection, report-only delete,
+    manifest additivity + determinism."""
+    print("\n[35] test_transformer_audit (ADR-021)")
+    mod = _import_script()
+
+    with tempfile.TemporaryDirectory() as _td:
+        td = Path(_td)
+        lora_root = td / "loras"
+        troot = td / "checkpoints"
+        troot2 = td / "checkpoints_old"  # sibling with shared name-prefix
+        base_dir = td / "base" / "transformer"
+        for d in (lora_root, troot, troot2, base_dir):
+            d.mkdir(parents=True)
+
+        # Base with 4 DISTINCT shapes so unique-(shape,dtype) pairing works.
+        base_sd = {
+            "transformer_blocks.0.q.weight": torch.arange(
+                64 * 64, dtype=torch.float32).reshape(64, 64),
+            "transformer_blocks.0.k.weight": torch.arange(
+                32 * 64, dtype=torch.float32).reshape(32, 64),
+            "transformer_blocks.0.v.weight": torch.arange(
+                16 * 64, dtype=torch.float32).reshape(16, 64),
+            "transformer_blocks.0.o.weight": torch.arange(
+                8 * 64, dtype=torch.float32).reshape(8, 64),
+        }
+        safetensors.torch.save_file(base_sd, str(base_dir / "m.safetensors"))
+
+        # (a) byte-duplicate under ComfyUI-style names (name-agnostic match)
+        dup_sd = {f"model.diffusion_model.blk.{i}.weight": t.clone()
+                  for i, t in enumerate(base_sd.values())}
+        safetensors.torch.save_file(dup_sd, str(troot / "dup.safetensors"))
+        # (b) same shapes, different content → finetune, not duplicate
+        ft_sd = {k: v + 1.0 for k, v in dup_sd.items()}
+        safetensors.torch.save_file(ft_sd, str(troot / "finetune.safetensors"))
+        # (c) fp16 cast → shape-class match, dtype-exact pairing fails
+        fp16_sd = {k: v.half() for k, v in dup_sd.items()}
+        safetensors.torch.save_file(fp16_sd, str(troot / "fp16cast.safetensors"))
+        # (d) bnb marker → quant_unsupported
+        safetensors.torch.save_file(
+            {"w.weight": torch.zeros(4, 4),
+             "w.absmax": torch.zeros(4)}, str(troot / "bnb_nf4.safetensors"))
+        # (e) DiT-family keys, non-matching shapes → no_matching_base
+        safetensors.torch.save_file(
+            {"transformer_blocks.0.x.weight": torch.zeros(7, 7)},
+            str(troot / "nomatch.safetensors"))
+        # (f) garbage under the transformer root → deletable, REPORT-ONLY
+        (troot / "zero.safetensors").write_bytes(b"")
+        # (g) second root: one valid file (root_index=1 + same-basename case)
+        safetensors.torch.save_file(dup_sd, str(troot2 / "dup2.safetensors"))
+        # lora root: one usable lora so the lora side is non-empty
+        safetensors.torch.save_file({
+            "transformer_blocks.0.q.lora_A.weight": torch.zeros(8, 64),
+            "transformer_blocks.0.q.lora_B.weight": torch.zeros(64, 8),
+        }, str(lora_root / "l.safetensors"))
+
+        args = ["--audit-root", str(lora_root),
+                "--transformer-root", str(troot),
+                "--transformer-root", str(troot2),
+                "--no-config", "--base", f"synth={base_dir}",
+                "--print-manifest"]
+        r = _run_subprocess(args)
+        check("transformer run exits 0", r.returncode == 0,
+              detail=r.stderr[-300:])
+        m = json.loads(r.stdout)
+        by_rel = {(e["kind"], e["relative_path"]): e for e in m["files"]}
+
+        e = by_rel.get(("transformer", "dup.safetensors"))
+        check("dup: usable via prognosis", e is not None
+              and e["classification"] == "usable"
+              and e["reason"].startswith("prognosis_"), detail=repr(e))
+        check("dup: matched synth base", e and e["matched_bases"] == ["synth"])
+        check("dup: duplicate_of == synth (byte-equal samples)",
+              e and e["duplicate_of"] == "synth")
+        check("dup: root_index 0 + display root", e
+              and e["root_index"] == 0 and e["root"] == "checkpoints")
+
+        e = by_rel.get(("transformer", "finetune.safetensors"))
+        check("finetune: matched but NOT duplicate (content differs)",
+              e and e["matched_bases"] == ["synth"]
+              and e["duplicate_of"] is None, detail=repr(e))
+
+        e = by_rel.get(("transformer", "fp16cast.safetensors"))
+        check("fp16 cast: shape-class match, dtype-exact dup pairing fails "
+              "(Vision neg-case 5)",
+              e and e["matched_bases"] == ["synth"]
+              and e["duplicate_of"] is None)
+
+        e = by_rel.get(("transformer", "bnb_nf4.safetensors"))
+        check("bnb: unconvertable quant_unsupported_bnb (Vision neg-case 3)",
+              e and e["classification"] == "unconvertable"
+              and e["reason"] == "quant_unsupported_bnb", detail=repr(e))
+
+        e = by_rel.get(("transformer", "nomatch.safetensors"))
+        check("no shape match: unconvertable no_matching_base",
+              e and e["classification"] == "unconvertable"
+              and e["reason"] == "no_matching_base")
+
+        e = by_rel.get(("transformer", "zero.safetensors"))
+        check("garbage transformer: deletable (report-only)",
+              e and e["classification"] == "deletable"
+              and e["reason"] == "zero_byte")
+        check("transformer sha256 null (ADR-021 §5)",
+              all(x["sha256"] is None for x in m["files"]
+                  if x["kind"] == "transformer"))
+
+        e = by_rel.get(("transformer", "dup2.safetensors"))
+        check("second root: root_index 1", e and e["root_index"] == 1)
+        check("manifest transformer_roots array (resolved, CLI order)",
+              m.get("transformer_roots")
+              == [str(troot.resolve()), str(troot2.resolve())])
+
+        # additivity (F-3): lora entries carry NO transformer-only keys
+        lora_entries = [x for x in m["files"] if x["kind"] == "lora"]
+        check("lora entries unchanged (no root_index key — v1 shape)",
+              lora_entries and all("root_index" not in x
+                                   for x in lora_entries))
+        # F-3 proof hooks: kind-filtering consumer sees exactly the v1 view;
+        # naive consumer misparses (documented failure made visible)
+        v1_view = [x for x in m["files"] if x["kind"] == "lora"]
+        check("kind-filtering consumer sees only lora entries",
+              all(x["kind"] == "lora" for x in v1_view) and v1_view)
+        naive_usable = [x for x in m["files"]
+                        if x["classification"] == "usable"]
+        check("naive consumer WOULD ingest transformer rows as usable "
+              "(documented misparse, F-3)",
+              any(x["kind"] == "transformer" for x in naive_usable))
+
+        # sort: all lora (-1) before transformer roots, roots in index order
+        kinds_seq = [(x.get("root_index", -1) if x["kind"] == "transformer"
+                      else -1) for x in m["files"]]
+        check("files[] sorted by (root_index_or_-1, relative_path)",
+              kinds_seq == sorted(kinds_seq))
+
+        # determinism: second run byte-identical modulo audited_at
+        r2 = _run_subprocess(args)
+        m2 = json.loads(r2.stdout)
+        for x in (m, m2):
+            x.pop("audited_at", None)
+        check("determinism: two runs identical modulo audited_at "
+              "(Vision neg-case 7)", m == m2)
+
+        # ── report-only delete (Vision neg-case 1): --delete --yes must
+        # NOT unlink the garbage transformer file ──
+        r3 = _run_subprocess(["--audit-root", str(lora_root),
+                              "--transformer-root", str(troot),
+                              "--no-config", "--base", f"synth={base_dir}",
+                              "--delete", "--yes"])
+        check("delete run exits 0", r3.returncode == 0,
+              detail=r3.stderr[-200:])
+        check("garbage transformer file SURVIVES --delete --yes "
+              "(Vision invariants 7/11)",
+              (troot / "zero.safetensors").exists())
+
+        # ── disjointness startup aborts (F-1; Vision neg-case 8) ──
+        for label, aroot, extra in (
+            ("equal", troot, [str(troot)]),
+            ("descendant", td, [str(troot)]),
+            ("ancestor", troot, [str(td)]),
+        ):
+            r4 = _run_subprocess(["--audit-root", str(aroot),
+                                  "--transformer-root", extra[0],
+                                  "--no-config"])
+            check(f"disjointness abort: transformer-root {label} of "
+                  f"audit-root → exit 1", r4.returncode == 1,
+                  detail=f"rc={r4.returncode} {r4.stderr[-150:]}")
+        r4 = _run_subprocess(["--audit-root", str(lora_root),
+                              "--transformer-root", str(troot),
+                              "--transformer-root", str(troot / "sub_x"),
+                              "--no-config"])
+        check("pairwise overlap of transformer roots → exit 1",
+              r4.returncode == 1)
+        # NEW-1: sibling sharing a name-prefix is NOT nested — must run
+        check("sibling name-prefix roots accepted (checkpoints vs "
+              "checkpoints_old — NEW-1 component-boundary predicate)",
+              mod._check_root_disjointness(
+                  lora_root.resolve(),
+                  [troot.resolve(), troot2.resolve()]) is None)
+
+        # ── hostile-header sampler guards (F-4; Vision neg-case 10) ──
+        hostile = td / "hostile.bin"
+        hostile.write_bytes(b"\x00" * 64)
+        check("F-4: hi < lo → None (no negative read)",
+              mod._read_tensor_prefix(str(hostile), 8, 100, 50) is None)
+        check("F-4: offsets past EOF → None",
+              mod._read_tensor_prefix(str(hostile), 8, 10_000, 10_100)
+              is None)
+        check("F-4: hostile header_len → None",
+              mod._read_tensor_prefix(str(hostile), 10**12, 0, 100) is None)
+
+        # ── F-T1: crafted >100MB declared header → garbage verdict with
+        # NO large read (the probe must cap before f.read(n)) ──
+        crafted = troot / "hdrbomb.safetensors"
+        with open(crafted, "wb") as f:
+            f.write(struct.pack("<Q", 200_000_000))  # declares 200 MB hdr
+            f.write(b"\x00" * 1024)                  # tiny actual body
+        probe = mod._probe_safetensors_garbage(crafted, crafted.stat().st_size)
+        check("F-T1: >100MB declared header → unparseable_header "
+              "(capped, no unbounded read)",
+              probe == mod.R_UNPARSEABLE_HEADER, detail=repr(probe))
+        crafted.unlink()
+
+        # ── review finding 9a: unreadable base shard → base excluded from
+        # matching (partial |B| would inflate overlap), loud warning ──
+        badbase = td / "badbase" / "transformer"
+        badbase.mkdir(parents=True)
+        safetensors.torch.save_file(
+            {"transformer_blocks.0.q.weight": base_sd[
+                "transformer_blocks.0.q.weight"].clone()},
+            str(badbase / "a.safetensors"))
+        with open(badbase / "b.safetensors", "wb") as f:  # corrupt shard
+            f.write(struct.pack("<Q", 500))
+            f.write(b"not json at all")
+        r5 = _run_subprocess(["--audit-root", str(lora_root),
+                              "--transformer-root", str(troot),
+                              "--no-config", "--base", f"bad={badbase}",
+                              "--print-manifest"])
+        m5 = json.loads(r5.stdout)
+        e = {(x["kind"], x["relative_path"]): x
+             for x in m5["files"]}.get(("transformer", "dup.safetensors"))
+        # (this fixture's keys give family hint "?", so the §2 precedence
+        # yields format_unknown; the load-bearing assertions are
+        # unconvertable + zero matches — NOT an inflated-overlap usable)
+        check("9a: unreadable base shard → base excluded from matching "
+              "(unconvertable/format_unknown, NOT inflated-overlap usable)",
+              e is not None and e["classification"] == "unconvertable"
+              and e["reason"] == "format_unknown"
+              and e["matched_bases"] == [], detail=repr(e))
+        check("9a: loud warning names the unreadable shard",
+              any(w["code"] == "unreadable"
+                  and "excluded from transformer matching" in w["detail"]
+                  for w in m5["warnings"]), detail=repr(m5["warnings"])[:200])
+
+        # ── review finding 9b: AIO bundle → dit-only matching, aio_bundle ──
+        aio_sd = {f"model.diffusion_model.blk.{i}.weight": t.clone()
+                  for i, t in enumerate(base_sd.values())}
+        aio_sd["first_stage_model.decoder.conv.weight"] = torch.zeros(3, 3)
+        aio_sd["cond_stage_model.emb.weight"] = torch.zeros(5, 5)
+        safetensors.torch.save_file(aio_sd, str(troot / "aio.safetensors"))
+        # ── review finding 9c: all-same-shape base → <2 unique pairs →
+        # duplicate inconclusive + warning ──
+        samebase = td / "samebase" / "transformer"
+        samebase.mkdir(parents=True)
+        same_sd = {f"transformer_blocks.{i}.w.weight":
+                   torch.full((64, 64), float(i)) for i in range(4)}
+        safetensors.torch.save_file(same_sd,
+                                    str(samebase / "m.safetensors"))
+        same_t = {f"model.diffusion_model.{i}.w.weight":
+                  torch.full((64, 64), float(i)) for i in range(4)}
+        safetensors.torch.save_file(same_t,
+                                    str(troot / "sameshape.safetensors"))
+        # ── review finding 9d: two roots with the SAME basename ──
+        troot3 = td / "other" / "checkpoints"
+        troot3.mkdir(parents=True)
+        safetensors.torch.save_file(dup_sd,
+                                    str(troot3 / "dup3.safetensors"))
+        r6 = _run_subprocess(["--audit-root", str(lora_root),
+                              "--transformer-root", str(troot),
+                              "--transformer-root", str(troot3),
+                              "--no-config",
+                              "--base", f"synth={base_dir}",
+                              "--base", f"same={samebase}",
+                              "--print-manifest"])
+        m6 = json.loads(r6.stdout)
+        idx6 = {(x["kind"], x["relative_path"]): x for x in m6["files"]}
+        e = idx6.get(("transformer", "aio.safetensors"))
+        check("9b: AIO bundle → usable/aio_bundle via dit-only matching",
+              e is not None and e["classification"] == "usable"
+              and e["reason"] == "aio_bundle"
+              and "synth" in (e["matched_bases"] or []), detail=repr(e))
+        e = idx6.get(("transformer", "sameshape.safetensors"))
+        check("9c: <2 unique-shape pairs → duplicate inconclusive "
+              "(null + warning)",
+              e is not None and e["duplicate_of"] is None
+              and any(w["code"] == "dup_check_inconclusive"
+                      for w in m6["warnings"]), detail=repr(e))
+        e_dup = idx6.get(("transformer", "dup.safetensors"))
+        e_dup3 = idx6.get(("transformer", "dup3.safetensors"))
+        check("9d: same-basename roots → distinct root_index (F-2)",
+              e_dup is not None and e_dup3 is not None
+              and e_dup["root_index"] == 0 and e_dup3["root_index"] == 1
+              and e_dup["root"] == e_dup3["root"] == "checkpoints")
+        # cleanup extra fixtures so earlier-run manifests stay reproducible
+        (troot / "aio.safetensors").unlink()
+        (troot / "sameshape.safetensors").unlink()
+
+
 def main() -> int:
     print("=" * 70)
     print(f"  test_lora_audit.py — S1+S2+S3+S4 of ADR-014")
@@ -1555,6 +1843,7 @@ def main() -> int:
         test_delete_reclassify_skip()
         test_delete_containment_outside_root()
         test_delete_per_file_fault_isolation()
+        test_transformer_audit()
     finally:
         teardown_fixtures()
     print("\n" + "─" * 70)
