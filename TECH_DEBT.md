@@ -655,3 +655,20 @@ ADR-010's "Deferred / Out of Scope" section formally declares the following non-
 - **What:** Finding 1's atomic reservation covers only the **auto-number** branch. The `if savepath:` branch (user-supplied template) still resolves a path and hands it to `generate()` with no atomic reservation, so two daemons sharing `--output-dir` with the *same template and same params* (a template lacking `%seed%`/timestamp entropy) TOCTOU-overwrite each other exactly as Finding 1 described.
 - **Why not now:** Naming here is user-controlled (add entropy or per-device templates); Finding 1 explicitly scoped only the auto-number counter; this slice did not touch the branch. Recorded so "auto-number is atomic" is not mistaken for "all output paths are collision-safe."
 - **Trigger:** A user hitting template-collision in a parallel setup, OR extending atomic reservation to the template branch (would need to reserve the resolved path the same way, handling the template's own dir creation). Flagged by the slice-3 `security-auditor` pass.
+
+## 2026-07-06 — transformer shape-multiset matcher cross-matches 3072-dim DiT families
+
+**What:** ADR-021 §3's 0.90 shape-multiset overlap matched Qwen-Image
+single-file transformers against the Chroma base (both 3072-dim inventories)
+— `matched_bases` spans architecturally distinct families. Family assignment
+is protected downstream (duplicate_of + sidecar-agreement pick in the catalog
+builder), but the matcher itself is looser than ADR-021 §3's "different DiT
+families differ long before 90%" claim on real data.
+**Why not now:** catalog-side evidence precedence makes the assignment
+correct; the matcher's usable/unconvertable boundary is unaffected for the
+現 population (files matching wrong-family bases also match their own).
+**Trigger:** any file whose matched_bases is WRONG-family-only (would
+classify usable against a base it can't load on), or transformer dry-load /
+gen-validation surfacing a load failure on a matched base. Fix directions:
+dtype-exact multiset, per-key-count weighting, or raising the threshold with
+unique-shape anchors.
