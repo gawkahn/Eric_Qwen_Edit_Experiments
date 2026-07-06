@@ -892,6 +892,15 @@ Krea key remap (verified — only family *detection* exists, no converter).
 targets — they're fp8, already handled. **One piece of work — the Krea key
 converter — unblocks the plain Krea fp8 file AND both "int8 convrot" downloads.**
 The generic INT8-ConvRot entry above remains a valid FUTURE item (real int8-convrot
-files exist upstream), but it is decoupled from these specific models. Dark Beast
-(civitai 2242173, "krea2 aggressive", still downloading) to be confirmed — expected
-to be the same Krea-2 + fp8 situation.
+files exist upstream), but it is decoupled from these specific models. **Dark Beast
+CONFIRMED (inspected 2026-07-06):** `darkBeastINT8Convrot2_darkBeastKREA2FP8.safetensors`
+(22 GB) is ALSO fp8 + native-Krea, NO int8/convrot (its only "rot/conv" tensors are
+VAE conv layers). It differs from RedCraft in two ways: (a) it's an **all-in-one
+bundle** — `text_encoders.*` (Qwen3-VL-4B, 714 tensors) + `vae.*` (194) +
+`model.diffusion_model.*` transformer (430); (b) the transformer fp8 is **plain-cast
+(no scale, no comfy_quant)** → our loader already upcasts plain-cast fp8 to bf16, so
+again the quant is a non-issue. So Dark Beast needs the Krea key converter PLUS
+component-splitting (extract the transformer from the bundle; Krea-2-Turbo base
+supplies TE/VAE, or use the bundled ones). **RedCraft is the clean first target**
+(transformer-only, comfy_quant fp8, blocked ONLY on Krea keys). Both filenames'
+"INT8 ConvRot" labels are misnomers — neither file contains int8 or rotation tensors.
