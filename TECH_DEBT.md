@@ -773,3 +773,57 @@ is a harness fix; the former is the real product fix (surface daemon LoRA
 warnings client-side, already a Backlog candidate per the memory).
 **Trigger:** next gen-validation batch (harness must gate on load success);
 OR wiring the LLM iterative generator (it MUST know if a LoRA applied).
+
+## 2026-07-06 — SVDQuant / Nunchaku (int4/fp4) single-file consumption unsupported
+
+**What:** Community 4-bit SVDQuant checkpoints (MIT-Han-Lab **Nunchaku**) cannot be
+loaded. Grant has `svdq-int4_r32-flux.1-dev`, `svdq-fp4_r32-flux.1-dev`, and
+`svdq-fp4_r128-qwen-image` under `.../diffusion_models/Flux.1-dev/`. Header
+`__metadata__` self-declares `model_class: NunchakuFluxTransformer2dModel`,
+`quantization_config.method: "svdquant"` (weight+activation int4, group_size 64);
+tensor layout is `qweight` (packed 4-bit) + `wscales` + `lora_down`/`lora_up`
+(the low-rank SVD outlier branch) + `smooth`/`smooth_orig`. This is a distinct
+format from ADR-019's fp8/GGUF: **not** a diffusers `quantization_config` and
+**not** a `from_single_file` path — diffusers has zero svdquant/nunchaku
+awareness (verified). It requires the separate **`nunchaku`** inference engine
+(custom CUDA kernels): `NunchakuFluxTransformer2dModel.from_pretrained(path)`
+swapped into a diffusers pipeline. Nunchaku upstream covers Flux.1 (dev/
+schnell/kontext/fill), Qwen-Image, SANA, PixArt — so Grant's Flux + Qwen-Image
+svdq files are in scope.
+**Why not now:** heavyweight new dep with tight kernel/torch/CUDA coupling —
+must verify a `nunchaku` wheel exists for the pinned stack (torch 2.11 / cu13 /
+Blackwell) before committing to a pin (§11); this is the same release-cadence
+risk that deferred nvfp4 (ADR-019). Blackwell is where Nunchaku's speedup is
+largest, so the hardware fit is good IF the wheel lines up. New loader-routing
+surface (svdq detection → nunchaku transformer class → pipeline assembly) and a
+§12 security review (caller-supplied model surface). Would be its own ADR
+(sibling to ADR-019), not a slice of it.
+**Trigger:** Grant prioritizing the Flux/Qwen svdq files over other work AND a
+`nunchaku` wheel confirmed for the pinned stack. "All the rage" in the community
+(strong download momentum), so likely worth doing once the dep story is clean.
+
+## 2026-07-06 — Krea-2 single-file / GGUF checkpoints cannot be loaded (no converter)
+
+**What:** Community Krea-2 finetunes shipped as single-file
+(`krea2MuseByStable_v15TurboFp8.safetensors` + `.gguf`,
+`krea2TurboUncensored_v1.safetensors`) fail to load. Two compounding reasons:
+(1) `Krea2Transformer2DModel` has **no `from_single_file`** in diffusers 0.39.0
+(not a `FromOriginalModelMixin` subclass — verified) — Krea-2 is too new, so
+single-file loading (plain OR quantized) is entirely absent upstream; (2) the
+files use **native Krea key names** (`blocks.N.attn.wq/wk`, `mlp.gate`,
+`qknorm.knorm.scale`) vs diffusers' `transformer_blocks.N.attn.to_q` /
+`text_fusion.layerwise_blocks` / `time_embed.*`, and diffusers'
+`single_file_utils` has no Krea converter. Our loader's direct-state-dict path
+(which already fp8-upcasts) fails on the key mismatch. **GGUF work does NOT help
+here** — it's built on `from_single_file`, which Krea lacks; the `.gguf` is
+strictly harder than the `.safetensors` (needs the same converter PLUS manual
+GGUF dequant).
+**Why not now:** the tractable path is a custom native-Krea→diffusers full-
+transformer key converter (analogous to the LoRA converters but whole-model) run
+before a direct load — moderate-to-large reverse-engineering; the `.safetensors`
+is the target (fp8 already handled), the `.gguf` parks behind it. Alternatively
+wait for diffusers to add Krea2 `from_single_file` upstream (free, not in our
+control, plausible given Krea momentum).
+**Trigger:** Grant wanting the Krea finetune specifically AND diffusers still
+lacking Krea single-file support; re-check each diffusers bump (upstream may
+close it for free).
