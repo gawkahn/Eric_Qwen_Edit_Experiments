@@ -801,6 +801,10 @@ surface (svdq detection → nunchaku transformer class → pipeline assembly) an
 **Trigger:** Grant prioritizing the Flux/Qwen svdq files over other work AND a
 `nunchaku` wheel confirmed for the pinned stack. "All the rage" in the community
 (strong download momentum), so likely worth doing once the dep story is clean.
+**Won't-do (Grant, 2026-07-06):** Grant is not interested in nunchaku support,
+and the svdq files above were a mis-identification — not his actual targets
+(see the INT8-ConvRot entry below). Entry retained per §12 (don't delete) as a
+record that the format is unsupported; not on the roadmap.
 
 ## 2026-07-06 — Krea-2 single-file / GGUF checkpoints cannot be loaded (no converter)
 
@@ -827,3 +831,34 @@ control, plausible given Krea momentum).
 **Trigger:** Grant wanting the Krea finetune specifically AND diffusers still
 lacking Krea single-file support; re-check each diffusers bump (upstream may
 close it for free).
+
+## 2026-07-06 — INT8-ConvRot single-file consumption unsupported (Grant's actual target format)
+
+**What:** Grant's two near-term target checkpoints are **INT8-ConvRot** format
+(civitai.red model 2242173 "Dark Beast … int8 convrot 2 … krea2 aggressive
+edition"; model 958009 "RedCraft … int8 convrot NSFW edition 2") — not yet
+downloaded. ConvRot = **rotation-based plug-and-play quantization for diffusion
+transformers** (QuaRot-family: fuse orthogonal rotations into the weights /
+activations to kill outliers, then quantize; here INT8 tensorwise,
+`convrot_groupsize` 256). Paper: arXiv:2512.03673
+(https://arxiv.org/html/2512.03673v1, Grant-supplied). It is a **ComfyUI-core
+format** — added in ComfyUI PR #14636 / commit `1a510f0`, with
+`ComfyUI-INT8-Toolkit` (SparknightLLC) around it; metadata self-declares
+`int8_tensorwise` + `convrot` (bool) + `convrot_groupsize`. **diffusers has zero
+awareness of it** (verified) — so comfyless (diffusers-based) cannot load it
+today. NOT nunchaku, NOT GGUF, NOT a `from_single_file` path.
+**Why not now:** supporting it in comfyless = a custom single-file loader + a
+**rotation-aware INT8 Linear** (apply the fused ConvRot rotation at compute, int8
+GEMM, per the paper / ComfyUI's `int8_tensorwise`+convrot op). This is a sibling
+to ADR-019 slice C (ported scaled-fp8 ops) but harder — the rotation matrices are
+new machinery. Reference implementations exist (ComfyUI core #14636 + INT8-
+Toolkit) to port from, and the arXiv paper for the math. §12 security review (
+caller-supplied model content parse) + likely a new dep. Own ADR (sibling to
+ADR-019), not a slice of it.
+**Extra caveat for the krea2 target (model 2242173):** it is a **Krea-2**
+finetune, so even with INT8-ConvRot support it inherits the Krea-2 single-file
+architecture gap (see the Krea entry below — no diffusers `from_single_file`,
+native key names). That one model is blocked on TWO fronts; the RedCraft target
+(958009) is likely a more standard base and blocked only on INT8-ConvRot.
+**Trigger:** Grant downloading the files + deciding to invest; re-check whether a
+diffusers/community loader lands first (ComfyUI-core status means momentum).
