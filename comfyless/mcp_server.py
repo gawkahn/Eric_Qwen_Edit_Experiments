@@ -29,7 +29,7 @@ import os
 import sys
 import time
 import traceback
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import click
 from mcp.server import Server
@@ -636,6 +636,9 @@ class _StartupConfig:
         "default_model",
         "mcp_max_iterations",
         "catalog",
+        "lora_paths",
+        "transformer_paths",
+        "all_roots",
     )
 
     def __init__(
@@ -645,12 +648,22 @@ class _StartupConfig:
         default_model: Optional[str],
         mcp_max_iterations: int,
         catalog: dict,
+        lora_paths: Tuple[str, ...] = (),
+        transformer_paths: Tuple[str, ...] = (),
     ) -> None:
         self.output_dir = output_dir
         self.model_base = model_base
         self.default_model = default_model
         self.mcp_max_iterations = mcp_max_iterations
         self.catalog = catalog
+        self.lora_paths = lora_paths
+        self.transformer_paths = transformer_paths
+        # ADR-018 §3: the load-boundary allowlist is the union of all
+        # spawn-time roots; derived once so resolver + _check_paths can
+        # never diverge (invariant 5).
+        self.all_roots: Tuple[str, ...] = (
+            model_base, *lora_paths, *transformer_paths,
+        )
 
 
 def _validate_startup_args(
@@ -659,6 +672,8 @@ def _validate_startup_args(
     default_model: Optional[str],
     mcp_max_iterations: int,
     catalog: Optional[str] = None,
+    lora_paths: Tuple[str, ...] = (),
+    transformer_paths: Tuple[str, ...] = (),
 ) -> _StartupConfig:
     """Resolve + validate spawn-time CLI args. Raises click.BadParameter on bad input.
 
@@ -704,6 +719,33 @@ def _validate_startup_args(
                 param_hint="--default-model",
             )
 
+    # ADR-018: extra kind-typed scan roots. Validated exactly like
+    # --model-base (invariant 1 fail-closed: NUL pre-check, realpath,
+    # must-be-directory), each independently; no root need be under
+    # another. The resolved tuples feed build_catalog (kind-typed scan)
+    # AND the _StartupConfig.all_roots load-boundary union.
+    resolved_loras: Tuple[str, ...] = ()
+    resolved_transformers: Tuple[str, ...] = ()
+    for flag, raw_paths in (("--lora-path", lora_paths),
+                            ("--transformer-path", transformer_paths)):
+        resolved: Tuple[str, ...] = ()
+        for raw in raw_paths:
+            if "\x00" in raw:
+                raise click.BadParameter(
+                    "contains embedded NUL byte", param_hint=flag,
+                )
+            r = os.path.realpath(raw)
+            if not os.path.isdir(r):
+                raise click.BadParameter(
+                    f"does not resolve to a directory: {raw!r}",
+                    param_hint=flag,
+                )
+            resolved += (r,)
+        if flag == "--lora-path":
+            resolved_loras = resolved
+        else:
+            resolved_transformers = resolved
+
     # --catalog: explicit NUL-byte pre-check before any os.* / open() so
     # direct in-process callers (tests, future internal use) get a clean
     # click.BadParameter instead of the raw `ValueError('embedded null
@@ -721,7 +763,11 @@ def _validate_startup_args(
     from comfyless.catalog import build_catalog, CatalogBuildError
 
     try:
-        built_catalog = build_catalog(resolved_base, catalog)
+        built_catalog = build_catalog(
+            resolved_base, catalog,
+            lora_paths=resolved_loras,
+            transformer_paths=resolved_transformers,
+        )
     except CatalogBuildError as e:
         # `from None` suppresses the CatalogBuildError chain so click's
         # pretty-printed error stays clean. The catalog layer's message
@@ -736,6 +782,8 @@ def _validate_startup_args(
         default_model=resolved_default,
         mcp_max_iterations=mcp_max_iterations,
         catalog=built_catalog,
+        lora_paths=resolved_loras,
+        transformer_paths=resolved_transformers,
     )
 
 
@@ -1292,7 +1340,7 @@ async def _handle_generate(
     model_in = (payload.get("model") or "").strip()
     if model_in:
         rr = resolve_reference(
-            cfg.catalog, model_in, cfg.model_base, expected_kind="model")
+            cfg.catalog, model_in, cfg.all_roots, expected_kind="model")
         if not rr.ok:
             raise _reference_error(rr.cause)
         model_abs = rr.abs_path
@@ -1325,7 +1373,7 @@ async def _handle_generate(
     transformer_name: Optional[str] = None
     if transformer_val:
         rr = resolve_reference(
-            cfg.catalog, transformer_val, cfg.model_base,
+            cfg.catalog, transformer_val, cfg.all_roots,
             expected_kind="transformer")
         if not rr.ok:
             raise _reference_error(rr.cause)
@@ -1364,7 +1412,7 @@ async def _handle_generate(
                     "ValidationError",
                     f"validation failed: loras[{i}].weight: expected number")
             rr = resolve_reference(
-                cfg.catalog, lora.get("name"), cfg.model_base,
+                cfg.catalog, lora.get("name"), cfg.all_roots,
                 expected_kind="lora")
             if not rr.ok:
                 raise _reference_error(rr.cause)
@@ -1383,7 +1431,7 @@ async def _handle_generate(
     if _check_paths(
         {"model": model_abs, "transformer_path": transformer_abs,
          "loras": loras_resolved},
-        cfg.model_base,
+        cfg.all_roots,
     ):
         raise _reference_error("WithinFailure")
 
@@ -1621,7 +1669,7 @@ async def _handle_generate_cascade(
         if stage == "stage_a" and not raw_v:
             continue  # stage_a is optional (validate_config requires only c + b)
         rr = resolve_reference(
-            cfg.catalog, raw_v, cfg.model_base,
+            cfg.catalog, raw_v, cfg.all_roots,
             expected_kind=("model", "transformer"))
         if not rr.ok:
             raise _reference_error(rr.cause)
@@ -1636,7 +1684,7 @@ async def _handle_generate_cascade(
     # failure here is a containment escape on an already-resolved path -> the
     # uniform reference error (the value is never echoed).
     for stage in stage_names:
-        if not _within(resolved_cc[stage], cfg.model_base):
+        if not any(_within(resolved_cc[stage], r) for r in cfg.all_roots):
             raise _reference_error("WithinFailure")
 
     # 5 — Output-path resolution. Cascade dispatch ignores top-level model/
@@ -1948,6 +1996,32 @@ async def _run_async(cfg: _StartupConfig) -> None:
     ),
 )
 @click.option(
+    "--lora-path",
+    "lora_paths",
+    required=False,
+    multiple=True,
+    type=click.Path(file_okay=False, dir_okay=True, resolve_path=False),
+    help=(
+        "ADR-018: additional scan root; EVERY .safetensors under it (any "
+        "depth) is minted as kind:'lora' and the root joins the "
+        "load-boundary allowlist union. Repeatable. Validated fail-closed "
+        "at spawn like --model-base."
+    ),
+)
+@click.option(
+    "--transformer-path",
+    "transformer_paths",
+    required=False,
+    multiple=True,
+    type=click.Path(file_okay=False, dir_okay=True, resolve_path=False),
+    help=(
+        "ADR-018: additional scan root minting kind:'transformer'. "
+        "Repeatable. Name the specific checkpoints/ and diffusion_models/ "
+        "trees, never a parent that also contains loras/ (cross-kind "
+        "overlap fails the build closed)."
+    ),
+)
+@click.option(
     "--default-model",
     required=False,
     default=None,
@@ -1988,6 +2062,8 @@ async def _run_async(cfg: _StartupConfig) -> None:
 def main(
     output_dir: str,
     model_base: str,
+    lora_paths: Tuple[str, ...],
+    transformer_paths: Tuple[str, ...],
     default_model: Optional[str],
     catalog: Optional[str],
     mcp_max_iterations: int,
@@ -2009,6 +2085,8 @@ def main(
         default_model=default_model,
         mcp_max_iterations=mcp_max_iterations,
         catalog=catalog,
+        lora_paths=lora_paths,
+        transformer_paths=transformer_paths,
     )
     asyncio.run(_run_async(cfg))
 

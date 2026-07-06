@@ -3922,6 +3922,211 @@ check("_AUDIT_DROPPED_FIELDS contains prompt + negative_prompt",
 
 
 # ════════════════════════════════════════════════════════════════════════
+print("\n== ADR-018: multi-root kind-typed catalog scan ==")
+# ════════════════════════════════════════════════════════════════════════
+
+
+def _mk_st(path: str, content: bytes = b"fake-weight-bytes") -> str:
+    """Create a .safetensors fixture file at any depth, mkdir -p style."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(content)
+    return path
+
+
+# ── kind-typed recursive minting + model-base behavior unchanged ────────
+with tempfile.TemporaryDirectory() as _mb, \
+     tempfile.TemporaryDirectory() as _lr, \
+     tempfile.TemporaryDirectory() as _tr:
+    _make_model_fixture(_mb, "QwenImage")
+    _make_loras_fixture(_mb, ["conv_lora"])  # legacy convention dir in mb
+    _deep = _mk_st(os.path.join(_lr, "Flux", "character",
+                                "deep_lora.safetensors"))
+    _mk_st(os.path.join(_tr, "SDXL", "juggernaut_x.safetensors"))
+    _cat18 = cat_mod.build_catalog(
+        _mb, None, lora_paths=(_lr,), transformer_paths=(_tr,))
+    check("ADR-018: nested lora minted kind:'lora' (depth 2)",
+          _cat18.get("deep_lora", {}).get("kind") == "lora")
+    check("ADR-018: nested transformer minted kind:'transformer'",
+          _cat18.get("juggernaut_x", {}).get("kind") == "transformer")
+    check("ADR-018: model-base model scan unchanged",
+          _cat18.get("QwenImage", {}).get("kind") == "model")
+    check("ADR-018: model-base convention loras/ scan unchanged",
+          _cat18.get("conv_lora", {}).get("kind") == "lora")
+    check("ADR-018: minted abs_path is the realpath under the lora root",
+          _cat18["deep_lora"]["abs_path"] == os.path.realpath(_deep))
+
+# ── repeatable roots ─────────────────────────────────────────────────────
+with tempfile.TemporaryDirectory() as _mb, \
+     tempfile.TemporaryDirectory() as _lr1, \
+     tempfile.TemporaryDirectory() as _lr2:
+    _mk_st(os.path.join(_lr1, "adr18_a.safetensors"))
+    _mk_st(os.path.join(_lr2, "adr18_b.safetensors"))
+    _cat18 = cat_mod.build_catalog(_mb, None, lora_paths=(_lr1, _lr2))
+    check("ADR-018: repeatable --lora-path roots both minted",
+          _cat18.get("adr18_a", {}).get("kind") == "lora"
+          and _cat18.get("adr18_b", {}).get("kind") == "lora")
+
+# ── stem collision, DISTINCT content → fail closed ───────────────────────
+with tempfile.TemporaryDirectory() as _mb, \
+     tempfile.TemporaryDirectory() as _lr:
+    _mk_st(os.path.join(_lr, "m1", "dup.safetensors"), b"content-A")
+    _mk_st(os.path.join(_lr, "m2", "dup.safetensors"), b"content-B-longer")
+    _assert_raises(
+        "ADR-018: stem collision with distinct content",
+        lambda: cat_mod.build_catalog(_mb, None, lora_paths=(_lr,)),
+        cat_mod.CatalogBuildError,
+        message_contains=["two distinct paths"],
+    )
+
+# ── stem collision, BYTE-IDENTICAL → pick-one alias (no error) ───────────
+with tempfile.TemporaryDirectory() as _mb, \
+     tempfile.TemporaryDirectory() as _lr:
+    _p1 = _mk_st(os.path.join(_lr, "m1", "accel.safetensors"), b"same-bytes")
+    _p2 = _mk_st(os.path.join(_lr, "m2", "accel.safetensors"), b"same-bytes")
+    _cat18 = cat_mod.build_catalog(_mb, None, lora_paths=(_lr,))
+    check("ADR-018: byte-identical duplicate aliases instead of failing",
+          _cat18.get("accel", {}).get("kind") == "lora")
+    check("ADR-018: alias retains one of the duplicate paths",
+          _cat18.get("accel", {}).get("abs_path")
+          in (os.path.realpath(_p1), os.path.realpath(_p2)))
+
+# ── cross-kind overlap (same tree under both flags) → fail closed ────────
+with tempfile.TemporaryDirectory() as _mb, \
+     tempfile.TemporaryDirectory() as _dual:
+    _mk_st(os.path.join(_dual, "xkind.safetensors"))
+    _assert_raises(
+        "ADR-018: cross-kind overlap (same path, two kinds)",
+        lambda: cat_mod.build_catalog(
+            _mb, None, lora_paths=(_dual,), transformer_paths=(_dual,)),
+        cat_mod.CatalogBuildError,
+        message_contains=["two kinds"],
+    )
+
+# ── cross-kind, DIFFERENT paths, byte-identical → still fail closed ──────
+# (code-review F-1: the pick-one carve-out applies only WITHIN a kind;
+# aliasing across kinds would make kind scan-order-dependent)
+with tempfile.TemporaryDirectory() as _mb, \
+     tempfile.TemporaryDirectory() as _lr, \
+     tempfile.TemporaryDirectory() as _tr:
+    _mk_st(os.path.join(_lr, "xk2.safetensors"), b"identical-bytes")
+    _mk_st(os.path.join(_tr, "xk2.safetensors"), b"identical-bytes")
+    _assert_raises(
+        "ADR-018 F-1: cross-kind byte-identical different paths",
+        lambda: cat_mod.build_catalog(
+            _mb, None, lora_paths=(_lr,), transformer_paths=(_tr,)),
+        cat_mod.CatalogBuildError,
+        message_contains=["two kinds"],
+    )
+
+# ── root validation fails closed (missing / file, both flags) ────────────
+with tempfile.TemporaryDirectory() as _mb:
+    _assert_raises(
+        "ADR-018: missing --lora-path root",
+        lambda: cat_mod.build_catalog(
+            _mb, None, lora_paths=("/nonexistent-adr018-xyzzy",)),
+        cat_mod.CatalogBuildError,
+        message_contains=["--lora-path"],
+    )
+    with tempfile.NamedTemporaryFile() as _f:
+        _assert_raises(
+            "ADR-018: --transformer-path root is a file",
+            lambda: cat_mod.build_catalog(
+                _mb, None, transformer_paths=(_f.name,)),
+            cat_mod.CatalogBuildError,
+            message_contains=["--transformer-path"],
+        )
+
+# ── symlink policy under kind roots (matches _scan invariant 4) ──────────
+with tempfile.TemporaryDirectory() as _mb, \
+     tempfile.TemporaryDirectory() as _lr, \
+     tempfile.TemporaryDirectory() as _elsewhere:
+    _target = _mk_st(os.path.join(_elsewhere, "real.safetensors"))
+    os.symlink(_target, os.path.join(_lr, "linked.safetensors"))
+    _mk_st(os.path.join(_elsewhere, "tree", "escaped.safetensors"))
+    os.symlink(os.path.join(_elsewhere, "tree"),
+               os.path.join(_lr, "linked_dir"))
+    _cat18 = cat_mod.build_catalog(_mb, None, lora_paths=(_lr,))
+    check("ADR-018: file symlink under kind root is skipped",
+          "linked" not in _cat18)
+    check("ADR-018: symlinked dir under kind root is not descended",
+          "escaped" not in _cat18)
+
+# ── resolve_reference containment against the roots union ────────────────
+with tempfile.TemporaryDirectory() as _mb, \
+     tempfile.TemporaryDirectory() as _lr:
+    _mk_st(os.path.join(_lr, "u_lora.safetensors"))
+    _cat18 = cat_mod.build_catalog(_mb, None, lora_paths=(_lr,))
+    _mb_r, _lr_r = os.path.realpath(_mb), os.path.realpath(_lr)
+    _rr = cat_mod.resolve_reference(
+        _cat18, "u_lora", (_mb_r, _lr_r), expected_kind="lora")
+    check("ADR-018: resolver accepts lora under roots union",
+          _rr.ok and _rr.abs_path == _cat18["u_lora"]["abs_path"])
+    _rr2 = cat_mod.resolve_reference(
+        _cat18, "u_lora", _mb_r, expected_kind="lora")
+    check("ADR-018: resolver str-root back-compat still fail-closed "
+          "(lora outside model_base → WithinFailure)",
+          (not _rr2.ok) and _rr2.cause == "WithinFailure")
+
+# ── _validate_startup_args + CLI wiring ──────────────────────────────────
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as tmp_base:
+    result = runner.invoke(mcps.main, [
+        "--output-dir", tmp_out,
+        "--model-base", tmp_base,
+        "--lora-path", "/nonexistent-adr018-cli-xyzzy",
+    ])
+    check("ADR-018: nonexistent --lora-path → non-zero exit at spawn",
+          result.exit_code != 0)
+
+with tempfile.TemporaryDirectory() as tmp_out, \
+     tempfile.TemporaryDirectory() as _mb, \
+     tempfile.TemporaryDirectory() as _lr, \
+     tempfile.TemporaryDirectory() as _tr:
+    _mk_st(os.path.join(_lr, "h_lora.safetensors"))
+    _mk_st(os.path.join(_tr, "h_tf.safetensors"))
+    _cfg18 = mcps._validate_startup_args(
+        output_dir=tmp_out, model_base=_mb, default_model=None,
+        mcp_max_iterations=100, lora_paths=(_lr,), transformer_paths=(_tr,))
+    check("ADR-018: cfg.all_roots is (model_base, *lora, *transformer) "
+          "realpaths",
+          _cfg18.all_roots == (os.path.realpath(_mb),
+                               os.path.realpath(_lr),
+                               os.path.realpath(_tr)))
+    check("ADR-018: startup catalog carries the kind-typed entries",
+          _cfg18.catalog.get("h_lora", {}).get("kind") == "lora"
+          and _cfg18.catalog.get("h_tf", {}).get("kind") == "transformer")
+    _assert_raises(
+        "ADR-018: NUL byte in --lora-path",
+        lambda: mcps._validate_startup_args(
+            output_dir=tmp_out, model_base=_mb, default_model=None,
+            mcp_max_iterations=100, lora_paths=("bad\x00path",)),
+        click.BadParameter,
+    )
+
+# ── _StartupConfig back-compat (no extra roots → union is just mb) ───────
+_c18 = mcps._StartupConfig(
+    output_dir="/o", model_base="/m", default_model=None,
+    mcp_max_iterations=5, catalog={})
+check("ADR-018: _StartupConfig default all_roots == (model_base,)",
+      _c18.all_roots == ("/m",))
+
+# ── _same_file_content / _file_sha256 unit behavior ──────────────────────
+with tempfile.TemporaryDirectory() as _td18:
+    _sa = _mk_st(os.path.join(_td18, "a.safetensors"), b"identical")
+    _sb = _mk_st(os.path.join(_td18, "b.safetensors"), b"identical")
+    _sc = _mk_st(os.path.join(_td18, "c.safetensors"), b"different!")
+    check("ADR-018: _same_file_content true for identical bytes",
+          cat_mod._same_file_content(_sa, _sb))
+    check("ADR-018: _same_file_content false for distinct content",
+          not cat_mod._same_file_content(_sa, _sc))
+    check("ADR-018: _same_file_content false when one side missing",
+          not cat_mod._same_file_content(_sa, os.path.join(_td18, "nope")))
+    check("ADR-018: _file_sha256 None on unreadable path",
+          cat_mod._file_sha256(os.path.join(_td18, "nope")) is None)
+
+
+# ════════════════════════════════════════════════════════════════════════
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print("──────────────────────────────────────────────────")

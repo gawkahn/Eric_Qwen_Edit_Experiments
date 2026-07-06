@@ -19,6 +19,13 @@ REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 # surfacing snapshot-hash-named dirs as catalog entries. hf-local is the curated
 # set with human-readable names (Grant, 2026-06-26).
 MODEL_BASE="${MODEL_BASE:-/home/gawkahn/projects/ai-lab/ai-base/models/hf-local}"
+# ADR-018 kind-typed scan roots. LORA_PATH: every .safetensors under it (any
+# depth) catalogs as a LoRA. TRANSFORMER_PATH_*: the two specific transformer
+# trees — never their comfyui/models parent (it also contains loras/ etc.;
+# cross-kind overlap fails the catalog build closed).
+LORA_PATH="${LORA_PATH:-/home/gawkahn/projects/ai-lab/ai-base/models/comfyui/models/loras}"
+TRANSFORMER_PATH_CKPT="${TRANSFORMER_PATH_CKPT:-/home/gawkahn/projects/ai-lab/ai-base/models/comfyui/models/checkpoints}"
+TRANSFORMER_PATH_DIFF="${TRANSFORMER_PATH_DIFF:-/home/gawkahn/projects/ai-lab/ai-base/models/comfyui/models/diffusion_models}"
 OUTPUT_DIR="${OUTPUT_DIR:-/home/gawkahn/gen-output}"
 HOST="${MCPO_HOST:-172.17.0.1}"   # docker bridge gateway: reachable from host + containers, not the wider LAN
 PORT="${MCPO_PORT:-8090}"
@@ -33,9 +40,14 @@ export HF_HUB_CACHE=/mnt/nvme-8tb/hf
 
 echo "[start-mcpo] binding ${HOST}:${PORT}, GPU=${GPU}"
 echo "[start-mcpo] model-base=${MODEL_BASE}"
+echo "[start-mcpo] lora-path=${LORA_PATH}"
+echo "[start-mcpo] transformer-paths=${TRANSFORMER_PATH_CKPT} ${TRANSFORMER_PATH_DIFF}"
 echo "[start-mcpo] output-dir=${OUTPUT_DIR}"
 
 exec uvx mcpo --host "$HOST" --port "$PORT" -- \
   "$REPO/.venv/bin/python3" -m comfyless.mcp_server \
     --model-base "$MODEL_BASE" \
+    --lora-path "$LORA_PATH" \
+    --transformer-path "$TRANSFORMER_PATH_CKPT" \
+    --transformer-path "$TRANSFORMER_PATH_DIFF" \
     --output-dir "$OUTPUT_DIR"

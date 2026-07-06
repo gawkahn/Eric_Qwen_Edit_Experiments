@@ -36,7 +36,7 @@ import stat
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 from comfyless.params_validation import QUANT_MODES, validate_machine_request
 
@@ -214,29 +214,44 @@ def _within(path: str, base: str) -> bool:
     return r == b or r.startswith(b + os.sep)
 
 
-def _check_paths(req: dict, model_base: str) -> Optional[str]:
-    """Return an error string if any path in the request is outside model_base."""
+def _check_paths(req: dict, roots: Union[str, Sequence[str]]) -> Optional[str]:
+    """Return an error string if any path in the request is outside every
+    allowed root.
+
+    `roots` is a single allowlist root (str) or a sequence of roots —
+    {model_base} ∪ lora roots ∪ transformer roots (ADR-018 §3). A path is
+    accepted iff it is `_within` ANY root. The union widens WHICH
+    operator-curated trees are loadable, never who chooses them: callers
+    still supply catalog names, and every root is a spawn-time operator
+    argument.
+    """
+    if isinstance(roots, str):
+        roots = (roots,)
+
+    def _in_any(p: str) -> bool:
+        return any(_within(p, b) for b in roots)
+
     model = req.get("model", "")
     if not model.startswith("/"):
         return f"model path must be absolute: {model!r}"
-    if not _within(model, model_base):
-        return f"model path outside --model-base: {model!r}"
+    if not _in_any(model):
+        return f"model path outside the allowed roots: {model!r}"
 
     for field in ("transformer_path", "vae_path", "text_encoder_path", "text_encoder_2_path"):
         p = req.get(field, "") or ""
         if p:
             if not p.startswith("/"):
                 return f"{field} must be absolute: {p!r}"
-            if not _within(p, model_base):
-                return f"{field} outside --model-base: {p!r}"
+            if not _in_any(p):
+                return f"{field} outside the allowed roots: {p!r}"
 
     for i, lora in enumerate(req.get("loras") or []):
         p = lora.get("path", "")
         if p:
             if not p.startswith("/"):
                 return f"loras[{i}].path must be absolute: {p!r}"
-            if not _within(p, model_base):
-                return f"loras[{i}].path outside --model-base: {p!r}"
+            if not _in_any(p):
+                return f"loras[{i}].path outside the allowed roots: {p!r}"
 
     return None
 
@@ -309,6 +324,7 @@ def _handle_connection(
     device: str,
     precision: str,
     server_state: dict,
+    extra_roots: Tuple[str, ...] = (),
 ) -> bool:
     """
     Process one client connection.
@@ -352,7 +368,9 @@ def _handle_connection(
 
     # req_type == "generate"
     # ── Path enforcement ─────────────────────────────────────────────────
-    err = _check_paths(req, model_base)
+    # ADR-018 §3: allowlist is the union {model_base} ∪ extra kind-typed
+    # roots (all spawn-time operator arguments).
+    err = _check_paths(req, (model_base, *extra_roots))
     if err:
         # Server-side audit log for path-validation rejections. Must happen
         # BEFORE _send_safe so the record exists even if the client has
@@ -716,14 +734,36 @@ def run_server(
     model_base: str,
     device: str = "cuda",
     precision: str = "bf16",
+    lora_paths: Tuple[str, ...] = (),
+    transformer_paths: Tuple[str, ...] = (),
 ) -> None:
-    """Start the comfyless model server and block until --unload is received."""
+    """Start the comfyless model server and block until --unload is received.
+
+    `lora_paths` / `transformer_paths` (ADR-018): additional spawn-time
+    allowlist roots; request paths pass `_check_paths` when within ANY of
+    {model_base} ∪ these roots. Validated fail-closed here exactly like
+    model_base.
+    """
     output_dir = os.path.realpath(output_dir)
     model_base = os.path.realpath(model_base)
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     if not os.path.isdir(model_base):
         raise FileNotFoundError(f"--model-base not found: {model_base}")
+
+    extra_roots: Tuple[str, ...] = ()
+    for flag, paths in (("--lora-path", lora_paths),
+                        ("--transformer-path", transformer_paths)):
+        for p in paths:
+            # Security-audit F-1 (2026-07-05): explicit NUL pre-check before
+            # realpath, mirroring the MCP startup path — a NUL would raise a
+            # bare ValueError from realpath instead of a clean error.
+            if "\x00" in p:
+                raise FileNotFoundError(f"{flag} contains embedded NUL byte")
+            root_real = os.path.realpath(p)
+            if not os.path.isdir(root_real):
+                raise FileNotFoundError(f"{flag} not found: {p}")
+            extra_roots += (root_real,)
 
     sock_path = socket_path(device)
     if sock_path.exists():
@@ -737,6 +777,8 @@ def run_server(
     _log(f"Listening on {sock_path}")
     _log(f"output-dir : {output_dir}")
     _log(f"model-base : {model_base}")
+    for r in extra_roots:
+        _log(f"extra-root : {r}")
     _log(f"device     : {device} / {precision}")
 
     server_state: dict = {}
@@ -746,7 +788,8 @@ def run_server(
             conn, _ = srv.accept()
             with conn:
                 keep_running = _handle_connection(
-                    conn, output_dir, model_base, device, precision, server_state
+                    conn, output_dir, model_base, device, precision,
+                    server_state, extra_roots,
                 )
     finally:
         srv.close()

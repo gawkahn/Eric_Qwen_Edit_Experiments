@@ -36,6 +36,7 @@ See `docs/decisions/ADR-015-mcp-catalog-reference-resolution.md` and
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -254,6 +255,41 @@ def normalize_name(s: str) -> str:
     return unicodedata.normalize("NFC", s)
 
 
+def _file_sha256(path: str) -> Optional[str]:
+    """SHA-256 of a file, or None on any read error."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _same_file_content(path_a: str, path_b: str) -> bool:
+    """True iff both paths are regular files with identical size AND SHA-256.
+
+    ADR-018 "pick one": a same-name / different-path scan collision between two
+    BYTE-IDENTICAL duplicate weight files (common when an accel-LoRA is copied
+    under several base-model folders) is a harmless alias, not an ambiguity.
+    Size is the cheap first gate; the hash confirms (collisions are rare, so the
+    full read at spawn is acceptable). Directories (diffusers model dirs) are
+    never content-equal here, so a model-vs-model name collision still fails
+    closed — only duplicate single-file weights are aliased.
+    """
+    try:
+        if not (os.path.isfile(path_a) and os.path.isfile(path_b)):
+            return False
+        if os.path.getsize(path_a) != os.path.getsize(path_b):
+            return False
+    except OSError:
+        return False
+    ha = _file_sha256(path_a)
+    hb = _file_sha256(path_b)
+    return ha is not None and ha == hb
+
+
 def _add_entry(
     catalog: CatalogDict,
     entry: CatalogEntry,
@@ -312,7 +348,38 @@ def _add_entry(
     if name_norm in catalog:
         existing = catalog[name_norm]
         if existing["abs_path"] == entry["abs_path"]:
+            # ADR-018 §2: the SAME path minted under two different kinds
+            # (operator passed overlapping --lora-path/--transformer-path
+            # trees) is a kind ambiguity — first-in-wins would make the
+            # entry's kind depend on scan order. Fail closed.
+            if existing["kind"] != entry["kind"]:
+                raise CatalogBuildError(
+                    f"catalog name {original_name!r} maps to the same path "
+                    f"under two kinds ({existing['kind']!r} vs "
+                    f"{entry['kind']!r}): {entry['abs_path']!r} — "
+                    f"overlapping kind-typed scan roots; narrow the roots"
+                )
             # Harmless alias / same-realpath; existing entry retained.
+            return
+        # Code-review F-1 (2026-07-05): a same-stem CROSS-KIND collision is
+        # never aliased, even for byte-identical content — aliasing would make
+        # the entry's kind scan-order-dependent (lora roots scan before
+        # transformer roots), so a legitimate request for the later kind would
+        # uniformly fail. Checked BEFORE the content carve-out.
+        if existing["kind"] != entry["kind"]:
+            raise CatalogBuildError(
+                f"catalog name {original_name!r} maps to two kinds "
+                f"({existing['kind']!r} vs {entry['kind']!r}): "
+                f"{existing['abs_path']!r} vs {entry['abs_path']!r} — "
+                f"overlapping kind-typed scan roots; narrow the roots"
+            )
+        # ADR-018 "pick one": two DIFFERENT paths under the same name. If the
+        # files are byte-identical duplicates (an accel-LoRA copied under several
+        # base-model folders; the same weight under checkpoints/ and
+        # diffusion_models/), keep the existing entry rather than failing. Only a
+        # GENUINE clash — distinct content, or a model directory — fails closed,
+        # so the agent can never be silently served the wrong weight.
+        if _same_file_content(existing["abs_path"], entry["abs_path"]):
             return
         raise CatalogBuildError(
             f"catalog name {original_name!r} maps to two distinct paths "
@@ -408,6 +475,39 @@ def _scan(model_base_real: str) -> Iterator[Tuple[CatalogEntry, str]]:
                 "target_family": None,
             }
             yield entry, stem
+
+
+def _scan_kind_root(
+    root_real: str, kind: str
+) -> Iterator[Tuple[CatalogEntry, str]]:
+    """Recursively yield (entry, stem) for every `.safetensors` under
+    `root_real` (already realpath-resolved), minting each as `kind` (ADR-018).
+
+    Unlike `_scan` (which classifies by the immediate-parent-dir convention and
+    stops at the first model_index.json), this is KIND-TYPED: the caller fixes
+    the kind by which root flag named the tree, and EVERY `.safetensors` at any
+    depth is minted — so nested `<base-model>/<type>/file` LoRA / transformer
+    layouts are covered. Symlinked directories are not descended
+    (followlinks=False) and file-symlinks are skipped, matching `_scan` (Vision
+    invariant 4). The entry name is the filename stem; cross-tree stem
+    collisions fail closed in `_add_entry` (no-partial-catalog).
+    """
+    for dirpath, _dirnames, filenames in os.walk(root_real, followlinks=False):
+        for fname in filenames:
+            if not fname.endswith(".safetensors"):
+                continue
+            file_path = os.path.join(dirpath, fname)
+            if os.path.islink(file_path):
+                continue
+            real_file = os.path.realpath(file_path)
+            entry: CatalogEntry = {
+                "abs_path": real_file,
+                "kind": kind,
+                "source": "scan",
+                "model_family": None,
+                "target_family": None,
+            }
+            yield entry, fname[: -len(".safetensors")]
 
 
 def _parse_manifest_entry(
@@ -585,6 +685,9 @@ def _parse_manifest(
 def build_catalog(
     model_base: str,
     catalog_path: Optional[str] = None,
+    *,
+    lora_paths: Tuple[str, ...] = (),
+    transformer_paths: Tuple[str, ...] = (),
 ) -> CatalogDict:
     """Build the catalog from a scan of `model_base` plus an optional
     operator manifest.
@@ -618,6 +721,25 @@ def build_catalog(
 
     for entry, name in _scan(model_base_real):
         _add_entry(catalog, entry, name)
+
+    # ADR-018: additional kind-typed recursive scan roots. Each is realpath-
+    # resolved and EVERY .safetensors under it (any depth) is minted as the
+    # root's kind. Entries merge through _add_entry (collision-safe). Order:
+    # model-base → lora roots → transformer roots → manifest.
+    # Root validation fails CLOSED (ADR-018 §2): os.walk on a missing path
+    # yields nothing, which would silently fail open into a partial catalog.
+    for flag, kind, paths in (
+        ("--lora-path", "lora", lora_paths),
+        ("--transformer-path", "transformer", transformer_paths),
+    ):
+        for p in paths:
+            root_real = os.path.realpath(p)
+            if not os.path.isdir(root_real):
+                raise CatalogBuildError(
+                    f"{flag} does not resolve to a directory: {p!r}"
+                )
+            for entry, name in _scan_kind_root(root_real, kind):
+                _add_entry(catalog, entry, name)
 
     if catalog_path is not None:
         for entry, name in _parse_manifest(catalog_path, model_base_real):
@@ -717,7 +839,7 @@ class ResolveResult:
 def resolve_reference(
     catalog: CatalogDict,
     raw_ref: str,
-    model_base: str,
+    roots: Union[str, Tuple[str, ...]],
     *,
     expected_kind: Optional[Union[str, Tuple[str, ...]]] = None,
 ) -> ResolveResult:
@@ -813,7 +935,11 @@ def resolve_reference(
     # Reuse the daemon's `_within` (lazy import; keeps this module's import-time
     # side effects stdlib-only, matching `_parse_manifest_entry`).
     from comfyless.server import _within
-    if not _within(abs_path, model_base):
+    # ADR-018 §3: containment is evaluated against the UNION of allowed
+    # roots ({model_base} ∪ lora roots ∪ transformer roots). A bare str is
+    # a 1-tuple so single-root callers are unchanged.
+    roots_t = (roots,) if isinstance(roots, str) else tuple(roots)
+    if not any(_within(abs_path, r) for r in roots_t):
         return ResolveResult(
             ok=False, path_was_discarded=path_was_discarded,
             cause="WithinFailure",

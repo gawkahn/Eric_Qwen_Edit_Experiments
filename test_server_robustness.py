@@ -735,6 +735,88 @@ check("socket_path propagates whitelist rejection", _rejects_path("../../x"))
 
 
 # ──────────────────────────────────────────────────────────────────────
+print("\n== ADR-018: _check_paths / run_server multi-root union ==")
+# ──────────────────────────────────────────────────────────────────────
+# Uses the REAL srv._check_paths (the module-level stub above was restored
+# after the connection tests).
+
+import os as _os
+import tempfile as _tempfile
+
+
+def _mk18(path, content=b"w"):
+    _os.makedirs(_os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(content)
+    return path
+
+
+with _tempfile.TemporaryDirectory() as _mb, \
+     _tempfile.TemporaryDirectory() as _lr, \
+     _tempfile.TemporaryDirectory() as _tr, \
+     _tempfile.TemporaryDirectory() as _outside:
+    _model = _os.path.join(_mb, "QwenImage")
+    _os.makedirs(_model)
+    _lora = _mk18(_os.path.join(_lr, "Flux", "char", "foo.safetensors"))
+    _tf = _mk18(_os.path.join(_tr, "SDXL", "jug.safetensors"))
+    _esc = _mk18(_os.path.join(_outside, "escape.safetensors"))
+
+    # str-root back-compat (single allowlist root)
+    check("ADR-018: str root back-compat — in-root model passes",
+          srv._check_paths({"model": _model}, _mb) is None)
+    _err = srv._check_paths({"model": _esc}, _mb)
+    check("ADR-018: str root back-compat — outside root rejected",
+          _err is not None and "outside the allowed roots" in _err)
+
+    # union acceptance: each field under its own root
+    _roots = (_mb, _lr, _tr)
+    check("ADR-018: union accepts model under mb + lora under lora root",
+          srv._check_paths(
+              {"model": _model,
+               "loras": [{"path": _lora, "weight": 1.0}]},
+              _roots) is None)
+    check("ADR-018: union accepts transformer_path under transformer root",
+          srv._check_paths(
+              {"model": _model, "transformer_path": _tf}, _roots) is None)
+
+    # rejection: lora root NOT in the allowlist
+    _err = srv._check_paths(
+        {"model": _model, "loras": [{"path": _lora, "weight": 1.0}]},
+        (_mb, _tr))
+    check("ADR-018: lora path rejected when its root absent from union",
+          _err is not None and "loras[0]" in _err)
+
+    # rejection: path outside ALL roots
+    _err = srv._check_paths({"model": _model, "vae_path": _esc}, _roots)
+    check("ADR-018: path outside all roots rejected under union",
+          _err is not None and "outside the allowed roots" in _err)
+
+    # relative paths still rejected regardless of union
+    check("ADR-018: relative model path still rejected",
+          srv._check_paths({"model": "rel/path"}, _roots) is not None)
+
+    # run_server root validation fails closed BEFORE binding a socket
+    with _tempfile.TemporaryDirectory() as _out18:
+        _raised = None
+        try:
+            srv.run_server(_out18, _mb,
+                           lora_paths=("/nonexistent-adr018-run-xyzzy",))
+        except FileNotFoundError as e:
+            _raised = str(e)
+        check("ADR-018: run_server missing --lora-path → FileNotFoundError",
+              _raised is not None and "--lora-path" in _raised)
+        _raised = None
+        try:
+            srv.run_server(_out18, _mb,
+                           transformer_paths=(_esc,))  # file, not dir
+        except FileNotFoundError as e:
+            _raised = str(e)
+        check("ADR-018: run_server non-dir --transformer-path → "
+              "FileNotFoundError",
+              _raised is not None and "--transformer-path" in _raised)
+
+
+# ──────────────────────────────────────────────────────────────────────
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print("──────────────────────────────────────────────────")
