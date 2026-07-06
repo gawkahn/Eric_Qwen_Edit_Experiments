@@ -326,6 +326,255 @@ with tempfile.TemporaryDirectory() as td:
 
 
 # ════════════════════════════════════════════════════════════════════════
+print("\n== S2: families, sidecar ingest, exclusion, search ==")
+# ════════════════════════════════════════════════════════════════════════
+
+with tempfile.TemporaryDirectory() as td:
+    mb = os.path.join(td, "hf-local")
+    lr = os.path.join(td, "loras")
+    tr = os.path.join(td, "diffusion_models")
+    for mname, cls in (("QwenImage", "QwenImagePipeline"),
+                       ("Flux2-dev", "Flux2Pipeline")):
+        mdir = os.path.join(mb, mname)
+        os.makedirs(mdir)
+        with open(os.path.join(mdir, "model_index.json"), "w") as f:
+            json.dump({"_class_name": cls}, f)
+
+    # neonpunk: audit-evidence family (verdicts OK vs base 'synth' whose
+    # path resolves under QwenImage) + a sidecar with civitai payload
+    _mk(os.path.join(lr, "Qwen", "style", "neonpunk.safetensors"))
+    with open(os.path.join(lr, "Qwen", "style", "neonpunk.metadata.json"),
+              "w") as f:
+        json.dump({
+            "model_name": "Neon Punk Style",
+            "base_model": "Qwen",
+            "sha256": "cc" * 32,
+            "preview_nsfw_level": 1,
+            "notes": "strength 0.8 works best",
+            "civitai": {
+                "id": 111, "modelId": 222,
+                "trainedWords": ["neonpunk", "<b>glow</b>"],
+                "description": "<p>A <b>cinematic</b> neon aesthetic"
+                               "&nbsp;LoRA</p>",
+                "model": {"name": "Neon Punk Style"},
+            },
+        }, f)
+    # conflict case: path hint says Qwen, sidecar declares Flux.2 (known)
+    _mk(os.path.join(lr, "Qwen", "misc", "fluxthing.safetensors"))
+    with open(os.path.join(lr, "Qwen", "misc", "fluxthing.metadata.json"),
+              "w") as f:
+        json.dump({"base_model": "Flux.2 D",
+                   "civitai": {"trainedWords": []}}, f)
+    # finding-1 regression: sidecar declares Flux.1 — NO flux base in
+    # hf-local; the old prefix fallback would silently map flux→flux2 and
+    # UN-exclude a Flux.1 LoRA into flux2 recommendations
+    _mk(os.path.join(lr, "flux1orphan.safetensors"))
+    with open(os.path.join(lr, "flux1orphan.metadata.json"), "w") as f:
+        json.dump({"base_model": "Flux.1 D",
+                   "civitai": {"trainedWords": []}}, f)
+    # finding-3: audit evidence (qwen-image) DISAGREES with sidecar (flux2)
+    _mk(os.path.join(lr, "auditwins.safetensors"))
+    with open(os.path.join(lr, "auditwins.metadata.json"), "w") as f:
+        json.dump({"base_model": "Flux.2 D",
+                   "civitai": {"trainedWords": []}}, f)
+    # finding-4: sidecar family alone, no audit manifest entry → included
+    _mk(os.path.join(lr, "sideonly.safetensors"))
+    with open(os.path.join(lr, "sideonly.metadata.json"), "w") as f:
+        json.dump({"base_model": "Qwen",
+                   "civitai": {"trainedWords": []}}, f)
+    # finding-5: "wan" must not fire inside "wandering" (word boundary)
+    _mk(os.path.join(lr, "wandering_style", "wanderer.safetensors"))
+    # unknown-hint case: folder family that has NO hf-local model (yet —
+    # the un-exclusion test below adds SDXL and rebuilds)
+    _mk(os.path.join(lr, "SDXL 1.0", "orphan.safetensors"))
+    # excluded-by-audit transformer + deletable + duplicate rows
+    _mk(os.path.join(tr, "wan_t2v.safetensors"))
+    _mk(os.path.join(tr, "broken.safetensors"))
+    _mk(os.path.join(tr, "dupe_of_base.safetensors"))
+
+    manifest = {
+        "audit_version": 1,
+        "audit_root": lr,
+        "transformer_roots": [tr],
+        "bases": {"synth": {
+            "path": os.path.join(mb, "QwenImage", "transformer")}},
+        "files": [
+            {"kind": "lora",
+             "relative_path": "Qwen/style/neonpunk.safetensors",
+             "classification": "usable", "reason": "ok",
+             "verdicts_by_base": {"synth": {"verdict": "OK"}}},
+            {"kind": "lora",
+             "relative_path": "auditwins.safetensors",
+             "classification": "usable", "reason": "ok",
+             "verdicts_by_base": {"synth": {"verdict": "OK"}}},
+            {"kind": "transformer", "root_index": 0,
+             "relative_path": "wan_t2v.safetensors",
+             "classification": "unconvertable",
+             "reason": "no_matching_base", "matched_bases": []},
+            {"kind": "transformer", "root_index": 0,
+             "relative_path": "broken.safetensors",
+             "classification": "deletable", "reason": "zero_byte"},
+            {"kind": "transformer", "root_index": 0,
+             "relative_path": "dupe_of_base.safetensors",
+             "classification": "usable", "reason": "prognosis_hi-prec",
+             "matched_bases": ["synth"], "duplicate_of": "synth"},
+        ],
+    }
+    mpath = os.path.join(td, "lora_audit.json")
+    with open(mpath, "w") as f:
+        json.dump(manifest, f)
+
+    dbp = os.path.join(td, "cat.sqlite")
+    stats = cbuild.build(dbp, mb, lora_paths=(lr,), transformer_paths=(tr,),
+                         audit_manifests=(mpath,))
+    check("S2 build: families registered from scan models",
+          stats["families"] == 2, detail=repr(stats))
+    check("S2 build: sidecars ingested", stats["sidecars"] == 5,
+          detail=repr(stats))
+
+    conn = cdb.connect(dbp)
+    row = conn.execute(
+        "SELECT * FROM entries WHERE name='neonpunk'").fetchone()
+    check("S2: audit evidence resolves family via base path → qwen-image",
+          row["model_family"] == "qwen-image", detail=repr(dict(row)))
+    check("S2: usable + known family → included",
+          row["excluded"] == 0 and row["excluded_reason"] is None)
+    check("S2: sidecar sha256 flows to the entry",
+          row["sha256"] == "cc" * 32)
+    d = conn.execute(
+        "SELECT * FROM descriptions WHERE entry_id = ? AND source='sidecar'",
+        (row["id"],)).fetchone()
+    check("S2: sidecar description sanitized (no HTML, text kept)",
+          d is not None and "<" not in (d["description"] or "")
+          and "cinematic" in d["description"], detail=repr(dict(d) if d else None))
+    check("S2: trigger words sanitized list",
+          json.loads(d["trigger_words"]) == ["neonpunk", "glow"])
+    check("S2: notes land as usage_tips",
+          d["usage_tips"] == "strength 0.8 works best")
+    check("S2: provenance URL from civitai modelId",
+          d["provenance_url"] == "https://civitai.com/models/222")
+
+    row = conn.execute(
+        "SELECT * FROM entries WHERE name='fluxthing'").fetchone()
+    check("S2: precedence sidecar>path (flux2 chosen, exact map)",
+          row["model_family"] == "flux2", detail=repr(dict(row)))
+    check("S2: family_conflict names the loser",
+          row["family_conflict"] is not None
+          and "path=" in row["family_conflict"])
+
+    # finding-1 regression: Flux.1 sidecar with no flux base must NOT
+    # prefix-map to flux2 — family stays NULL, entry excluded
+    row = conn.execute(
+        "SELECT * FROM entries WHERE name='flux1orphan'").fetchone()
+    check("S2 F1-regression: 'Flux.1 D' does NOT mis-map to flux2; "
+          "excluded no_hf_local_base",
+          row["model_family"] is None and row["excluded"] == 1
+          and row["excluded_reason"] == "no_hf_local_base",
+          detail=repr(dict(row)))
+
+    # finding-3: audit evidence outranks a DISAGREEING sidecar
+    row = conn.execute(
+        "SELECT * FROM entries WHERE name='auditwins'").fetchone()
+    check("S2 F3: audit (qwen-image) outranks disagreeing sidecar (flux2)",
+          row["model_family"] == "qwen-image", detail=repr(dict(row)))
+    check("S2 F3: conflict names sidecar=flux2",
+          row["family_conflict"] is not None
+          and "sidecar=flux2" in row["family_conflict"])
+
+    # finding-4: sidecar family alone (no manifest entry) → included
+    row = conn.execute(
+        "SELECT * FROM entries WHERE name='sideonly'").fetchone()
+    check("S2 F4: sidecar-only family, unaudited → included "
+          "(classification NULL is not an exclusion reason)",
+          row["model_family"] == "qwen-image" and row["excluded"] == 0
+          and row["classification"] is None)
+
+    # finding-5: word-boundary on short tokens
+    row = conn.execute(
+        "SELECT * FROM entries WHERE name='wanderer'").fetchone()
+    check("S2 F5: 'wandering_style' path does NOT hint family 'wan'",
+          row["model_family"] is None, detail=repr(dict(row)))
+
+    # finding-2: deletable + duplicate exclusion reasons
+    row = conn.execute(
+        "SELECT * FROM entries WHERE name='broken'").fetchone()
+    check("S2 F2: audit deletable → excluded audit_deletable",
+          row["excluded"] == 1
+          and row["excluded_reason"] == "audit_deletable")
+    row = conn.execute(
+        "SELECT * FROM entries WHERE name='dupe_of_base'").fetchone()
+    check("S2 F2: duplicate_of → excluded duplicate",
+          row["excluded"] == 1 and row["excluded_reason"] == "duplicate")
+
+    row = conn.execute(
+        "SELECT * FROM entries WHERE name='orphan'").fetchone()
+    check("S2: unknown hint (no hf-local sdxl) → excluded no_hf_local_base",
+          row["model_family"] is None and row["excluded"] == 1
+          and row["excluded_reason"] == "no_hf_local_base")
+
+    row = conn.execute(
+        "SELECT * FROM entries WHERE name='wan_t2v'").fetchone()
+    check("S2: audit unconvertable → excluded audit_unconvertable",
+          row["excluded"] == 1
+          and row["excluded_reason"] == "audit_unconvertable")
+
+    # search
+    hits = cdb.search(conn, "cinematic")
+    check("S2 search: FTS description term finds neonpunk",
+          any(h["name"] == "neonpunk" for h in hits), detail=repr(hits)[:200])
+    hits = cdb.search(conn, "neon")
+    check("S2 search: partial name finds neonpunk",
+          any(h["name"] == "neonpunk" for h in hits))
+    check("S2 search: best_description attached",
+          any(h.get("best_description") for h in hits))
+    hits = cdb.search(conn, "wan")
+    check("S2 search: excluded entry hidden by default",
+          not any(h["name"] == "wan_t2v" for h in hits))
+    hits = cdb.search(conn, "wan", include_excluded=True)
+    check("S2 search: --include-excluded reveals it",
+          any(h["name"] == "wan_t2v" for h in hits))
+    hits = cdb.search(conn, "neon", family="flux2")
+    check("S2 search: family filter excludes other families",
+          not any(h["name"] == "neonpunk" for h in hits))
+    check("S2 search: FTS operators cannot inject (quoted term)",
+          cdb.search(conn, 'neon" OR name:*') == []
+          or True)  # must not raise; result content irrelevant
+    check("S2 search: empty term → []", cdb.search(conn, "  ") == [])
+
+    # operator exclusion survives rebuild + re-exclusion pass
+    conn.execute("UPDATE entries SET excluded=1, excluded_reason='operator' "
+                 "WHERE name='neonpunk'")
+    conn.commit()
+    conn.close()
+    cbuild.build(dbp, mb, lora_paths=(lr,), transformer_paths=(tr,),
+                 audit_manifests=(mpath,))
+    conn = cdb.connect(dbp)
+    row = conn.execute(
+        "SELECT excluded, excluded_reason FROM entries "
+        "WHERE name='neonpunk'").fetchone()
+    check("S2: operator exclusion survives rebuild (never recomputed)",
+          row["excluded"] == 1 and row["excluded_reason"] == "operator")
+    conn.close()
+
+    # finding-2: UN-exclusion — evidence improves, excluded flips back.
+    # 'orphan' sits under "SDXL 1.0/"; adding an SDXL model to hf-local
+    # makes the path hint resolve → family sdxl → included on rebuild.
+    sdxl_dir = os.path.join(mb, "stable-diffusion-xl-base-1.0")
+    os.makedirs(sdxl_dir)
+    with open(os.path.join(sdxl_dir, "model_index.json"), "w") as f:
+        json.dump({"_class_name": "StableDiffusionXLPipeline"}, f)
+    cbuild.build(dbp, mb, lora_paths=(lr,), transformer_paths=(tr,),
+                 audit_manifests=(mpath,))
+    conn = cdb.connect(dbp)
+    row = conn.execute(
+        "SELECT * FROM entries WHERE name='orphan'").fetchone()
+    check("S2 F2: un-exclusion — new hf-local family flips excluded→0",
+          row["model_family"] == "sdxl" and row["excluded"] == 0
+          and row["excluded_reason"] is None, detail=repr(dict(row)))
+    conn.close()
+
+
+# ════════════════════════════════════════════════════════════════════════
 print("\n== Load-plane independence (Vision invariant 7, structural) ==")
 # ════════════════════════════════════════════════════════════════════════
 

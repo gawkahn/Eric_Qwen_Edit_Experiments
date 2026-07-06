@@ -72,6 +72,40 @@ def build_cmd(db_path: str, model_base: str, lora_paths, transformer_paths,
         f"-> {db_path}")
 
 
+@cli.command(name="search")
+@click.option("--db", "db_path", default=catalog_db.DEFAULT_DB_PATH,
+              show_default=True)
+@click.option("--kind", default=None,
+              type=click.Choice(["lora", "transformer", "model"]))
+@click.option("--family", default=None,
+              help="Filter to one model family (e.g. qwen-image, flux2).")
+@click.option("--limit", default=20, show_default=True,
+              type=click.IntRange(min=1))
+@click.option("--include-excluded", is_flag=True,
+              help="Also show excluded/stale entries (hidden by default).")
+@click.argument("term")
+def search_cmd(db_path: str, kind, family, limit: int,
+               include_excluded: bool, term: str) -> None:
+    """Search by description terms (FTS) or name / partial name.
+
+    Examples: search "cinematic"  ·  search "mystic" --kind lora
+    """
+    try:
+        conn = catalog_db.connect(db_path)
+    except catalog_db.CatalogDBError as e:
+        click.echo(f"[catalog] ERROR: {e}", err=True)
+        sys.exit(1)
+    try:
+        rows = catalog_db.search(conn, term, kind=kind, family=family,
+                                 limit=limit,
+                                 include_excluded=include_excluded)
+        click.echo(json.dumps(rows, indent=2, ensure_ascii=False))
+        if not rows:
+            click.echo(f"[catalog] no hits for {term!r}", err=True)
+    finally:
+        conn.close()
+
+
 @cli.command(name="show")
 @click.option("--db", "db_path", default=catalog_db.DEFAULT_DB_PATH,
               show_default=True)

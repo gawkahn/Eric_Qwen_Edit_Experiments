@@ -83,7 +83,7 @@ Best-description view: per entry, the single row whose source ranks `sidecar > c
 1. **Audit evidence** (strongest): LoRA `verdicts_by_base` OK/NORM base, transformer `matched_bases` → that base's family.
 2. **Sidecar declaration**: `base_model` string mapped through a fixed table ("Flux.1 D"→flux, "Flux.2"→flux2, "Qwen"→qwen-image, "SDXL 1.0"→sdxl, "Pony"→pony, "Illustrious"→illustrious, …; unknown strings recorded verbatim, family NULL).
 3. **Path convention** (weakest): `<root>/<family-folder>/…` directory-name hints.
-Disagreement → highest-precedence wins, `family_conflict` records the loser (Vision neg-case 6). No evidence → family NULL → excluded (`no_hf_local_base`) until audited.
+Disagreement → highest-precedence wins, `family_conflict` records the loser (Vision neg-case 6). No evidence → family NULL → excluded (`no_hf_local_base`) until audited. *(Clarified per S2 review finding 4: a family-KNOWN but audit-less entry — e.g. sidecar-only evidence — is INCLUDED; missing audit is not an exclusion reason. Only the four §4-step-5 reasons exclude.)*
 
 ### 6. Enrichment (network; explicit `enrich` step) and the injection seam
 

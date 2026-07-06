@@ -391,6 +391,141 @@ def upsert_description(conn: sqlite3.Connection, *, entry_id: int,
     )
 
 
+def upsert_family(conn: sqlite3.Connection, *, name: str, hf_local_path: str,
+                  model_index_class: Optional[str] = None,
+                  is_diffusers: bool = True) -> None:
+    """Register one model family (from the hf-local scan's model entries)."""
+    conn.execute(
+        """
+        INSERT INTO families (name, hf_local_path, model_index_class,
+                              is_diffusers)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT (name) DO UPDATE SET
+            hf_local_path = excluded.hf_local_path,
+            model_index_class = excluded.model_index_class,
+            is_diffusers = excluded.is_diffusers
+        """,
+        (name, hf_local_path, model_index_class, 1 if is_diffusers else 0))
+
+
+def set_entry_family(conn: sqlite3.Connection, entry_id: int,
+                     family: Optional[str],
+                     conflict: Optional[str] = None) -> None:
+    conn.execute(
+        "UPDATE entries SET model_family = ?, family_conflict = ? "
+        "WHERE id = ?", (family, conflict, entry_id))
+
+
+def apply_exclusions(conn: sqlite3.Connection) -> Dict[str, int]:
+    """Recompute exclusion for every non-operator row (ADR-022 §4 step 5 /
+    Grant's candidacy rule). Both directions: new evidence can un-exclude.
+    Rows the operator excluded by hand (`excluded_reason = 'operator'`) are
+    never touched. Model entries are never excluded (they ARE the bases).
+
+    Precedence: audit_deletable > audit_unconvertable > duplicate >
+    no_hf_local_base.
+    """
+    known = {r["name"] for r in conn.execute(
+        "SELECT name FROM families WHERE is_diffusers = 1")}
+    stats = {"excluded": 0, "included": 0}
+    rows = conn.execute(
+        "SELECT id, kind, model_family, classification, duplicate_of, "
+        "excluded_reason FROM entries WHERE kind != 'model'").fetchall()
+    for r in rows:
+        if r["excluded_reason"] == "operator":
+            continue
+        if r["classification"] == "deletable":
+            reason = "audit_deletable"
+        elif r["classification"] == "unconvertable":
+            reason = "audit_unconvertable"
+        elif r["duplicate_of"]:
+            reason = "duplicate"
+        elif r["model_family"] is None or r["model_family"] not in known:
+            reason = "no_hf_local_base"
+        else:
+            reason = None
+        conn.execute(
+            "UPDATE entries SET excluded = ?, excluded_reason = ? "
+            "WHERE id = ?",
+            (1 if reason else 0, reason, r["id"]))
+        stats["excluded" if reason else "included"] += 1
+    return stats
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  Search (ADR-022 §8) — FTS over descriptions + LIKE over names
+# ════════════════════════════════════════════════════════════════════════
+
+def _like_escape(term: str) -> str:
+    return (term.replace("\\", "\\\\").replace("%", r"\%")
+            .replace("_", r"\_"))
+
+
+def search(conn: sqlite3.Connection, term: str, *,
+           kind: Optional[str] = None, family: Optional[str] = None,
+           limit: int = 20,
+           include_excluded: bool = False) -> List[Dict[str, Any]]:
+    """Search by description terms (FTS) OR name/partial name (LIKE).
+
+    The term is always treated as a QUOTED FTS string (no FTS5 query
+    operators pass through — a hostile/odd term cannot inject MATCH
+    syntax). Ranking: name-prefix hits first, then FTS bm25, then
+    name-substring. Excluded/stale entries are hidden unless
+    include_excluded (Vision invariants 2/11).
+    """
+    term = (term or "").strip()
+    if not term:
+        return []
+    quoted = '"' + term.replace('"', '""') + '"'
+    like_sub = f"%{_like_escape(term)}%"
+    like_pre = f"{_like_escape(term)}%"
+
+    filters = []
+    args_tail: List[Any] = []
+    if not include_excluded:
+        filters.append("e.excluded = 0 AND e.stale = 0")
+    if kind:
+        filters.append("e.kind = ?")
+        args_tail.append(kind)
+    if family:
+        filters.append("e.model_family = ?")
+        args_tail.append(family)
+    where_tail = (" AND " + " AND ".join(filters)) if filters else ""
+
+    sql = f"""
+    SELECT e.*, s.rank_class, s.score FROM entries e JOIN (
+        SELECT id AS entry_id, 0 AS rank_class, 0.0 AS score
+          FROM entries WHERE name LIKE ? ESCAPE '\\'
+        UNION ALL
+        SELECT CAST(entry_id AS INTEGER), 1, bm25(catalog_fts)
+          FROM catalog_fts WHERE catalog_fts MATCH ?
+        UNION ALL
+        SELECT id AS entry_id, 2, 0.0
+          FROM entries WHERE name LIKE ? ESCAPE '\\'
+    ) s ON s.entry_id = e.id
+    WHERE 1=1{where_tail}
+    GROUP BY e.id
+    ORDER BY MIN(s.rank_class), MIN(s.score), e.name
+    LIMIT ?
+    """
+    rows = conn.execute(
+        sql, [like_pre, quoted, like_sub, *args_tail, limit]).fetchall()
+    out = []
+    for r in rows:
+        d = {k: r[k] for k in r.keys() if k not in ("rank_class", "score")}
+        desc = conn.execute(
+            """SELECT source, model_name, description, usage_tips,
+                      trigger_words, strength_rec, sampler_rec
+               FROM descriptions WHERE entry_id = ?
+               ORDER BY CASE source
+                   WHEN 'sidecar' THEN 0 WHEN 'civitai_api' THEN 1
+                   WHEN 'web' THEN 2 ELSE 3 END LIMIT 1""",
+            (r["id"],)).fetchone()
+        d["best_description"] = dict(desc) if desc else None
+        out.append(d)
+    return out
+
+
 # ════════════════════════════════════════════════════════════════════════
 #  FTS (full rebuild — ~1-2k rows, milliseconds; ADR-022 §8)
 # ════════════════════════════════════════════════════════════════════════
