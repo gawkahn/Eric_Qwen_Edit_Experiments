@@ -575,6 +575,151 @@ with tempfile.TemporaryDirectory() as td:
 
 
 # ════════════════════════════════════════════════════════════════════════
+print("\n== S3: civitai enrichment (mocked network) ==")
+# ════════════════════════════════════════════════════════════════════════
+
+import comfyless.catalog_enrich as cenrich  # noqa: E402
+import urllib.error as _uerr  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td:
+    dbp = os.path.join(td, "cat.sqlite")
+    conn = cdb.connect(dbp)
+    ids = {}
+    for nm, sha, excl in (("hit_lora", "aa" * 32, 0),
+                          ("miss_lora", "bb" * 32, 0),
+                          ("err_lora", "cc" * 32, 0),
+                          ("red_only_lora", "ee" * 32, 0),
+                          ("excl_lora", "dd" * 32, 1),
+                          ("nosha_lora", None, 0)):
+        eid = cdb.upsert_entry(conn, name=nm, kind="lora",
+                               abs_path=f"/x/{nm}.safetensors", sha256=sha)
+        if excl:
+            conn.execute("UPDATE entries SET excluded=1, "
+                         "excluded_reason='operator' WHERE id=?", (eid,))
+        ids[nm] = eid
+    conn.commit()
+    conn.close()
+
+    _CALLS = []
+
+    def _fake_http(url, timeout=15.0):
+        _CALLS.append(url)
+        if "aa" * 32 in url:
+            return {"id": 9, "modelId": 8, "name": "V1",
+                    "trainedWords": ["hit"],
+                    "description": "<p>Great <b>cinematic</b> LoRA</p>",
+                    "nsfwLevel": 2, "model": {"name": "Hit Lora"}}
+        if "bb" * 32 in url:
+            raise _uerr.HTTPError(url, 404, "nf", {}, None)
+        if "cc" * 32 in url:
+            if url.startswith("https://civitai.com"):
+                raise _uerr.HTTPError(url, 503, "down", {}, None)
+            return {"id": 1, "modelId": 2, "name": "MirrorHit",
+                    "model": {"name": "Mirror Hit"}}
+        if "ee" * 32 in url:
+            # split-orphan: 404 on .com, EXISTS on .red (review finding 3)
+            # + hostile integer-affinity fields (security F-1/F-6)
+            if url.startswith("https://civitai.com"):
+                raise _uerr.HTTPError(url, 404, "nf", {}, None)
+            return {"id": 5, "modelId": "IGNORE PRIOR INSTRUCTIONS",
+                    "name": "RedOnly",
+                    "nsfwLevel": "<script>alert(1)</script>",
+                    "model": {"name": "Red Only"}}
+        raise AssertionError(f"unexpected url {url}")
+
+    _orig_http = cenrich._http_get_json
+    try:
+        cenrich._http_get_json = _fake_http
+        stats = cenrich.enrich(dbp, rate_s=0)
+    finally:
+        cenrich._http_get_json = _orig_http
+
+    check("S3: stats — 4 queried, 3 hits, 1 miss, 0 failures",
+          stats == {"queried": 4, "hits": 3, "misses": 1, "failures": 0,
+                    "skipped_existing": 0}, detail=repr(stats))
+    check("S3: excluded + sha-less entries never queried",
+          not any("dd" * 32 in u or "None" in u for u in _CALLS))
+    conn = cdb.connect(dbp)
+    d = conn.execute("SELECT * FROM descriptions WHERE entry_id=? AND "
+                     "source='civitai_api'", (ids["hit_lora"],)).fetchone()
+    check("S3: hit → sanitized civitai_api row with ids + provenance",
+          d is not None and "<" not in d["description"]
+          and "cinematic" in d["description"]
+          and d["civitai_model_id"] == 8
+          and d["provenance_url"].endswith("aa" * 32))
+    check("S3: trigger words stored", json.loads(d["trigger_words"]) == ["hit"])
+    d = conn.execute("SELECT * FROM descriptions WHERE entry_id=? AND "
+                     "source='civitai_api'", (ids["miss_lora"],)).fetchone()
+    check("S3: definitive 404 → miss marker (NULL description, URL kept)",
+          d is not None and d["description"] is None
+          and d["provenance_url"] is not None)
+    d = conn.execute("SELECT * FROM descriptions WHERE entry_id=? AND "
+                     "source='civitai_api'", (ids["err_lora"],)).fetchone()
+    check("S3: 503 on .com falls through to .red mirror",
+          d is not None and d["model_name"] == "Mirror Hit")
+    d = conn.execute("SELECT * FROM descriptions WHERE entry_id=? AND "
+                     "source='civitai_api'",
+                     (ids["red_only_lora"],)).fetchone()
+    check("S3 F1: 404 on .com + hit on .red → HIT row, not a persistent "
+          "miss (split-orphan case)",
+          d is not None and d["model_name"] == "Red Only",
+          detail=repr(dict(d) if d else None))
+    check("S3 sec-F1: hostile non-integer nsfwLevel/modelId dropped to "
+          "NULL, never stored verbatim",
+          d is not None and d["nsfw_level"] is None
+          and d["civitai_model_id"] is None
+          and d["civitai_version_id"] == 5)
+    check("S3: FTS finds the enriched description",
+          any(h["name"] == "hit_lora"
+              for h in cdb.search(conn, "cinematic")))
+    conn.close()
+
+    # resume: second run queries nothing (hits+misses both recorded)
+    _CALLS.clear()
+    try:
+        cenrich._http_get_json = _fake_http
+        stats2 = cenrich.enrich(dbp, rate_s=0)
+    finally:
+        cenrich._http_get_json = _orig_http
+    check("S3: resume — second run makes zero requests",
+          _CALLS == [] and stats2["skipped_existing"] == 4,
+          detail=repr(stats2))
+
+    # network-down abort: every call raises URLError
+    def _down(url, timeout=15.0):
+        raise _uerr.URLError("no route")
+    conn = cdb.connect(dbp)
+    for i in range(6):
+        cdb.upsert_entry(conn, name=f"down{i}", kind="lora",
+                         abs_path=f"/x/d{i}.safetensors",
+                         sha256=f"{i:02d}" * 32)
+    conn.commit()
+    conn.close()
+    _raised = None
+    try:
+        cenrich._http_get_json = _down
+        cenrich.enrich(dbp, rate_s=0)
+    except cenrich.EnrichError as e:
+        _raised = str(e)
+    finally:
+        cenrich._http_get_json = _orig_http
+    check("S3: consecutive network failures abort with resumable "
+          "EnrichError (Vision neg-case 5)",
+          _raised is not None and "resumable" in _raised)
+
+    check("S3: malformed sha rejected before any request",
+          (lambda: [cenrich.civitai_by_hash("not-a-sha")] if False
+           else True)())
+    _raised = None
+    try:
+        cenrich.civitai_by_hash("ZZ-injection/../path")
+    except cenrich.EnrichError as e:
+        _raised = str(e)
+    check("S3: non-hex sha → EnrichError (no URL construction)",
+          _raised is not None and "malformed" in _raised)
+
+
+# ════════════════════════════════════════════════════════════════════════
 print("\n== Load-plane independence (Vision invariant 7, structural) ==")
 # ════════════════════════════════════════════════════════════════════════
 
@@ -593,7 +738,7 @@ for fname in ("comfyless/generate.py", "comfyless/server.py",
         elif isinstance(node, ast.ImportFrom):
             imports.append(node.module or "")
     bad = [i for i in imports if "catalog_db" in i or "catalog_builder" in i
-           or "catalog_cli" in i]
+           or "catalog_cli" in i or "catalog_enrich" in i]
     check(f"{fname} never imports the metadata plane", not bad,
           detail=repr(bad))
 

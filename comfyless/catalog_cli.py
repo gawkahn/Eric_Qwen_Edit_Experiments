@@ -72,6 +72,49 @@ def build_cmd(db_path: str, model_base: str, lora_paths, transformer_paths,
         f"-> {db_path}")
 
 
+@cli.command(name="enrich")
+@click.option("--db", "db_path", default=catalog_db.DEFAULT_DB_PATH,
+              show_default=True)
+@click.option("--limit", default=None, type=click.IntRange(min=1),
+              help="Max lookups this run (resumable).")
+@click.option("--rate", "rate_s", default=1.0, show_default=True,
+              type=click.FloatRange(min=0.0),
+              help="Seconds between requests (civitai rate courtesy).")
+@click.option("--refresh", is_flag=True,
+              help="Re-query entries that already have a civitai_api row.")
+@click.option("--include-excluded", is_flag=True,
+              help="Also enrich excluded entries (default: candidates only).")
+@click.option("--hash-missing", "do_hash", is_flag=True,
+              help="First compute sha256 for LoRA entries lacking one "
+                   "(local IO only).")
+@click.option("--force-fs", is_flag=True)
+def enrich_cmd(db_path: str, limit, rate_s: float, refresh: bool,
+               include_excluded: bool, do_hash: bool,
+               force_fs: bool) -> None:
+    """Tier-2 enrichment: civitai hash lookups (THE only network step).
+
+    Exit codes: 0 clean · 2 partial (some lookups failed / network abort;
+    run again to resume).
+    """
+    from .catalog_enrich import enrich, hash_missing, EnrichError
+    if do_hash:
+        hs = hash_missing(db_path, force_fs=force_fs)
+        click.echo(f"[catalog] hashed {hs['hashed']} "
+                   f"({hs['errors']} errors)")
+    try:
+        stats = enrich(db_path, limit=limit, rate_s=rate_s,
+                       refresh=refresh, include_excluded=include_excluded,
+                       force_fs=force_fs)
+    except catalog_db.CatalogDBError as e:
+        click.echo(f"[catalog] ERROR: {e}", err=True)
+        sys.exit(1)
+    except EnrichError as e:
+        click.echo(f"[catalog] enrich aborted: {e}", err=True)
+        sys.exit(2)
+    click.echo(f"[catalog] enrich: {stats}")
+    sys.exit(0 if stats["failures"] == 0 else 2)
+
+
 @cli.command(name="search")
 @click.option("--db", "db_path", default=catalog_db.DEFAULT_DB_PATH,
               show_default=True)

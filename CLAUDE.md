@@ -71,9 +71,9 @@ python3 test_lora_order_insensitive.py      #  13 tests: direct-merge LoRAs orde
 python3 test_vae_override_class.py          #  10 tests: --vae override honors the checkpoint's own VAE class (cherry-picked from krea-testing ad6689e)
 python3 test_lora_audit.py                  # 197 tests: scripts/lora_audit.py classify / manifest / dry-load / convert / delete (ADR-014 S1–S4) + transformer audit (ADR-021: prognosis mapping, shape match, sampled dedupe, root disjointness, report-only)
 python3 test_lora_convert_krea.py           #  24 tests: Krea-2 LoRA format-conversion plan (krea_native → diffusers_krea)
-python3 test_catalog_db.py                  #  85 tests: catalog DB metadata plane (ADR-022 S1+S2) — schema, FUSE guard, sanitizer, upsert/stale semantics, manifest kind-branch join, families/sidecar/exclusion/search, load-plane independence
+python3 test_catalog_db.py                  #  98 tests: catalog DB metadata plane (ADR-022 S1-S3) — schema, FUSE guard, sanitizer, upsert/stale semantics, manifest kind-branch join, families/sidecar/exclusion/search, civitai enrichment (mocked network), load-plane independence
 ```
-All sixteen suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 2090 unit tests; expect 0 failures.
+All sixteen suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 2103 unit tests; expect 0 failures.
 
 `test_flux2.py` is a live GPU smoke test that performs an actual Flux.2 generation — separate from the unit suites above. Run only when you need to verify end-to-end Flux.2 behavior.
 
@@ -268,3 +268,52 @@ The MCP server (`comfyless/mcp_server.py`) caches one pipeline in-process and ev
 - Dimension alignment is 32px throughout; violating this causes transformer shape errors.
 - `pipeline.vae.enable_tiling()` is always called on generation pipelines — required for >2 MP decode without OOM.
 - The Edit pipeline takes a `Qwen2VLProcessor` (vision-language processor); the Generation pipeline does **not** — it uses only a tokenizer
+
+<!-- gitnexus:start -->
+# GitNexus — Code Intelligence
+
+This project is indexed by GitNexus as **Eric_Qwen_Edit_Experiments** (4131 symbols, 7537 relationships, 287 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+
+> Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
+
+## Always Do
+
+- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
+- **MUST run `detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows. For regression review, compare against the default branch: `detect_changes({scope: "compare", base_ref: "main"})`.
+- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
+- When exploring unfamiliar code, use `query({search_query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
+- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `context({name: "symbolName"})`.
+- For security review, `explain({target: "fileOrSymbol"})` lists taint findings (source→sink flows; needs `analyze --pdg`).
+
+## Never Do
+
+- NEVER edit a function, class, or method without first running `impact` on it.
+- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
+- NEVER rename symbols with find-and-replace — use `rename` which understands the call graph.
+- NEVER commit changes without running `detect_changes()` to check affected scope.
+
+## Resources
+
+| Resource | Use for |
+|----------|---------|
+| `gitnexus://repo/Eric_Qwen_Edit_Experiments/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/Eric_Qwen_Edit_Experiments/clusters` | All functional areas |
+| `gitnexus://repo/Eric_Qwen_Edit_Experiments/processes` | All execution flows |
+| `gitnexus://repo/Eric_Qwen_Edit_Experiments/process/{name}` | Step-by-step execution trace |
+
+## Cross-Repo Groups
+
+This repository is listed under GitNexus **group(s): ai-lab** (see `~/.gitnexus/groups/`). For cross-repo analysis, use MCP tools `impact`, `query`, and `context` with `repo` set to `@<groupName>` or `@<groupName>/<memberPath>` (paths match keys in that group’s `group.yaml`). Use `group_list` / `group_sync` for membership and sync. From the project root: `node .gitnexus/run.cjs group list`, `node .gitnexus/run.cjs group sync <name>`, `node .gitnexus/run.cjs group impact <name> --target <symbol> --repo <group-path>` (the `.gitnexus/run.cjs` path is repo-root-relative).
+
+## CLI
+
+| Task | Read this skill file |
+|------|---------------------|
+| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
+| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
+| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
+| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
+| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
+| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
+
+<!-- gitnexus:end -->
