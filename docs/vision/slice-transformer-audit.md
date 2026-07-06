@@ -36,6 +36,9 @@
 5. dtype-mismatched (fp8 repackage of a bf16 base) → NOT a duplicate (distinct artifact).
 6. `--transformer-root` missing/not-a-dir → startup abort exit 1 (fail-closed).
 7. Manifest determinism: two runs byte-identical modulo `audited_at`.
+8. `--transformer-root` nested under / containing / equal to `--audit-root`, or two overlapping transformer roots → startup abort exit 1 (security-auditor F-1: the nested case would let `--delete --yes` unlink a garbage transformer file classified as a LoRA).
+9. Two transformer roots sharing a basename → entries distinguished by `root_index`; determinism holds (F-2).
+10. Crafted header with `data_offsets` `hi < lo` or past-EOF in the duplicate sampler → bounded zero-length read, pair NOT byte-equal, no memory blowup (F-4).
 
 ## Out of scope
 
