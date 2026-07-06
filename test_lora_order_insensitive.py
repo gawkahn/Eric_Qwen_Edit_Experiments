@@ -35,6 +35,7 @@ from nodes.eric_lora_format_convert_apply import (
     resolve_merge_target,
     resolve_restore_target,
     _apply_converted_lora_as_delta,
+    flatten_lokr_to_lora_sd,
 )
 from nodes.eric_qwen_edit_lora import unload_adapters
 
@@ -197,6 +198,139 @@ restored = dict(mc.named_parameters())[key + ".weight"]
 check("C3 unload restored original weight despite wrapper teardown",
       torch.allclose(restored, orig),
       f"max diff {(restored - orig).abs().max().item()}")
+
+
+# ── LoKR → standard-LoRA flatten (2026-07-06; LoKR-on-Z-Image rescue) ──
+# A same-arch LoKR that the direct-merge can't place (e.g. Z-Image key
+# mapping) is flattened to lora_A/lora_B via SVD so diffusers' fast path
+# can load it. Verify: reconstruction accuracy, key format, passthrough,
+# rank truncation, empty-on-no-lokr.
+print("\n── flatten_lokr_to_lora_sd (LoKR-on-Z-Image rescue) ──")
+torch.manual_seed(7)
+_w1 = torch.randn(2, 2)
+_w2 = torch.randn(4, 4)  # kron -> 8x8, full rank captured at r<=8
+_sd = {
+    "layers.0.attention.to_q.lokr_w1": _w1,
+    "layers.0.attention.to_q.lokr_w2": _w2,
+    "layers.0.other.lora_A.weight": torch.randn(4, 8),  # passthrough
+}
+_flat = flatten_lokr_to_lora_sd(_sd, target_rank=64)
+_A = _flat.get("layers.0.attention.to_q.lora_A.weight")
+_B = _flat.get("layers.0.attention.to_q.lora_B.weight")
+check("flatten: emits lora_A/lora_B at the same module path",
+      _A is not None and _B is not None)
+check("flatten: lokr_w1/w2 keys removed",
+      not any(".lokr_" in k for k in _flat))
+check("flatten: non-LoKR keys pass through untouched",
+      "layers.0.other.lora_A.weight" in _flat)
+if _A is not None:
+    _err = (_B.float() @ _A.float() - torch.kron(_w1, _w2)).abs().max().item()
+    check("flatten: B@A reconstructs kron(w1,w2) (scale=1.0, no alpha)",
+          _err < 1e-4, f"max err {_err:.2e}")
+# rank truncation: 64x64 delta, cap at 16 → A rows <= 16
+_flat2 = flatten_lokr_to_lora_sd(
+    {"x.lokr_w1": torch.randn(4, 4), "x.lokr_w2": torch.randn(16, 16)},
+    target_rank=16)
+check("flatten: rank truncation honored (A rows <= target_rank)",
+      _flat2["x.lora_A.weight"].shape[0] <= 16)
+# no LoKR present → empty (caller treats as nothing to flatten)
+check("flatten: returns {} when no LoKR modules present",
+      flatten_lokr_to_lora_sd({"a.lora_A.weight": torch.randn(2, 4)}) == {})
+
+# review finding 3: stored alpha sentinel (ai-toolkit ~1e10) MUST be ignored
+# for full w1/w2 — else scale = 1e10/r produces pure noise. reconstruct_lokr_
+# delta ignores alpha when neither w is decomposed; flatten relies on it.
+_flat_a = flatten_lokr_to_lora_sd(
+    {"m.lokr_w1": _w1, "m.lokr_w2": _w2, "m.alpha": torch.tensor(1e10)},
+    target_rank=64)
+_Aa = _flat_a["m.lora_A.weight"]
+_Ba = _flat_a["m.lora_B.weight"]
+_erra = (_Ba.float() @ _Aa.float() - torch.kron(_w1, _w2)).abs().max().item()
+check("flatten: alpha sentinel (1e10) IGNORED for full w1/w2 (scale stays "
+      "1.0, not noise)", _erra < 1e-4, f"max err {_erra:.2e}")
+
+# review finding 4: decomposed-only module (no full w1/w2) is skipped, not
+# guessed — and does not emit lora keys for that module.
+_flat_dec = flatten_lokr_to_lora_sd(
+    {"d.lokr_w1_a": torch.randn(2, 4), "d.lokr_w1_b": torch.randn(4, 2)})
+check("flatten: decomposed-only LoKR module skipped (no full w1/w2)",
+      _flat_dec == {})
+
+# ── review finding 2: wiring — flatten fires ONLY after PEFT raises AND
+# direct-merge applies 0; the stale peft_config marker is popped before the
+# standard loader re-registers. Monkeypatch the tiers around the real
+# _load_lokr_adapter dispatcher. ──
+print("\n── LoKR flatten wiring (fires only on failure; marker pop) ──")
+import nodes.eric_qwen_edit_lora as _lm
+
+
+class _FakeTf(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.peft_config = {}
+
+
+class _FakePipe:
+    def __init__(self):
+        self.transformer = _FakeTf()
+
+
+_lokr_sd = {"layers.0.attn.to_q.lokr_w1": torch.randn(2, 2),
+            "layers.0.attn.to_q.lokr_w2": torch.randn(4, 4)}
+_save = (_lm._load_lokr_adapter_peft, _lm._load_lokr_adapter_direct,
+         _lm._load_lora_adapter)
+
+
+def _peft_raise(*a, **k):
+    raise RuntimeError("size mismatch")
+
+
+# Case A: PEFT raises, direct applies 0 (and leaves a stale marker) → flatten.
+_seen = {}
+
+
+def _direct_zero(pipe, sd, name, lp, weight=1.0):
+    pipe.transformer.peft_config[name] = {"_type": "lokr_direct",
+                                          "_applied_modules": 0}
+    return False
+
+
+def _std_capture(pipe, sd, name, lp, weight=1.0):
+    _seen["std"] = True
+    _seen["marker_at_call"] = name in pipe.transformer.peft_config
+    _seen["has_loraA"] = any(k.endswith(".lora_A.weight") for k in sd)
+    return True
+
+
+try:
+    _lm._load_lokr_adapter_peft = _peft_raise
+    _lm._load_lokr_adapter_direct = _direct_zero
+    _lm._load_lora_adapter = _std_capture
+    _rc = _lm._load_lokr_adapter(_FakePipe(), dict(_lokr_sd), "adap", "[t]", 1.0)
+finally:
+    (_lm._load_lokr_adapter_peft, _lm._load_lokr_adapter_direct,
+     _lm._load_lora_adapter) = _save
+check("wiring: PEFT-raise + direct-0 → flatten → standard loader invoked",
+      _seen.get("std") is True)
+check("wiring: standard loader receives flattened lora_A/B keys",
+      _seen.get("has_loraA") is True)
+check("wiring: stale peft_config marker POPPED before standard re-register",
+      _seen.get("marker_at_call") is False)
+check("wiring: rescue reports overall success", _rc is True)
+
+# Case B: direct-merge applies >0 → flatten NOT reached (no behavior change
+# for currently-working LoKRs).
+_seen2 = {}
+try:
+    _lm._load_lokr_adapter_peft = _peft_raise
+    _lm._load_lokr_adapter_direct = lambda *a, **k: True
+    _lm._load_lora_adapter = lambda *a, **k: _seen2.setdefault("std", True)
+    _rc2 = _lm._load_lokr_adapter(_FakePipe(), dict(_lokr_sd), "adap2", "[t]", 1.0)
+finally:
+    (_lm._load_lokr_adapter_peft, _lm._load_lokr_adapter_direct,
+     _lm._load_lora_adapter) = _save
+check("wiring: direct-merge success → flatten NOT reached (Flux LoKRs "
+      "unaffected)", "std" not in _seen2 and _rc2 is True)
 
 
 print(f"\n{passed} passed, {failed} failed")

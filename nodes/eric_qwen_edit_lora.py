@@ -288,8 +288,37 @@ def _load_lokr_adapter(pipe, state_dict: dict, adapter_name: str,
     except (ValueError, RuntimeError) as peft_err:
         print(f"{log_prefix} PEFT injection failed: {peft_err}")
         print(f"{log_prefix} Falling back to direct weight merge...")
-        return _load_lokr_adapter_direct(
+        if _load_lokr_adapter_direct(
             pipe, state_dict, adapter_name, log_prefix, weight=weight,
+        ):
+            return True
+        # Both LoKR-native paths applied 0 modules — e.g. a same-arch LoKR
+        # whose module names diffusers maps (Z-Image) but whose
+        # factorization the PEFT/direct paths can't handle. Rescue: flatten
+        # LoKR → standard lora_A/lora_B (SVD) and route through the standard
+        # loader's diffusers fast path, which does the arch key mapping.
+        # Lossy (rank-64 SVD); the alternative is a silent no-op.
+        # (2026-07-06; TECH_DEBT LoKR-on-Z-Image.)
+        from .eric_lora_format_convert_apply import flatten_lokr_to_lora_sd
+        try:
+            flat = flatten_lokr_to_lora_sd(state_dict, log_prefix=log_prefix)
+        except Exception as flat_err:  # noqa: BLE001 — never let rescue crash the load
+            print(f"{log_prefix} LoKR→LoRA flatten failed: "
+                  f"{str(flat_err)[:120]}")
+            return False
+        if not flat:
+            return False
+        # Drop the failed direct-merge's stale peft_config marker so the
+        # standard loader can register adapter_name cleanly.
+        transformer = (getattr(pipe, "transformer", None)
+                       or getattr(pipe, "unet", None))
+        if transformer is not None and hasattr(transformer, "peft_config"):
+            transformer.peft_config.pop(adapter_name, None)
+        print(f"{log_prefix} Retrying as flattened standard LoRA "
+              f"({len([k for k in flat if k.endswith('.lora_A.weight')])} "
+              f"modules)...")
+        return _load_lora_adapter(
+            pipe, flat, adapter_name, log_prefix, weight=weight,
         )
 
 

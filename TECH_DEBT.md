@@ -751,6 +751,9 @@ handling to Z-Image (arch-specific) — a real code slice with its own review.
 **Trigger:** Grant wanting Z-Image LoKR LoRAs usable; OR any new arch that
 ships LoKR LoRAs. Affected entries are marked `gen_tests.verdict='load_failed'`.
 
+**Resolved: 2026-07-06** — `flatten_lokr_to_lora_sd` (nodes/eric_lora_format_convert_apply.py) added as a final fallback in `_load_lokr_adapter`: when PEFT + direct-merge both fail (0 modules), the LoKR is flattened to standard lora_A/lora_B via SVD (reuses reconstruct_lokr_delta + svd_compress_to_lora) and routed through diffusers' fast path, which handles Z-Image key mapping. Arch-agnostic; fires only on failure (Flux/Klein LoKRs unaffected). Verified end-to-end (3 dead Z-Image LoKRs now load + apply, coherent output); 13 unit tests (test_lora_order_insensitive.py) incl. wiring + alpha-sentinel guard. code-reviewer APPROVED after test-coverage fold.
+**Residual (code-review finding 1, LOW):** the rescue is reached only when the PEFT inject RAISES. If a future LoKR mis-sizes but PEFT silently no-ops (reports incompatible keys without raising), the flatten never runs and the silent-failure returns. Closing it fully needs a post-PEFT-success 0-module verification. Trigger: a LoKR that silently no-ops through PEFT.
+
 ## 2026-07-06 — gen-validation judged output images, not adapter application (methodology gap)
 
 **What:** The Phase-A/B/rerun LoRA gen-validation judged the OUTPUT images

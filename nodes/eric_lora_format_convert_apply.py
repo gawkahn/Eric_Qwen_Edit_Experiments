@@ -337,6 +337,82 @@ def _emit_lora_module(
     out_state_dict[base + _OUT_LORA_B] = B
 
 
+_LOKR_SUFFIXES = (
+    ".lokr_w1_a", ".lokr_w1_b", ".lokr_w2_a", ".lokr_w2_b",
+    ".lokr_t2", ".lokr_w1", ".lokr_w2", ".alpha",
+)
+
+
+def flatten_lokr_to_lora_sd(
+    state_dict: Dict[str, "torch.Tensor"],
+    *,
+    target_rank: int = 64,
+    log_prefix: str = "[LoRA-Convert]",
+) -> Dict[str, "torch.Tensor"]:
+    """Flatten a LoKR state dict to standard ``lora_A``/``lora_B`` (SVD).
+
+    Reconstructs each module's delta = ``kron(w1, w2) * scale`` and
+    SVD-compresses it to ``(lora_A, lora_B)``, emitting
+    ``<module>.lora_A.weight`` / ``<module>.lora_B.weight`` at the SAME
+    module paths (no key rename — this is a FORMAT flatten, not an
+    architecture conversion). Non-LoKR keys pass through unchanged.
+
+    Purpose (2026-07-06): a same-architecture LoKR whose module names
+    diffusers already maps (e.g. Z-Image — standard LoRA loads fine there
+    via ``pipe.load_lora_weights``) still fails the LoKR-native paths — the
+    PEFT injector mis-sizes the decompose factor and the direct merge's
+    key lookup misses Z-Image's resolution-mapped param names. Flattening
+    to standard LoRA lets the proven diffusers fast path do the arch key
+    mapping. Lossy by ``target_rank`` SVD truncation (same tradeoff as the
+    Flux LoKR→LoRA conversion path); the alternative is a silent no-op.
+    See TECH_DEBT 2026-07-06 (LoKR-on-Z-Image).
+
+    Returns a NEW state dict, or ``{}`` when no LoKR modules were found
+    (caller treats empty as "nothing to flatten").
+    """
+    import torch
+
+    modules: Dict[str, Dict[str, "torch.Tensor"]] = {}
+    passthrough: Dict[str, "torch.Tensor"] = {}
+    for k, v in state_dict.items():
+        suf = next((s for s in _LOKR_SUFFIXES if k.endswith(s)), None)
+        if suf is None:
+            passthrough[k] = v
+            continue
+        modules.setdefault(k[: -len(suf)], {})[suf] = v
+
+    out: Dict[str, "torch.Tensor"] = dict(passthrough)
+    n = 0
+    skipped = 0
+    for base, parts in modules.items():
+        w1 = parts.get(".lokr_w1")
+        w2 = parts.get(".lokr_w2")
+        if w1 is None or w2 is None:
+            # Decomposed-only (w1_a/w1_b without a full w1) is not observed
+            # in the target files; skip rather than guess. Loud so a future
+            # such file surfaces instead of silently dropping.
+            print(f"{log_prefix} flatten: module {base!r} lacks a full "
+                  f"lokr_w1/lokr_w2 pair — skipped")
+            skipped += 1
+            continue
+        delta = reconstruct_lokr_delta(w1, w2, parts.get(".alpha"))
+        if delta.ndim != 2:
+            print(f"{log_prefix} flatten: module {base!r} delta is "
+                  f"{delta.ndim}-D (expected 2-D) — skipped")
+            skipped += 1
+            continue
+        lora_a, lora_b, _alpha = svd_compress_to_lora(delta, target_rank)
+        dt = w1.dtype
+        out[base + ".lora_A.weight"] = lora_a.to(dt)
+        out[base + ".lora_B.weight"] = lora_b.to(dt)
+        n += 1
+
+    if n or skipped:
+        print(f"{log_prefix} flattened {n} LoKR modules → standard LoRA "
+              f"(rank≤{target_rank}); skipped={skipped}")
+    return out if n else {}
+
+
 def convert_state_dict(
     source_state_dict: Dict[str, "torch.Tensor"],
     plan: ConversionPlan,
