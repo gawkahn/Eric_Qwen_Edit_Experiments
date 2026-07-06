@@ -851,10 +851,17 @@ today. NOT nunchaku, NOT GGUF, NOT a `from_single_file` path.
 **rotation-aware INT8 Linear** (apply the fused ConvRot rotation at compute, int8
 GEMM, per the paper / ComfyUI's `int8_tensorwise`+convrot op). This is a sibling
 to ADR-019 slice C (ported scaled-fp8 ops) but harder — the rotation matrices are
-new machinery. Reference implementations exist (ComfyUI core #14636 + INT8-
-Toolkit) to port from, and the arXiv paper for the math. §12 security review (
-caller-supplied model content parse) + likely a new dep. Own ADR (sibling to
-ADR-019), not a slice of it.
+new machinery. **Decisive feasibility point (arXiv:2512.03673): PURE PyTorch, NO
+custom CUDA kernels.** ConvLinear = group-wise Regular Hadamard Transform on
+activations (block 256; matrices deterministic/constructed on the fly, done as
+reshape+matmul, NOT stored) → int8-quantize rotated activations → int8 GEMM vs
+per-channel-scaled int8 weights → dequant. "No specialized inference engine
+needed; compatible with standard PyTorch." That is the decisive advantage over
+nunchaku (kernels) and what makes it tractable — a ConvRotInt8Linear analogous to
+slice C's ScaledFp8Linear plus the Hadamard step; likely NO new heavyweight dep.
+Reference impls to port: ComfyUI core #14636 + INT8-Toolkit (paper ships no public
+repo). §12 security review (caller-supplied model content parse). Own ADR (sibling
+to ADR-019), not a slice of it. Paper tested FLUX.1-dev/schnell only (AdaLN DiTs).
 **Extra caveat for the krea2 target (model 2242173):** it is a **Krea-2**
 finetune, so even with INT8-ConvRot support it inherits the Krea-2 single-file
 architecture gap (see the Krea entry below — no diffusers `from_single_file`,
