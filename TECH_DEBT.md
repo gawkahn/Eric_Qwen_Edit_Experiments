@@ -672,3 +672,21 @@ classify usable against a base it can't load on), or transformer dry-load /
 gen-validation surfacing a load failure on a matched base. Fix directions:
 dtype-exact multiset, per-key-count weighting, or raising the threshold with
 unique-shape anchors.
+
+## 2026-07-06 — Z-Image-Turbo gets base-model family defaults (fried output)
+
+**What:** `infer_model_family` maps both Z-Image-base and Z-Image-Turbo to
+`"zimage"` (single `ZImagePipeline` class, NO `is_distilled` marker in
+model_index.json — unlike Krea-2, whose flag drives the `krea`/`krea-turbo`
+split). `FAMILY_DEFAULTS["zimage"]` (steps 30, cfg 4.0) therefore applies to
+the Turbo distill, which needs ~8 steps / CFG 1.0 — produces garbage.
+Found live during Phase-B catalog gen-validation (every Z-Image-Turbo run
+fried); worked around with explicit `--steps 8 --cfg 1.0`.
+**Why not now:** no robust discriminator: model_index is identical; the only
+delta is scheduler `shift` (3.0 vs 6.0), a tuning value, not a distill
+marker — a heuristic on it would be fragile. Proper fix is per-MODEL default
+overrides (operator manifest or catalog `families`/models metadata), which is
+a design slice, not a patch.
+**Trigger:** next zimage-related slice, OR the first user hit of fried
+Z-Image-Turbo output via MCP/OWUI (agents don't pass explicit steps), OR any
+new distilled variant landing in hf-local with the same no-marker problem.
