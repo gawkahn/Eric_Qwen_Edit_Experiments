@@ -756,6 +756,167 @@ with tempfile.TemporaryDirectory() as td:
 
 
 # ════════════════════════════════════════════════════════════════════════
+print("\n== S4: worklist / annotate / exclude verbs ==")
+# ════════════════════════════════════════════════════════════════════════
+
+from click.testing import CliRunner as _CliRunner  # noqa: E402
+import comfyless.catalog_cli as ccli  # noqa: E402
+
+_runner = _CliRunner()  # click>=8.2 separates stderr by default
+with tempfile.TemporaryDirectory() as td:
+    dbp = os.path.join(td, "cat.sqlite")
+    conn = cdb.connect(dbp)
+    e_bare = cdb.upsert_entry(conn, name="bare_lora", kind="lora",
+                              abs_path="/x/b.safetensors")
+    conn.execute("UPDATE entries SET model_family='qwen-image' WHERE id=?",
+                 (e_bare,))
+    e_desc = cdb.upsert_entry(conn, name="described", kind="lora",
+                              abs_path="/x/d.safetensors")
+    cdb.upsert_description(conn, entry_id=e_desc, source="sidecar",
+                           description="already documented")
+    e_dual_l = cdb.upsert_entry(conn, name="dualname", kind="lora",
+                                abs_path="/x/dn.safetensors")
+    cdb.upsert_entry(conn, name="dualname", kind="transformer",
+                     abs_path="/t/dn.safetensors")
+    # miss-marker case (review finding 1): civitai_api row with NULL
+    # description (definitive 404 miss) must stay ON the worklist
+    e_missed = cdb.upsert_entry(conn, name="missed_lora", kind="lora",
+                                abs_path="/x/m.safetensors")
+    cdb.upsert_description(conn, entry_id=e_missed, source="civitai_api",
+                           provenance_url="https://civitai.com/api/x")
+    conn.commit()
+    conn.close()
+
+    r = _runner.invoke(ccli.cli, ["worklist", "--db", dbp])
+    rows = json.loads(r.stdout)
+    names = [x["name"] for x in rows]
+    check("S4 worklist: bare entry listed, described entry absent",
+          "bare_lora" in names and "described" not in names,
+          detail=repr(names))
+    check("S4 worklist: civitai MISS marker stays on the worklist "
+          "(review finding 1)", "missed_lora" in names)
+    check("S4 worklist: no filesystem paths in output (audit-confirmed)",
+          all("abs_path" not in x and "relative_path" not in x
+              for x in rows))
+
+    r = _runner.invoke(ccli.cli, ["annotate", "--db", dbp, "--source",
+                                  "web", "--description", "x", "bare_lora"])
+    check("S4 annotate: --source web without --url refused (provenance)",
+          r.exit_code == 1)
+    r = _runner.invoke(ccli.cli, [
+        "annotate", "--db", dbp, "--source", "web",
+        "--url", "https://example.org/found",
+        "--description", "<p>A <b>watercolor</b> style</p>",
+        "--trigger-word", "wcolor", "bare_lora"])
+    check("S4 annotate: web write-back ok", r.exit_code == 0,
+          detail=r.output[-150:])
+    conn = cdb.connect(dbp)
+    d = conn.execute("SELECT * FROM descriptions WHERE entry_id=? AND "
+                     "source='web'", (e_bare,)).fetchone()
+    check("S4 annotate: sanitized + provenance stored",
+          d is not None and "<" not in d["description"]
+          and "watercolor" in d["description"]
+          and d["provenance_url"] == "https://example.org/found")
+    check("S4 annotate: FTS rebuilt (searchable immediately)",
+          any(h["name"] == "bare_lora"
+              for h in cdb.search(conn, "watercolor")))
+    conn.close()
+
+    r = _runner.invoke(ccli.cli, [
+        "annotate", "--db", dbp, "--source", "ai_authored",
+        "--usage-tips", "start at 0.7", "--strength", "0.7-0.9",
+        "--sampler", "euler 28 steps", "bare_lora"])
+    check("S4 annotate: ai_authored tier (no url needed) with recs",
+          r.exit_code == 0)
+    r = _runner.invoke(ccli.cli, ["annotate", "--db", dbp, "--source",
+                                  "sidecar", "--description", "x", "b"])
+    check("S4 annotate: machine tiers (sidecar) rejected by Choice",
+          r.exit_code != 0)
+    r = _runner.invoke(ccli.cli, ["annotate", "--db", dbp, "--source",
+                                  "ai_authored", "--description", "x",
+                                  "dualname"])
+    check("S4 annotate: ambiguous name without --kind → exit 2",
+          r.exit_code == 2)
+    r = _runner.invoke(ccli.cli, ["annotate", "--db", dbp, "--source",
+                                  "ai_authored", "--kind", "lora",
+                                  "--description", "x", "dualname"])
+    check("S4 annotate: --kind disambiguates", r.exit_code == 0)
+
+    # re-annotate replace semantics pinned (review finding 5)
+    r = _runner.invoke(ccli.cli, [
+        "annotate", "--db", dbp, "--source", "web",
+        "--url", "https://example.org/f2", "--usage-tips", "tips only",
+        "bare_lora"])
+    conn = cdb.connect(dbp)
+    d = conn.execute("SELECT * FROM descriptions WHERE entry_id=? AND "
+                     "source='web'", (e_bare,)).fetchone()
+    check("S4 annotate: re-annotate REPLACES the whole source row "
+          "(documented footgun)",
+          r.exit_code == 0 and d["description"] is None
+          and d["usage_tips"] == "tips only")
+    conn.close()
+
+    # hostile provenance URL (security F-1/F-3): javascript: dropped,
+    # zero-width stripped from a valid https URL
+    r = _runner.invoke(ccli.cli, [
+        "annotate", "--db", dbp, "--source", "ai_authored",
+        "--url", "javascript:alert(1)", "--description", "x", "bare_lora"])
+    conn = cdb.connect(dbp)
+    d = conn.execute("SELECT provenance_url FROM descriptions WHERE "
+                     "entry_id=? AND source='ai_authored'",
+                     (e_bare,)).fetchone()
+    check("S4 sec-F1: javascript: provenance URL dropped to NULL",
+          r.exit_code == 0 and d["provenance_url"] is None)
+    check("S4 sec-F1: sanitize_url strips zero-width + keeps https",
+          cdb.sanitize_url("https://ex\u200bample.org/a") ==
+          "https://example.org/a"
+          and cdb.sanitize_url("data:text/html;x") is None
+          and cdb.sanitize_url("https://" + "a" * 5000).startswith("https")
+          and len(cdb.sanitize_url("https://" + "a" * 5000)) == 2048)
+    conn.close()
+
+    # exclude error branches (review finding 2)
+    r = _runner.invoke(ccli.cli, ["exclude", "--db", dbp, "no_such_name"])
+    check("S4 exclude: nonexistent name -> exit 2", r.exit_code == 2)
+    r = _runner.invoke(ccli.cli, ["exclude", "--db", dbp, "dualname"])
+    check("S4 exclude: ambiguous name -> exit 2", r.exit_code == 2)
+    # --clear on a NON-operator exclusion refused (security F-2)
+    conn = cdb.connect(dbp)
+    conn.execute("UPDATE entries SET excluded=1, "
+                 "excluded_reason='audit_unconvertable' WHERE id=?",
+                 (e_missed,))
+    conn.commit()
+    conn.close()
+    r = _runner.invoke(ccli.cli, ["exclude", "--db", dbp, "--clear",
+                                  "missed_lora"])
+    conn = cdb.connect(dbp)
+    row = conn.execute("SELECT excluded, excluded_reason FROM entries "
+                       "WHERE id=?", (e_missed,)).fetchone()
+    check("S4 sec-F2: --clear refuses a non-operator (audit) exclusion",
+          r.exit_code == 2 and row["excluded"] == 1
+          and row["excluded_reason"] == "audit_unconvertable")
+    conn.close()
+
+    r = _runner.invoke(ccli.cli, ["exclude", "--db", dbp, "bare_lora"])
+    conn = cdb.connect(dbp)
+    row = conn.execute("SELECT excluded, excluded_reason FROM entries "
+                       "WHERE id=?", (e_bare,)).fetchone()
+    check("S4 exclude: operator exclusion set",
+          r.exit_code == 0 and row["excluded"] == 1
+          and row["excluded_reason"] == "operator")
+    conn.close()
+    r = _runner.invoke(ccli.cli, ["exclude", "--db", dbp, "--clear",
+                                  "bare_lora"])
+    conn = cdb.connect(dbp)
+    row = conn.execute("SELECT excluded, excluded_reason FROM entries "
+                       "WHERE id=?", (e_bare,)).fetchone()
+    check("S4 exclude --clear: un-excluded",
+          r.exit_code == 0 and row["excluded"] == 0
+          and row["excluded_reason"] is None)
+    conn.close()
+
+
+# ════════════════════════════════════════════════════════════════════════
 print("\n== Load-plane independence (Vision invariant 7, structural) ==")
 # ════════════════════════════════════════════════════════════════════════
 

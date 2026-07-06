@@ -141,6 +141,22 @@ def sanitize_text(raw: Any, cap: int = DESCRIPTION_CAP) -> str:
     return s[:cap]
 
 
+def sanitize_url(raw: Any, cap: int = 2048) -> Optional[str]:
+    """Provenance-URL cleaner (S4 security F-1 — the raw bind bypassed the
+    every-field-sanitized contract): control/zero-width/bidi stripped,
+    whitespace rejected inside the URL, length-capped, http(s) schemes
+    ONLY (ADR-022 §6: provenance is URLs only — javascript:/data: etc.
+    are dropped, returning None)."""
+    if raw is None:
+        return None
+    s = _CTRL_ZW_RE.sub("", str(raw)).strip()
+    s = s.split()[0] if s.split() else ""
+    low = s.lower()
+    if not (low.startswith("https://") or low.startswith("http://")):
+        return None
+    return s[:cap]
+
+
 def sanitize_trigger_words(raw: Any) -> str:
     """Trigger-word list → JSON array of ≤64 sanitized words (≤64 B each)."""
     words: List[str] = []
@@ -387,7 +403,7 @@ def upsert_description(conn: sqlite3.Connection, *, entry_id: int,
          sanitize_text(strength_rec, cap=128) or None,
          sanitize_text(sampler_rec, cap=128) or None,
          nsfw_level, civitai_model_id, civitai_version_id,
-         provenance_url, now or _utcnow()),
+         sanitize_url(provenance_url), now or _utcnow()),
     )
 
 

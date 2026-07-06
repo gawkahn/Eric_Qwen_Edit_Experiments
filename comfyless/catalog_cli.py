@@ -149,6 +149,169 @@ def search_cmd(db_path: str, kind, family, limit: int,
         conn.close()
 
 
+@cli.command(name="worklist")
+@click.option("--db", "db_path", default=catalog_db.DEFAULT_DB_PATH,
+              show_default=True)
+@click.option("--kind", default=None,
+              type=click.Choice(["lora", "transformer"]))
+@click.option("--family", default=None)
+@click.option("--limit", default=50, show_default=True,
+              type=click.IntRange(min=1))
+def worklist_cmd(db_path: str, kind, family, limit: int) -> None:
+    """Candidates still BARE after tiers 1-2 (no description text from any
+    source) — the research worklist for web/ai_authored enrichment
+    (ADR-022 §6 tiers 3-4)."""
+    try:
+        conn = catalog_db.connect(db_path)
+    except catalog_db.CatalogDBError as e:
+        click.echo(f"[catalog] ERROR: {e}", err=True)
+        sys.exit(1)
+    try:
+        q = """
+        SELECT e.name, e.kind, e.model_family, e.classification, e.sha256
+        FROM entries e
+        WHERE e.excluded = 0 AND e.stale = 0 AND e.kind != 'model'
+          AND NOT EXISTS (SELECT 1 FROM descriptions d
+                          WHERE d.entry_id = e.id
+                            AND d.description IS NOT NULL)
+        """
+        args: list = []
+        if kind:
+            q += " AND e.kind = ?"
+            args.append(kind)
+        if family:
+            q += " AND e.model_family = ?"
+            args.append(family)
+        q += " ORDER BY e.model_family, e.name LIMIT ?"
+        args.append(limit)
+        rows = [dict(r) for r in conn.execute(q, args).fetchall()]
+        click.echo(json.dumps(rows, indent=2, ensure_ascii=False))
+        click.echo(f"[catalog] {len(rows)} bare candidates", err=True)
+    finally:
+        conn.close()
+
+
+@cli.command(name="annotate")
+@click.option("--db", "db_path", default=catalog_db.DEFAULT_DB_PATH,
+              show_default=True)
+@click.option("--kind", default=None,
+              type=click.Choice(["lora", "transformer", "model"]))
+@click.option("--source", required=True,
+              type=click.Choice(["web", "ai_authored"]),
+              help="Provenance tier. The machine tiers (sidecar, "
+                   "civitai_api) cannot be written by hand.")
+@click.option("--description", default=None)
+@click.option("--usage-tips", default=None)
+@click.option("--trigger-word", "trigger_words", multiple=True)
+@click.option("--strength", "strength_rec", default=None,
+              help="e.g. '0.8 for style, 1.0 for character'")
+@click.option("--sampler", "sampler_rec", default=None,
+              help="e.g. 'euler, 28 steps, cfg 4'")
+@click.option("--url", "provenance_url", default=None,
+              help="Source URL (required for --source web).")
+@click.argument("name")
+def annotate_cmd(db_path: str, kind, source: str, description, usage_tips,
+                 trigger_words, strength_rec, sampler_rec, provenance_url,
+                 name: str) -> None:
+    """Write tier-3 (web research) / tier-4 (AI-authored) enrichment for
+    one entry. All text passes the sanitizer; provenance is mandatory
+    (ADR-022 §6).
+
+    NOTE: re-annotating REPLACES the whole (entry, source) row — omitted
+    fields become NULL. Pass every field you want kept on re-annotate.
+    """
+    if source == "web" and not provenance_url:
+        click.echo("[catalog] ERROR: --url is required for --source web "
+                   "(provenance, Vision invariant 4)", err=True)
+        sys.exit(1)
+    try:
+        conn = catalog_db.connect(db_path)
+    except catalog_db.CatalogDBError as e:
+        click.echo(f"[catalog] ERROR: {e}", err=True)
+        sys.exit(1)
+    try:
+        q = "SELECT id, kind FROM entries WHERE name = ?"
+        args = [name]
+        if kind:
+            q += " AND kind = ?"
+            args.append(kind)
+        rows = conn.execute(q, args).fetchall()
+        if not rows:
+            click.echo(f"[catalog] no entry named {name!r}", err=True)
+            sys.exit(2)
+        if len(rows) > 1:
+            click.echo(f"[catalog] ambiguous name {name!r} "
+                       f"({', '.join(r['kind'] for r in rows)}) — pass "
+                       f"--kind", err=True)
+            sys.exit(2)
+        catalog_db.upsert_description(
+            conn, entry_id=rows[0]["id"], source=source,
+            description=description, usage_tips=usage_tips,
+            trigger_words=list(trigger_words) or None,
+            strength_rec=strength_rec, sampler_rec=sampler_rec,
+            provenance_url=provenance_url)
+        catalog_db.rebuild_fts(conn)
+        conn.commit()
+        click.echo(f"[catalog] annotated {name!r} ({source})")
+    finally:
+        conn.close()
+
+
+@cli.command(name="exclude")
+@click.option("--db", "db_path", default=catalog_db.DEFAULT_DB_PATH,
+              show_default=True)
+@click.option("--kind", default=None,
+              type=click.Choice(["lora", "transformer"]))
+@click.option("--clear", is_flag=True,
+              help="Clear an operator exclusion (the next build's policy "
+                   "pass re-evaluates the entry normally).")
+@click.argument("name")
+def exclude_cmd(db_path: str, kind, clear: bool, name: str) -> None:
+    """Operator exclusion — never touched by rebuilds until --clear."""
+    try:
+        conn = catalog_db.connect(db_path)
+    except catalog_db.CatalogDBError as e:
+        click.echo(f"[catalog] ERROR: {e}", err=True)
+        sys.exit(1)
+    try:
+        q = "SELECT id FROM entries WHERE name = ?"
+        args = [name]
+        if kind:
+            q += " AND kind = ?"
+            args.append(kind)
+        rows = conn.execute(q, args).fetchall()
+        if len(rows) != 1:
+            click.echo(f"[catalog] {'no' if not rows else 'ambiguous'} "
+                       f"entry {name!r}"
+                       + (" — pass --kind" if len(rows) > 1 else ""),
+                       err=True)
+            sys.exit(2)
+        if clear:
+            # Scoped to operator exclusions (security F-2): clearing an
+            # AUDIT exclusion would transiently surface a deletable/
+            # duplicate asset in search until the next build re-applies
+            # policy. Audit exclusions clear themselves when evidence
+            # changes on rebuild.
+            cur = conn.execute(
+                "UPDATE entries SET excluded = 0, excluded_reason = NULL "
+                "WHERE id = ? AND excluded_reason = 'operator'",
+                (rows[0]["id"],))
+            if cur.rowcount == 0:
+                click.echo(f"[catalog] {name!r} has no OPERATOR exclusion "
+                           f"to clear (audit exclusions clear on rebuild "
+                           f"when evidence changes)", err=True)
+                sys.exit(2)
+        else:
+            conn.execute("UPDATE entries SET excluded = 1, "
+                         "excluded_reason = 'operator' WHERE id = ?",
+                         (rows[0]["id"],))
+        conn.commit()
+        click.echo(f"[catalog] {name!r} "
+                   f"{'un-excluded' if clear else 'excluded (operator)'}")
+    finally:
+        conn.close()
+
+
 @cli.command(name="show")
 @click.option("--db", "db_path", default=catalog_db.DEFAULT_DB_PATH,
               show_default=True)

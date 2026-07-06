@@ -135,3 +135,5 @@ Tiers, each filling only what's missing (idempotent upsert on `(entry, source)`)
 ## Changelog
 
 - **2026-07-05 (proposed):** Drafted per Grant's catalog-service directive + AskUserQuestion decisions. S1 may begin after `code-reviewer`; the ADR itself goes to `security-auditor` design review together with S3–S5 implementation (the seams are implementation-shaped; §6/§7 name the posture the review must hold me to).
+
+- **2026-07-06 (S1–S4 shipped; surface deltas):** S1 (schema/builder), S2 (families/sidecar/exclusion/search + family-pick refinement: `duplicate_of`'s base is definitive family evidence; multi-base matches prefer the sidecar-agreeing base), S3 (civitai enrichment; security review `docs/security/review-catalog-enrich-2026-07-06.md`), S4 (annotate/exclude + **standalone `worklist` verb** — §6's `enrich --worklist` phrasing superseded; a read-only listing verb doesn't belong under the network verb). Re-annotate is whole-row replace on (entry, source) — documented in the verb help. First production build + live enrichment: 954 entries, 202+16 candidates, 184 civitai hits / 18 misses / 0 failures.
