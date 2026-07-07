@@ -950,3 +950,17 @@ vendoring option.
 - **Trigger:** Add a `fs_is_fuse` fail-closed guard to `connect_readonly` (mirroring `connect`)
   the next time `catalog_db.py` is opened for a deliberate change, OR if a user ever reports a
   startup/search hang with `--catalog-db` pointed at a mergerfs path.
+
+## 2026-07-07 — Converted Krea LoRAs drop `.diff_b` bias deltas and second-level fp8 scales (`weight_scale_2`)
+
+- **What:** `convert_state_dict` (`nodes/eric_lora_format_convert_apply.py`) emits WEIGHT
+  deltas only. On a converted Krea LoRA, bias deltas (`.diff_b`) and any second-level fp8
+  scale (`weight_scale_2`) are counted and loudly warned but never merged; the scaled-fp8
+  header loader also rejects `weight_scale_2` (`nodes/eric_diffusion_fp8_ops.py`). Surfaced by
+  the code-review of the fp8-resident-Krea-LoRA fix (7cc99ab, ADR-019 Changelog 2026-07-07).
+- **Why not now:** the in-hand community Krea LoRAs (snofs / lenovo / nicegirls) ship neither,
+  so they apply fully; no LoRA in the collection exercises the path, and merging a bias delta
+  or a second-level scale into a REQUANTIZED fp8 base needs its own DMR-style security pass
+  (a new write target beyond the DMR-3 `.weight`-only merge surface).
+- **Trigger:** a Krea-2 distill/turbo LoRA reported partially-applied (some modules active,
+  bias/scale-bearing ones silently skipped), OR a `weight_scale_2` reject in the daemon log.
