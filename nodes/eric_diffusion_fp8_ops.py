@@ -613,9 +613,61 @@ def load_scaled_fp8_component(component_class, weights_path: str, dtype,
             bf16_sd[k] = t.to(dtype) if t.is_floating_point() else t
     del sd
 
-    model = component_class.from_single_file(
-        bf16_sd, config=config_path, torch_dtype=dtype, local_files_only=True,
+    # ComfyUI-native Krea-2 checkpoints (community civitai single-file) use key
+    # names released diffusers 0.39.0 has no from_single_file converter for.
+    # Convert them ourselves (pure 1:1 renames) + from_config + load_state_dict.
+    # The missing-key assertion fails LOUD if the rename table ever drifts (and
+    # marks the rules dead if a future diffusers release covers this format).
+    # (ADR-019 Changelog 2026-07-07; nodes/eric_krea2_convert.py.)
+    from .eric_krea2_convert import (
+        is_krea2_comfy_checkpoint, convert_krea2_comfy_state_dict,
+        reshape_to_model_shapes,
     )
+    if is_krea2_comfy_checkpoint(bf16_sd.keys()):
+        print(f"{log_prefix} ComfyUI-native Krea-2 keys — converting to "
+              f"diffusers + from_config build")
+        diff_sd = convert_krea2_comfy_state_dict(bf16_sd, strip_prefix)
+        del bf16_sd
+        config = component_class.load_config(config_path, local_files_only=True)
+        model = component_class.from_config(config)
+        # The only native/diffusers layout delta: block modulation `mod.lin`
+        # is a FLAT (6*dim,) scale_shift_table vs diffusers (6, dim). Reshape
+        # is allowlisted to *scale_shift_table targets (code-review finding 2).
+        _mshapes = {n: tuple(p.shape) for n, p in
+                    list(model.named_parameters()) + list(model.named_buffers())}
+        reshape_to_model_shapes(diff_sd, _mshapes)
+        incompat = model.load_state_dict(diff_sd, strict=False, assign=True)
+        del diff_sd
+        # Refuse rather than generate from random-init weights. Assert BOTH
+        # missing (a model param the converter didn't fill) AND unexpected (a
+        # converted key the model doesn't have — the other half of a mis-rename)
+        # to lock the pure-1:1 contract (code-review findings 3/9).
+        if incompat.missing_keys or incompat.unexpected_keys:
+            raise ScaledFp8FormatError(
+                f"Krea-2 key conversion mismatch "
+                f"({len(incompat.missing_keys)} missing / "
+                f"{len(incompat.unexpected_keys)} unexpected model params; "
+                f"rename table incomplete) — e.g. missing "
+                f"{_safe_name((sorted(incompat.missing_keys) or ['-'])[0])}; "
+                f"refusing rather than generate from random-init weights"
+            )
+        model = model.to(dtype)
+        # assign=True coerced Krea2's _keep_in_fp32_modules norms to the dequant
+        # dtype (bf16); from_pretrained keeps them fp32 for numerical stability.
+        # Restore that so single-file loads match the base model's precision
+        # contract (code-review finding 4). Leaf-exact match on the module name.
+        _keep = getattr(component_class, "_keep_in_fp32_modules", None) or []
+        if _keep:
+            _kept = 0
+            for _name, _mod in model.named_modules():
+                if _name.rsplit(".", 1)[-1] in _keep:
+                    _mod.to(torch.float32)
+                    _kept += 1
+            print(f"{log_prefix} restored {_kept} _keep_in_fp32_modules to fp32")
+    else:
+        model = component_class.from_single_file(
+            bf16_sd, config=config_path, torch_dtype=dtype, local_files_only=True,
+        )
 
     # ── 3. Hardware gate, then fingerprint-swap to fp8 residency ────────
     if not (torch.cuda.is_available()

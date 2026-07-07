@@ -35,6 +35,11 @@ _spec2 = importlib.util.spec_from_file_location(
 edu = importlib.util.module_from_spec(_spec2)
 _spec2.loader.exec_module(edu)
 
+_speck = importlib.util.spec_from_file_location(
+    "krea2c", Path(__file__).parent / "nodes" / "eric_krea2_convert.py")
+krea2c = importlib.util.module_from_spec(_speck)
+_speck.loader.exec_module(krea2c)
+
 passed = 0
 failed = 0
 
@@ -648,6 +653,105 @@ else:
 
 # ──────────────────────────────────────────────────────────────────────
 import shutil
+# ── ComfyUI-native Krea-2 → diffusers key converter (ADR-019 2026-07-07) ──
+print("\n── Krea-2 ComfyUI→diffusers key converter ──")
+_CK = krea2c.convert_krea2_comfy_key
+# detection (prefix-tolerant, fail-closed)
+check("krea2-detect: native keys → True",
+      krea2c.is_krea2_comfy_checkpoint(
+          ["blocks.0.attn.wq.weight", "blocks.0.mod.lin", "first.weight"]))
+check("krea2-detect: with model.diffusion_model. prefix → True",
+      krea2c.is_krea2_comfy_checkpoint(
+          ["model.diffusion_model.blocks.0.attn.wq.weight",
+           "model.diffusion_model.blocks.0.mod.lin"]))
+check("krea2-detect: diffusers-format keys → False",
+      not krea2c.is_krea2_comfy_checkpoint(
+          ["transformer_blocks.0.attn.to_q.weight", "img_in.weight"]))
+check("krea2-detect: unrelated/empty → False",
+      not krea2c.is_krea2_comfy_checkpoint(["some.other.model.weight"])
+      and not krea2c.is_krea2_comfy_checkpoint([]))
+# per-rule key mapping (main blocks)
+_RULES = {
+    "blocks.5.attn.wq.weight": "transformer_blocks.5.attn.to_q.weight",
+    "blocks.5.attn.wk.weight": "transformer_blocks.5.attn.to_k.weight",
+    "blocks.5.attn.wv.weight": "transformer_blocks.5.attn.to_v.weight",
+    "blocks.5.attn.wo.weight": "transformer_blocks.5.attn.to_out.0.weight",
+    "blocks.5.attn.gate.weight": "transformer_blocks.5.attn.to_gate.weight",
+    "blocks.5.attn.qknorm.qnorm.scale": "transformer_blocks.5.attn.norm_q.weight",
+    "blocks.5.attn.qknorm.knorm.scale": "transformer_blocks.5.attn.norm_k.weight",
+    "blocks.5.mlp.gate.weight": "transformer_blocks.5.ff.gate.weight",
+    "blocks.5.mlp.up.weight": "transformer_blocks.5.ff.up.weight",
+    "blocks.5.mlp.down.weight": "transformer_blocks.5.ff.down.weight",
+    "blocks.5.mod.lin": "transformer_blocks.5.scale_shift_table",
+    "blocks.5.prenorm.scale": "transformer_blocks.5.norm1.weight",
+    "blocks.5.postnorm.scale": "transformer_blocks.5.norm2.weight",
+    # text-fusion blocks
+    "txtfusion.layerwise_blocks.1.attn.wk.weight":
+        "text_fusion.layerwise_blocks.1.attn.to_k.weight",
+    "txtfusion.refiner_blocks.0.mlp.down.weight":
+        "text_fusion.refiner_blocks.0.ff.down.weight",
+    "txtfusion.refiner_blocks.0.attn.qknorm.qnorm.scale":
+        "text_fusion.refiner_blocks.0.attn.norm_q.weight",
+    "txtfusion.projector.weight": "text_fusion.projector.weight",
+    # top-level embeds / final layer
+    "first.weight": "img_in.weight",
+    "first.bias": "img_in.bias",
+    "last.linear.bias": "final_layer.linear.bias",
+    "last.norm.scale": "final_layer.norm.weight",
+    "last.modulation.lin": "final_layer.scale_shift_table",
+    "tmlp.0.weight": "time_embed.linear_1.weight",
+    "tmlp.2.bias": "time_embed.linear_2.bias",
+    "tproj.0.weight": "time_mod_proj.weight",
+    "txtmlp.0.scale": "txt_in.norm.weight",
+    "txtmlp.1.weight": "txt_in.linear_1.weight",
+    "txtmlp.3.bias": "txt_in.linear_2.bias",
+}
+for _src, _want in _RULES.items():
+    check(f"krea2-map: {_src} → {_want}", _CK(_src) == _want,
+          detail=f"got {_CK(_src)!r}")
+# state-dict conversion: strips prefix, renames, values by reference
+_nat = {"model.diffusion_model.blocks.0.attn.wq.weight": torch.zeros(2),
+        "model.diffusion_model.first.weight": torch.ones(3)}
+_out = krea2c.convert_krea2_comfy_state_dict(_nat, "model.diffusion_model.")
+check("krea2-sd: prefix stripped + keys renamed",
+      set(_out) == {"transformer_blocks.0.attn.to_q.weight", "img_in.weight"})
+check("krea2-sd: no residual native markers",
+      not any(".wq." in k or k.startswith("first.") for k in _out))
+check("krea2-sd: tensor values passed by reference (no copy)",
+      _out["img_in.weight"] is _nat["model.diffusion_model.first.weight"])
+# security: an unrecognised key passes through UNCHANGED (no injection of an
+# arbitrary target; the loader's missing-key assertion catches real gaps)
+check("krea2-map: unknown key passes through unchanged",
+      _CK("totally.unknown.key.weight") == "totally.unknown.key.weight")
+# reshape helper: flat scale_shift_table → 2D (numel-safe); allowlisted
+_rsd = {
+    "transformer_blocks.0.scale_shift_table": torch.arange(12).float(),  # (12,)
+    "transformer_blocks.0.attn.to_q.weight": torch.zeros(6),             # numel-match, NOT allowlisted
+    "final_layer.scale_shift_table": torch.zeros(4),                     # numel MISMATCH vs (2,3)
+}
+_mshapes = {
+    "transformer_blocks.0.scale_shift_table": (6, 2),
+    "transformer_blocks.0.attn.to_q.weight": (2, 3),
+    "final_layer.scale_shift_table": (2, 3),
+}
+krea2c.reshape_to_model_shapes(_rsd, _mshapes)
+check("krea2-reshape: flat scale_shift_table reshaped to model 2D shape",
+      tuple(_rsd["transformer_blocks.0.scale_shift_table"].shape) == (6, 2))
+check("krea2-reshape: reshape is lossless (values preserved row-major)",
+      _rsd["transformer_blocks.0.scale_shift_table"][1, 0].item() == 2.0)
+check("krea2-reshape: NON-scale_shift_table key NOT reshaped (allowlist bound)",
+      tuple(_rsd["transformer_blocks.0.attn.to_q.weight"].shape) == (6,))
+check("krea2-reshape: numel-mismatch scale_shift_table left alone (load raises)",
+      tuple(_rsd["final_layer.scale_shift_table"].shape) == (4,))
+# self-guard: control character in a key name is rejected without echoing it
+_ctrl_raised = False
+try:
+    krea2c.convert_krea2_comfy_state_dict({"blocks.0.attn.wq.weight\x01": torch.zeros(1)})
+except ValueError as _e:
+    _ctrl_raised = "\x01" not in str(_e)  # rejected AND raw key not echoed
+check("krea2-guard: control-char key rejected without echoing the raw key",
+      _ctrl_raised)
+
 shutil.rmtree(_TMP, ignore_errors=True)
 print("\n" + "─" * 50)
 print(f"  {passed} passed, {failed} failed")
