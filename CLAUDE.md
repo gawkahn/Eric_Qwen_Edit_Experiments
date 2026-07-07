@@ -272,7 +272,7 @@ The MCP server (`comfyless/mcp_server.py`) caches one pipeline in-process and ev
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **Eric_Qwen_Edit_Experiments** (4458 symbols, 7950 relationships, 289 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **Eric_Qwen_Edit_Experiments** (4477 symbols, 7994 relationships, 289 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
