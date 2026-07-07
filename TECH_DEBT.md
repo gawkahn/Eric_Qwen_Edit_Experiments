@@ -904,3 +904,34 @@ component-splitting (extract the transformer from the bundle; Krea-2-Turbo base
 supplies TE/VAE, or use the bundled ones). **RedCraft is the clean first target**
 (transformer-only, comfy_quant fp8, blocked ONLY on Krea keys). Both filenames'
 "INT8 ConvRot" labels are misnomers — neither file contains int8 or rotation tensors.
+
+## 2026-07-06 — UPDATE: diffusers PR #14126 adds Krea2 from_single_file — TESTED, converts our files' keys correctly
+
+**Finding (tested 2026-07-06):** diffusers **PR #14126** ("Add from_single_file()
+support for Ideogram4 and Krea2 transformers", open, opened 2026-07-06, fixes
+#14122) adds `FromOriginalModelMixin` + a Krea2 single-file key converter to
+`Krea2Transformer2DModel`. Pulled the PR head (still `0.39.0.dev0` — SAME base as
+our pin, so API-compatible) into an isolated /tmp checkout, overrode only diffusers
+via PYTHONPATH against the project .venv, and ran RedCraft through it:
+- **Key conversion WORKS.** RedCraft's native ComfyUI keys
+  (`model.diffusion_model.blocks.N.attn.wq/wk/wv/wo`, `mlp.*`, `mod.lin`) convert
+  cleanly to diffusers (`transformer_blocks.N.attn.to_q…`). Model loads with all
+  430 params, 0 meta/uninitialized, correct shapes. NO missing-key warnings. (Needs
+  `low_cpu_mem_usage=False` to dodge a meta-tensor/fp8 cast NotImplementedError —
+  a mechanical detail, not a key problem.)
+- **fp8 scale is dropped.** diffusers reports every `.weight_scale` as "not used".
+  Verified the correct dequant is `fp8 × weight_scale` (absmax 1.859, EXACT match to
+  base Krea-2-Turbo `to_q`); diffusers keeps the raw fp8 (absmax 448) → wrong
+  weights without our scaling. **Applying `fp8 × weight_scale` is exactly slice
+  C-d's comfy_quant cq-w path.**
+**Path forward (supersedes "write our own converter"):** the two halves compose —
+**diffusers PR #14126 (key conversion) + our slice C-d (fp8 scale) = correct
+RedCraft load.** Dark Beast (plain fp8-cast, no scale) needs only the key conversion
++ bundle-split. So the comfyless work becomes a modest INTEGRATION slice (route
+native-Krea single-files through Krea2.from_single_file for keys, then apply our
+comfy_quant scaling on the fp8 layers), NOT a from-scratch key converter.
+**Options:** (a) wait for #14126 merge + diffusers release, then bump pin + integrate;
+(b) vendor the PR's Krea2 converter function now (pure key-mapping) to unblock before
+release, tracking upstream. Either way the earlier "custom Krea converter" plan is
+retired. NOTE: isolated PR checkout left at scratchpad/diffusers-pr14126 for the
+vendoring option.
