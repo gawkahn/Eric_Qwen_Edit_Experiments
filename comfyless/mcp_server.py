@@ -239,6 +239,151 @@ def _resolved_cascade_params_as_names(
     return out
 
 
+# ── extract_params reverse resolution (ADR-015 §3 / slice-4 invariants 8-10) ──
+
+#: The catalog-miss notice text, verbatim from ADR-015 §3 (line 62).
+_EXTRACT_NOT_IN_CATALOG_NOTICE = "reference not in catalog; returned as filename"
+
+
+def _sidecar_name_index(catalog: dict) -> dict:
+    """Build a kind-scoped `basename -> [names]` index over the LIVE catalog
+    for extract_params reverse resolution (slice-4 invariant 9).
+
+    Key is `(kind, os.path.basename(entry["abs_path"]))` — basename-to-
+    basename, so a sidecar's stored path basename lines up (catalog NAMES are
+    stems, but abs_path basenames keep the file extension) and manifest-
+    renamed entries still match by their real filename. Value is a LIST
+    because two roots (ADR-018) can hold same-named files; disambiguation
+    falls to model_family (invariant 9). No filesystem op is performed here
+    or by callers on any sidecar-supplied path.
+    """
+    index: dict = {}
+    for name, entry in catalog.items():
+        key = (entry["kind"], os.path.basename(entry["abs_path"]))
+        index.setdefault(key, []).append(name)
+    return index
+
+
+def _resolve_sidecar_ref(value, kinds: tuple, family, index: dict,
+                         catalog: dict) -> tuple:
+    """Reverse-resolve one sidecar weight reference to a live-catalog NAME.
+
+    Returns `(rendered, missed)`: `rendered` is the catalog name on a hit,
+    the value unchanged on an HF-repo-id passthrough, or the bare basename on
+    a miss; `missed` is True ONLY when a not-in-catalog notice should be
+    emitted (never for a hit or an HF-repo passthrough).
+
+    Resolution is EXACT against the live catalog (invariant 9): an HF repo id
+    passes through untouched (N14); otherwise the value's basename is looked
+    up per kind in `kinds`. Exactly one match -> its name. Multiple matches
+    (ADR-018 multi-root basename collisions) are narrowed by `family` against
+    each candidate's model_family / target_family; if that does not reduce to
+    exactly one, it is a MISS (invariant 10 / N15 — never guess a wrong
+    name). A miss renders the basename (never the directory) via
+    `_basename_or_repo_id` plus a notice. No filesystem op on `value`.
+    """
+    if not isinstance(value, str) or not value:
+        return value, False
+    from nodes.eric_diffusion_utils import _is_hf_repo_id
+    if _is_hf_repo_id(value):
+        return value, False  # HF passthrough: unchanged, no notice (N14)
+    base = os.path.basename(value)
+    candidates: list = []
+    for kind in kinds:
+        candidates.extend(index.get((kind, base), ()))
+    if len(candidates) == 1:
+        return candidates[0], False
+    if len(candidates) > 1 and family:
+        narrowed = [
+            n for n in candidates
+            if catalog[n].get("model_family") == family
+            or catalog[n].get("target_family") == family
+        ]
+        if len(narrowed) == 1:
+            return narrowed[0], False
+    # Miss or unresolved ambiguity -> basename + notice (invariants 10/15).
+    return _basename_or_repo_id(value), True
+
+
+def _render_extracted_params(normalized: dict, *, model_family,
+                             index: dict, catalog: dict) -> tuple:
+    """Rewrite a COMFYLESS_SCHEMA-normalized sidecar blob so every path-typed
+    weight reference becomes a live-catalog NAME, dropping every abs-path-
+    bearing field (slice-4 invariants 8-10). Returns `(params_out, notices)`.
+
+    No absolute path or directory survives: `model`/`transformer`/`loras[]`
+    resolve to names (basename + notice on catalog miss); `vae_path` /
+    `text_encoder*` / `output_path` / `savepath` / `lora_warnings` are dropped
+    outright. `model_family` (dropped by the schema normalizer as a non-param)
+    is re-injected verbatim when supplied. Each LoRA `weight` is coerced to a
+    number-or-None so a non-numeric value can never smuggle a string across
+    (code-reviewer slice-4 LOW). Notices are deduped (multiple misses collapse
+    to one generic INFO notice; N13).
+
+    Cascade (Stable Cascade) sidecars are OUT OF SCOPE here: their real
+    on-disk shape is FLAT (`cascade.py` dispatch spreads the config —
+    `stage_c`/`stage_b`/`config_source`/`output_path` — at top level, NOT
+    nested under `cascade_config`), and every such key is non-schema, so
+    `_validate_params` drops them all (no leak, but no stage replay). Real
+    flat-cascade support is a follow-on step (4d); see the Vision.
+    """
+    out = dict(normalized)
+    notices: list = []
+
+    def _note(missed: bool) -> None:
+        if missed:
+            notices.append({"level": "INFO",
+                            "message": _EXTRACT_NOT_IN_CATALOG_NOTICE})
+
+    if out.get("model"):
+        name, missed = _resolve_sidecar_ref(
+            out["model"], ("model", "transformer"), model_family, index,
+            catalog)
+        out["model"] = name
+        _note(missed)
+
+    tval = out.pop("transformer_path", None)
+    if tval:
+        name, missed = _resolve_sidecar_ref(
+            tval, ("transformer",), model_family, index, catalog)
+        out["transformer"] = name
+        _note(missed)
+
+    src_loras = out.get("loras")
+    if isinstance(src_loras, list):
+        new_loras: list = []
+        for entry in src_loras:
+            if not isinstance(entry, dict):
+                continue
+            name, missed = _resolve_sidecar_ref(
+                entry.get("path", ""), ("lora",), model_family, index, catalog)
+            _note(missed)
+            w = entry.get("weight")
+            # Coerce to number-or-None: a crafted sidecar must not echo an
+            # arbitrary string (e.g. a path) through the weight field.
+            weight = w if isinstance(w, (int, float)) and not isinstance(
+                w, bool) else None
+            new_loras.append({"name": name, "weight": weight})
+        out["loras"] = new_loras
+
+    # Drop every remaining abs-path-bearing field (invariant 8). savepath /
+    # output_path are non-schema and normally already gone; popped defensively.
+    for k in ("vae_path", "text_encoder_path", "text_encoder_2_path",
+              "output_path", "savepath", "lora_warnings"):
+        out.pop(k, None)
+
+    if model_family:
+        out["model_family"] = model_family
+
+    seen: set = set()
+    deduped: list = []
+    for n in notices:
+        if n["message"] not in seen:
+            seen.add(n["message"])
+            deduped.append(n)
+    return out, deduped
+
+
 # ════════════════════════════════════════════════════════════════════════
 # Tool description text (refinable per ADR-011 §2 amendment 2026-04-30)
 # ════════════════════════════════════════════════════════════════════════
@@ -596,6 +741,44 @@ _SEARCH_INPUT_SCHEMA: dict[str, Any] = {
 }
 
 
+_EXTRACT_PARAMS_TOOL_DESCRIPTION = """\
+Read the generation parameters from a comfyless JSON metadata sidecar (the
+`<image>.json` file written next to a generated image) so you can inspect or
+replay a prior run. Give the sidecar's path; it must be a `.json` file inside
+the server's output directory. PNG files are NOT read — sidecar JSON only.
+
+Returns {"params": {...}} — the normalized generation parameters (prompt,
+negative_prompt, seed, steps, cfg_scale, true_cfg_scale, width, height,
+sampler, schedule, model_family, and weight references). Weight references
+are CATALOG NAMES, not paths: `model`, `transformer`, and each `loras[].name`
+are resolved through the catalog so you can feed them straight back into
+`generate`. A reference whose file is not in the catalog is returned as its
+bare filename and flagged with an INFO notice in an optional `notices` array;
+absolute directories never appear. Unknown / non-parameter keys in the file
+are dropped.
+"""
+
+_EXTRACT_PARAMS_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["path"],
+    "properties": {
+        "path": {"type": "string", "minLength": 1},
+    },
+}
+
+#: One generic rejection shared by BOTH sidecar-path gates (resolved name not
+#: `.json` / resolved path outside --output-dir) so the response cannot
+#: distinguish which gate failed or echo the resolved path (invariant 4/N10).
+_SIDECAR_PATH_REJECT = (
+    "sidecar path rejected: must be a .json file within the output directory")
+
+#: One sanitized error for any past-the-gates read failure (missing /
+#: unreadable / malformed JSON / non-object), carrying no traceback, no
+#: absolute path, no partial result (invariant 14 / failure semantics).
+_SIDECAR_UNREADABLE = "sidecar could not be read as JSON params"
+
+
 # ════════════════════════════════════════════════════════════════════════
 # Audit-line writer  (invariants 4, 5)
 # ════════════════════════════════════════════════════════════════════════
@@ -947,6 +1130,11 @@ async def _list_tools_impl(cfg: _StartupConfig) -> list[Tool]:
             description=_LIST_TRANSFORMERS_TOOL_DESCRIPTION,
             inputSchema=_LIST_TRANSFORMERS_INPUT_SCHEMA,
         ),
+        Tool(
+            name="extract_params",
+            description=_EXTRACT_PARAMS_TOOL_DESCRIPTION,
+            inputSchema=_EXTRACT_PARAMS_INPUT_SCHEMA,
+        ),
     ]
     # ADR-022 S5: `search` is advertised ONLY when the metadata DB was
     # configured at spawn — the tool surface never promises what the
@@ -1279,6 +1467,11 @@ async def _call_tool_impl(
             for k, v in (arguments or {}).items()
             if k in ("query", "kind", "model_family", "limit")
         }
+    elif name == "extract_params":
+        # Echo only the requested path (operator-visible per invariant 13),
+        # capped — the returned params blob is NEVER echoed to the audit.
+        _p = (arguments or {}).get("path")
+        audit_payload = {"path": _p[:256]} if isinstance(_p, str) else {}
     else:
         audit_payload = arguments
 
@@ -1297,6 +1490,8 @@ async def _call_tool_impl(
                 cfg, arguments)
         elif name == "search":
             result, result_count = await _handle_search(cfg, arguments)
+        elif name == "extract_params":
+            result = await _handle_extract_params(cfg, arguments)
         else:
             raise _MCPHandlerError(
                 "UnknownTool",
@@ -2271,6 +2466,73 @@ async def _handle_list_transformers(
 # ════════════════════════════════════════════════════════════════════════
 # Server builder + async runner
 # ════════════════════════════════════════════════════════════════════════
+
+async def _handle_extract_params(
+    cfg: _StartupConfig,
+    arguments: dict,
+) -> list[TextContent]:
+    """extract_params (slice 4): read a JSON sidecar under --output-dir and
+    return its COMFYLESS_SCHEMA parameters with weight references rendered as
+    live-catalog NAMES (basename + INFO notice on catalog miss).
+
+    Two ordered path checks on the sidecar `path` argument (ADR-011 §3 second
+    exclusion): realpath FIRST, then (1) resolved name ends in `.json`, (2)
+    resolved path within --output-dir. Both gates share ONE generic rejection
+    so the response cannot distinguish which check failed or echo the resolved
+    path (invariant 4 / N10). PNG bytes are never parsed; the PURE
+    `_validate_params` normalizer is used — never the CLI's `_load_params` /
+    `_load_sidecar` (which reach the PNG path / CLI dispatch). No model load,
+    no network, no write. Name resolution runs against the LIVE `cfg.catalog`,
+    never the metadata DB (DB enrichment lands in slice-4 step 3).
+    """
+    # Input-shape validation (the framework runs with validate_input=False,
+    # so the handler defends itself). NUL is rejected before any realpath.
+    path = (arguments or {}).get("path")
+    if not isinstance(path, str) or not path:
+        raise _MCPHandlerError(
+            "ValidationError",
+            "validation failed: path: expected non-empty string")
+    if "\x00" in path:
+        raise _MCPHandlerError(
+            "ValidationError",
+            "validation failed: path: contains embedded NUL byte")
+
+    # Two ordered gates, realpath FIRST (defeats a legit.json -> evil.png
+    # symlink). ONE generic rejection for both -> no type/enumeration oracle.
+    resolved = os.path.realpath(path)
+    if not resolved.endswith(".json") or not _within(resolved, cfg.output_dir):
+        raise _MCPHandlerError("SidecarPathRejected", _SIDECAR_PATH_REJECT)
+
+    # Past the gates: read + JSON-parse. Any failure -> ONE sanitized error
+    # (no traceback, no abs path, no partial return).
+    try:
+        with open(resolved, "r") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        raise _MCPHandlerError(
+            "SidecarUnreadable", _SIDECAR_UNREADABLE) from None
+    if not isinstance(raw, dict):
+        raise _MCPHandlerError("SidecarUnreadable", _SIDECAR_UNREADABLE)
+
+    # model_family is a non-schema provenance field the normalizer drops;
+    # capture it from the RAW blob for family-disambiguation + re-injection.
+    raw_family = raw.get("model_family")
+    family = raw_family if isinstance(raw_family, str) and raw_family else None
+
+    # Pure COMFYLESS_SCHEMA normalization: drops unknown / non-parameter keys.
+    # NOT _load_params (-> PNG path) and NOT CLI dispatch (invariant 5).
+    from comfyless.generate import _validate_params
+    normalized = _validate_params(raw, source="extract_params")
+
+    index = _sidecar_name_index(cfg.catalog)
+    params_out, notices = _render_extracted_params(
+        normalized, model_family=family, index=index, catalog=cfg.catalog)
+
+    response: dict = {"params": params_out}
+    if notices:
+        response["notices"] = notices
+    return [TextContent(type="text", text=json.dumps(response, default=str))]
+
 
 def _build_server(cfg: _StartupConfig) -> Server:
     """Construct the MCP server and register handlers under the framework's

@@ -245,16 +245,18 @@ with tempfile.TemporaryDirectory() as tmp_out, \
         default_model=None, mcp_max_iterations=100,
     )
     tools = _run(mcps._list_tools_impl(cfg))
-    check("Slice-2b invariant 1: list_tools returns 4 elements",
-          isinstance(tools, list) and len(tools) == 4,
+    check("Slice-4: list_tools returns 5 elements (extract_params added; "
+          "no DB so search absent)",
+          isinstance(tools, list) and len(tools) == 5,
           detail=f"len={len(tools)}")
     check("Slice-2b invariant 1: every element is a Tool",
           all(isinstance(t, Tool) for t in tools))
     _tool_names = sorted(t.name for t in tools)
-    check("Slice-2b invariant 1: tool names are exactly "
-          "{generate, list_models, list_loras, list_transformers}",
-          _tool_names == ["generate", "list_loras", "list_models",
-                          "list_transformers"],
+    check("Slice-4: tool names are exactly "
+          "{extract_params, generate, list_models, list_loras, "
+          "list_transformers}",
+          _tool_names == ["extract_params", "generate", "list_loras",
+                          "list_models", "list_transformers"],
           detail=f"names={_tool_names}")
     _tools_by_name = {t.name: t for t in tools}
     check("Invariant 8: 'generate' tool description still names qwen-image "
@@ -2683,13 +2685,13 @@ with tempfile.TemporaryDirectory() as tmp_out, \
     # list_* handlers).
     tools = _run(mcps._list_tools_impl(cfg))
     check("Step3 carry: _list_tools_impl with populated catalog still "
-          "returns the static four tools (slice-2b)",
-          isinstance(tools, list) and len(tools) == 4,
+          "returns the static five tools (slice-4; no DB so search absent)",
+          isinstance(tools, list) and len(tools) == 5,
           detail=f"len={len(tools)}")
     _names = sorted(t.name for t in tools)
     check("Step3 carry: tool names unchanged by catalog content",
-          _names == ["generate", "list_loras", "list_models",
-                     "list_transformers"],
+          _names == ["extract_params", "generate", "list_loras",
+                     "list_models", "list_transformers"],
           detail=f"names={_names}")
 
 
@@ -3005,9 +3007,9 @@ with tempfile.TemporaryDirectory() as tmp_out, \
     )
     tools = _run(mcps._list_tools_impl(cfg))
     by_name = {t.name: t for t in tools}
-    check("N20: tools/list advertises exactly 4 tools (slice-2b)",
+    check("N20: tools/list advertises exactly 5 tools (slice-4; no DB)",
           set(by_name) == {"generate", "list_models", "list_loras",
-                           "list_transformers"})
+                           "list_transformers", "extract_params"})
     check("N20: 'generate' inputSchema is byte-identical to _GENERATE_INPUT_SCHEMA "
           "(slice-1 invariant 14)",
           by_name["generate"].inputSchema == mcps._GENERATE_INPUT_SCHEMA)
@@ -4197,7 +4199,7 @@ with tempfile.TemporaryDirectory() as _td:
     tools = _run(mcps._list_tools_impl(cfg_db))
     names5 = [t.name for t in tools]
     check("S5: search advertised WITH --catalog-db",
-          "search" in names5 and len(names5) == 5)
+          "search" in names5 and len(names5) == 6)
     tools = _run(mcps._list_tools_impl(cfg_nodb))
     check("S5: search NOT advertised without --catalog-db",
           "search" not in [t.name for t in tools])
@@ -4367,6 +4369,308 @@ _vsa_src = inspect.getsource(mcps._validate_startup_args)
 check("4a: _validate_startup_args performs no default-path discovery",
       "_discover_default_catalog_db" not in _vsa_src
       and "DEFAULT_DB_PATH" not in _vsa_src)
+
+
+# ════════════════════════════════════════════════════════════════════════
+print("\n== Slice 4 step 2: extract_params (gates + names, no DB) ==")
+# ════════════════════════════════════════════════════════════════════════
+
+with tempfile.TemporaryDirectory() as _tp_out, \
+     tempfile.TemporaryDirectory() as _tp_ext:
+    _out = os.path.realpath(_tp_out)
+    _cat4 = {
+        "my_model": {"abs_path": "/models/checkpoints/My-Model",
+                     "kind": "model", "source": "scan",
+                     "model_family": "qwen-image", "target_family": None},
+        "cool_lora": {"abs_path": "/models/loras/cool_lora.safetensors",
+                      "kind": "lora", "source": "scan",
+                      "model_family": None, "target_family": None},
+        "my_xformer": {"abs_path": "/models/dit/my_xformer.safetensors",
+                       "kind": "transformer", "source": "scan",
+                       "model_family": None, "target_family": None},
+        # ambiguity fixture: same basename `dup.safetensors` under two roots,
+        # distinct target_family for family-narrowing (N15).
+        "dupA": {"abs_path": "/rootA/dup.safetensors", "kind": "lora",
+                 "source": "scan", "model_family": None,
+                 "target_family": "flux2"},
+        "dupB": {"abs_path": "/rootB/dup.safetensors", "kind": "lora",
+                 "source": "scan", "model_family": None,
+                 "target_family": "qwen-image"},
+    }
+    _cfg4 = mcps._StartupConfig(
+        output_dir=_out, model_base=_out, default_model=None,
+        mcp_max_iterations=100, catalog=_cat4, catalog_db_path=None)
+
+    def _write_sidecar(fname, obj):
+        p = os.path.join(_out, fname)
+        with open(p, "w") as f:
+            _json.dump(obj, f)
+        return p
+
+    def _extract(p):
+        res = _run(mcps._handle_extract_params(_cfg4, {"path": p}))
+        return _json.loads(res[0].text)
+
+    # ── N6/N7/N11/N12: happy path, names, no-leak ──
+    _sc = _write_sidecar("run1.json", {
+        "prompt": "a cat", "negative_prompt": "dog", "seed": 42, "steps": 30,
+        "cfg_scale": 3.5, "width": 1024, "height": 1024,
+        "model": "/models/checkpoints/My-Model", "model_family": "qwen-image",
+        "transformer_path": "/models/dit/my_xformer.safetensors",
+        "vae_path": "/models/vae/foo.safetensors",
+        "text_encoder_path": "/models/te/bar.safetensors",
+        "output_path": "/outputs/run1.png", "savepath": "%input%",
+        "lora_warnings": ["LoRA not applied: /abs/secret.safetensors"],
+        "loras": [{"path": "/models/loras/cool_lora.safetensors",
+                   "weight": 0.8}],
+        "__exfil__": "SECRETVALUE",
+        "timestamp": "2026-01-01", "elapsed_seconds": 12.3,
+        "contract_version": 1,
+    })
+    _r = _extract(_sc)
+    _pp = _r["params"]
+    check("N12: model -> catalog name, and the name is a live catalog key",
+          _pp.get("model") == "my_model" and "my_model" in _cfg4.catalog)
+    check("N6: transformer_path -> transformer name; *_path key dropped",
+          _pp.get("transformer") == "my_xformer"
+          and "transformer_path" not in _pp)
+    check("N6: loras -> [{name, weight}] with path dropped",
+          _pp.get("loras") == [{"name": "cool_lora", "weight": 0.8}])
+    check("N6: non-path params pass through verbatim (+ model_family)",
+          _pp.get("prompt") == "a cat" and _pp.get("seed") == 42
+          and _pp.get("model_family") == "qwen-image")
+    check("N7: unknown key dropped", "__exfil__" not in _pp)
+    check("N6: all-hit sidecar carries no notices", "notices" not in _r)
+    _flat = _json.dumps(_r)
+    check("N11: no abs path or dropped path-field anywhere in the response",
+          "/models/" not in _flat and "/outputs/" not in _flat
+          and "/abs/" not in _flat and "SECRETVALUE" not in _flat
+          and "vae_path" not in _flat and "text_encoder" not in _flat
+          and "output_path" not in _flat and "savepath" not in _flat
+          and "lora_warnings" not in _flat and "transformer_path" not in _flat
+          and '"path"' not in _flat, detail=_flat[:300])
+
+    # ── N13: catalog miss -> bare basename + one generic INFO notice ──
+    _r2 = _extract(_write_sidecar("run2.json", {
+        "prompt": "x", "model": "/somewhere/unknown_model.safetensors"}))
+    check("N13: not-in-catalog model -> bare basename (no directory)",
+          _r2["params"].get("model") == "unknown_model.safetensors")
+    check("N13: miss -> exactly one INFO notice, verbatim ADR-015 text",
+          _r2.get("notices") == [{"level": "INFO",
+              "message": "reference not in catalog; returned as filename"}])
+    check("N13: miss response leaks no directory",
+          "/somewhere" not in _json.dumps(_r2))
+
+    # ── N14: HF repo id passes through unchanged, no notice ──
+    _r3 = _extract(_write_sidecar("run3.json", {
+        "prompt": "x", "model": "Qwen/Qwen-Image"}))
+    check("N14: HF repo id passed through unchanged, no notice",
+          _r3["params"].get("model") == "Qwen/Qwen-Image"
+          and "notices" not in _r3)
+
+    # ── N15: ambiguous basename — miss without family, narrowed with it ──
+    _r4 = _extract(_write_sidecar("run4.json", {
+        "prompt": "x",
+        "loras": [{"path": "/anywhere/dup.safetensors", "weight": 1.0}]}))
+    check("N15: ambiguous basename (no family) -> basename miss, never a guess",
+          _r4["params"]["loras"] == [{"name": "dup.safetensors",
+                                      "weight": 1.0}]
+          and _r4.get("notices"))
+    _r4b = _extract(_write_sidecar("run4b.json", {
+        "prompt": "x", "model_family": "flux2",
+        "loras": [{"path": "/anywhere/dup.safetensors", "weight": 1.0}]}))
+    check("N15: model_family disambiguates the collision to one name",
+          _r4b["params"]["loras"] == [{"name": "dupA", "weight": 1.0}]
+          and "notices" not in _r4b)
+
+    # ── N16 (descope): a REAL cascade sidecar is FLAT (cascade.py spreads the
+    # config at top level, NOT under cascade_config — stage_c/stage_b/
+    # config_source/output_path are top-level). Every cascade/path key is
+    # non-schema, so _validate_params drops them all: no stage replay yet
+    # (follow-on step 4d) but crucially NO abs path leaks. ──
+    _r5 = _extract(_write_sidecar("cascade_flat.json", {
+        "prompt": "a castle", "seed": 7,
+        "model_family": "stable-cascade",
+        "stage_c": "/models/dit/stage_c.safetensors",
+        "stage_b": "/models/dit/stage_b.safetensors",
+        "scaffolding_repo": "stabilityai/stable-cascade",
+        "config_source": "/home/user/cascade_default.json",
+        "output_path": "/outputs/castle.png"}))
+    _p5 = _r5["params"]
+    check("N16(descope): flat cascade path fields all dropped (no leak)",
+          all(k not in _p5 for k in ("stage_c", "stage_b", "scaffolding_repo",
+                                     "config_source", "output_path"))
+          and "cascade_config" not in _p5)
+    check("N16(descope): flat cascade sidecar leaks no abs path anywhere",
+          "/models/" not in _json.dumps(_r5)
+          and "/home/" not in _json.dumps(_r5)
+          and "/outputs/" not in _json.dumps(_r5))
+    check("N16(descope): non-path params (prompt/seed/model_family) survive",
+          _p5.get("prompt") == "a castle" and _p5.get("seed") == 7
+          and _p5.get("model_family") == "stable-cascade")
+
+    # ── LOW fold: non-numeric LoRA weight coerced to None (no string egress) ──
+    _rw = _extract(_write_sidecar("weight.json", {
+        "prompt": "x",
+        "loras": [{"path": "/models/loras/cool_lora.safetensors",
+                   "weight": "/abs/evil/path"}]}))
+    check("LOW: non-numeric lora weight coerced to None (no string egress)",
+          _rw["params"]["loras"] == [{"name": "cool_lora", "weight": None}]
+          and "/abs/" not in _json.dumps(_rw))
+
+    # ── N1/N2/N3/N4/N5/N10: path gates ──
+    _png = os.path.join(_out, "foo.png")
+    open(_png, "w").close()
+    _n1_msg = None
+    try:
+        _run(mcps._handle_extract_params(_cfg4, {"path": _png}))
+        check("N1: wrong extension rejected", False)
+    except mcps._MCPHandlerError as e:
+        _n1_msg = e.safe_message
+        check("N1: wrong extension rejected",
+              e.error_class == "SidecarPathRejected")
+
+    _outside = os.path.join(os.path.realpath(_tp_ext), "outside.json")
+    with open(_outside, "w") as f:
+        _json.dump({"prompt": "x"}, f)
+    _n4_msg = None
+    try:
+        _run(mcps._handle_extract_params(_cfg4, {"path": _outside}))
+        check("N4: out-of-root .json rejected", False)
+    except mcps._MCPHandlerError as e:
+        _n4_msg = e.safe_message
+        check("N4: out-of-root .json rejected",
+              e.error_class == "SidecarPathRejected")
+
+    check("N10: N1 (wrong-ext) and N4 (out-of-root) frames are byte-identical",
+          _n1_msg == _n4_msg and _n1_msg is not None)
+    check("N10: rejection echoes no resolved path",
+          _n1_msg and _out not in _n1_msg and "foo.png" not in _n1_msg)
+
+    _evil_png = os.path.join(_out, "evil.png")
+    open(_evil_png, "w").close()
+    _sym = os.path.join(_out, "legit.json")
+    os.symlink(_evil_png, _sym)
+    try:
+        _run(mcps._handle_extract_params(_cfg4, {"path": _sym}))
+        check("N2: .json->.png symlink rejected (realpath before suffix)",
+              False)
+    except mcps._MCPHandlerError as e:
+        check("N2: .json->.png symlink rejected (realpath before suffix)",
+              e.error_class == "SidecarPathRejected")
+
+    _sym2 = os.path.join(_out, "inside.json")
+    os.symlink(_outside, _sym2)
+    try:
+        _run(mcps._handle_extract_params(_cfg4, {"path": _sym2}))
+        check("N3: .json->outside-root symlink rejected", False)
+    except mcps._MCPHandlerError as e:
+        check("N3: .json->outside-root symlink rejected",
+              e.error_class == "SidecarPathRejected")
+
+    try:
+        _run(mcps._handle_extract_params(
+            _cfg4, {"path": _out + "/a\x00b.json"}))
+        check("N5: NUL byte rejected", False)
+    except mcps._MCPHandlerError as e:
+        check("N5: NUL byte rejected before realpath",
+              e.error_class == "ValidationError")
+
+    # ── N8/N9/N-missing: past-the-gate read failures -> sanitized error ──
+    _bad = os.path.join(_out, "bad.json")
+    with open(_bad, "w") as f:
+        f.write("{not valid json")
+    try:
+        _run(mcps._handle_extract_params(_cfg4, {"path": _bad}))
+        check("N8: malformed JSON -> sanitized error", False)
+    except mcps._MCPHandlerError as e:
+        check("N8: malformed JSON -> sanitized error (no traceback/abs path)",
+              e.error_class == "SidecarUnreadable"
+              and "Traceback" not in e.safe_message
+              and ".py" not in e.safe_message and _out not in e.safe_message)
+
+    _lst = os.path.join(_out, "list.json")
+    with open(_lst, "w") as f:
+        _json.dump(["a", "b"], f)
+    try:
+        _run(mcps._handle_extract_params(_cfg4, {"path": _lst}))
+        check("N9: non-object JSON -> sanitized error", False)
+    except mcps._MCPHandlerError as e:
+        check("N9: non-object (top-level list) JSON -> sanitized error",
+              e.error_class == "SidecarUnreadable")
+
+    try:
+        _run(mcps._handle_extract_params(
+            _cfg4, {"path": os.path.join(_out, "nope.json")}))
+        check("N-missing: within-root nonexistent .json -> sanitized error",
+              False)
+    except mcps._MCPHandlerError as e:
+        check("N-missing: within-root nonexistent .json -> sanitized error",
+              e.error_class == "SidecarUnreadable"
+              and _out not in e.safe_message)
+
+    # ── N24: input-schema shape (missing / non-string / empty path) ──
+    for _bad_args in ({}, {"path": 123}, {"path": ""}):
+        try:
+            _run(mcps._handle_extract_params(_cfg4, _bad_args))
+            check(f"N24: bad path arg rejected {_bad_args}", False)
+        except mcps._MCPHandlerError as e:
+            check(f"N24: bad path arg rejected {_bad_args}",
+                  e.error_class == "ValidationError")
+
+    # ── N-static: uses the pure normalizer, never CLI/PNG readers ──
+    # Match the CALL form `name(` — the docstring mentions the forbidden
+    # readers by name to explain their exclusion, so a bare-name check would
+    # false-positive on the prose. Widened (code-reviewer INFO) to cover the
+    # render helper and the module-level `import argparse`.
+    _ep_src = inspect.getsource(mcps._handle_extract_params)
+    _rp_src = inspect.getsource(mcps._render_extracted_params)
+    _mod_src = inspect.getsource(mcps)
+    # Line-based import detection (a comment mentioning "import argparse" must
+    # not trip it — the module docstring literally says it does NOT import it).
+    _imports_argparse = any(
+        _l.strip() == "import argparse"
+        or _l.strip().startswith("import argparse ")
+        or _l.strip().startswith("from argparse ")
+        for _l in _mod_src.splitlines())
+    check("N-static: handler+render call _validate_params only, never "
+          "_load_params/_load_sidecar/_apply_overrides; module has no argparse",
+          "_validate_params(" in _ep_src and "_load_params(" not in _ep_src
+          and "_load_sidecar(" not in _ep_src
+          and "_apply_overrides(" not in _ep_src
+          and "_load_params(" not in _rp_src
+          and "_load_sidecar(" not in _rp_src
+          and not _imports_argparse)
+
+    # ── N22/N23: audit on stderr only; path echoed, params blob NOT ──
+    _cap_err = io.StringIO()
+    _cap_out = io.StringIO()
+    _sc_audit = _write_sidecar("audit.json", {
+        "prompt": "SUPER SECRET PROMPT",
+        "model": "/models/checkpoints/My-Model"})
+    with unittest.mock.patch.object(sys, "stderr", _cap_err), \
+         unittest.mock.patch.object(sys, "stdout", _cap_out):
+        _run(mcps._call_tool_impl(_cfg4, "extract_params",
+                                  {"path": _sc_audit}))
+    _etext = _cap_err.getvalue()
+    check("N22: extract_params audit lands on stderr; stdout clean",
+          _etext.strip() != "" and _cap_out.getvalue() == "")
+    _arec = None
+    for _l in _etext.splitlines():
+        _l = _l.strip()
+        if _l.startswith("{"):
+            try:
+                _o = _json.loads(_l)
+                if _o.get("tool") == "extract_params":
+                    _arec = _o
+                    break
+            except _json.JSONDecodeError:
+                pass
+    check("N22: audit record present and echoes the requested path",
+          _arec is not None
+          and _arec.get("input", {}).get("path") == _sc_audit)
+    check("N23: audit never carries the extracted prompt text",
+          "SUPER SECRET PROMPT" not in _etext)
 
 
 # ════════════════════════════════════════════════════════════════════════
