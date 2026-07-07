@@ -44,6 +44,18 @@ C-d variants (comfy_quant descriptor next to the C-a scale layout):
         quantization; ScaledFp8Linear runs the dequant-matmul path,
         _scaled_mm is never called. Variant is inferred from input_scale
         tensor PRESENCE, never from the descriptor JSON (delta D5/D6).
+
+Partial-quant (slice PQ, security review PQ-1..6 / reqs 31-38): a cq file
+MAY also carry "naked" plain-fp8 layers ALONGSIDE the descriptored set —
+ComfyUI partial-quant leaves peripheral projections (img_in, final_layer,
+time/text embeds) unscaled while quantizing the repeated block Linears. The
+D3 rule is therefore PER-LAYER, not whole-file: each fp8 base is EITHER
+fully descriptored+scaled OR fully bare (no scale of any kind, no
+descriptor); any partial coverage is a loud reject. Naked layers upcast to
+bf16 (the reviewed `cc` cast). "Naked" is defined by scale-ABSENCE, never
+descriptor-absence, so a present scale is never silently discarded. No
+naked-fraction cap — airtightness comes from the fully-bare reject, not
+from bounding the fraction (a mostly-naked file just loads as a bf16 model).
 """
 
 from __future__ import annotations
@@ -225,18 +237,38 @@ def _classify_cq(path: str, keys, dtypes, shapes, fp8_keys, cq_keys, cb_hits):
             )
         cq_bases.add(base)
 
-    # D3: EVERY fp8 weight carries a descriptor, or none do (none is the
-    # plain ca/cb/cc path, which never reaches here).
+    # D3 (amended — slice PQ, security review PQ-1 / req 31): a cq file MAY
+    # carry "naked" plain-fp8 layers ALONGSIDE the descriptored set — ComfyUI
+    # partial-quant commonly leaves the peripheral projections (img_in,
+    # final_layer, time/text embeds) unscaled while quantizing the repeated
+    # block Linears. The old all-or-nothing rule becomes PER-LAYER: each fp8
+    # base is EITHER fully descriptored+scaled OR fully bare. A naked base
+    # carrying ANY scale or descriptor is the ambiguous/crafted case and is
+    # refused — "naked" is defined by scale-ABSENCE so a PRESENT scale is
+    # never silently ignored (the D6 present-value argument, applied per
+    # layer). No naked-fraction cap: airtightness comes from this reject, not
+    # from bounding the fraction (req 36). The cq + C-b co-presence reject at
+    # the top of this function is preserved untouched (req 33).
     fp8_bases = {k[: -len(".weight")] for k in fp8_keys
                  if k.endswith(".weight")}
     naked = sorted(fp8_bases - cq_bases)
+    _naked_forbidden = (_CA_SUFFIXES["weight_scale"], _CA_SUFFIXES["input_scale"],
+                        _CB_SUFFIXES["weight_scale"], _CB_SUFFIXES["input_scale"],
+                        _CQ_SUFFIX)
+    for base in naked:
+        for sfx in _naked_forbidden:
+            if base + sfx in key_set:
+                raise ScaledFp8FormatError(
+                    f"descriptor-less fp8 layer {_safe_name(base + '.weight')} "
+                    f"carries {_safe_name(base + sfx)} — a naked fp8 layer must "
+                    f"be FULLY bare (no scale or descriptor of any kind); "
+                    f"partial coverage is refused (D3/PQ-1)"
+                )
     if naked:
-        raise ScaledFp8FormatError(
-            f"file mixes descriptor-carrying and plain fp8 layers (e.g. "
-            f"{_safe_name(naked[0] + '.weight')} has no descriptor while "
-            f"{_safe_name(sorted(cq_bases)[0] + _CQ_SUFFIX)} exists) — "
-            f"refusing (D3)"
-        )
+        preview = sorted(_safe_name(b) for b in naked)[:4]
+        print(f"[EricDiffusion-fp8] comfy_quant: {len(naked)} plain-fp8 "
+              f"(naked) layer(s) upcast to bf16: {preview}"
+              + ("..." if len(naked) > 4 else ""))
 
     # req 14: bounded read + strict parse. One decision: format allowlist.
     from safetensors import safe_open
@@ -545,6 +577,19 @@ def load_scaled_fp8_component(component_class, weights_path: str, dtype,
             )
         base = k[: -len(".weight")]
         ws_key, is_key = base + w_sfx, base + i_sfx
+        # slice PQ / req 32 (security review PQ-2/PQ-5): a FULLY-bare fp8 base
+        # — no weight_scale, no input_scale, no comfy_quant descriptor — is a
+        # plain fp8-cast layer (ComfyUI partial-quant leaves peripheral
+        # projections unscaled). Skip it here so stage 2 upcasts it to bf16
+        # (the reviewed `cc` path). "Naked" is defined by scale-ABSENCE, NEVER
+        # descriptor-absence: a base carrying a scale but no descriptor must
+        # fall through to the F6/D6 checks below — never silently upcast,
+        # which would DISCARD a present scale (~448x corruption). This sits
+        # AFTER the `.weight` check above (req 35) so a non-.weight fp8 tensor
+        # still raises rather than being skipped.
+        if ws_key not in sd and is_key not in sd \
+                and base + _CQ_SUFFIX not in sd:
+            continue
         if ws_key not in sd or (require_input and is_key not in sd):
             raise ScaledFp8FormatError(
                 f"fp8 weight {_safe_name(k)} lacks its paired scales "

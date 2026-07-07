@@ -282,16 +282,105 @@ _expect_reject(
         "b.comfy_quant": _desc({"format": "float8_e4m3fn"}),
     }), "dangling")
 
+# ── slice PQ: partial-quant — naked plain-fp8 coexists with descriptored ──
+# Security review PQ-1..6 / reqs 31-38. "Naked" = a descriptor-less fp8 base;
+# legal ONLY when FULLY bare (no scale of any kind). Any scale on a naked base
+# is refused — a PRESENT scale must never be silently ignored (~448x
+# corruption). classify is the airtight gate (review: "the only airtight
+# control"). Replaces the former all-or-nothing D3 reject.
+print("── slice PQ: partial-quant naked-fp8 coexistence (reqs 31-38) ──")
+
+# Positive: descriptored + FULLY-BARE naked → accepted (the target layout).
+v, _ = _classify(_mk("pq_cqw_naked.safetensors", {
+    "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+    "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+    "first.weight": _fp8((16, 16), seed=2),   # naked, fully bare
+}))
+check("PQ: cq-w descriptored + fully-bare naked → accepted (test 7)",
+      v == "cq-w", f"got {v}")
+
+v, _ = _classify(_mk("pq_cqa_naked.safetensors", {
+    "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+    "a.input_scale": _scalar(0.5),
+    "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+    "first.weight": _fp8((16, 16), seed=2),   # naked, fully bare
+}))
+check("PQ: cq-a descriptored + fully-bare naked → accepted (test 6)",
+      v == "cq-a", f"got {v}")
+
+# Positive (no cap, req 36/PQ-6): mostly-naked + ONE descriptor → accepted.
+v, _ = _classify(_mk("pq_mostly_naked.safetensors", {
+    "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+    "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+    "b.weight": _fp8((16, 16), seed=1),        # naked
+    "c.weight": _fp8((16, 16), seed=2),        # naked
+    "d.weight": _fp8((16, 16), seed=3),        # naked
+}))
+check("PQ: mostly-naked + one descriptor → accepted, no cap (test 11)",
+      v == "cq-w", f"got {v}")
+
+# Test 10 (PQ-4): the naked-set enumeration log fires and names the count.
+import io as _io, contextlib as _cl  # noqa: E402
+_buf = _io.StringIO()
+with _cl.redirect_stdout(_buf):
+    _classify(_mk("pq_log.safetensors", {
+        "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+        "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+        "first.weight": _fp8((16, 16), seed=2),   # 1 naked layer
+    }))
+_logout = _buf.getvalue()
+check("PQ: naked-set enumeration log fires with count (PQ-4, test 10)",
+      "1 plain-fp8" in _logout and "naked" in _logout,
+      f"log: {_logout[:160]!r}")
+
+# Negative {0,1,0}: naked base carrying a weight_scale (no descriptor) — the
+# old "mixed" case; a present scale must not be ignored (tests 1+2).
 _expect_reject(
-    "mixed descriptor/plain fp8 layers rejected (D3 NEGATIVE)",
-    _mk("cqmixed.safetensors", {
+    "PQ: naked base carrying weight_scale rejected (PQ-1 / {0,1,0}, test 1/2)",
+    _mk("pq_naked_ws.safetensors", {
         "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
         "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
         "b.weight": _fp8((16, 16), seed=1), "b.weight_scale": _scalar(0.01),
-    }), "mixes")
+    }), "bare")
+
+# Negative {0,0,1}: naked base carrying an input_scale only → reject (test 3).
+_expect_reject(
+    "PQ: naked base carrying input_scale rejected (PQ-1 / {0,0,1}, test 3)",
+    _mk("pq_naked_is.safetensors", {
+        "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+        "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+        "b.weight": _fp8((16, 16), seed=1), "b.input_scale": _scalar(0.5),
+    }), "bare")
+
+# Negative {0,1,1}: naked base carrying BOTH scales → reject (the silent
+# ~448x-corruption combo; must NOT load as scaled) (test 4).
+_expect_reject(
+    "PQ: naked base carrying both scales rejected (PQ-1 / {0,1,1}, test 4)",
+    _mk("pq_naked_both.safetensors", {
+        "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+        "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+        "b.weight": _fp8((16, 16), seed=1),
+        "b.weight_scale": _scalar(0.01), "b.input_scale": _scalar(0.5),
+    }), "bare")
+
+# Loader (PQ-5 / req 35, test 9): a naked fp8 tensor NOT ending in .weight
+# must still raise at the .weight check, never be skipped as naked.
+_expect_reject(
+    "PQ: loader rejects non-.weight fp8 tensor (PQ-5, test 9)",
+    lambda: fp8ops.load_scaled_fp8_component(
+        None, _mk("pq_nonweight.safetensors", {
+            "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+            "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+            "b.bias": _fp8((16,), seed=1),   # naked fp8, not a .weight
+        }), torch.bfloat16, "", "cq-w"), "not a .weight")
+
+# End-to-end LOAD of a mixed file (naked→bf16, descriptored→ScaledFp8Linear;
+# tests 6/7/8/11 loader half) is CUDA-gated (the fingerprint swap needs sm89+)
+# and is validated by the live smoke test on the real krea2turbobadmilkmela
+# checkpoint. The classify battery above is the airtight security gate (PQ-1).
 
 _expect_reject(
-    "cq + C-b marker co-presence rejected (D3 NEGATIVE)",
+    "cq + C-b marker co-presence rejected (D3 NEGATIVE, test 5)",
     _mk("cqcb.safetensors", {
         "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
         "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
