@@ -145,7 +145,15 @@ def convert_krea2_comfy_state_dict(
         if any(ord(c) < 0x20 for c in k):
             raise ValueError(
                 "control character in checkpoint key name — refusing")
-        nk = k[len(strip_prefix):] if strip_prefix and k.startswith(strip_prefix) else k
+        # Prefer the caller's detected dominant prefix; fall back to the
+        # robust per-key strip (a TE+VAE BUNDLE dilutes the transformer prefix
+        # below the loader's 50% dominance threshold, so strip_prefix is None
+        # there even though the transformer keys ARE `model.diffusion_model.`-
+        # prefixed).
+        if strip_prefix and k.startswith(strip_prefix):
+            nk = k[len(strip_prefix):]
+        else:
+            nk = _strip_known_prefix(k)
         out[convert_krea2_comfy_key(nk)] = v
     return out
 
@@ -175,3 +183,80 @@ def reshape_to_model_shapes(state_dict, model_shapes):
         if tuple(t.shape) != ms and t.numel() == int(torch.tensor(ms).prod()):
             state_dict[k] = t.reshape(ms)
     return state_dict
+
+
+class Krea2ConversionError(ValueError):
+    """Raised when the ComfyUI→diffusers Krea-2 conversion is incomplete
+    (missing/unexpected model params) — fail-closed rather than generate from
+    partially random-init weights."""
+
+
+# Top-level namespaces of BUNDLED (non-transformer) components some community
+# single-files ship alongside the transformer (e.g. Dark Beast = Qwen3-VL TE +
+# VAE + transformer). When loading as a --transformer override we keep only the
+# transformer.
+_NON_TRANSFORMER_ROOTS = frozenset(
+    ("text_encoders", "vae", "conditioner", "cond_stage_model",
+     "first_stage_model", "text_encoder", "text_encoder_2"))
+# Native Krea-2 transformer top-level namespaces (prefix already stripped).
+_TRANSFORMER_ROOT_PREFIXES = (
+    "blocks.", "txtfusion.", "first.", "last.", "tmlp.", "tproj.", "txtmlp.")
+
+
+def is_krea2_bundle(keys: Iterable[str]) -> bool:
+    """True iff the checkpoint bundles non-transformer components (TE/VAE)
+    alongside the transformer."""
+    return any(k.split(".", 1)[0] in _NON_TRANSFORMER_ROOTS for k in keys)
+
+
+def extract_krea2_transformer_sd(state_dict):
+    """If `state_dict` bundles TE/VAE, return ONLY the transformer sub-dict.
+    Non-bundles are returned unchanged. Identifies transformer keys by their
+    native namespace AFTER stripping any known prefix — robust to a bundle
+    whose transformer prefix isn't the dominant one."""
+    if not is_krea2_bundle(state_dict.keys()):
+        return state_dict
+    return {k: v for k, v in state_dict.items()
+            if _strip_known_prefix(k).startswith(_TRANSFORMER_ROOT_PREFIXES)}
+
+
+def build_krea2_transformer(component_class, native_sd, config_path, dtype,
+                            strip_prefix=None, log_prefix="[Krea2]"):
+    """Build a diffusers Krea-2 transformer from a ComfyUI-native state dict
+    (values already dequantized/upcast to `dtype`).
+
+    Shared by the scaled-fp8 loader (after dequant) and the general single-file
+    path (after fp8→bf16 upcast / bf16 as-is). Handles: bundle extraction, key
+    conversion, scale_shift_table reshape, strict load, fp32-norm restoration.
+    Raises `Krea2ConversionError` on ANY missing/unexpected key. Returns the
+    model on CPU (dtype, with `_keep_in_fp32_modules` restored to fp32)."""
+    import torch
+    native_sd = extract_krea2_transformer_sd(native_sd)
+    diff_sd = convert_krea2_comfy_state_dict(native_sd, strip_prefix)
+    config = component_class.load_config(config_path, local_files_only=True)
+    model = component_class.from_config(config)
+    mshapes = {n: tuple(p.shape) for n, p in
+               list(model.named_parameters()) + list(model.named_buffers())}
+    reshape_to_model_shapes(diff_sd, mshapes)
+    incompat = model.load_state_dict(diff_sd, strict=False, assign=True)
+    if incompat.missing_keys or incompat.unexpected_keys:
+        _miss = sorted(incompat.missing_keys)
+        raise Krea2ConversionError(
+            f"Krea-2 key conversion mismatch "
+            f"({len(incompat.missing_keys)} missing / "
+            f"{len(incompat.unexpected_keys)} unexpected model params; rename "
+            f"table incomplete for this checkpoint) — e.g. missing "
+            f"{_miss[0] if _miss else '-'!r}; refusing rather than generate "
+            f"from random-init weights")
+    model = model.to(dtype)
+    # assign=True coerced _keep_in_fp32_modules norms to `dtype`; from_pretrained
+    # keeps them fp32 for stability — restore that (base-model precision parity).
+    keep = getattr(component_class, "_keep_in_fp32_modules", None) or []
+    if keep:
+        n_fp32 = 0
+        for name, mod in model.named_modules():
+            if name.rsplit(".", 1)[-1] in keep:
+                mod.to(torch.float32)
+                n_fp32 += 1
+        print(f"{log_prefix} restored {n_fp32} _keep_in_fp32_modules to fp32")
+    return model

@@ -751,6 +751,60 @@ except ValueError as _e:
     _ctrl_raised = "\x01" not in str(_e)  # rejected AND raw key not echoed
 check("krea2-guard: control-char key rejected without echoing the raw key",
       _ctrl_raised)
+# bundle detection + prefix-robust extraction (Dark Beast = TE+VAE+transformer)
+check("krea2-bundle: TE+VAE keys detected as bundle",
+      krea2c.is_krea2_bundle(["text_encoders.x.weight", "vae.y",
+                              "model.diffusion_model.blocks.0.attn.wq.weight"]))
+check("krea2-bundle: transformer-only NOT a bundle",
+      not krea2c.is_krea2_bundle(
+          ["model.diffusion_model.blocks.0.attn.wq.weight", "first.weight"]))
+_bundle_sd = {
+    "text_encoders.te.weight": torch.zeros(1),
+    "vae.enc.weight": torch.zeros(1),
+    "model.diffusion_model.blocks.0.attn.wq.weight": torch.zeros(2),
+    "model.diffusion_model.first.weight": torch.zeros(3),
+}
+_ex = krea2c.extract_krea2_transformer_sd(_bundle_sd)
+check("krea2-bundle: extraction keeps ONLY transformer keys (prefix-robust)",
+      set(_ex) == {"model.diffusion_model.blocks.0.attn.wq.weight",
+                   "model.diffusion_model.first.weight"})
+_nb = {"blocks.0.attn.wq.weight": torch.zeros(1)}
+check("krea2-bundle: non-bundle returned unchanged (same object)",
+      krea2c.extract_krea2_transformer_sd(_nb) is _nb)
+# prefix-robust conversion: strip_prefix=None but keys ARE prefixed (bundle
+# dilutes the dominant-prefix detection to None)
+_pr = krea2c.convert_krea2_comfy_state_dict(
+    {"model.diffusion_model.blocks.0.attn.wq.weight": torch.zeros(1)}, None)
+check("krea2-sd: prefix-robust — strips model.diffusion_model. with strip_prefix=None",
+      "transformer_blocks.0.attn.to_q.weight" in _pr)
+# build_krea2_transformer fail-closed: incomplete conversion raises (GPU-free
+# via a tiny fake component class; code-review F8).
+class _FakeKrea2(nn.Module):
+    _keep_in_fp32_modules = []
+    def __init__(self):
+        super().__init__()
+        self.img_in = nn.Linear(4, 3)  # img_in.weight (3,4) + img_in.bias (3,)
+    @classmethod
+    def load_config(cls, p, **k):
+        return {}
+    @classmethod
+    def from_config(cls, c):
+        return cls()
+# complete: first.weight+bias → img_in.weight+bias (all model params filled)
+_m = krea2c.build_krea2_transformer(
+    _FakeKrea2, {"first.weight": torch.zeros(3, 4), "first.bias": torch.zeros(3)},
+    "ignored", torch.float32)
+check("krea2-build: complete native sd builds without error (fake model)",
+      hasattr(_m, "img_in"))
+# incomplete: only first.weight → img_in.bias missing → fail closed
+_bc_raised = False
+try:
+    krea2c.build_krea2_transformer(
+        _FakeKrea2, {"first.weight": torch.zeros(3, 4)}, "ignored", torch.float32)
+except krea2c.Krea2ConversionError:
+    _bc_raised = True
+check("krea2-build: incomplete conversion → Krea2ConversionError (fail-closed)",
+      _bc_raised)
 
 shutil.rmtree(_TMP, ignore_errors=True)
 print("\n" + "─" * 50)

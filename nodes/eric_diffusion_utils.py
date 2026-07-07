@@ -669,6 +669,41 @@ def _load_single_weights(component_class, weights_path: str, dtype,
         print(f"[EricDiffusion] Plain fp8-cast checkpoint (no scales) — "
               f"standard path upcasts to {dtype}")
 
+    # ── Native-Krea (non-scaled-fp8): plain-fp8 (cc) / bf16 / TE+VAE bundle ──
+    # Scaled-fp8 native-Krea already returned via load_scaled_fp8_component
+    # above. These flavors would fall through to from_single_file, which
+    # released diffusers has no Krea2 converter for → convert ourselves with
+    # the shared builder (bundle extraction + fp32-norm restore). (ADR-019
+    # Changelog 2026-07-07.)
+    if weights_path.lower().endswith(".safetensors"):
+        try:
+            from safetensors import safe_open as _safe_open
+            with _safe_open(weights_path, framework="pt") as _kf:
+                _krea_keys = list(_kf.keys())
+        except Exception:
+            _krea_keys = []
+        from .eric_krea2_convert import (
+            is_krea2_comfy_checkpoint, build_krea2_transformer,
+            extract_krea2_transformer_sd,
+        )
+        if _krea_keys and is_krea2_comfy_checkpoint(_krea_keys):
+            print(f"[EricDiffusion] ComfyUI-native Krea-2 checkpoint "
+                  f"(non-scaled) — converting to diffusers")
+            from safetensors.torch import load_file as _st_load
+            _sd = _st_load(weights_path)
+            # Drop bundled TE/VAE BEFORE upcasting (code-review F6) so a big
+            # TE+VAE bundle only upcasts the transformer, not the discarded
+            # encoders/VAE.
+            _sd = extract_krea2_transformer_sd(_sd)
+            # fp8→target upcast (bf16 stays); in-place to avoid doubling RAM.
+            for _k in list(_sd):
+                _v = _sd.pop(_k)
+                _sd[_k] = _v.to(dtype) if _v.is_floating_point() else _v
+            return build_krea2_transformer(
+                component_class, _sd, config_path, dtype,
+                strip_prefix=detected_prefix,
+                log_prefix="[EricDiffusion-Krea2]")
+
     def _load_stripped_in_memory(src_path: str, prefix: str, target_dtype, cfg_path: str):
         """Load weights into RAM, strip the dominant prefix, and instantiate the
         component via from_config + load_state_dict(assign=True).
