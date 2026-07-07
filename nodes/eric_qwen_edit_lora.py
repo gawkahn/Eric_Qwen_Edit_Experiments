@@ -1214,6 +1214,25 @@ def _set_adapters_safe(pipe, adapter_name: str, weight: float,
               f"(adapter may have been loaded via direct merge)")
 
 
+def plan_match_model_names(module) -> list:
+    """Model-side name list that `find_matching_plan`'s `model_signature`
+    substring is tested against (e.g. the Krea plan's `to_gate`).
+
+    Includes BUFFERS, not just parameters: fp8-resident quantized Linears
+    (`ScaledFp8Linear`) register their `.weight` as a buffer, and bias-free
+    projections (e.g. Krea attn `to_gate`, the SwiGLU `ff.*`) carry no
+    Parameter at all — so `named_parameters()` alone hides them and the plan
+    signature goes undetected, making `find_matching_plan` return None. On
+    such a base the krea_native→diffusers_krea rename never fires and every
+    LoRA falls through to a 0-module merge. A strict superset for bf16 bases
+    (whose weights are Parameters either way), and safe: `find_matching_plan`
+    pins the source family from the LoRA keys, so extra names can only
+    qualify the already-selected plan, never cross-match a wrong one.
+    """
+    return ([n for n, _ in module.named_parameters()]
+            + [n for n, _ in module.named_buffers()])
+
+
 def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
                           log_prefix: str = "[LoRA]",
                           weight: float = 1.0,
@@ -1289,7 +1308,10 @@ def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
             # (lora_unet_*); decode to BFL dot format so
             # detect_lora_format recognises them as bfl_original.
             source_sd = decode_kohya_to_bfl(source_sd)
-            model_param_names = [n for n, _ in transformer.named_parameters()]
+            # Buffer-aware model names so fp8-resident (ScaledFp8Linear) bases
+            # are detectable by the plan's model_signature — see
+            # plan_match_model_names.
+            model_param_names = plan_match_model_names(transformer)
             plan = find_matching_plan(source_sd, model_param_names)
             if plan is not None:
                 print(

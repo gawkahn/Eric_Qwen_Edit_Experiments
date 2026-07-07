@@ -782,6 +782,18 @@ def _apply_converted_lora_as_delta(
     return (applied_diff + applied_lora) > 0
 
 
+def mergeable_target_names(transformer) -> set:
+    """Name set the `load_converted_lora` pre-filter tests converted modules
+    against — the SAME buffer-aware, DMR-3-guarded map the direct merge uses
+    (`merge_resolution_map` = parameters + `.weight`-named buffers). A plain
+    `named_parameters()` set is buffer-blind, so fp8-resident ScaledFp8Linear
+    weights (buffers, bias-free) would be dropped here before ever reaching
+    the merge. Factored out so the pre-filter's buffer-awareness is unit-
+    testable (see test_lora_convert_krea.py)."""
+    from .eric_diffusion_fp8_ops import merge_resolution_map
+    return set(merge_resolution_map(transformer).keys())
+
+
 def load_converted_lora(
     pipe,
     converted_state_dict: Dict[str, "torch.Tensor"],
@@ -834,7 +846,15 @@ def load_converted_lora(
     # convert_state_dict unchanged and would produce "unexpected keys"
     # warnings from pipe.load_lora_weights.  Filter them here where we
     # have the transformer and can check directly.
-    param_names = {n for n, _ in transformer.named_parameters()}
+    #
+    # Resolve against the SAME map the direct-merge step uses
+    # (merge_resolution_map = parameters + `.weight`-named buffers, DMR-3
+    # scale-buffer guard applied). A plain named_parameters() set is
+    # buffer-blind: fp8-resident ScaledFp8Linear weights are buffers and
+    # bias-free projections (Krea attn/ff) carry no Parameter, so every
+    # converted module would be dropped here — before ever reaching the
+    # buffer-aware merge below — defeating conversion on fp8 bases.
+    param_names = mergeable_target_names(transformer)
     valid_converted: Dict[str, "torch.Tensor"] = {}
     dropped_bases: set = set()
     for k, v in converted_state_dict.items():
