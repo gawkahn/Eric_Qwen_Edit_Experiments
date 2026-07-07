@@ -4304,6 +4304,72 @@ with tempfile.TemporaryDirectory() as _td:
 
 
 # ════════════════════════════════════════════════════════════════════════
+print("\n== Slice 4a: default catalog-db auto-discovery ==")
+# ════════════════════════════════════════════════════════════════════════
+
+with tempfile.TemporaryDirectory() as _td4a:
+    # N25: a readable DB at the probed path -> returns its realpath.
+    _good_db = os.path.join(_td4a, "good.sqlite")
+    _mk_s5_db(_good_db)
+    _disc = mcps._discover_default_catalog_db(_good_db)
+    check("4a N25: readable default DB discovered -> realpath",
+          _disc == os.path.realpath(_good_db), detail=repr(_disc))
+
+    # N25 integration: discovery + validate wires catalog_db_path exactly as
+    # main() does (no server spawn), and `search` becomes advertised.
+    _cfg4a = mcps._validate_startup_args(
+        output_dir=_td4a, model_base=_td4a, default_model=None,
+        mcp_max_iterations=100,
+        catalog_db=mcps._discover_default_catalog_db(_good_db))
+    check("4a N25: discovered DB flows into cfg.catalog_db_path",
+          _cfg4a.catalog_db_path == os.path.realpath(_good_db))
+    _tools4a = _run(mcps._list_tools_impl(_cfg4a))
+    check("4a N25: search advertised after auto-discovery",
+          "search" in [t.name for t in _tools4a])
+
+    # N26: no file at the probed path -> None (server would start DB-less).
+    _absent = mcps._discover_default_catalog_db(
+        os.path.join(_td4a, "nope.sqlite"))
+    check("4a N26: missing default DB -> None (fail-open)", _absent is None)
+
+    # N28a: present-but-corrupt file (not a sqlite DB) -> None, never raises.
+    _corrupt = os.path.join(_td4a, "corrupt.sqlite")
+    with open(_corrupt, "wb") as _f:
+        _f.write(b"this is not a sqlite database at all\x00\xff")
+    check("4a N28: corrupt default DB -> None (fail-open, no raise)",
+          mcps._discover_default_catalog_db(_corrupt) is None)
+
+    # N28b: valid sqlite but wrong schema version -> None (fail-open).
+    _badver = os.path.join(_td4a, "badver.sqlite")
+    _c = _sqlite3.connect(_badver)
+    _c.execute("PRAGMA user_version = 99")
+    _c.commit()
+    _c.close()
+    check("4a N28: wrong-schema default DB -> None (fail-open)",
+          mcps._discover_default_catalog_db(_badver) is None)
+
+    # N28c: embedded-NUL db_path -> None, never raises (security-auditor
+    # INFO-4 fold: the "never raises" contract holds for an explicit path).
+    check("4a N28: NUL-byte db_path -> None (fail-open, no raise)",
+          mcps._discover_default_catalog_db("/x\x00/nul.sqlite") is None)
+
+# N27: main() prefers an explicit --catalog-db over discovery (never
+# overridden). Static-source check (mirrors the getsource idiom); the
+# behavioral fail-CLOSED half is proven by the S5 spawn tests above
+# (explicit missing / wrong-schema --catalog-db -> non-zero exit).
+_main_src = inspect.getsource(mcps.main.callback)
+check("4a N27: main() prefers explicit --catalog-db, discovery only when unset",
+      "catalog_db if catalog_db is not None" in _main_src
+      and "_discover_default_catalog_db()" in _main_src)
+# _validate_startup_args stays discovery-free (test-isolation guarantee):
+# direct callers passing catalog_db=None never pick up a default DB.
+_vsa_src = inspect.getsource(mcps._validate_startup_args)
+check("4a: _validate_startup_args performs no default-path discovery",
+      "_discover_default_catalog_db" not in _vsa_src
+      and "DEFAULT_DB_PATH" not in _vsa_src)
+
+
+# ════════════════════════════════════════════════════════════════════════
 # LoRA-not-applied notices (ADR-015 2026-07-06) — agent-facing, NAME-BASED,
 # PATH-FREE. The security-load-bearing property: neither the abs_path nor the
 # outcome `reason` (which may embed a path) may ever appear in a notice.

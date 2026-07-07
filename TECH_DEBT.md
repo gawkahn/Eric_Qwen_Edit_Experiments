@@ -935,3 +935,18 @@ comfy_quant scaling on the fp8 layers), NOT a from-scratch key converter.
 release, tracking upstream. Either way the earlier "custom Krea converter" plan is
 retired. NOTE: isolated PR checkout left at scratchpad/diffusers-pr14126 for the
 vendoring option.
+
+## 2026-07-07 — Security: `connect_readonly` skips the FUSE guard on an explicit `--catalog-db` path
+
+- **What:** `comfyless/catalog_db.connect_readonly` (unlike the writable `connect`, which
+  calls `fs_is_fuse`) performs no FUSE/mergerfs check before opening. A WAL-mode SQLite
+  read on a FUSE union can hang on fcntl byte-range locks (the documented environment
+  foot-gun). Surfaced by the slice-4a security review (INFO-3,
+  `docs/security/review-slice-4a-catalog-db-autodiscover-2026-07-07.md`).
+- **Why not now:** Not reachable via slice-4a auto-discovery — `DEFAULT_DB_PATH` lives under
+  `~/.local/share` (home ext4, not the `/home/gawkahn/projects` mergerfs union). Only an
+  operator who explicitly points `--catalog-db` at a FUSE-backed path is exposed, and a hang
+  there is a pre-existing gap in `catalog_db.py`, outside slice 4's edit scope.
+- **Trigger:** Add a `fs_is_fuse` fail-closed guard to `connect_readonly` (mirroring `connect`)
+  the next time `catalog_db.py` is opened for a deliberate change, OR if a user ever reports a
+  startup/search hang with `--catalog-db` pointed at a mergerfs path.

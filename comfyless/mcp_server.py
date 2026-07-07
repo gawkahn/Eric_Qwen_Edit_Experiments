@@ -726,6 +726,47 @@ class _StartupConfig:
         self.catalog_db_path = catalog_db_path
 
 
+def _discover_default_catalog_db(
+    db_path: Optional[str] = None,
+) -> Optional[str]:
+    """Step 4a (slice-4 Vision invariant 16): fail-open discovery of the
+    default metadata DB.
+
+    Returns a realpath'd path when a readable catalog DB exists at
+    `db_path` (default: `catalog_db.DEFAULT_DB_PATH`), else `None`. NEVER
+    raises: a missing file, an unreadable/corrupt DB, a schema mismatch,
+    or an IO error all yield `None`, so the server starts WITHOUT a DB
+    rather than failing closed (N25/N26/N28). Read-only — opens the DB
+    solely to probe it, closes immediately, never writes or creates.
+
+    Discovery lives HERE (called by `main()` on an UNSET `--catalog-db`),
+    deliberately NOT inside `_validate_startup_args`, so that (a) an
+    explicitly-supplied `--catalog-db` keeps its fail-CLOSED validation
+    (N27) and (b) direct in-process callers of `_validate_startup_args`
+    (the test suite) see no implicit default-path pickup.
+    """
+    import sqlite3
+    from comfyless.catalog_db import (
+        DEFAULT_DB_PATH,
+        connect_readonly,
+        CatalogDBError,
+    )
+    path = DEFAULT_DB_PATH if db_path is None else db_path
+    try:
+        probe = connect_readonly(path)
+        probe.close()
+    except (CatalogDBError, sqlite3.Error, OSError, ValueError):
+        # Fail-open by design: any problem with the default DB means "no
+        # DB", never a startup crash (invariant 16 / N28). connect_readonly
+        # raises CatalogDBError on missing-file / schema-mismatch; a corrupt
+        # file surfaces as sqlite3.Error at the PRAGMA probe; OSError covers
+        # permission / IO faults; ValueError covers an embedded-NUL db_path
+        # (realpath raises it) so the "never raises" contract holds for an
+        # explicitly-passed path too, not just the NUL-free DEFAULT_DB_PATH.
+        return None
+    return os.path.realpath(path)
+
+
 def _validate_startup_args(
     output_dir: str,
     model_base: str,
@@ -2394,6 +2435,24 @@ def main(
                      "--model-base", "/abs/path/models"]
         }
     """
+    # Step 4a: an UNSET --catalog-db falls back to fail-open discovery of
+    # the metadata DB at its canonical default path, so the DB (and the
+    # `search` tool + extract_params enrichment) is the normal case once
+    # built — not an opt-in flag. An explicit --catalog-db is never
+    # overridden and keeps its fail-CLOSED validation in
+    # _validate_startup_args (N27).
+    effective_catalog_db = (
+        catalog_db if catalog_db is not None
+        else _discover_default_catalog_db()
+    )
+    if catalog_db is None and effective_catalog_db is not None:
+        print(
+            f"comfyless-mcp: auto-discovered catalog DB at "
+            f"{effective_catalog_db} — `search` tool and metadata "
+            f"enrichment now active",
+            file=sys.stderr,
+            flush=True,
+        )
     cfg = _validate_startup_args(
         output_dir=output_dir,
         model_base=model_base,
@@ -2402,7 +2461,7 @@ def main(
         catalog=catalog,
         lora_paths=lora_paths,
         transformer_paths=transformer_paths,
-        catalog_db=catalog_db,
+        catalog_db=effective_catalog_db,
     )
     asyncio.run(_run_async(cfg))
 
