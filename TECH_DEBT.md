@@ -951,6 +951,39 @@ vendoring option.
   the next time `catalog_db.py` is opened for a deliberate change, OR if a user ever reports a
   startup/search hang with `--catalog-db` pointed at a mergerfs path.
 
+## 2026-07-07 — dequant-fp8 routing gaps: text-encoder slot + directory-fallback (slice R1/R2/R3 INFO deferrals)
+
+- **What:** two conscious scope limits from the R1/R2/R3 code review (both INFO, not blockers):
+  (a) `_load_pipeline` wires `dequant_fp8` only for the transformer/unet override — a LARGE
+  text-encoder override pointing at a native scaled-fp8 single file with `--quant` active would
+  stay `ScaledFp8Linear`-resident and torchao would silently no-op on it, the exact class R3
+  closes for the transformer; (b) `load_component`'s directory-override fallbacks
+  (`_try_from_single_file` in the `subfolder`/`direct` branches) don't thread the flag — safe
+  today because they never enter the scaled-fp8 loader, but a future re-route would drop it.
+- **Why not now:** the security review (req 44) scoped R3 to the transformer single-file
+  override — the only case in live use; no known native-fp8 TE files in the collection.
+- **Trigger:** first native scaled-fp8 text-encoder file appears, OR `_try_from_single_file`
+  is ever taught to route into the scaled-fp8 loader.
+
+## 2026-07-07 — fp8-RESIDENT LoRA direct merge produces NaN (black images) for some Krea LoRAs; not root-caused
+
+- **What:** merging converted krea LoRAs into an fp8-resident (`ScaledFp8Linear`) base via the
+  DMR dequant→add→requant path reports success (`applied=256, skipped=0`) but generation renders
+  all-black (`invalid value encountered in cast` = NaN in the decoded image). Observed live on
+  `moodyKrea2Mix_v30` with `nicegirls_krea2` and `ultra_real_krea2_v1` (single AND stacked);
+  `MysticXXX_KREA2_v1` and `snofs` merge fine on the same base. LoRA files themselves are clean
+  (no NaN/Inf, unremarkable magnitudes — the failing ones are SMALLER than the working one), so
+  the mechanism is in the resident-merge/runtime numerics, not the adapters. Needs a GPU
+  reproduction to bisect (requant scale coarsening? weight-only dequant cache? activation
+  overflow at 6144-dim `to_gate`?).
+- **Why not now:** ADR-019 slice R1/R2/R3 (2026-07-07) routes the affected combination around the
+  resident path entirely — `--quant fp8` now dequants the native file to bf16 and re-quantizes
+  via torchao `Float8Tensor`, the representation the DMR merge is proven on. With that
+  workaround live, the resident-path NaN stops blocking Grant's workflow.
+- **Trigger:** anyone needs LoRAs on an fp8-RESIDENT base *without* `--quant` (VRAM-constrained
+  case where the bf16 dequant spike is unaffordable), OR a torchao-path generation also renders
+  black (would falsify the "resident-merge-specific" theory and reopen the diagnosis).
+
 ## 2026-07-07 — Converted Krea LoRAs drop `.diff_b` bias deltas and second-level fp8 scales (`weight_scale_2`)
 
 - **What:** `convert_state_dict` (`nodes/eric_lora_format_convert_apply.py`) emits WEIGHT
