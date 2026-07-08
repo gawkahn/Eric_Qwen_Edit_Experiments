@@ -595,14 +595,22 @@ print("\n── slice DQ: client wire request carries the triple ─────
 
 import argparse as _ap
 
+# Since 2026-07-08 the quant triple is sidecar-replayable: the builder
+# sources it from the MERGED PARAMS dict, not argparse. The Namespace below
+# deliberately carries CONFLICTING stale quant attrs — if the builder ever
+# regresses to reading args, the checks fail loudly.
 _args_q = _ap.Namespace(precision="bf16", device="cuda", offload_vae=False,
                         attention_slicing=False, sequential_offload=False,
-                        savepath=None, quant="fp8",
-                        quant_skip=["text_encoder"], quant_only=[],
+                        savepath=None, quant=None,
+                        quant_skip=None, quant_only=None,
                         # krea-testing's builder also reads the rebalance
                         # fields; inert extras on main (attributes unread).
                         rebalance=False, rebalance_mult=4.0)
-_wire = _gen._build_server_request(_args_q, {"model": "/m", "prompt": "p"}, [])
+_wire = _gen._build_server_request(
+    _args_q,
+    {"model": "/m", "prompt": "p", "quant": "fp8",
+     "quant_skip": ["text_encoder"], "quant_only": []},
+    [])
 check("wire request carries quant", _wire.get("quant") == "fp8",
       f"got {_wire.get('quant')!r}")
 check("wire request carries quant_skip",

@@ -1271,6 +1271,12 @@ def generate(
         "height": height,
         "sampler": sampler,
         "schedule": schedule,
+        # Quantize-on-load triple — sidecar-replayable (2026-07-08): quant
+        # affects output correctness for some transformer/LoRA combos, so a
+        # --params replay must reproduce it.
+        "quant": quant or "none",
+        "quant_skip": list(quant_skip or ()),
+        "quant_only": list(quant_only or ()),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "elapsed_seconds": round(elapsed, 2),
         "contract_version": CONTRACT_VERSION,
@@ -1354,16 +1360,22 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--vae-from-transformer", action="store_true", default=None,
                    help="Extract VAE from the --transformer AIO checkpoint")
     p.add_argument("--precision", choices=["bf16", "fp16", "fp32"], default="bf16")
-    p.add_argument("--quant", choices=list(QUANT_MODES), default="none",
+    # Quant triple defaults are None SENTINELS (not "none"/[]) so the
+    # schema merge can tell "flag not given" from "user said none": a
+    # sidecar's quant survives --params replay unless the CLI explicitly
+    # overrides it (sidecar-replayable since 2026-07-08; resolved to the
+    # schema defaults after the merge).
+    p.add_argument("--quant", choices=list(QUANT_MODES), default=None,
                    help="Quantize-on-load (ADR-019): fp8 halves VRAM on the "
                         "transformer + large text encoders (VAE/CLIP never "
                         "quantized). Needs compute capability >= 8.9; falls "
-                        "back to bf16 with a warning otherwise.")
-    p.add_argument("--quant-skip", action="append", default=[], metavar="COMPONENT",
+                        "back to bf16 with a warning otherwise. Recorded in "
+                        "the sidecar and replayed by --params.")
+    p.add_argument("--quant-skip", action="append", default=None, metavar="COMPONENT",
                    help="Exclude a component slot (e.g. text_encoder) from "
                         "quantization. Repeatable. For isolating quality "
                         "regressions to one component.")
-    p.add_argument("--quant-only", action="append", default=[], metavar="COMPONENT",
+    p.add_argument("--quant-only", action="append", default=None, metavar="COMPONENT",
                    help="Quantize exactly these component slots, overriding "
                         "the default eligible set. Repeatable. VAE is refused "
                         "even here.")
@@ -1510,6 +1522,11 @@ def _run_json_mode() -> int:
             text_encoder_path=params.get("text_encoder_path", ""),
             text_encoder_2_path=params.get("text_encoder_2_path", ""),
             vae_from_transformer=params.get("vae_from_transformer", False),
+            # quant became schema-legal on 2026-07-08; forward rather than
+            # silently ignore (it affects output correctness).
+            quant=params.get("quant") or "none",
+            quant_skip=tuple(params.get("quant_skip") or ()),
+            quant_only=tuple(params.get("quant_only") or ()),
         )
 
         sidecar_path = os.path.join(output_dir, f"{output_stem}.json")
@@ -1661,9 +1678,11 @@ def _build_server_request(
         "vae_from_transformer": p.get("vae_from_transformer", False),
         # Quantize-on-load triple (ADR-019 slice DQ). Slot names, not paths —
         # the canonical validator enforces that server-side per entry.
-        "quant":               args.quant,
-        "quant_skip":          list(args.quant_skip),
-        "quant_only":          list(args.quant_only),
+        # Sourced from the merged params (sidecar-replayable, 2026-07-08),
+        # not argparse — a --params sidecar's quant reaches the daemon.
+        "quant":               p.get("quant") or "none",
+        "quant_skip":          list(p.get("quant_skip") or []),
+        "quant_only":          list(p.get("quant_only") or []),
     }
     # Pre-expanded template (iteration tokens resolved client-side) takes
     # precedence over args.savepath when provided.
@@ -1992,7 +2011,9 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
         # --override only takes effect with --params (per its --help
         # text); we don't apply overrides here.
         p = {
-            k: default
+            # list defaults are copied so runs never share/mutate the
+            # schema's default objects (quant_skip/quant_only are lists).
+            k: (list(default) if isinstance(default, list) else default)
             for k, (_type, default) in COMFYLESS_SCHEMA.items()
             if default is not None and k != "loras"
         }
@@ -2017,6 +2038,15 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
     # Final validation pass: catches anything an override injected that the
     # schema doesn't know about, or a CLI-merged value whose type is wrong.
     p = _validate_params(p, source="cli-merged")
+
+    # quant is choices-gated at argparse but a sidecar/--override can inject
+    # any string — fail loudly HERE rather than after model resolution
+    # (mirrors the daemon's slice-DQ semantic check).
+    _q = p.get("quant") or "none"
+    if _q not in QUANT_MODES:
+        print(f"Error: unknown quant mode {_q!r} (from --params/--override). "
+              f"Expected: {' | '.join(QUANT_MODES)}", file=sys.stderr)
+        return 1
 
     # ── Plan iterations (no-op when --iterate is absent) ──────────────────
     # Run BEFORE the required-field check so that --iterate prompt/--iterate model
@@ -2193,9 +2223,9 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                 text_encoder_path=p_cur.get("text_encoder_path", ""),
                 text_encoder_2_path=p_cur.get("text_encoder_2_path", ""),
                 vae_from_transformer=p_cur.get("vae_from_transformer", False),
-                quant=args.quant,
-                quant_skip=tuple(args.quant_skip),
-                quant_only=tuple(args.quant_only),
+                quant=p_cur.get("quant") or "none",
+                quant_skip=tuple(p_cur.get("quant_skip") or ()),
+                quant_only=tuple(p_cur.get("quant_only") or ()),
             )
             if iterate_batch_id:
                 metadata["iterate_batch_id"] = iterate_batch_id

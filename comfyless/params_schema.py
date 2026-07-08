@@ -71,6 +71,11 @@ _FIELD_DEFAULTS: Dict[str, object] = {
     "text_encoder_2_path":  "",
     "vae_from_transformer": False,
     "loras":                [],
+    # Quantize-on-load triple — sidecar-replayable since 2026-07-08 (some
+    # transformer/LoRA combos depend on the quant path for correct output).
+    "quant":                "none",
+    "quant_skip":           [],
+    "quant_only":           [],
 }
 
 

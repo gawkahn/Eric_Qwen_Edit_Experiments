@@ -59,6 +59,16 @@ SCHEMA_KIND = types.MappingProxyType({
     "true_cfg_scale":       _KIND_FLOAT_NONE,
     "vae_from_transformer": _KIND_BOOL,
     "loras":                _KIND_LIST,
+    # Quantize-on-load triple (ADR-019). MOVED from _RUNTIME_KIND on
+    # 2026-07-08: originally classed a runtime/VRAM knob, but slice R1/R2/R3
+    # made quant affect output CORRECTNESS (some transformer/LoRA combos
+    # only work under --quant fp8's dequant→torchao path), so it is now a
+    # sidecar-persisted, --params-replayable parameter. quant_skip/quant_only
+    # entries are component SLOT names (e.g. "text_encoder"), never paths —
+    # validate_machine_request enforces that per entry.
+    "quant":                _KIND_STR,
+    "quant_skip":           _KIND_LIST,
+    "quant_only":           _KIND_LIST,
 })
 
 
@@ -80,14 +90,8 @@ _RUNTIME_KIND = types.MappingProxyType({
     "rebalance":          _KIND_BOOL,
     "rebalance_mult":     _KIND_FLOAT,
     "rebalance_weights":  _KIND_LIST,
-    # Quantize-on-load (ADR-019 slice A). Runtime knobs like `precision` —
-    # hardware/VRAM tradeoffs, not sidecar-persisted image parameters.
-    # quant_skip/quant_only entries are component SLOT names (e.g.
-    # "text_encoder"), never paths — validate_machine_request enforces that
-    # per entry.
-    "quant":              _KIND_STR,
-    "quant_skip":         _KIND_LIST,
-    "quant_only":         _KIND_LIST,
+    # (The quant triple lived here until 2026-07-08 — now in SCHEMA_KIND;
+    # see the note there. The wire union below is unchanged by the move.)
 })
 
 # Allowed quant modes at the machine boundary. Deliberately duplicated from

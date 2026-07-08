@@ -58,7 +58,7 @@ python -m py_compile nodes/<file>.py   # syntax check a single file
 ```bash
 python3 test_manual_loop.py                 # 186 tests: samplers, manual loop, encode helper, Qwen edit
 python3 test_multistage.py                  # 141 tests: multistage infrastructure
-python3 test_params_schema.py               # 208 tests: comfyless COMFYLESS_SCHEMA + adapters + krea routing/rebalance + Krea2 attention-backend pin + Z-Image base/Turbo name-hint detection & routing (ADR-009) + LoRA-failure surfacing (ADR-015)
+python3 test_params_schema.py               # 222 tests: comfyless COMFYLESS_SCHEMA + adapters + krea routing/rebalance + Krea2 attention-backend pin + Z-Image base/Turbo name-hint detection & routing (ADR-009) + LoRA-failure surfacing (ADR-015) + quant sidecar round-trip (quant in SCHEMA_KIND, 2026-07-08)
 python3 test_cascade.py                     # 129 tests: comfyless Stable Cascade dispatch (ADR-010)
 python3 test_machine_boundary_validator.py  # 130 tests: machine-boundary validator (ADR-012)
 python3 test_iterate.py                     #  92 tests: comfyless --iterate (ADR-008)
@@ -73,7 +73,7 @@ python3 test_lora_audit.py                  # 197 tests: scripts/lora_audit.py c
 python3 test_lora_convert_krea.py           #  31 tests: Krea-2 LoRA format-conversion plan (krea_native → diffusers_krea) + fp8-resident buffer-visibility (LoRAs on ScaledFp8Linear bases — fix 7cc99ab)
 python3 test_catalog_db.py                  # 125 tests: catalog DB metadata plane (ADR-022 S1-S5) — schema, FUSE guard, sanitizer, upsert/stale semantics, manifest kind-branch join, families/sidecar/exclusion/search, civitai enrichment (mocked network), load-plane independence
 ```
-All sixteen suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 2330 unit tests; expect 0 failures.
+All sixteen suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 2344 unit tests; expect 0 failures.
 
 `test_flux2.py` is a live GPU smoke test that performs an actual Flux.2 generation — separate from the unit suites above. Run only when you need to verify end-to-end Flux.2 behavior.
 

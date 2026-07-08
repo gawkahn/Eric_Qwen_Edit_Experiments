@@ -947,6 +947,66 @@ check("_report_lora_outcome: failure code IS _LORA_SOFT_FAIL_RC",
       g._report_lora_outcome({"lora_warnings": ["x"]}) == g._LORA_SOFT_FAIL_RC)
 
 
+# ── quant is sidecar-replayable (2026-07-08) ───────────────────────────
+# quant moved from _RUNTIME_KIND to SCHEMA_KIND: it affects output
+# CORRECTNESS for some transformer/LoRA combos (fp8-resident merges go
+# black; --quant fp8's dequant→torchao path works), so --params replay must
+# reproduce it. These pin the three legs of the round-trip.
+print("\n── quant sidecar round-trip ───────────────────────────────────")
+import argparse as _qap
+import tempfile as _qtf
+import os as _qos
+
+# Leg 1: a sidecar carrying the triple survives _validate_params intact.
+_qd = _qtf.mkdtemp(prefix="quant_sidecar_test_")
+_qp = _qos.path.join(_qd, "s.json")
+with open(_qp, "w") as _qf:
+    json.dump({"model": "/m", "prompt": "p", "quant": "fp8",
+               "quant_skip": ["text_encoder"], "quant_only": []}, _qf)
+_ql = g._load_params(_qp)
+check("sidecar quant survives _load_params", _ql.get("quant") == "fp8",
+      f"got {_ql.get('quant')!r}")
+check("sidecar quant_skip survives _load_params",
+      _ql.get("quant_skip") == ["text_encoder"])
+
+# Leg 2: argparse defaults are None SENTINELS — an omitted --quant must not
+# clobber the sidecar's value in the CLI merge (regressing these defaults
+# to "none"/[] silently breaks --params replay).
+_qargv, sys.argv = sys.argv, ["comfyless"]
+try:
+    _qargs = g._parse_args()
+finally:
+    sys.argv = _qargv
+check("--quant argparse default is the None sentinel", _qargs.quant is None)
+check("--quant-skip/--quant-only argparse defaults are None sentinels",
+      _qargs.quant_skip is None and _qargs.quant_only is None)
+check("_cli_value_for treats unset quant as not-explicit",
+      g._cli_value_for(_qargs, "quant") is None)
+
+# Positive precedence leg: an EXPLICIT `--quant none` is non-None ("none"),
+# so it wins the merge over a sidecar's fp8 (review note, 2026-07-08).
+_qargv, sys.argv = sys.argv, ["comfyless", "--quant", "none"]
+try:
+    _qargs2 = g._parse_args()
+finally:
+    sys.argv = _qargv
+check("explicit --quant none is non-None and explicit in the merge",
+      g._cli_value_for(_qargs2, "quant") == "none")
+
+# Leg 3: quant keys are params, not skip-set metadata — sidecar load must
+# NOT drop them the way it drops timestamp/elapsed.
+check("quant keys are NOT in _SKIP_SIDECAR_KEYS",
+      not ({"quant", "quant_skip", "quant_only"} & g._SKIP_SIDECAR_KEYS))
+# Schema seeding gives copies, not the shared default list objects. The
+# comprehension is inline in _run_cli_mode, so pin it at the source level
+# (repo precedent: test_server_robustness's source-text checks) — reverting
+# to `k: default` would share the schema's mutable [] across runs.
+import inspect as _qinsp
+_qsrc = _qinsp.getsource(g._run_cli_mode)
+check("seeding comprehension copies list defaults (source pin)",
+      "list(default) if isinstance(default, list) else default" in _qsrc)
+
+
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print("──────────────────────────────────────────────────")
