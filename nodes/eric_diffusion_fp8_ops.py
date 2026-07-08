@@ -56,6 +56,20 @@ bf16 (the reviewed `cc` cast). "Naked" is defined by scale-ABSENCE, never
 descriptor-absence, so a present scale is never silently discarded. No
 naked-fraction cap — airtightness comes from the fully-bare reject, not
 from bounding the fraction (a mostly-naked file just loads as a bf16 model).
+
+Slice R1/R2 (security review R1R2R3, reqs 39-45): the per-layer rule extends
+to NON-`.weight` fp8 tensors (norm scales, biases, modulation tables —
+aggressive ComfyUI exports cast these to fp8 too): fully bare → upcast to
+bf16; any bound scale/descriptor → loud reject (req 39). Residual assumption
+(req 43): non-`.weight` fp8 tensors are assumed unscaled under all
+conventions — a hypothetical format binding a scale to one under a name
+outside the recognized suffix set would upcast at scale 1.0; airtightness
+comes from the binding reject, not from proving the class. `dequant_fp8=True`
+(req 40) returns the all-bf16 model after step 2, skipping only the
+validation-free residency swap; in that mode `weight_scale` is applied by the
+dequant and `input_scale` is validated-then-DROPPED (req 42) — an
+activation-quant param correctly superseded by torchao dynamic activation
+quantization when --quant re-quantizes downstream.
 """
 
 from __future__ import annotations
@@ -506,7 +520,8 @@ def _fingerprint(t: torch.Tensor):
 def load_scaled_fp8_component(component_class, weights_path: str, dtype,
                               config_path: str, variant: str,
                               strip_prefix: str | None = None,
-                              log_prefix: str = "[EricDiffusion-fp8]"):
+                              log_prefix: str = "[EricDiffusion-fp8]",
+                              dequant_fp8: bool = False):
     """Load a C-a/C-b scaled-fp8 single file, fp8-resident where possible.
 
     Flow (Vision §3 as amended by the security review):
@@ -568,13 +583,36 @@ def load_scaled_fp8_component(component_class, weights_path: str, dtype,
     scale_keys = {k for k in sd if k.endswith((w_sfx, i_sfx))}
     cq_keys = {k for k in sd if k.endswith(_CQ_SUFFIX)}
     fp8_entries = {}   # base source key -> (fp8 weight, w_scale, i_scale|None)
+    # Slice R1 / req 39+41 (security review R1R2R3): aggressively-quantized
+    # ComfyUI exports cast NON-Linear params to fp8 too — norm scales
+    # (qknorm/prenorm/postnorm), modulation tables (mod.lin), biases. These
+    # are never GEMM weights; a FULLY-BARE one (no scale or descriptor bound
+    # under any recognized convention) upcasts to bf16 in stage 2 like any
+    # naked tensor. "Bare" is defined by binding-ABSENCE, never by "it isn't
+    # a .weight" — a present binding is a loud reject (the PQ-2 present-value
+    # principle; silently discarding a bound scale would corrupt ~448x).
+    # Skipped tensors never enter fp8_entries, so they can never reach the
+    # step-3 residency swap. Enumerated in one aggregate log line below.
+    _NONWEIGHT_BINDINGS = (_CA_SUFFIXES["weight_scale"],
+                           _CA_SUFFIXES["input_scale"],
+                           _CB_SUFFIXES["weight_scale"],
+                           _CB_SUFFIXES["input_scale"],
+                           _CQ_SUFFIX)
+    nonweight_naked = []
     for k, t in sd.items():
         if k in scale_keys or k in cq_keys or t.dtype not in _TORCH_FP8:
             continue
         if not k.endswith(".weight"):
-            raise ScaledFp8FormatError(
-                f"fp8 tensor {_safe_name(k)} is not a .weight — unsupported layout"
-            )
+            for sfx in _NONWEIGHT_BINDINGS:
+                if k + sfx in sd:
+                    raise ScaledFp8FormatError(
+                        f"non-.weight fp8 tensor {_safe_name(k)} carries "
+                        f"{_safe_name(k + sfx)} — a bound scale/descriptor on "
+                        f"a non-Linear fp8 tensor is refused rather than "
+                        f"silently ignored (R1/req 39)"
+                    )
+            nonweight_naked.append(k)
+            continue
         base = k[: -len(".weight")]
         ws_key, is_key = base + w_sfx, base + i_sfx
         # slice PQ / req 32 (security review PQ-2/PQ-5): a FULLY-bare fp8 base
@@ -644,6 +682,12 @@ def load_scaled_fp8_component(component_class, weights_path: str, dtype,
         )
     print(f"{log_prefix} {len(fp8_entries)} scaled-fp8 Linears in file "
           f"(variant {variant})")
+    if nonweight_naked:
+        # req 41 — one aggregate line, never silent (PQ-4 pattern).
+        _pv = sorted(_safe_name(k) for k in nonweight_naked)[:4]
+        print(f"{log_prefix} {len(nonweight_naked)} non-.weight fp8 tensor(s) "
+              f"(norm/bias/modulation) upcast to bf16: {_pv}"
+              + ("..." if len(nonweight_naked) > 4 else ""))
 
     # ── 2. Dequantize → let diffusers build the model ────────────────────
     bf16_sd = {}
@@ -676,6 +720,20 @@ def load_scaled_fp8_component(component_class, weights_path: str, dtype,
         model = component_class.from_single_file(
             bf16_sd, config=config_path, torch_dtype=dtype, local_files_only=True,
         )
+
+    # Slice R2 / req 40 (security review R1R2R3): dequant-to-bf16 mode —
+    # return the clean bf16 model HERE, skipping only step 3 (the residency
+    # swap, which contains zero validation). Steps 1-2 above ran byte-
+    # identically: every scale was validated (weight_scale applied in the
+    # dequant; input_scale validated-then-dropped, correctly superseded by
+    # torchao dynamic activation quant downstream). Used when --quant is
+    # active so quantize_module receives plain nn.Linear modules and
+    # re-quantizes into torchao Float8Tensor — the representation the DMR
+    # LoRA merge is proven on (reqs 21-30).
+    if dequant_fp8:
+        print(f"{log_prefix} dequant-fp8 mode: all-bf16 model returned "
+              f"(no fp8 residency; --quant re-quantizes via torchao)")
+        return model
 
     # ── 3. Hardware gate, then fingerprint-swap to fp8 residency ────────
     if not (torch.cuda.is_available()

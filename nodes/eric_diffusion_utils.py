@@ -579,7 +579,7 @@ def _diagnose_slot_mismatch(ckpt_keys: set, target_slot: str) -> str:
 
 def _load_single_weights(component_class, weights_path: str, dtype,
                          base_path: str, subfolder_hint: str,
-                         pipeline_class=None):
+                         pipeline_class=None, dequant_fp8: bool = False):
     """Load a component from a single weight file (e.g. CivitAI checkpoint).
 
     Primary path: use component_class.from_single_file() which handles
@@ -664,6 +664,7 @@ def _load_single_weights(component_class, weights_path: str, dtype,
         return load_scaled_fp8_component(
             component_class, weights_path, dtype, config_path,
             _fp8_variant, strip_prefix=detected_prefix,
+            dequant_fp8=dequant_fp8,
         )
     if _fp8_variant == "cc":
         print(f"[EricDiffusion] Plain fp8-cast checkpoint (no scales) — "
@@ -1209,7 +1210,8 @@ def _try_from_single_file(component_class, weight_path: str, dtype,
 
 
 def load_component(component_class, path: str, dtype, base_path: str = None,
-                   subfolder_hint: str = None, pipeline_class=None):
+                   subfolder_hint: str = None, pipeline_class=None,
+                   dequant_fp8: bool = False):
     """Load a pipeline component from path, handling all layout formats.
 
     For every format, tries from_pretrained first (expects diffusers-format
@@ -1284,7 +1286,8 @@ def load_component(component_class, path: str, dtype, base_path: str = None,
                 "single_file format requires base_path and subfolder_hint to load config")
         return _load_single_weights(component_class, path, dtype,
                                     base_path, subfolder_hint,
-                                    pipeline_class=pipeline_class)
+                                    pipeline_class=pipeline_class,
+                                    dequant_fp8=dequant_fp8)
 
     # ── Directory with exactly one weight file ──────────────────────────
     if fmt == "single_file_in_dir":
@@ -1296,7 +1299,8 @@ def load_component(component_class, path: str, dtype, base_path: str = None,
                 "single_file format requires base_path and subfolder_hint to load config")
         return _load_single_weights(component_class, weight_path, dtype,
                                     base_path, subfolder_hint,
-                                    pipeline_class=pipeline_class)
+                                    pipeline_class=pipeline_class,
+                                    dequant_fp8=dequant_fp8)
 
     raise ValueError(
         f"Cannot determine component format for: {path!r}\n"

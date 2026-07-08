@@ -827,6 +827,26 @@ def _load_pipeline(
                            text_encoder_2_path, vae_from_transformer])
     model_index = read_model_index(model_path) if _has_components else {}
 
+    # ── Quant config resolved BEFORE component overrides (slice R3 / req 44)
+    # so the transformer override can load in dequant-fp8 mode when it is in
+    # the quant-eligible set: a natively-fp8 single file then dequants to a
+    # clean bf16 model and the in-place torchao quantize below re-quantizes
+    # it into Float8Tensor — the rep the DMR LoRA merge is proven on —
+    # instead of staying ScaledFp8Linear-resident (which torchao skips,
+    # making --quant a silent no-op on such files). build_quant_config is
+    # pure over (model_path, args); on any fallback quant_selected is empty
+    # → dequant_fp8 False → fp8-resident behavior unchanged (fail-closed).
+    quant_config = None
+    quant_selected: dict = {}
+    if quant != "none":
+        if sequential_offload:
+            _log("[comfyless] WARNING: quant + sequential_offload is "
+                 "untested together — proceeding with both")
+        quant_config, quant_selected, _ = build_quant_config(
+            model_path, quant, skip=tuple(quant_skip), only=tuple(quant_only),
+            device=device, log_prefix="[comfyless]",
+        )
+
     comp_kwargs: dict = {}
     if transformer_path:
         _log(f"[comfyless] Transformer override: {transformer_path!r}")
@@ -843,6 +863,9 @@ def _load_pipeline(
             cls_, transformer_path, dtype,
             base_path=model_path, subfolder_hint=transformer_slot,
             pipeline_class=pipeline_class,
+            # In the quant set → native-fp8 single files dequant to bf16 so
+            # the in-place torchao quantize below gets plain nn.Linear.
+            dequant_fp8=(transformer_slot in quant_selected),
         )
         _log(f"[comfyless] Custom {transformer_slot} loaded ({cname})")
 
@@ -914,23 +937,15 @@ def _load_pipeline(
     # Standard components quantize during from_pretrained (shard-by-shard,
     # low peak memory). Override components (comp_kwargs) were instantiated
     # above and bypass quantization_config — they get in-place quantize_
-    # after load if their slot is in the eligible set.
-    quant_selected: dict = {}
-    if quant != "none":
-        if sequential_offload:
-            _log("[comfyless] WARNING: quant + sequential_offload is "
-                 "untested together — proceeding with both")
-        quant_config, quant_selected, _ = build_quant_config(
-            model_path, quant, skip=tuple(quant_skip), only=tuple(quant_only),
-            device=device, log_prefix="[comfyless]",
-        )
-        if quant_config is not None:
-            # Slots passed in as pre-built modules skip from_pretrained's
-            # loader, so drop them from the mapping (quantized below instead).
-            for slot in comp_kwargs:
-                quant_config.quant_mapping.pop(slot, None)
-            if quant_config.quant_mapping:
-                load_kwargs["quantization_config"] = quant_config
+    # after load if their slot is in the eligible set. (quant_config /
+    # quant_selected computed BEFORE the overrides — slice R3 hoist.)
+    if quant_config is not None:
+        # Slots passed in as pre-built modules skip from_pretrained's
+        # loader, so drop them from the mapping (quantized below instead).
+        for slot in comp_kwargs:
+            quant_config.quant_mapping.pop(slot, None)
+        if quant_config.quant_mapping:
+            load_kwargs["quantization_config"] = quant_config
 
     pipe = pipeline_class.from_pretrained(model_path, **load_kwargs)
 

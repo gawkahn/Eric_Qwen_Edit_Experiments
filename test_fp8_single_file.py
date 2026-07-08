@@ -25,20 +25,33 @@ import torch
 import torch.nn as nn
 from safetensors.torch import save_file
 
-_spec = importlib.util.spec_from_file_location(
-    "fp8ops", Path(__file__).parent / "nodes" / "eric_diffusion_fp8_ops.py")
-fp8ops = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(fp8ops)
+# Load the modules under their REAL package names (registered in
+# sys.modules) so the in-function relative imports (`from
+# .eric_krea2_convert import ...` in fp8_ops, `from .eric_diffusion_fp8_ops
+# import ...` in utils) resolve — required by the slice-R1/R2 POSITIVE load
+# tests, which reach step 2 of the loader (the reject-only tests never did).
+# A synthetic `nodes` package avoids executing the real nodes/__init__.py
+# (which imports every node file and their ComfyUI deps).
+import types  # noqa: E402
 
-_spec2 = importlib.util.spec_from_file_location(
-    "edu", Path(__file__).parent / "nodes" / "eric_diffusion_utils.py")
-edu = importlib.util.module_from_spec(_spec2)
-_spec2.loader.exec_module(edu)
+if "nodes" not in sys.modules:
+    _pkg = types.ModuleType("nodes")
+    _pkg.__path__ = [str(Path(__file__).parent / "nodes")]
+    sys.modules["nodes"] = _pkg
 
-_speck = importlib.util.spec_from_file_location(
-    "krea2c", Path(__file__).parent / "nodes" / "eric_krea2_convert.py")
-krea2c = importlib.util.module_from_spec(_speck)
-_speck.loader.exec_module(krea2c)
+
+def _load_pkg_module(alias, modname):
+    spec = importlib.util.spec_from_file_location(
+        f"nodes.{modname}", Path(__file__).parent / "nodes" / f"{modname}.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[f"nodes.{modname}"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+krea2c = _load_pkg_module("krea2c", "eric_krea2_convert")
+fp8ops = _load_pkg_module("fp8ops", "eric_diffusion_fp8_ops")
+edu = _load_pkg_module("edu", "eric_diffusion_utils")
 
 passed = 0
 failed = 0
@@ -363,21 +376,161 @@ _expect_reject(
         "b.weight_scale": _scalar(0.01), "b.input_scale": _scalar(0.5),
     }), "bare")
 
-# Loader (PQ-5 / req 35, test 9): a naked fp8 tensor NOT ending in .weight
-# must still raise at the .weight check, never be skipped as naked.
+# Loader test 9 — AMENDED by slice R1 (security review R1R2R3 req 39): a
+# fully-bare non-.weight fp8 tensor now UPCASTS (positive covered in the R1
+# battery below); the reject arm is a non-.weight fp8 tensor carrying a
+# BOUND scale — a present binding is never silently ignored.
 _expect_reject(
-    "PQ: loader rejects non-.weight fp8 tensor (PQ-5, test 9)",
+    "PQ/R1: loader rejects BOUND non-.weight fp8 tensor (req 39, amended test 9)",
     lambda: fp8ops.load_scaled_fp8_component(
         None, _mk("pq_nonweight.safetensors", {
             "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
             "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
-            "b.bias": _fp8((16,), seed=1),   # naked fp8, not a .weight
-        }), torch.bfloat16, "", "cq-w"), "not a .weight")
+            "b.bias": _fp8((16,), seed=1),          # non-.weight fp8...
+            "b.bias.weight_scale": _scalar(0.01),   # ...with a bound scale
+        }), torch.bfloat16, "", "cq-w"), "non-.weight")
 
-# End-to-end LOAD of a mixed file (naked→bf16, descriptored→ScaledFp8Linear;
-# tests 6/7/8/11 loader half) is CUDA-gated (the fingerprint swap needs sm89+)
-# and is validated by the live smoke test on the real krea2turbobadmilkmela
-# checkpoint. The classify battery above is the airtight security gate (PQ-1).
+# ── slice R1/R2: non-weight fp8 upcast + dequant-to-bf16 mode ──────────
+# Security review R1R2R3 reqs 39-45 (docs/security/review-slice-R1R2R3-
+# dequant-nonweight-2026-07-07.md). Positive loads run CPU-side via a
+# capture stub: dequant mode returns right after from_single_file, and the
+# stub records the bf16 dict the loader hands over.
+print("── slice R1/R2: non-weight fp8 + dequant mode (reqs 39-45) ────")
+
+
+class _CaptureComp(nn.Module):
+    """from_single_file stub — records the state dict the loader built."""
+    @classmethod
+    def from_single_file(cls, sd, config=None, torch_dtype=None,
+                         local_files_only=True):
+        m = cls()
+        m._received_sd = dict(sd)
+        return m
+
+
+import io as _io2, contextlib as _cl2  # noqa: E402
+
+# R1 test 1 + 6 + log: cq-w set + fully-bare non-.weight fp8 (1D bias and a
+# 2D modulation table) → loads; both upcast to bf16; enumeration log fires.
+_buf = _io2.StringIO()
+with _cl2.redirect_stdout(_buf):
+    _m = fp8ops.load_scaled_fp8_component(
+        _CaptureComp, _mk("r1_pos.safetensors", {
+            "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+            "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+            "first.bias": _fp8((16,), seed=1),        # 1D non-.weight, bare
+            "mod.lin": _fp8((6, 16), seed=2),         # 2D non-.weight, bare
+        }), torch.bfloat16, "", "cq-w", dequant_fp8=True)
+_r1log = _buf.getvalue()
+check("R1: fully-bare non-.weight fp8 loads (test 1)",
+      hasattr(_m, "_received_sd"))
+check("R1: 1D non-.weight fp8 upcast to bf16 (test 1)",
+      _m._received_sd["first.bias"].dtype == torch.bfloat16)
+check("R1: 2D non-.weight fp8 upcast to bf16, no residency (test 6)",
+      _m._received_sd["mod.lin"].dtype == torch.bfloat16
+      and not any(isinstance(mm, fp8ops.ScaledFp8Linear)
+                  for mm in _m.modules()))
+check("R1: non-.weight enumeration log fires (req 41)",
+      "2 non-.weight fp8" in _r1log, f"log: {_r1log[:200]!r}")
+# Descriptored weight was DEQUANTIZED (fp8*scale), not raw-cast (test 7 half).
+_expected = (_fp8((16, 16)).to(torch.float32) * 0.01).to(torch.bfloat16)
+check("R1/R2: descriptored weight dequantized via weight_scale (test 7)",
+      torch.equal(_m._received_sd["a.weight"], _expected))
+
+# R1 tests 2/3/5: non-.weight fp8 carrying each binding class → reject.
+for _lbl, _extra in [
+    ("weight_scale (test 2)", {"g.gamma.weight_scale": _scalar(0.01)}),
+    ("input_scale (test 3)", {"g.gamma.input_scale": _scalar(0.5)}),
+    ("comfy_quant (test 5)",
+     {"g.gamma.comfy_quant": _desc({"format": "float8_e4m3fn"})}),
+]:
+    _expect_reject(
+        f"R1: non-.weight fp8 with bound {_lbl} rejected (req 39)",
+        lambda _e=_extra: fp8ops.load_scaled_fp8_component(
+            None, _mk("r1_bound.safetensors", {
+                "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+                "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+                "g.gamma": _fp8((16,), seed=3), **_e,
+            }), torch.bfloat16, "", "cq-w"), "non-.weight")
+
+# R1 test 4: C-b binding on a non-.weight fp8 in a cq file → whole-file
+# reject at CLASSIFY via the cb-copresence guard (safe false-reject).
+_expect_reject(
+    "R1: non-.weight fp8 with C-b binding → classify cb-copresence reject (test 4)",
+    _mk("r1_cb.safetensors", {
+        "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+        "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+        "g.gamma": _fp8((16,), seed=3), "g.gamma.scale_weight": _scalar(0.01),
+    }), "C-b")
+
+# R2 test 8: dequant_fp8=True does NOT skip validation — NaN input_scale on
+# a cq-a file still rejects (the finding-40 guard).
+_expect_reject(
+    "R2: dequant mode still validates input_scale (NaN → reject, test 8)",
+    lambda: fp8ops.load_scaled_fp8_component(
+        _CaptureComp, _mk("r2_nanin.safetensors", {
+            "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+            "a.input_scale": _scalar(float("nan")),
+            "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+        }), torch.bfloat16, "", "cq-a", dequant_fp8=True))
+
+# R2 test 9: dequant mode still validates weight_scale (zero → reject).
+_expect_reject(
+    "R2: dequant mode still validates weight_scale (0 → reject, test 9)",
+    lambda: fp8ops.load_scaled_fp8_component(
+        _CaptureComp, _mk("r2_zerows.safetensors", {
+            "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.0),
+            "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+        }), torch.bfloat16, "", "cq-w", dequant_fp8=True))
+
+# R2 test 10: default flag (omitted) = resident behavior — the dequant log
+# must NOT fire (fail-closed default).
+_buf = _io2.StringIO()
+with _cl2.redirect_stdout(_buf):
+    _m10 = fp8ops.load_scaled_fp8_component(
+        _CaptureComp, _mk("r2_default.safetensors", {
+            "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+            "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+        }), torch.bfloat16, "", "cq-w")
+check("R2: default (no flag) does not enter dequant mode (test 10)",
+      _m10 is not None and "dequant-fp8 mode" not in _buf.getvalue())
+
+# R2 test 11: dequant return placement covers the KREA build branch too —
+# monkeypatch build_krea2_transformer, feed a krea-marker file, assert the
+# stub's return object comes back (i.e. return sits after BOTH branches).
+_sentinel = nn.Module()
+_orig_build = krea2c.build_krea2_transformer
+krea2c.build_krea2_transformer = lambda *a, **k: _sentinel
+try:
+    _m11 = fp8ops.load_scaled_fp8_component(
+        _CaptureComp, _mk("r2_krea.safetensors", {
+            "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+            "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+            # krea-native markers (bf16) so is_krea2_comfy_checkpoint fires
+            "blocks.0.attn.wq.weight": torch.zeros(4, 4, dtype=torch.bfloat16),
+            "blocks.0.mod.lin": torch.zeros(24, dtype=torch.bfloat16),
+        }), torch.bfloat16, "", "cq-w", dequant_fp8=True)
+finally:
+    krea2c.build_krea2_transformer = _orig_build
+check("R2: dequant return covers the krea build branch (test 11)",
+      _m11 is _sentinel)
+
+# R3/test 12 (threading): load_component → _load_single_weights →
+# load_scaled_fp8_component carries dequant_fp8 through the utils layer.
+_p12 = _mk("r3_thread.safetensors", {
+    "a.weight": _fp8((16, 16)), "a.weight_scale": _scalar(0.01),
+    "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+})
+_buf = _io2.StringIO()
+with _cl2.redirect_stdout(_buf):
+    _m12 = edu.load_component(_CaptureComp, _p12, torch.bfloat16,
+                              base_path=_TMP, subfolder_hint="transformer",
+                              dequant_fp8=True)
+check("R3: dequant_fp8 threads through load_component (test 12)",
+      hasattr(_m12, "_received_sd") and "dequant-fp8 mode" in _buf.getvalue(),
+      f"log: {_buf.getvalue()[:200]!r}")
+# generate.py's hoist (quant_selected → dequant_fp8 at the override site) is
+# verified by code review (req 44); it has no unit seam without a pipeline.
 
 _expect_reject(
     "cq + C-b marker co-presence rejected (D3 NEGATIVE, test 5)",
@@ -493,14 +646,18 @@ p = _mk("dangling.safetensors", {
 _expect_reject("dangling scale with no fp8 weight rejected (F1/F6 NEGATIVE)",
                lambda: _load(p), "dangling")
 
+# AMENDED by slice R1 (req 39): a fully-bare non-.weight fp8 tensor now
+# upcasts (R1 battery covers the positive); the reject arm requires a bound
+# scale — a present binding is never silently ignored.
 p = _mk("fp8bias.safetensors", {
     "a.weight": _fp8((16, 16)),
     "a.weight_scale": _scalar(0.01),
     "a.input_scale": _scalar(0.5),
     "a.bias": _fp8((16,), seed=1),
+    "a.bias.weight_scale": _scalar(0.01),   # bound → reject (R1/req 39)
 })
-_expect_reject("fp8 non-.weight tensor rejected (layout NEGATIVE)",
-               lambda: _load(p), "not a .weight")
+_expect_reject("fp8 non-.weight tensor with bound scale rejected (R1 NEGATIVE)",
+               lambda: _load(p), "non-.weight")
 
 p = _mk("fp8_3d.safetensors", {
     "a.weight": _fp8((4, 4, 4)),
