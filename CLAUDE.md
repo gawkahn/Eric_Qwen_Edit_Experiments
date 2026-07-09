@@ -68,7 +68,7 @@ python3 test_machine_boundary_validator.py  # 138 tests: machine-boundary valida
 python3 test_iterate.py                     #  92 tests: comfyless --iterate (ADR-008)
 python3 test_samplers.py                    #  41 tests: custom schedulers / sampler swap
 python3 test_server_robustness.py           # 114 tests: comfyless IPC timeouts + BrokenPipe survival + device-keyed socket routing + server-side device pinning + atomic output reservation (ADR-020) + daemon quant carriage (ADR-019 slice DQ: validation, cache-key discrimination, quant forwarding, H-1 symlink refusal) + multi-root _check_paths union (ADR-018) + NAG cache-key freedom & daemon/wire carriage (ADR-023)
-python3 test_mcp_server.py                  # 654 tests: comfyless MCP server (ADR-011 slice 1 + ADR-015 slice 2 catalog/list_models/list_loras + slice 2b list_transformers + slice 3 generate catalog-name migration + slice 3b cascade catalog-name migration + ADR-018 multi-root kind-typed scan + ADR-022 S5 catalog search/family filters + ADR-015 2026-07-06 LoRA-failure name-based notices)
+python3 test_mcp_server.py                  # 685 tests: comfyless MCP server (ADR-011 slice 1 + ADR-015 slice 2 catalog/list_models/list_loras + slice 2b list_transformers + slice 3 generate catalog-name migration + slice 3b cascade catalog-name migration + ADR-018 multi-root kind-typed scan + ADR-022 S5 catalog search/family filters + ADR-015 2026-07-06 LoRA-failure name-based notices + slice 4d flat-cascade extract_params stage-name resolution + dtype value-allowlist)
 python3 test_quant.py                       # 101 tests: fp8 quantize-on-load (ADR-019 slice A) — eligibility policy, cache-key discrimination, DMR dispatcher routing, boundary hygiene
 python3 test_fp8_single_file.py             # 195 tests: ComfyUI scaled-fp8 single-file loader + DMR merge (ADR-019 slices C/C-d/DMR) — classifier variants, security-review negatives, ScaledFp8Linear numerics, dequant->merge->requant dispatcher + ComfyUI-native Krea-2 key converter (ADR-019 2026-07-07) + partial-quant naked-fp8 coexistence (slice PQ, reqs 31-38) + non-weight fp8 upcast & dequant-to-bf16 mode (slice R1/R2/R3, reqs 39-45) + int8-tensorwise ci-w consumption (slice I8, reqs 46-56)
 python3 test_lora_order_insensitive.py      #  26 tests: direct-merge LoRAs order-insensitive to PEFT wrapping + LoKR->LoRA flatten (LoKR-on-Z-Image rescue: reconstruction, wiring, alpha-sentinel guard)
@@ -78,7 +78,7 @@ python3 test_lora_convert_krea.py           #  31 tests: Krea-2 LoRA format-conv
 python3 test_catalog_db.py                  # 125 tests: catalog DB metadata plane (ADR-022 S1-S5) — schema, FUSE guard, sanitizer, upsert/stale semantics, manifest kind-branch join, families/sidecar/exclusion/search, civitai enrichment (mocked network), load-plane independence
 python3 test_nag.py                         # 101 tests: NAG negative guidance (ADR-023 Krea-2 + ADR-024 flux/flux2/flux2klein/zimage expansion) — formula vs reference equations, per-arch processor selection/dormancy/lane re-sync on tiny transformers (incl. Z-Image hand-swap + ragged captions, Flux2 dual/parallel variants, HF1-1 pooled-tiling negative control), pipeline routing guards, N1 boundary-warning pins
 ```
-All seventeen suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 2537 unit tests; expect 0 failures.
+All seventeen suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 2568 unit tests; expect 0 failures.
 
 `test_flux2.py` is a live GPU smoke test that performs an actual Flux.2 generation — separate from the unit suites above. Run only when you need to verify end-to-end Flux.2 behavior.
 
@@ -274,51 +274,3 @@ The MCP server (`comfyless/mcp_server.py`) caches one pipeline in-process and ev
 - `pipeline.vae.enable_tiling()` is always called on generation pipelines — required for >2 MP decode without OOM.
 - The Edit pipeline takes a `Qwen2VLProcessor` (vision-language processor); the Generation pipeline does **not** — it uses only a tokenizer
 
-<!-- gitnexus:start -->
-# GitNexus — Code Intelligence
-
-This project is indexed by GitNexus as **Eric_Qwen_Edit_Experiments** (4533 symbols, 8073 relationships, 285 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
-
-> Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — the PINNED runner. **Never `npx gitnexus analyze`** (it pulls latest, unpinned — a newer analyze writes a DB format the pinned MCP server can't read; that exact mismatch broke the index on 2026-07-08). Ignore any hook/tool output suggesting npx.
-
-## Always Do
-
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run `detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows. For regression review, compare against the default branch: `detect_changes({scope: "compare", base_ref: "main"})`.
-- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use `query({search_query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `context({name: "symbolName"})`.
-- For security review, `explain({target: "fileOrSymbol"})` lists taint findings (source→sink flows; needs `analyze --pdg`).
-
-## Never Do
-
-- NEVER edit a function, class, or method without first running `impact` on it.
-- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
-- NEVER rename symbols with find-and-replace — use `rename` which understands the call graph.
-- NEVER commit changes without running `detect_changes()` to check affected scope.
-
-## Resources
-
-| Resource | Use for |
-|----------|---------|
-| `gitnexus://repo/Eric_Qwen_Edit_Experiments/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/Eric_Qwen_Edit_Experiments/clusters` | All functional areas |
-| `gitnexus://repo/Eric_Qwen_Edit_Experiments/processes` | All execution flows |
-| `gitnexus://repo/Eric_Qwen_Edit_Experiments/process/{name}` | Step-by-step execution trace |
-
-## Cross-Repo Groups
-
-This repository is listed under GitNexus **group(s): ai-lab** (see `~/.gitnexus/groups/`). For cross-repo analysis, use MCP tools `impact`, `query`, and `context` with `repo` set to `@<groupName>` or `@<groupName>/<memberPath>` (paths match keys in that group’s `group.yaml`). Use `group_list` / `group_sync` for membership and sync. From the project root: `node .gitnexus/run.cjs group list`, `node .gitnexus/run.cjs group sync <name>`, `node .gitnexus/run.cjs group impact <name> --target <symbol> --repo <group-path>` (the `.gitnexus/run.cjs` path is repo-root-relative).
-
-## CLI
-
-| Task | Read this skill file |
-|------|---------------------|
-| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
-| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
-| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
-| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
-| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
-| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
-
-<!-- gitnexus:end -->
