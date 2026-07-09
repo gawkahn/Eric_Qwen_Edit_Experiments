@@ -1056,3 +1056,22 @@ family gate table in generate.py). Chroma stays deferred with a changed shape: i
 so the right fix is routing negatives to its real CFG, not NAG. Deferrals (1) compute sharing,
 (3) ComfyUI nodes, and (4) CFG+NAG combined mode remain open, plus a new one: Flux.2
 reference-image (kontext) inputs skip NAG loudly (HF2-1). Triggers unchanged.
+
+## 2026-07-09 — `_abspath` in the daemon wire request does not expand `~`
+
+- **What:** `_build_wire_request._abspath` (`comfyless/generate.py:1822`) is bare
+  `os.path.abspath()`. A `~/...` path in a `--params` sidecar or an `--iterate` JSON list is
+  not a repo ID, so `resolve_hf_path` passes it through untouched (`generate.py:2323`), and
+  `abspath` then joins it onto the client's CWD — the daemon receives `<cwd>/~/projects/...`
+  and rejects it via `_check_paths` ("outside the allowed roots"). Affects `model`,
+  `transformer_path`, `vae_path`, `text_encoder{,_2}_path`, and `loras[].path`. CLI flags are
+  unaffected only because the shell expands the tilde before argparse sees it.
+- **Why not now:** hand-writing `/home/<user>/...` in the JSON is a complete workaround, and
+  the fix touches the `--json`/wire boundary feeding the server's allowed-roots check, so it
+  wants `code-reviewer` plus a decision on whether tilde expansion belongs client-side at all
+  (client `$HOME` then picks which path the server opens — benign for a solo local tool,
+  but exactly the input the root check exists to constrain).
+- **Trigger:** next deliberate change to wire-request path handling, or the next time a
+  hand-written sidecar / iterate list fails the allowed-roots check. Check whether
+  `cascade.py` and `mcp_server.py` build path fields the same way — if so the fix is one
+  shared helper, not three copies.
