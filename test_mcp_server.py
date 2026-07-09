@@ -4674,6 +4674,150 @@ with tempfile.TemporaryDirectory() as _tp_out, \
 
 
 # ════════════════════════════════════════════════════════════════════════
+print("\n== Slice 4 step 3: extract_params catalog-DB enrichment ==")
+# ════════════════════════════════════════════════════════════════════════
+
+def _mk_enrich_db(path):
+    conn = _cdb.connect(path)
+    e1 = _cdb.upsert_entry(conn, name="cool_lora", kind="lora",
+                           abs_path="/models/loras/cool_lora.safetensors",
+                           classification="style")
+    _cdb.set_entry_family(conn, e1, "qwen-image")
+    _cdb.upsert_description(conn, entry_id=e1, source="civitai_api",
+                            model_name="Cool Style",
+                            description="A cool style LoRA",
+                            usage_tips="use at 0.7",
+                            trigger_words=["coolstyle"], strength_rec="0.7")
+    # a lora whose trigger_words is stored MALFORMED (non-list) to exercise
+    # the read-boundary guard (N21) even against a DB written out-of-band.
+    e2 = _cdb.upsert_entry(conn, name="badtrig", kind="lora",
+                           abs_path="/models/loras/badtrig.safetensors")
+    _cdb.upsert_description(conn, entry_id=e2, source="web",
+                            description="bad trigger fixture",
+                            strength_rec="0.5")
+    conn.execute("UPDATE descriptions SET trigger_words=? WHERE entry_id=?",
+                 ('{"not":"a list"}', e2))
+    # my_xformer resolves (a hit) but carries NO metadata at all (N19).
+    _cdb.upsert_entry(conn, name="my_xformer", kind="transformer",
+                      abs_path="/models/dit/my_xformer.safetensors")
+    _cdb.rebuild_fts(conn)
+    conn.commit()
+    conn.close()
+
+
+with tempfile.TemporaryDirectory() as _te_out, \
+     tempfile.TemporaryDirectory() as _te_db:
+    _eout = os.path.realpath(_te_out)
+    _edbp = os.path.join(_te_db, "enrich.sqlite")
+    _mk_enrich_db(_edbp)
+    _ecat = {
+        "cool_lora": {"abs_path": "/models/loras/cool_lora.safetensors",
+                      "kind": "lora", "source": "scan",
+                      "model_family": None, "target_family": None},
+        "badtrig": {"abs_path": "/models/loras/badtrig.safetensors",
+                    "kind": "lora", "source": "scan",
+                    "model_family": None, "target_family": None},
+        "my_xformer": {"abs_path": "/models/dit/my_xformer.safetensors",
+                       "kind": "transformer", "source": "scan",
+                       "model_family": None, "target_family": None},
+    }
+    _ecfg_db = mcps._StartupConfig(
+        output_dir=_eout, model_base=_eout, default_model=None,
+        mcp_max_iterations=100, catalog=_ecat, catalog_db_path=_edbp)
+    _ecfg_nodb = mcps._StartupConfig(
+        output_dir=_eout, model_base=_eout, default_model=None,
+        mcp_max_iterations=100, catalog=_ecat, catalog_db_path=None)
+
+    def _ewrite(fname, obj):
+        p = os.path.join(_eout, fname)
+        with open(p, "w") as f:
+            _json.dump(obj, f)
+        return p
+
+    def _eextract(cfg, p):
+        res = _run(mcps._handle_extract_params(cfg, {"path": p}))
+        return _json.loads(res[0].text)
+
+    _sc = _ewrite("e1.json", {
+        "prompt": "x",
+        "transformer_path": "/models/dit/my_xformer.safetensors",
+        "loras": [{"path": "/any/cool_lora.safetensors", "weight": 0.7},
+                  {"path": "/any/unknown.safetensors", "weight": 0.5}]})
+    _r = _eextract(_ecfg_db, _sc)
+    _enr = _r.get("enrichment", {})
+
+    # N17: resolved lora enriched with allowlisted metadata; no path fields.
+    check("N17: resolved lora enriched (strength_rec + trigger_words + source)",
+          _enr.get("cool_lora", {}).get("description", {}).get("strength_rec")
+          == "0.7"
+          and _enr["cool_lora"]["description"].get("trigger_words")
+          == ["coolstyle"]
+          and _enr["cool_lora"]["description"].get("source") == "civitai_api")
+    check("N17: enrichment carries top-level classification + model_family",
+          _enr.get("cool_lora", {}).get("classification") == "style"
+          and _enr["cool_lora"].get("model_family") == "qwen-image")
+    _enr_flat = _json.dumps(_enr)
+    check("N17: enrichment block leaks no path-typed field",
+          "abs_path" not in _enr_flat and "/models/" not in _enr_flat
+          and "relative_path" not in _enr_flat and '"root"' not in _enr_flat)
+
+    # N19: my_xformer resolves (hit) but has no metadata -> absent from map.
+    check("N19: resolved name with no DB metadata -> not in enrichment",
+          "my_xformer" not in _enr)
+
+    # N20: the missed lora is never enriched; params still render correctly.
+    check("N20: catalog-miss reference never enriched",
+          "unknown.safetensors" not in _enr and "unknown" not in _enr)
+    check("N20: params render resolved name + basename-miss",
+          _r["params"]["loras"] == [{"name": "cool_lora", "weight": 0.7},
+                                    {"name": "unknown.safetensors",
+                                     "weight": 0.5}])
+
+    # N18: DB absent -> no enrichment key; names still resolve.
+    _r_nodb = _eextract(_ecfg_nodb, _sc)
+    check("N18: DB absent -> no enrichment key; names still resolve",
+          "enrichment" not in _r_nodb
+          and _r_nodb["params"]["loras"][0]["name"] == "cool_lora")
+
+    # N21: malformed (non-list) trigger_words -> guarded (omitted), no crash.
+    _r2 = _eextract(_ecfg_db, _ewrite("e2.json", {
+        "prompt": "x",
+        "loras": [{"path": "/any/badtrig.safetensors", "weight": 1.0}]}))
+    _bd = _r2.get("enrichment", {}).get("badtrig", {}).get("description", {})
+    check("N21: malformed trigger_words guarded (omitted); other fields kept",
+          "trigger_words" not in _bd and _bd.get("strength_rec") == "0.5")
+
+    # Fail-open: a resolved-but-DB-unavailable path (bogus db_path) -> no crash,
+    # no enrichment (invariant 12).
+    _ecfg_baddb = mcps._StartupConfig(
+        output_dir=_eout, model_base=_eout, default_model=None,
+        mcp_max_iterations=100, catalog=_ecat,
+        catalog_db_path=os.path.join(_te_db, "nonexistent.sqlite"))
+    _r3 = _eextract(_ecfg_baddb, _sc)
+    check("N-failopen: unreadable DB -> no enrichment, no error",
+          "enrichment" not in _r3
+          and _r3["params"]["loras"][0]["name"] == "cool_lora")
+
+    # N-guard (both-reviewer fold): a mid-enrichment exception must NEVER fail
+    # the extract — the structural try/except in the handler drops enrichment
+    # and returns params. Monkeypatch the helper to raise.
+    _orig_enrich = mcps._enrich_from_catalog_db
+    def _boom_enrich(*_a, **_k):
+        raise RuntimeError("boom")
+    mcps._enrich_from_catalog_db = _boom_enrich
+    try:
+        _rboom = _eextract(_ecfg_db, _sc)
+    finally:
+        mcps._enrich_from_catalog_db = _orig_enrich
+    check("N-guard: enrichment exception -> params still returned, no "
+          "enrichment key, no crash",
+          _rboom.get("params", {}).get("loras")
+          == [{"name": "cool_lora", "weight": 0.7},
+              {"name": "unknown.safetensors", "weight": 0.5}]
+          and "enrichment" not in _rboom)
+
+
+# ════════════════════════════════════════════════════════════════════════
 # LoRA-not-applied notices (ADR-015 2026-07-06) — agent-facing, NAME-BASED,
 # PATH-FREE. The security-load-bearing property: neither the abs_path nor the
 # outcome `reason` (which may embed a path) may ever appear in a notice.
