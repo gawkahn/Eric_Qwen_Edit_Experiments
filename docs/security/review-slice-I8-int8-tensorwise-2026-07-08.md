@@ -1,0 +1,65 @@
+AI-Disclosure: security-auditor (Claude Fable 5) authored; Grant reviewed. Design-phase review, pre-code — extends review-slice-C (F1-F12, reqs 1-10), review-slice-Cd (D1-D9, reqs 11-20), review-slice-PQ (PQ-1..6, reqs 31-38), review-slice-R1R2R3 (reqs 39-45). Reqs 21-30 are DMR's. New requirements numbered from 46.
+
+# Delta security review — ADR-019 Slice I8 (comfy int8-tensorwise, weight-only, `ci-w`)
+
+## Summary
+
+The proposal extends `_classify_cq` and `load_scaled_fp8_component` to accept ComfyUI-core int8-tensorwise files (PR #14636 unrotated base case): descriptor `{"format": "int8_tensorwise"}` + BF16 scalar `weight_scale` + I8 `.weight`, dequanted to bf16 with **no residency op** — `ci-w` is unconditional-dequant mode, so no Int8Linear, no step-3 swap, no `_scaled_mm` exposure, no new DMR merge representation, and no `contains_scaled_fp8`/`is_quantized_module` guard extension is needed. That single design choice (rule 7) eliminates the entire residency-guard finding class and is the strongest thing about this design. Threat model unchanged across the chain: same-uid solo-desktop operator loading a community checkpoint they chose; safetensors is unpickled and mmap-bounded; ceiling = silent numerical corruption of the operator's own generation.
+
+What was checked: the three new parse elements (I8 dtype pairing, BF16 scale acceptance, the convrot JSON check) against every existing gate in classify/load order — entry condition, control-char, nvfp4 `weight_scale_2`, cb-copresence, D2 descriptor gates, D1 pairing, PQ naked block, D4 JSON strictness, D6 variant inference, D7 header scale sanity, loader pairing/stray/dangling checks, and the step-2 dict build. Two structural gaps dominate the findings. First, the step-2 pass-through branch (`bf16_sd[k] = t.to(dtype) if t.is_floating_point() else t`) is a **pre-existing silent channel for int8**: a non-floating tensor passes through raw and `load_state_dict`'s `copy_()` implicitly casts integer values into float params — integer-valued garbage weights with no error. Every no-naked-int8 rule must therefore be enforced at classify AND re-asserted at load so no I8 tensor can ever reach that branch (the PQ-2 two-point pattern). Second, the int8 flavor is the first descriptor schema **demonstrated** to carry semantic-modifier fields (`convrot`/`convrot_groupsize` change what the weight bytes *mean*), which invalidates the D8 log-and-ignore posture for this flavor: a convrot-specific blocklist is the wrong shape — strict field allowlist is required, and the same rotation concern back-propagates to the shipped fp8 descriptor path as a flagged, separate-scope companion finding (I8-4). Verdict: **APPROVABLE WITH CHANGES**.
+
+## Coverage matrix (I8 tensor inside a file entering `_classify_cq`)
+
+Variables: D = `.comfy_quant`, W = `.weight_scale`, suffix = `.weight`-named. File-wide preconditions: any `.input_scale` anywhere → reject; any C-b marker → existing reject; `weight_scale_2` → existing nvfp4 reject (fires before cq dispatch).
+
+| `.weight`? | D | W | Outcome | Enforcement point |
+|---|---|---|---------|-------------------|
+| yes | 1 | 1 | **accept-scaled** (ci-w entry, dequant) | pairing loop |
+| yes | 1 | 0 | REJECT (missing weight_scale) | missing_ws analog at classify + F6 at load |
+| yes | 0 | 1 | REJECT (scale w/o descriptor — PQ-1 analog) | naked-I8 reject at classify + loader re-assert |
+| yes | 0 | 0 | REJECT (naked int8 — no float interpretation) | naked-I8 reject at classify + loader re-assert |
+| no  | any | any | REJECT (non-`.weight` I8, bare or bound) | blanket non-weight-I8 reject |
+
+**No cell maps to upcast or pass-through.** The PQ/R1 naked-coexistence relaxations were justified because fp8 bytes ARE a float format; raw int8 bytes have no float meaning without a scale — the reject-everything-unpaired polarity is the only sound one, enforced at BOTH classify and load (I8-2).
+
+## Findings
+
+**[HIGH] I8-1 — Flavor must derive from tensor dtypes only, with dtype↔format cross-consistency enforced in BOTH directions.** Two crafted combinations must be explicitly closed: (a) I8-paired descriptors whose JSON declares `"float8_e4m3fn"`, and (b) F8-paired descriptors declaring `"int8_tensorwise"`. Flavor = function of paired-weight dtypes exclusively, computed before any JSON read; then apply the flavor's literal allowlist (`{"int8_tensorwise"}` for int8; the existing fp8 pair NOT widened). Mixed I8+F8 descriptored weights ⇒ reject. Other paired dtypes keep rejecting with the message naming the actual dtype found.
+
+**[HIGH] I8-2 — No-naked-int8 must be re-asserted at load; the step-2 raw pass-through is a live silent-garbage channel for I8.** Today the pairing loop skips non-fp8 dtypes and step 2 passes non-floating tensors through raw; an I8 tensor reaching that branch flows into `load_state_dict` where `copy_()` implicitly casts integers into float params — silent corruption with no error. Remediation: (a) ci-w pairing keys on `torch.int8` with descriptor + validated scale + 2D required; (b) an unconditional loader guard so no `torch.int8` tensor reaches the step-2 pass-through in ANY variant routed through this loader; (c) divergence-simulation negative test.
+
+**[HIGH] I8-3 — Convrot-specific reject is the wrong shape; the int8 flavor needs a strict descriptor-field allowlist.** The int8_tensorwise descriptor schema is *demonstrated* to carry fields that change weight SEMANTICS (rotation), not metadata. A blocklist of one known field protects only against the field known today; the next semantic modifier sails through log-and-ignore and dequants to silent garbage. Remediation: for the int8 flavor, reject on ANY field outside a literal allowlist of `{"format"}`. This subsumes the convrot reject and converts the D5 worry into plain fail-closed schema validation — the JSON still drives exactly one decision. fp8 flavors keep their shipped log-and-ignore behavior (modulo I8-4).
+
+**[MED] I8-4 — Convrot on fp8-format descriptors: the SHIPPED path would silently load a rotated file today (companion; must be explicitly scoped in or out, not left ambient).** If ConvRot can rotate fp8-format checkpoints, a `{"format": "float8_e4m3fn", "convrot": ...}` descriptor is log-and-ignored today and rotated weights load unrotated. Smallest change: in the existing fp8 descriptor loop, reject any descriptor containing a key starting with `"convrot"` (covers `convrot_groupsize`), all flavors.
+
+**[MED] I8-5 — Scale dtype must be checked on the RAW tensor before upcast; `_validate_scale` parameterization must not loosen fp8 call sites.** (a) Header scale loop parameterized per flavor: int8 ⇒ dtype in {BF16, F32}, scalar; fp8 ⇒ F32-only byte-identical. (b) `_validate_scale` gains an explicit per-call dtype allowlist with F32-only default so every existing call site (including the DMR requant) is unchanged; the ci-w site opts into {bfloat16, float32}. (c) Value policy after `.to(float32)` unchanged — BF16 NaN/Inf survive upcast and are caught; BF16 subnormals remain subnormal in F32 and are caught by the min-normal floor. (d) Regression: BF16 scale on a cq-w fp8 file still rejects; requant path still F32-only.
+
+**[MED] I8-6 — Mixing matrix: reject naked-F8 in an int8-flavored file for v1; make the dtype exclusion bidirectional.** The PQ naked-F8 relaxation was granted on real-file evidence; no int8 file with naked-F8 peripherals exists. int8-flavored file: ANY F8 tensor anywhere ⇒ reject (v1; revisit on evidence). fp8-flavored file: ANY I8 tensor ⇒ reject (classify-side mirror of the I8-2 loader guard).
+
+**[LOW] I8-7 — Keep the 2D-only rule for descriptored I8 weights** (the residency rationale is gone but the convention and test surface are 2D Linear weights; loosen only when a real file demands it).
+
+**[INFO] I8-8 — BF16 scale precision: bounded multiplicative error (≤ ~0.4% relative), full F32 exponent range, no bypass vector; all adversarial values survive upcast and are caught. Accept {BF16, F32} for int8; fp8 stays F32-only.**
+
+**[INFO] I8-9 — Enforcement-boundary residual: descriptor-free all-int8 files never enter the parser (entry condition) and take the standard path with its pre-existing behavior — unchanged, and invariant 2 requires not grabbing them. Document in the module docstring.**
+
+**[INFO] I8-10 — No new attack primitive**, conditional on I8-1/I8-2/I8-3: I8 pairing is name/dtype logic on the same header surface; BF16 scales are value-validated; the field-allowlist check reads JSON key names inside the existing D2 bounds. No new compute op, no residency, memory ceiling = a bf16 model. A huge-but-normal scale can produce ±Inf dequant weights — identical to the shipped fp8 posture (F2 never capped magnitude), self-inflicted, no new requirement.
+
+## Requirements delta (46-56)
+
+46. Flavor determined from paired-weight tensor DTYPES only, before any JSON read; extended D1 accepts F8 or I8 pairing; any descriptor→I8 pairing ⇒ int8 flavor ⇒ ALL descriptored weights I8 (mixed ⇒ reject); other paired dtypes reject with the message naming the actual dtype. Per-flavor literal format allowlists (`{"int8_tensorwise"}` int8; existing pair fp8, NOT widened) enforce dtype↔format consistency both directions (I8-1).
+47. int8 flavor: any `.input_scale` key anywhere ⇒ reject (v1 weight-only); existing cb-copresence, `weight_scale_2`, control-char, and D2 descriptor gates preserved byte-identical and regression-tested on int8-shaped inputs.
+48. No-naked-int8 at classify per the coverage matrix: an I8 tensor is legal iff it is a 2D `.weight` with descriptor + weight_scale in a file whose flavor is int8; every other cell ⇒ loud reject; no cell upcasts (I8-2, I8-7).
+49. Loader re-assertion (PQ-2 pattern): ci-w pairing keys on `torch.int8`; an unconditional guard ensures no `torch.int8` tensor reaches the step-2 raw pass-through branch in ANY variant routed through `load_scaled_fp8_component`; divergence-simulation negative test (I8-2).
+50. Scale dtype allowlist checked on the RAW tensor pre-upcast, parameterized per flavor: int8 ⇒ {BF16, F32} scalar; fp8 flavors ⇒ F32-only byte-identical, including the DMR requant call site (F32-only default in `_validate_scale`); value policy applied after upcast to F32, unchanged (I8-5, I8-8).
+51. int8 descriptor strict field allowlist `{"format"}`: any other field, convrot included, ⇒ loud reject. Framed as fail-closed schema validation; D5 scope lock intact. fp8 flavors' D8 log-and-ignore unchanged by this requirement (I8-3).
+52. Convrot-prefixed fields on fp8-flavored descriptors: companion change flagged OUTSIDE this slice's declared scope — decide explicitly (own slice, or fold in with declared scope) before merge; do not land silently (I8-4).
+53. ci-w has no residency, unconditionally: return after step 2 regardless of `dequant_fp8`; no Int8Linear class exists; ci-w models contain zero `ScaledFp8Linear`; no change to DMR, `contains_scaled_fp8`, or `is_quantized_module` (tested).
+54. int8-flavored file + any F8 tensor ⇒ reject; fp8-flavored file + any I8 tensor ⇒ reject (bidirectional exclusion, v1; relax only on real-file evidence per the PQ precedent) (I8-6).
+55. Module docstring + CLAUDE.md Review-bar row text updated: ci-w flavor, the strict-allowlist D8 amendment for int8, the enforcement-boundary residual (marker-less int8 files stay on the standard path, invariant 2), and the "no residency by design" rationale (I8-9).
+56. Test battery (25 cases: positives — target-shaped load, dequant numerics, F32-scale accept, unconditional-dequant invariant, routing/log; negatives — mixed dtypes, both cross-consistency directions, BF16-paired descriptor message, input_scale reject, convrot/convrot_groupsize/unknown-field rejects, fp8 unknown-field regression, all naked/partial-coverage cells, non-weight I8, loader divergence re-assert, bidirectional mixing, F16/vector scale rejects, BF16 scale value battery (NaN/Inf/0/negative/subnormal), fp8-BF16-scale regression, non-2D reject, nvfp4/C-b/D2/control-char regressions on int8-shaped inputs, PQ fixture regression) lands in the same slice as the code.
+
+## Verdict
+
+**APPROVABLE WITH CHANGES.** The design's core choices are right: dequant-only (no residency) removes whole finding classes; polarity on naked int8 is correct; the D5-compatible flavor inference is preserved. Merge is gated on **I8-1** (flavor from dtypes with two-way cross-consistency), **I8-2** (loader re-assertion closing the pre-existing step-2 int8 pass-through — the single highest-consequence gap, a live silent-cast channel today), and **I8-3** (strict field allowlist replacing the convrot-specific reject); I8-4 must be explicitly scoped in or out before merge. I8-5 through I8-7 are required but mechanical; I8-8 through I8-10 are confirmations.
+
+**Scope decision recorded at implementation (parent session, declared per req 52): I8-4 is FOLDED INTO this slice** — the fp8 descriptor loop rejects convrot-prefixed fields (all flavors); other unknown fields on fp8 descriptors keep log-and-ignore.

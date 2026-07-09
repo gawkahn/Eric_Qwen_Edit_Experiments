@@ -870,6 +870,21 @@ native key names). That one model is blocked on TWO fronts; the RedCraft target
 **Trigger:** Grant downloading the files + deciding to invest; re-check whether a
 diffusers/community loader lands first (ComfyUI-core status means momentum).
 
+**Partial resolution: 2026-07-08 — UNROTATED int8_tensorwise now loads (ADR-019
+slice I8, `ci-w`).** A real unrotated file (`x3n0_m4tr1xKrea2`, 224 I8 Linears +
+BF16 scalar scales, descriptor exactly `{"format": "int8_tensorwise"}`) drove a
+much smaller slice than this entry costed: no rotation ⇒ dequant is `W = int8 ×
+scale`, loaded dequant-to-bf16 with NO Int8Linear (with `--quant fp8`, torchao
+re-quantizes — the proven LoRA path). Security reqs 46-56
+(`docs/security/review-slice-I8-int8-tensorwise-2026-07-08.md`). **What remains
+open in THIS entry is exactly the ConvRot-ROTATED case** — descriptors carrying
+`convrot`/`convrot_groupsize` now fail LOUDLY (strict field allowlist on int8
+descriptors; convrot-prefixed fields reject on fp8 descriptors too, I8-4)
+instead of being unloadable-with-a-confusing-error, but applying the rotation
+at compute (ConvRotInt8Linear + Hadamard step) is still unbuilt. The costing
+above stands for that case; trigger unchanged (a real rotated file + decision
+to invest).
+
 ## 2026-07-06 — CORRECTION (after inspecting a real file): "int8 convrot" targets are actually scaled-fp8; the blocker is Krea keys, not the quant
 
 **What the file actually is:** `redcraft22INT8Convrot_11INT8Native.safetensors`
