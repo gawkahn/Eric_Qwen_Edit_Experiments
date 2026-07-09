@@ -1030,3 +1030,22 @@ vendoring option.
   (a new write target beyond the DMR-3 `.weight`-only merge surface).
 - **Trigger:** a Krea-2 distill/turbo LoRA reported partially-applied (some modules active,
   bias/scale-bearing ones silently skipped), OR a `weight_scale_2` reject in the daemon log.
+
+## 2026-07-08 — NAG v1 deferrals: compute sharing, other families, ComfyUI nodes, CFG+NAG
+
+- **What:** NAG for Krea-2 (ADR-023) landed naive: (1) the batch-2 lanes recompute the image
+  tokens twice per NAG'd step (~1.9-2.0x wall full-window) — the paper's image-token compute
+  sharing (+87%-overhead variant) is not implemented; (2) only krea/krea-turbo are gated in —
+  other distilled families (Flux Schnell-class, Qwen distills) could reuse the machinery with
+  their own processors; (3) no ComfyUI node surface — comfyless/MCP only; (4) NAG + classic
+  CFG (guidance_scale>0) routes to stock CFG with a warning instead of combining them the way
+  the reference pipeline can (`do_true_cfg` + NAG simultaneously).
+- **Why not now:** correctness first (ADR-023 decision 3) — the naive port is testable against
+  the reference math and Grant's A/B; compute sharing changes the processor's q/k/v layout and
+  deserves its own slice with a wall-clock benchmark. Other families and ComfyUI nodes have no
+  user demand yet. CFG+NAG has no use case on the checkpoints in hand (Raw uses CFG, Turbo
+  uses NAG).
+- **Trigger:** NAG's ~2x wall cost bothers Grant on 8-step Turbo (→ compute sharing or a VSF
+  arXiv:2508.10931 benchmark); a non-krea distilled checkpoint needs negative prompts (→
+  family expansion); NAG wanted in the ComfyUI graph (→ node surface); a model where CFG and
+  NAG both matter (→ combined mode).

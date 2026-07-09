@@ -151,7 +151,37 @@ implementation drifts from this scope.
 
 ## Changelog
 
-- 2026-07-08 — Initial. Accepted (UX + session plan decided by Grant). Research
+- 2026-07-08 (review correction) — The method section's `φ = nag_scale`
+  binding is wrong as written: with the paper's `Z̃ = Z⁺ + φ·(Z⁺ − Z⁻)`,
+  the code form `Z⁺·s − Z⁻·(s−1)` corresponds to `s = φ + 1`, not `s = φ`.
+  The implementation and its defaults use the CODE convention (`nag_scale`
+  = s; s ≤ 1 is the mathematical no-op; the reference repo's demo values
+  4-5 are s-values), matching the reference repo exactly. Body left
+  unedited per the accepted-ADR discipline — this entry is the correction.
+  (code-reviewer finding 2, 2026-07-08.)
+- 2026-07-08 (later) — IMPLEMENTED. `pipelines/nag_krea2.py` (`nag_merge` +
+  `NAGKrea2AttnProcessor` + `Krea2NAGPipeline` + `apply/remove_nag_processors`
+  + `nag_pipe_call`); comfyless wiring in `generate.py` (`_nag_gate` family
+  gate, `--nag-scale/tau/alpha/end` None-sentinel flags, metadata emission),
+  `params_validation.py`/`params_schema.py` (SCHEMA_KIND quadruple, defaults
+  0.0/2.5/0.25/1.0), `server.py` (forwarding), `mcp_server.py` (tool schema +
+  forwarding + cascade ignore-notice). Cache-key DECISION: the quadruple stays
+  OUT of the daemon/MCP pipeline cache keys — processors are installed
+  per-call and restored in a `finally` (N6), so a cached pipeline serves any
+  NAG config; pinned by test_server_robustness. Scale convention: code form
+  (`Z+·s − Z−·(s−1)`), L1 norms per paper. NAG+classic-CFG (guidance_scale>0)
+  routes to stock CFG with a loud warning (v1 scope). The daemon delegation
+  path is used by default — the quadruple rides the wire request. Hazards
+  H1-H6 each have a test leg (test_nag.py, 50 tests; totals: schema +24,
+  server +9, validator +8). code-reviewer (Fable) 2026-07-08: no blocking
+  findings; advisories folded same-session — `nag_warnings` metadata channel
+  so every skip crosses the daemon/MCP boundary (N1; lora_warnings
+  precedent), CFG-interplay gate hoisted into generate() for client-visible
+  warning, unconditional finally-restore (partial-swap-proof N6), range
+  sanity warnings on tau/alpha/end. security-auditor exemption per this
+  ADR's Review bar CONFIRMED by the reviewer (four floats through
+  established SCHEMA_KIND typing; no new parsing/IPC/path surface). Live
+  A/B verification by Grant pending.
   basis: arXiv:2505.21179 + official repo (ChenDarYen/Normalized-Attention-
   Guidance: `nag/attention_flux_nag.py` single-stream path is the porting
   template; `nag/attention_nag.py` L103-110 the formula reference;

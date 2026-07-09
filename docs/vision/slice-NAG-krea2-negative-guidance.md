@@ -1,6 +1,7 @@
 # Vision — Slice NAG: Normalized Attention Guidance for Krea-2 (comfyless)
 
-**Status:** ready to implement (fresh session). Design: ADR-023. Risk: L2.
+**Status:** implemented 2026-07-08 (see ADR-023 changelog); live A/B
+verification by Grant pending. Design: ADR-023. Risk: L2.
 **AI-Disclosure:** Claude (Fable 5) authored; Grant approved design 2026-07-08.
 
 ## What must be true when done
