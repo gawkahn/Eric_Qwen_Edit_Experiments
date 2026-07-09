@@ -173,7 +173,8 @@ sharing (unchanged from ADR-023); separate `--nag-negative`.
   noted as softer than Krea — consistent with HF1-1 (negative flows via
   T5 tokens only; positive pooled shared) plus the strong distillation
   prior at guidance 3.5; tuning order: scale 5-6 → alpha 0.3-0.4 → lower
-  guidance. flux2klein live check still pending.
+  guidance. flux2klein VERIFIED live by Grant later the same day —
+  every ADR-024 family is now live-confirmed. Slice closed.
 - 2026-07-09 (later) — IMPLEMENTED. `pipelines/nag_common.py` (shared
   formula + tail/front/full lane-merge helpers), `pipelines/nag_flux.py`,
   `pipelines/nag_flux2.py` (two processor variants + shared denoise loop +
