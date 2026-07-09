@@ -151,6 +151,9 @@ implementation drifts from this scope.
 
 ## Changelog
 
+- 2026-07-09 — VERIFIED live by Grant ("it works" — negative prompt
+  demonstrably influences Turbo output with --nag-scale). Slice closed;
+  deferred items tracked in TECH_DEBT 2026-07-08.
 - 2026-07-08 (review correction) — The method section's `φ = nag_scale`
   binding is wrong as written: with the paper's `Z̃ = Z⁺ + φ·(Z⁺ − Z⁻)`,
   the code form `Z⁺·s − Z⁻·(s−1)` corresponds to `s = φ + 1`, not `s = φ`.
