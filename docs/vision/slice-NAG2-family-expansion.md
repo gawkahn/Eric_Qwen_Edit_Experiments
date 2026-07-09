@@ -1,6 +1,8 @@
 # Vision — Slice NAG2: family expansion (flux, flux2, flux2klein, zimage)
 
-**Status:** in implementation 2026-07-09. Design: ADR-024. Risk: L2.
+**Status:** implemented 2026-07-09 (see ADR-024 changelog; code-reviewer
+blocking finding F1 folded); live per-family A/B by Grant pending.
+Design: ADR-024. Risk: L2.
 **AI-Disclosure:** Claude (Fable 5) authored; Grant directed the expansion.
 
 ## What must be true when done

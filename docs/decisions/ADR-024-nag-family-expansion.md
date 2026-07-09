@@ -163,6 +163,25 @@ sharing (unchanged from ADR-023); separate `--nag-negative`.
 
 ## Changelog
 
+- 2026-07-09 (later) — IMPLEMENTED. `pipelines/nag_common.py` (shared
+  formula + tail/front/full lane-merge helpers), `pipelines/nag_flux.py`,
+  `pipelines/nag_flux2.py` (two processor variants + shared denoise loop +
+  base/Klein mirrors), `pipelines/nag_zimage.py` (hand-swap install,
+  front-slice merge, list-based batch-2); gate table + importlib dispatch
+  in `generate.py`; `family_defaults.py` zimage-turbo comment corrected.
+  NEW HAZARD FOUND BY TESTS (HF1-1): Flux.1's temb includes the pooled
+  CLIP text projection — per-lane pooled embeds diverge the image lanes
+  and break NAG's same-queries requirement; the mirror tiles the POSITIVE
+  pooled to both lanes (the reference repo's TruncAdaLayerNorm hack solves
+  the same problem); pinned with a divergence negative-control test.
+  code-reviewer (Fable) 2026-07-09: 1 blocking finding folded (Z-Image
+  partial-swap restore — apply now appends into a caller-owned list
+  BEFORE each swap, so a mid-apply failure restores the swapped prefix;
+  contract test added) + 6 advisories folded (stale comments, deliberate
+  cache_context omission documented, callback KeyError parity, zimage
+  gate leg). security-auditor exemption per Review bar confirmed by the
+  reviewer. Tests: test_nag.py 101 (+51), schema +10; all 17 suites
+  2537/2537. Live per-family A/B by Grant pending.
 - 2026-07-09 — Initial. Accepted. Research basis: three parallel wiring-map
   agents over installed diffusers 0.39.0 (transformer_flux.py,
   transformer_flux2.py + both Flux.2 pipelines, transformer_z_image.py +

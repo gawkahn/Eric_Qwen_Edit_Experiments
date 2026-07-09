@@ -1049,3 +1049,10 @@ vendoring option.
   arXiv:2508.10931 benchmark); a non-krea distilled checkpoint needs negative prompts (→
   family expansion); NAG wanted in the ComfyUI graph (→ node surface); a model where CFG and
   NAG both matter (→ combined mode).
+
+**Partially resolved: 2026-07-09** — deferral (2) "other families" closed by ADR-024: NAG now
+covers flux, flux2, flux2klein, zimage, zimage-turbo (pipelines/nag_{common,flux,flux2,zimage}.py;
+family gate table in generate.py). Chroma stays deferred with a changed shape: it is de-distilled,
+so the right fix is routing negatives to its real CFG, not NAG. Deferrals (1) compute sharing,
+(3) ComfyUI nodes, and (4) CFG+NAG combined mode remain open, plus a new one: Flux.2
+reference-image (kontext) inputs skip NAG loudly (HF2-1). Triggers unchanged.
