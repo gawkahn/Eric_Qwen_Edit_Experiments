@@ -7,6 +7,34 @@ Format: **Item** — why deferred, what triggers revisiting.
 
 ## Security
 
+**extract_params: free-string fields (`model_family`/`prompt`/`negative_prompt`) echo verbatim** *(2026-07-09)*
+Both `_render_extracted_cascade_params` (step 4d) and the core-step
+`_render_extracted_params` (`comfyless/mcp_server.py:382-383`) re-emit these
+free-text fields verbatim (family with a truthy-string guard; prompts with an
+`isinstance str` guard). A crafted sidecar can therefore place an abs-path-shaped
+string in one of them and have it echo back in the response.
+**Why not now:** these are the same-uid caller's OWN sidecar bytes (no real
+resolved path or server secret is disclosed — the agent could read the file
+directly, ADR-015 §3), and they are semantically free text / a family label, not
+path-typed reference fields. The behavior is identical in the already-reviewed
+non-cascade renderer — 4d did not introduce it, and fixing only the cascade path
+would create an asymmetry. **Trigger:** a shared bound/validation across BOTH
+renderers (one slice), or any threat-model change that elevates the agent above
+trusted-same-uid (HTTP transport, multi-tenant). Surfaced by step-4d
+code-reviewer + security-auditor INFO, 2026-07-09
+(`docs/security/review-slice-4d-cascade-2026-07-09.md`).
+
+**extract_params: sidecar parsed with unbounded `json.load` (no size ceiling)** *(2026-07-09)*
+`_handle_extract_params` (`comfyless/mcp_server.py`) reads the gated `.json`
+sidecar with `json.load` and no size limit, so a same-uid actor who drops a very
+large `.json` under `--output-dir` could cause a transient memory spike.
+**Why not now:** same-uid, requires write access to the output dir, and it is a
+property of the whole slice-4 read path rather than the 4d cascade branch;
+no availability guarantee is currently in the threat model. **Trigger:** a
+resource-bound pass over the MCP read surface, or any move toward an untrusted /
+networked caller. Surfaced by step-4d security-auditor INFO, 2026-07-09
+(`docs/security/review-slice-4d-cascade-2026-07-09.md`).
+
 **MCP server: HF-cache-hit vs cache-miss is observably distinguishable to the agent** *(2026-05-17)*
 `comfyless/mcp_server.py:_handle_generate` step 4 (HF resolution) runs
 BEFORE step 5 (path allowlist). An agent probing HF repo IDs can distinguish

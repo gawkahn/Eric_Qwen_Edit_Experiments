@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-07
 **ADR:** [ADR-011](../decisions/ADR-011-comfyless-mcp-server.md) — §2 (`extract_params` row), §3 second exclusion (PNG NOT exposed; two ordered checks on the sidecar path argument), 2026-04-28 F-3 fold-in. [ADR-015](../decisions/ADR-015-mcp-catalog-reference-resolution.md) §3 (return catalog names; basename fallback + INFO notice on miss) / §5 slice-4. [ADR-022](../decisions/ADR-022-catalog-service.md) — the metadata DB as the enrichment source (a Changelog amendment extending its consumers to `extract_params`).
-**Status:** accepted (Grant approved 2026-07-07; implement Step 4a first). Supersedes the draft [slice-2-mcp-extract-params.md](slice-2-mcp-extract-params.md) (never approved; its two ordered path checks carry forward verbatim, its return contract is replaced by the ADR-015 names contract + ADR-022 enrichment settled here).
+**Status:** accepted (Grant approved 2026-07-07; implement Step 4a first). Steps 4a / core / step-3 (enrichment) shipped; **step 4d (flat cascade resolution) design added 2026-07-09** — see the [Step 4d](<#Step 4d — flat cascade sidecar resolution (follow-on)>) section. Supersedes the draft [slice-2-mcp-extract-params.md](slice-2-mcp-extract-params.md) (never approved; its two ordered path checks carry forward verbatim, its return contract is replaced by the ADR-015 names contract + ADR-022 enrichment settled here).
 **AI-Disclosure:** Claude (Opus 4.8, 1M context) authored; Grant to review and approve.
 
 ---
@@ -124,6 +124,42 @@ Step 4a: **N25** no `--catalog-db`, default file exists + readable → server ad
 - **Positive:** `./.venv/bin/python3 test_mcp_server.py` — new `extract_params` section exercises N6/N12/N17 against fixture sidecars + a fixture DB written into temp dirs; step-4a section exercises N25–N28.
 - **Negatives N1–N28** as sections in `test_mcp_server.py` (script-style, no pytest; run via `./.venv/bin/python3` per ADR-013). Static-source checks (N-newkeys) via `inspect.getsource`/`ast`.
 - **All sixteen suites continue to pass** (current 2259; `test_mcp_server.py` count grows). CLAUDE.md suite-count line updated in the closure step.
+
+## Step 4d — flat cascade sidecar resolution (follow-on)
+
+**Date:** 2026-07-09. **Status:** accepted (Grant approved the detection heuristic 2026-07-09 — OR of the two signals below). Follow-on within this accepted slice; the core step (invariant 8 ¶2, N16) forward-referenced it. Same L3 Red Zone gate: `code-reviewer` (Opus) **and** `security-auditor` (Opus) before commit; security output to `docs/security/review-slice-4d-cascade-2026-07-09.md`.
+
+### Problem
+
+A real on-disk cascade sidecar (written only by `cascade.py` `dispatch()` → `_write_sidecar`; the MCP cascade handler writes no JSON sidecar) is **FLAT**: `stage_c`/`stage_b`/`stage_a`/`scaffolding_repo` and the runtime keys `config_source`/`output_path` are top-level, never nested under `cascade_config` (verified `cascade.py:75-89`, `:930-950`). Every one is non-schema, so the core-step `_validate_params` drops them ALL. Result today: **safe** (no abs-path egress — N16) but **no stage-name replay**. Step 4d recovers replay by resolving the flat `stage_*` to catalog names, still leaking nothing.
+
+### Design
+
+- **Detection (on the RAW blob, before normalization erases the keys):**
+  `cascade = isinstance(raw.get("stage_c"), str) or raw.get("model_family") == "stable-cascade"`.
+  The OR maximizes legitimate replay coverage; both branches are leak-safe regardless of which fires (a false-positive routes a non-cascade blob through the cascade allowlist, which drops everything unrecognized; a false-negative routes a cascade blob through the non-cascade path, which drops all cascade keys — the pre-4d status quo).
+- **Rendering (new helper `_render_extracted_cascade_params(raw, *, index, catalog)` → `(params_out, notices, hit_names)`):** reads the RAW sidecar directly (NOT `_validate_params` — it would erase the cascade keys). Emits `params = {prompt?, negative_prompt?, seed?, model_family?, cascade_config: {…}}` where `cascade_config` is built by an **ALLOWLIST** (never a denylist — the reviewer's abs-path-egress concern, Vision invariant 8 ¶2) of known cascade scalar fields.
+- **Stage resolution** reuses `_resolve_sidecar_ref` verbatim against the LIVE `cfg.catalog`, kinds `("model", "transformer")` (a stage weight catalogs as `transformer` single-file / `model` diffusers-tree — identical to `_handle_generate_cascade` §2.5). `model_family` from raw feeds family disambiguation.
+- **Enrichment** reuses `_enrich_from_catalog_db` on the resolved-hit stage names (invariants 11-12 unchanged).
+
+### Invariants (extend the core-step list)
+
+17. **Detection is on the RAW blob; the cascade branch never calls `_validate_params`.** Because the flat cascade keys are non-schema, normalization would erase them; the cascade renderer reads raw. It still performs NO CLI dispatch, NO PNG parse, NO model load / network / write (invariants 5/7 hold). It never calls `cascade.validate_config` (that applies defaults / coerces / can raise — extract is a read-only reporter, not a validator).
+18. **Stage refs resolve via `_resolve_sidecar_ref`, kinds `{model, transformer}`, against the LIVE catalog only.** `stage_c`/`stage_b` expected, `stage_a` optional (key omitted when absent/empty). Hit → catalog name (a replay-valid `resolve_reference` key); miss / unresolved ambiguity → bare basename + one INFO notice (invariants 9/10/15 reused). No filesystem op on any stage value; the DB never resolves.
+19. **Output `cascade_config` is an ALLOWLIST, replay-shaped, no abs path.** Only these fields cross: `stage_c`/`stage_b`/`stage_a` (names), `prior_steps`, `prior_cfg_scale`, `decoder_steps`, `decoder_cfg_scale`, `width`, `height`, `prior_dtype`, `decoder_dtype`, `vae_dtype`. Numerics coerce to number-or-None (a crafted `prior_steps:"/mnt/x"` becomes `None`, never an echoed string — mirrors the LoRA-weight coercion, code-reviewer slice-4 LOW); dtype fields are **value-allowlisted** to the exact set `cascade._resolve_torch_dtype` accepts (`bf16`/`bfloat16`/`fp16`/`float16`/`half`/`fp32`/`float32`/`float`) and dropped otherwise — a length cap alone would let a short `/`-bearing string egress (code-reviewer + security-auditor step-4d MEDIUM, 2026-07-09; N32b). Unknown top-level / cascade keys are dropped. The nested shape mirrors `_resolved_cascade_params_as_names`, i.e. the `generate` tool's `cascade_config` input — so the returned blob replays.
+20. **`scaffolding_repo`, `config_source`, `output_path`, and all runtime keys are dropped.** `scaffolding_repo` is the operator-default architecture config, not agent-affectable (mirrors the generate-cascade removed-field rule + `_resolved_cascade_params_as_names`); `config_source`/`output_path` are abs paths; `iterate_batch_id`/`run_index`/`total_runs`/`timestamp`/`elapsed_seconds`/`prior_seconds`/`decoder_seconds` are runtime noise. None appear anywhere in the response (no key, no value).
+21. **Enrichment reuse, unchanged.** Resolved-hit stage names feed the SAME `_enrich_from_catalog_db` (read-only, by-name, allowlisted, fail-open, separate top-level `enrichment` map — invariants 11-12). Miss basenames and non-hits are never enriched. Boundary invariants 13-15 are unchanged: `extract_params` stays advertised unconditionally; the audit line still omits params + enrichment content.
+
+### Negative cases (extend N1-N28)
+
+- **N29** REAL flat cascade sidecar (top-level `stage_c`/`stage_b` in catalog, plus `scaffolding_repo`/`config_source`/`output_path`) → `params.cascade_config.stage_c`/`stage_b` are catalog NAMES; response body contains NO `scaffolding_repo`/`config_source`/`output_path` key and NO abs directory string (`/mnt/…`, model-base/output-dir roots); top-level `prompt`/`seed`/`model_family` survive.
+- **N30** `stage_a` present + in catalog → `cascade_config.stage_a` = its name; `stage_a` absent → key omitted (no null).
+- **N31** a cascade stage not in the catalog → `cascade_config.stage_*` = bare basename (no directory) + exactly one INFO `"reference not in catalog; returned as filename"` notice; ambiguous `(kind, basename)` unresolved by family → treated as miss, never a wrong-name guess (N15 reused).
+- **N32** cascade sidecar with a junk top-level key (`"__exfil__":"/mnt/secret"`) and a junk cascade scalar (`"prior_steps":"/mnt/x"`) → junk key absent from response; `prior_steps` coerced to `None` (never the string); no abs path anywhere.
+- **N33** detection via `model_family` alone (`stage_c` missing, `model_family=="stable-cascade"`) → routed to the cascade renderer (OR heuristic); resolves whatever `stage_*` are present, else an empty allowlisted `cascade_config`.
+- **N34** DB present + a resolved stage name has a description row → `enrichment[<stage-name>]` is an allowlisted block; contains no `abs_path`/`root`/`relative_path`.
+- **N35** a NON-cascade sidecar (`model` present, no `stage_c`, `model_family != "stable-cascade"`) → unchanged core-step behavior (regression guard that 4d did not alter the non-cascade branch: no `cascade_config` key appears).
+- **N36** an in-catalog cascade `stage_c` → the returned stage name is a valid `resolve_reference` key (round-trips — mirrors N12).
 
 ## Red Zone ownership
 

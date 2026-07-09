@@ -323,12 +323,13 @@ def _render_extracted_params(normalized: dict, *, model_family,
     (code-reviewer slice-4 LOW). Notices are deduped (multiple misses collapse
     to one generic INFO notice; N13).
 
-    Cascade (Stable Cascade) sidecars are OUT OF SCOPE here: their real
-    on-disk shape is FLAT (`cascade.py` dispatch spreads the config —
-    `stage_c`/`stage_b`/`config_source`/`output_path` — at top level, NOT
-    nested under `cascade_config`), and every such key is non-schema, so
-    `_validate_params` drops them all (no leak, but no stage replay). Real
-    flat-cascade support is a follow-on step (4d); see the Vision.
+    Cascade (Stable Cascade) sidecars are NOT rendered here: their real on-disk
+    shape is FLAT (`cascade.py` dispatch spreads the config —
+    `stage_c`/`stage_b`/`config_source`/`output_path` — at top level, NOT nested
+    under `cascade_config`), and every such key is non-schema, so
+    `_validate_params` would drop them all. The handler routes a detected cascade
+    sidecar to `_render_extracted_cascade_params` (step 4d) BEFORE this function
+    is reached; this function only ever sees non-cascade blobs.
     """
     out = dict(normalized)
     notices: list = []
@@ -388,6 +389,126 @@ def _render_extracted_params(normalized: dict, *, model_family,
             seen.add(n["message"])
             deduped.append(n)
     return out, deduped, hits
+
+
+#: cascade_config scalar allowlist for step-4d flat-cascade rendering
+#: (Vision invariant 19). Numerics coerce to number-or-None; dtypes to a
+#: short string. Everything else (paths, runtime keys, unknowns) is dropped.
+_CASCADE_NUMERIC_FIELDS = ("prior_steps", "prior_cfg_scale",
+                           "decoder_steps", "decoder_cfg_scale",
+                           "width", "height")
+_CASCADE_DTYPE_FIELDS = ("prior_dtype", "decoder_dtype", "vae_dtype")
+#: The ONLY dtype VALUES that may cross the boundary — the exact set
+#: `cascade._resolve_torch_dtype` accepts. Value-allowlisting (not just a length
+#: cap) closes the one hole where a crafted `/`-bearing string could egress
+#: through a dtype field, matching the number-or-None discipline on the numeric
+#: fields (code-reviewer + security-auditor step-4d MEDIUM, 2026-07-09).
+_CASCADE_DTYPE_VALUES = frozenset((
+    "bf16", "bfloat16", "fp16", "float16", "half",
+    "fp32", "float32", "float"))
+
+
+def _is_cascade_sidecar(raw: dict) -> bool:
+    """Detect a FLAT Stable Cascade sidecar on the RAW blob (step 4d).
+
+    OR of two signals (Grant 2026-07-09): a top-level string `stage_c` (the
+    cascade-defining key — a non-cascade generate sidecar never has it) OR
+    `model_family == "stable-cascade"` (what `cascade.py` dispatch writes into
+    the sidecar). Both render branches are leak-safe regardless of which fires;
+    the OR maximizes legitimate replay coverage (Vision step-4d detection).
+    """
+    return (isinstance(raw.get("stage_c"), str)
+            or raw.get("model_family") == "stable-cascade")
+
+
+def _render_extracted_cascade_params(raw: dict, *, index: dict,
+                                     catalog: dict) -> tuple:
+    """Render a FLAT Stable Cascade sidecar (step 4d) into a replay-shaped,
+    ALLOWLISTED params blob whose stage references are live-catalog NAMES.
+    Returns `(params_out, notices, hit_names)` — same contract as
+    `_render_extracted_params`; `hit_names` are the resolved stage names that
+    are catalog hits (the enrichment targets, invariant 21).
+
+    The real on-disk cascade sidecar is flat (`cascade.py` dispatch spreads the
+    config at top level — `stage_c`/`stage_b`/`stage_a`/`scaffolding_repo` and
+    the runtime keys `config_source`/`output_path` are top-level; verified
+    cascade.py:75-89, :930-950). Every key is non-schema, so this path reads the
+    RAW blob directly (NOT `_validate_params`, which would erase them all) and
+    NOT `cascade.validate_config` (extract is a read-only reporter, not a
+    validator — invariant 17). No model load, no network, no write.
+
+    No absolute path or directory survives (invariants 19-20):
+      - `stage_c`/`stage_b`/`stage_a` -> live-catalog names (kinds
+        {model, transformer}, via `_resolve_sidecar_ref` against the LIVE
+        catalog only); basename + one INFO notice on catalog miss; `stage_a`
+        omitted when absent/empty.
+      - `scaffolding_repo` (operator-default architecture config, not agent-
+        affectable), `config_source`, `output_path`, and every runtime/timing
+        key are DROPPED (never emitted).
+      - `cascade_config` is built by an ALLOWLIST of known scalar fields, never
+        a denylist over caller bytes (Vision invariant 8 ¶2 — the reviewer's
+        abs-path-egress concern). Numerics coerce to number-or-None so a crafted
+        string/path can never smuggle across a numeric field (mirrors the LoRA-
+        weight coercion, code-reviewer slice-4 LOW); dtype fields coerce to a
+        capped short string or drop.
+    Top-level `prompt`/`negative_prompt`/`seed`/`model_family` pass through with
+    light type guards. The nested shape mirrors `_resolved_cascade_params_as_names`
+    (the `generate` tool's `cascade_config` input), so the blob replays.
+    """
+    family = raw.get("model_family")
+    family = family if isinstance(family, str) and family else None
+
+    notices: list = []
+    hits: set = set()
+    cc_out: dict = {}
+
+    for stage in ("stage_c", "stage_b", "stage_a"):
+        val = raw.get(stage)
+        if not isinstance(val, str) or not val:
+            continue  # stage_a (and any absent stage) is simply omitted
+        name, missed = _resolve_sidecar_ref(
+            val, ("model", "transformer"), family, index, catalog)
+        cc_out[stage] = name
+        if missed:
+            notices.append({"level": "INFO",
+                            "message": _EXTRACT_NOT_IN_CATALOG_NOTICE})
+        elif name in catalog:  # a hit (never a miss basename or HF passthrough)
+            hits.add(name)
+
+    # Allowlisted scalar carry-through (invariant 19). Numerics -> number-or-None;
+    # dtype names -> a capped short string. Unknown keys never reach here.
+    for k in _CASCADE_NUMERIC_FIELDS:
+        if k in raw:
+            v = raw[k]
+            cc_out[k] = v if isinstance(v, (int, float)) and not isinstance(
+                v, bool) else None
+    for k in _CASCADE_DTYPE_FIELDS:
+        v = raw.get(k)
+        # Value-allowlist, not a length cap: a crafted `/`-bearing dtype string
+        # must never echo across the boundary (invariant 19 / 20). Unknown value
+        # -> dropped, exactly like a non-numeric on a numeric field above.
+        if isinstance(v, str) and v.lower() in _CASCADE_DTYPE_VALUES:
+            cc_out[k] = v.lower()
+
+    params_out: dict = {"cascade_config": cc_out}
+    for k in ("prompt", "negative_prompt"):
+        v = raw.get(k)
+        if isinstance(v, str):
+            params_out[k] = v
+    sv = raw.get("seed")
+    if isinstance(sv, int) and not isinstance(sv, bool):
+        params_out["seed"] = sv
+    if family:
+        params_out["model_family"] = family
+
+    # Dedupe notices (multiple stage misses collapse to one INFO; mirrors N13).
+    seen: set = set()
+    deduped: list = []
+    for n in notices:
+        if n["message"] not in seen:
+            seen.add(n["message"])
+            deduped.append(n)
+    return params_out, deduped, hits
 
 
 def _enrich_from_catalog_db(names, catalog: dict, db_path) -> dict:
@@ -2635,7 +2756,11 @@ async def _handle_extract_params(
     `_validate_params` normalizer is used — never the CLI's `_load_params` /
     `_load_sidecar` (which reach the PNG path / CLI dispatch). No model load,
     no network, no write. Name resolution runs against the LIVE `cfg.catalog`,
-    never the metadata DB (DB enrichment lands in slice-4 step 3).
+    never the metadata DB; DB enrichment (step 3) is by resolved name, read-only,
+    fail-open. A FLAT Stable Cascade sidecar (step 4d) is detected on the RAW
+    blob and routed to `_render_extracted_cascade_params` (allowlisted nested
+    `cascade_config` with stage_* as catalog names); all other sidecars go
+    through the pure `_validate_params` + `_render_extracted_params` path.
     """
     # Input-shape validation (the framework runs with validate_input=False,
     # so the handler defends itself). NUL is rejected before any realpath.
@@ -2671,14 +2796,21 @@ async def _handle_extract_params(
     raw_family = raw.get("model_family")
     family = raw_family if isinstance(raw_family, str) and raw_family else None
 
-    # Pure COMFYLESS_SCHEMA normalization: drops unknown / non-parameter keys.
-    # NOT _load_params (-> PNG path) and NOT CLI dispatch (invariant 5).
-    from comfyless.generate import _validate_params
-    normalized = _validate_params(raw, source="extract_params")
-
     index = _sidecar_name_index(cfg.catalog)
-    params_out, notices, hit_names = _render_extracted_params(
-        normalized, model_family=family, index=index, catalog=cfg.catalog)
+    if _is_cascade_sidecar(raw):
+        # Step 4d: a FLAT Stable Cascade sidecar. Its keys are all non-schema
+        # (`_validate_params` would erase them), so render from the RAW blob via
+        # an allowlist; the stage_* references resolve to live-catalog NAMES
+        # (invariants 17-20). Same leak-safe resolver + enrichment reuse.
+        params_out, notices, hit_names = _render_extracted_cascade_params(
+            raw, index=index, catalog=cfg.catalog)
+    else:
+        # Pure COMFYLESS_SCHEMA normalization: drops unknown / non-parameter
+        # keys. NOT _load_params (-> PNG path) and NOT CLI dispatch (invariant 5).
+        from comfyless.generate import _validate_params
+        normalized = _validate_params(raw, source="extract_params")
+        params_out, notices, hit_names = _render_extracted_params(
+            normalized, model_family=family, index=index, catalog=cfg.catalog)
 
     # Step 3: enrich each resolved name with metadata-DB detail (read-only,
     # by name, fail-open). Absent DB / no metadata -> no `enrichment` key.

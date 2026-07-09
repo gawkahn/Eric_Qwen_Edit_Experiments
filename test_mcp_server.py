@@ -4483,11 +4483,13 @@ with tempfile.TemporaryDirectory() as _tp_out, \
           _r4b["params"]["loras"] == [{"name": "dupA", "weight": 1.0}]
           and "notices" not in _r4b)
 
-    # ── N16 (descope): a REAL cascade sidecar is FLAT (cascade.py spreads the
-    # config at top level, NOT under cascade_config — stage_c/stage_b/
-    # config_source/output_path are top-level). Every cascade/path key is
-    # non-schema, so _validate_params drops them all: no stage replay yet
-    # (follow-on step 4d) but crucially NO abs path leaks. ──
+    # ── N31 (step 4d): a REAL flat cascade sidecar whose stages are NOT in this
+    # catalog. cascade.py spreads the config at top level (stage_c/stage_b/
+    # config_source/output_path top-level). Step 4d now RESOLVES the flat
+    # stage_* under a nested cascade_config — here misses -> bare basenames +
+    # one INFO notice — while still DROPPING scaffolding_repo/config_source/
+    # output_path and leaking NO abs path. (Was N16-descope pre-4d; the deeper
+    # hit/enrichment/round-trip cases live in the step-4d section below.) ──
     _r5 = _extract(_write_sidecar("cascade_flat.json", {
         "prompt": "a castle", "seed": 7,
         "model_family": "stable-cascade",
@@ -4497,15 +4499,23 @@ with tempfile.TemporaryDirectory() as _tp_out, \
         "config_source": "/home/user/cascade_default.json",
         "output_path": "/outputs/castle.png"}))
     _p5 = _r5["params"]
-    check("N16(descope): flat cascade path fields all dropped (no leak)",
-          all(k not in _p5 for k in ("stage_c", "stage_b", "scaffolding_repo",
-                                     "config_source", "output_path"))
-          and "cascade_config" not in _p5)
-    check("N16(descope): flat cascade sidecar leaks no abs path anywhere",
+    _cc5 = _p5.get("cascade_config", {})
+    check("N31(4d): flat cascade routed -> nested cascade_config present",
+          isinstance(_cc5, dict) and _cc5)
+    check("N31(4d): out-of-catalog stages -> bare basenames (no directory)",
+          _cc5.get("stage_c") == "stage_c.safetensors"
+          and _cc5.get("stage_b") == "stage_b.safetensors")
+    check("N31(4d): miss -> exactly one INFO notice, verbatim ADR-015 text",
+          _r5.get("notices") == [{"level": "INFO",
+              "message": "reference not in catalog; returned as filename"}])
+    check("N29(4d): scaffolding_repo/config_source/output_path all dropped",
+          all(k not in _cc5 and k not in _p5 for k in
+              ("scaffolding_repo", "config_source", "output_path")))
+    check("N29(4d): flat cascade sidecar leaks no abs path anywhere",
           "/models/" not in _json.dumps(_r5)
           and "/home/" not in _json.dumps(_r5)
           and "/outputs/" not in _json.dumps(_r5))
-    check("N16(descope): non-path params (prompt/seed/model_family) survive",
+    check("N29(4d): non-path params (prompt/seed/model_family) survive",
           _p5.get("prompt") == "a castle" and _p5.get("seed") == 7
           and _p5.get("model_family") == "stable-cascade")
 
@@ -4815,6 +4825,180 @@ with tempfile.TemporaryDirectory() as _te_out, \
           == [{"name": "cool_lora", "weight": 0.7},
               {"name": "unknown.safetensors", "weight": 0.5}]
           and "enrichment" not in _rboom)
+
+
+# ════════════════════════════════════════════════════════════════════════
+print("\n== Slice 4 step 4d: extract_params flat-cascade resolution ==")
+# ════════════════════════════════════════════════════════════════════════
+
+def _mk_cascade_db(path):
+    conn = _cdb.connect(path)
+    e = _cdb.upsert_entry(conn, name="cascade_prior", kind="model",
+                          abs_path="/models/cascade/stage_c")
+    _cdb.set_entry_family(conn, e, "stable-cascade")
+    _cdb.upsert_description(conn, entry_id=e, source="civitai_api",
+                            model_name="Cascade Prior",
+                            description="Stage C prior",
+                            strength_rec="1.0")
+    _cdb.rebuild_fts(conn)
+    conn.commit()
+    conn.close()
+
+
+with tempfile.TemporaryDirectory() as _tc_out, \
+     tempfile.TemporaryDirectory() as _tc_db:
+    _cout = os.path.realpath(_tc_out)
+    _cdbp = os.path.join(_tc_db, "cascade.sqlite")
+    _mk_cascade_db(_cdbp)
+    # Cascade stages catalog as kind {model (diffusers tree) | transformer
+    # (single-file)} — the SAME kinds _handle_generate_cascade resolves against.
+    _ccat = {
+        "cascade_prior": {"abs_path": "/models/cascade/stage_c",
+                          "kind": "model", "source": "scan",
+                          "model_family": "stable-cascade",
+                          "target_family": None},
+        "cascade_decoder": {"abs_path": "/models/cascade/stage_b.safetensors",
+                            "kind": "transformer", "source": "scan",
+                            "model_family": "stable-cascade",
+                            "target_family": None},
+        "cascade_vqgan": {"abs_path": "/models/cascade/stage_a.safetensors",
+                          "kind": "transformer", "source": "scan",
+                          "model_family": "stable-cascade",
+                          "target_family": None},
+    }
+    _ccfg = mcps._StartupConfig(
+        output_dir=_cout, model_base=_cout, default_model=None,
+        mcp_max_iterations=100, catalog=_ccat, catalog_db_path=_cdbp)
+
+    def _cwrite(fname, obj):
+        p = os.path.join(_cout, fname)
+        with open(p, "w") as f:
+            _json.dump(obj, f)
+        return p
+
+    def _cextract(cfg, p):
+        res = _run(mcps._handle_extract_params(cfg, {"path": p}))
+        return _json.loads(res[0].text)
+
+    # ── N29/N30/N36: real flat cascade sidecar, all stages IN catalog ──
+    _rc = _cextract(_ccfg, _cwrite("cflat1.json", {
+        "prompt": "a knight", "negative_prompt": "blurry", "seed": 11,
+        "model_family": "stable-cascade",
+        "stage_c": "/some/dir/stage_c",
+        "stage_b": "/other/dir/stage_b.safetensors",
+        "stage_a": "/x/stage_a.safetensors",
+        "prior_steps": 20, "prior_cfg_scale": 4.0,
+        "decoder_steps": 10, "decoder_cfg_scale": 0.0,
+        "width": 1024, "height": 1024,
+        "prior_dtype": "bf16", "decoder_dtype": "bf16", "vae_dtype": "fp32",
+        "scaffolding_repo": "stabilityai/stable-cascade",
+        "config_source": "/home/user/casc.json",
+        "output_path": "/outputs/knight.png",
+        "run_index": 0, "total_runs": 1, "timestamp": "2026-01-01",
+        "elapsed_seconds": 9.9, "prior_seconds": 5.0, "decoder_seconds": 4.9,
+        "__exfil__": "/mnt/secret"}))
+    _pc = _rc["params"]
+    _ccc = _pc.get("cascade_config", {})
+    check("N29(4d): stage_c/stage_b/stage_a -> catalog NAMES",
+          _ccc.get("stage_c") == "cascade_prior"
+          and _ccc.get("stage_b") == "cascade_decoder"
+          and _ccc.get("stage_a") == "cascade_vqgan")
+    check("N36(4d): a resolved stage name is a live catalog key (round-trips)",
+          _ccc.get("stage_c") in _ccfg.catalog)
+    check("N29(4d): all-hit cascade sidecar carries no notices",
+          "notices" not in _rc)
+    check("N19-allow(4d): cascade_config carries only allowlisted scalars",
+          _ccc.get("prior_steps") == 20 and _ccc.get("decoder_cfg_scale") == 0.0
+          and _ccc.get("width") == 1024 and _ccc.get("prior_dtype") == "bf16"
+          and _ccc.get("vae_dtype") == "fp32")
+    check("N20/N29(4d): scaffolding_repo/config_source/output_path + runtime "
+          "keys all dropped",
+          all(k not in _ccc and k not in _pc for k in (
+              "scaffolding_repo", "config_source", "output_path",
+              "run_index", "total_runs", "timestamp", "elapsed_seconds",
+              "prior_seconds", "decoder_seconds")))
+    check("N32(4d): junk top-level key dropped",
+          "__exfil__" not in _json.dumps(_rc))
+    _fc = _json.dumps(_rc)
+    check("N29(4d): no abs path anywhere in response",
+          "/some/" not in _fc and "/other/" not in _fc and "/x/" not in _fc
+          and "/home/" not in _fc and "/outputs/" not in _fc
+          and "/mnt/" not in _fc)
+    check("N29(4d): top-level prompt/negative_prompt/seed/model_family survive",
+          _pc.get("prompt") == "a knight"
+          and _pc.get("negative_prompt") == "blurry"
+          and _pc.get("seed") == 11
+          and _pc.get("model_family") == "stable-cascade")
+
+    # ── N30: stage_a absent -> key omitted (no null) ──
+    _rc2 = _cextract(_ccfg, _cwrite("cflat2.json", {
+        "model_family": "stable-cascade",
+        "stage_c": "/d/stage_c", "stage_b": "/d/stage_b.safetensors"}))
+    _ccc2 = _rc2["params"].get("cascade_config", {})
+    check("N30(4d): stage_a absent -> cascade_config has no stage_a key",
+          "stage_a" not in _ccc2 and _ccc2.get("stage_c") == "cascade_prior")
+
+    # ── N32: a non-numeric cascade scalar coerced to None (no string egress) ──
+    _rc3 = _cextract(_ccfg, _cwrite("cflat3.json", {
+        "stage_c": "/d/stage_c", "stage_b": "/d/stage_b.safetensors",
+        "prior_steps": "/mnt/evil"}))
+    _ccc3 = _rc3["params"].get("cascade_config", {})
+    check("N32(4d): non-numeric cascade scalar coerced to None (no string "
+          "egress)",
+          _ccc3.get("prior_steps") is None and "/mnt/" not in _json.dumps(_rc3))
+
+    # ── N32b: a `/`-bearing dtype value is VALUE-allowlisted -> dropped, never
+    # echoed (code-reviewer + security-auditor step-4d MEDIUM). A legit dtype
+    # in the same sidecar still survives, proving drop is value-scoped. ──
+    _rc3b = _cextract(_ccfg, _cwrite("cflat3b.json", {
+        "stage_c": "/d/stage_c", "stage_b": "/d/stage_b.safetensors",
+        "prior_dtype": "/mnt/secret/x", "decoder_dtype": "bf16",
+        "vae_dtype": "not-a-dtype"}))
+    _ccc3b = _rc3b["params"].get("cascade_config", {})
+    check("N32b(4d): path-shaped dtype dropped; no abs path egress",
+          "prior_dtype" not in _ccc3b and "/mnt/" not in _json.dumps(_rc3b))
+    check("N32b(4d): unknown non-path dtype also dropped (value-allowlist)",
+          "vae_dtype" not in _ccc3b)
+    check("N32b(4d): a legit dtype in the same sidecar still passes",
+          _ccc3b.get("decoder_dtype") == "bf16")
+
+    # ── N33: detection by model_family alone (no top-level stage_c) ──
+    _rc4 = _cextract(_ccfg, _cwrite("cflat4.json", {
+        "model_family": "stable-cascade", "prompt": "z",
+        "stage_b": "/d/stage_b.safetensors"}))
+    check("N33(4d): model_family-only detection routes to cascade renderer",
+          "cascade_config" in _rc4["params"]
+          and _rc4["params"]["cascade_config"].get("stage_b")
+          == "cascade_decoder")
+
+    # ── N34: enrichment of a resolved stage name (read-only, allowlisted) ──
+    _enrc = _rc.get("enrichment", {})
+    check("N34(4d): resolved stage name enriched from DB "
+          "(strength_rec + model_family)",
+          _enrc.get("cascade_prior", {}).get("description", {})
+              .get("strength_rec") == "1.0"
+          and _enrc.get("cascade_prior", {}).get("model_family")
+              == "stable-cascade")
+    check("N34(4d): enrichment leaks no path-typed field",
+          "abs_path" not in _json.dumps(_enrc)
+          and "/models/" not in _json.dumps(_enrc)
+          and "relative_path" not in _json.dumps(_enrc))
+
+    # ── N35: NON-cascade sidecar unaffected (regression guard) ──
+    _rc5 = _cextract(_ccfg, _cwrite("noncascade.json", {
+        "prompt": "plain", "model": "/n/whatever.safetensors",
+        "steps": 30, "model_family": "flux2"}))
+    check("N35(4d): non-cascade sidecar -> no cascade_config key (path "
+          "unaltered)",
+          "cascade_config" not in _rc5["params"]
+          and _rc5["params"].get("model_family") == "flux2")
+
+    # ── source-level (N17): cascade branch never normalizes/validates ──
+    _rcc_src = inspect.getsource(mcps._render_extracted_cascade_params)
+    check("N17(4d): cascade renderer never CALLS _validate_params/validate_config "
+          "(call-form check; docstring may name them)",
+          "_validate_params(" not in _rcc_src
+          and "validate_config(" not in _rcc_src)
 
 
 # ════════════════════════════════════════════════════════════════════════
