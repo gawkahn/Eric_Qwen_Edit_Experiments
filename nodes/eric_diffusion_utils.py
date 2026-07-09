@@ -657,10 +657,15 @@ def _load_single_weights(component_class, weights_path: str, dtype,
         classify_fp8_single_file, load_scaled_fp8_component,
     )
     _fp8_variant, _fp8_info = classify_fp8_single_file(weights_path)
-    if _fp8_variant in ("ca", "cb", "cq-a", "cq-w"):
-        print(f"[EricDiffusion] Detected ComfyUI scaled-fp8 checkpoint "
-              f"(variant {_fp8_variant}, {_fp8_info.get('n_fp8', '?')} fp8 "
-              f"tensors) — native scaled-fp8 loader")
+    if _fp8_variant in ("ca", "cb", "cq-a", "cq-w", "ci-w"):
+        if _fp8_variant == "ci-w":
+            print(f"[EricDiffusion] Detected ComfyUI int8-tensorwise "
+                  f"checkpoint ({_fp8_info.get('n_int8', '?')} int8 "
+                  f"tensors) — dequant-to-bf16 loader (slice I8)")
+        else:
+            print(f"[EricDiffusion] Detected ComfyUI scaled-fp8 checkpoint "
+                  f"(variant {_fp8_variant}, {_fp8_info.get('n_fp8', '?')} "
+                  f"fp8 tensors) — native scaled-fp8 loader")
         return load_scaled_fp8_component(
             component_class, weights_path, dtype, config_path,
             _fp8_variant, strip_prefix=detected_prefix,

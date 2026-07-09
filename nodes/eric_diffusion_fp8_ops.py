@@ -57,6 +57,23 @@ descriptor-absence, so a present scale is never silently discarded. No
 naked-fraction cap — airtightness comes from the fully-bare reject, not
 from bounding the fraction (a mostly-naked file just loads as a bf16 model).
 
+Slice I8 (ci-w, security review reqs 46-56): comfy_quant descriptors may
+instead pair with INT8 weights — ComfyUI-core int8_tensorwise (unrotated).
+Flavor derives from paired-weight DTYPES before any JSON read (D5); the
+int8 descriptor then must be EXACTLY {"format": "int8_tensorwise"} — a
+STRICT field allowlist, because this schema is demonstrated to carry
+weight-SEMANTICS modifiers (ConvRot rotations): unknown fields reject,
+never log-and-ignore (the fp8 D8 rule does not apply to this flavor, and
+convrot-prefixed fields reject on fp8 descriptors too, I8-4). No naked-
+int8 analog of PQ exists — raw int8 bytes have no float interpretation,
+so every I8 tensor must be a fully-paired 2D .weight (both classify and
+load enforce it; the stage-2 pass-through refuses int8 in all variants).
+int8 scales are scalar {BF16,F32}; fp8 scales stay F32-only. ci-w has NO
+residency op (no Int8Linear): it always dequantizes to bf16 — with
+--quant fp8, torchao re-quantizes downstream. Marker-less all-int8 files
+never enter this parser (entry condition) and keep their standard-path
+behavior (invariant 2).
+
 Slice R1/R2 (security review R1R2R3, reqs 39-45): the per-layer rule extends
 to NON-`.weight` fp8 tensors (norm scales, biases, modulation tables —
 aggressive ComfyUI exports cast these to fp8 too): fully bare → upcast to
@@ -238,18 +255,45 @@ def _classify_cq(path: str, keys, dtypes, shapes, fp8_keys, cq_keys, cb_hits):
                 f"{_CQ_MAX_NUMEL} bytes; refusing without reading it (D2)"
             )
 
-    # D1: every descriptor pairs with an fp8 weight at the same base.
+    # D1 (amended — slice I8, req 46): every descriptor pairs with a
+    # QUANTIZED weight at the same base — fp8 (cq flavors) or int8 (ci-w).
+    # The FLAVOR derives from the paired tensor DTYPES exclusively, computed
+    # BEFORE any descriptor JSON is read (D5: attacker JSON never selects
+    # the flavor; the per-flavor format allowlist then cross-checks it).
     key_set = set(keys)
     cq_bases = set()
+    _paired = {}   # base -> header dtype of its .weight
     for k in cq_keys:
         base = k[: -len(_CQ_SUFFIX)]
         wk = base + ".weight"
-        if wk not in key_set or dtypes.get(wk) not in _FP8_DTYPES:
+        wdt = dtypes.get(wk)
+        if wk not in key_set or wdt not in _FP8_DTYPES + ("I8",):
             raise ScaledFp8FormatError(
-                f"descriptor {_safe_name(k)} has no fp8 weight at "
-                f"{_safe_name(wk)} — dangling descriptors are refused (D1)"
+                f"descriptor {_safe_name(k)} has no quantized weight at "
+                f"{_safe_name(wk)} (found: {wdt or 'missing'}) — dangling "
+                f"descriptors are refused (D1)"
             )
+        _paired[base] = wdt
         cq_bases.add(base)
+    if any(d == "I8" for d in _paired.values()):
+        if any(d != "I8" for d in _paired.values()):
+            _bi = next(b for b, d in _paired.items() if d == "I8")
+            _bf = next(b for b, d in _paired.items() if d != "I8")
+            raise ScaledFp8FormatError(
+                f"file mixes int8 ({_safe_name(_bi)}) and fp8 "
+                f"({_safe_name(_bf)}) descriptored weights — a legitimate "
+                f"file uses one quant flavor; refusing (I8 req 46)"
+            )
+        return _classify_ci(path, keys, dtypes, shapes, cq_keys, cq_bases,
+                            key_set)
+    # fp8 flavor + any I8 tensor anywhere = ambiguous/crafted now that I8
+    # carries meaning in this parser; the loader re-asserts (req 49/54).
+    _i8_stray = [k for k in keys if dtypes[k] == "I8"]
+    if _i8_stray:
+        raise ScaledFp8FormatError(
+            f"fp8-flavored comfy_quant file carries int8 tensor "
+            f"{_safe_name(_i8_stray[0])} — refusing (I8 req 54)"
+        )
 
     # D3 (amended — slice PQ, security review PQ-1 / req 31): a cq file MAY
     # carry "naked" plain-fp8 layers ALONGSIDE the descriptored set — ComfyUI
@@ -313,6 +357,22 @@ def _classify_cq(path: str, keys, dtypes, shapes, fp8_keys, cq_keys, cb_hits):
                     f"deferred; see ADR-019)"
                 )
             formats.add(fmt)
+            # I8-4 (folded into slice I8 with declared scope, req 52):
+            # convrot-prefixed fields declare a ROTATION baked into the
+            # weights — a semantic modifier, not metadata. Log-and-ignore
+            # would dequantize rotated weights UNROTATED (silent garbage),
+            # so all flavors reject. Other unknown fields keep the shipped
+            # D8 log-and-ignore below.
+            _rot = sorted(f for f in desc
+                          if isinstance(f, str) and f.startswith("convrot"))
+            if _rot:
+                raise ScaledFp8FormatError(
+                    f"descriptor {_safe_name(k)} declares "
+                    f"{_safe_name(_rot[0])} — ConvRot-rotated checkpoints "
+                    f"are unsupported (the rotation must be applied at "
+                    f"compute; loading unrotated is silent corruption). "
+                    f"See TECH_DEBT 'INT8-ConvRot'. (I8-4)"
+                )
             unknown_fields.update(set(desc) - _CQ_KNOWN_FIELDS)
 
     # D8: one aggregate line, not per-layer; unknown fields surfaced once.
@@ -357,11 +417,153 @@ def _classify_cq(path: str, keys, dtypes, shapes, fp8_keys, cq_keys, cb_hits):
     return ("cq-a" if with_in else "cq-w"), info
 
 
-def _validate_scale(name: str, t: torch.Tensor) -> None:
-    """Scalar-F32 + finite-and-positive scale validation at load (F2/F3/F12).
+#: int8-tensorwise scale dtypes (header names). BF16 is the observed
+#: ComfyUI convention; F32 is a strict-superset-in-precision emitter
+#: variation. fp8 flavors stay F32-only (D7 untouched). (I8 req 50.)
+_CI_SCALE_DTYPES = ("BF16", "F32")
+
+
+def _classify_ci(path: str, keys, dtypes, shapes, cq_keys, cq_bases,
+                 key_set):
+    """Classify a comfy_quant INT8-tensorwise file (slice I8, reqs 46-56).
+
+    Returns ("ci-w", info) or raises ScaledFp8FormatError. Dispatched from
+    _classify_cq when the descriptors pair with I8 weights (flavor from
+    tensor DTYPES, decided before any JSON read — D5). The descriptor JSON
+    confirms exactly one thing: `{"format": "int8_tensorwise"}`, with a
+    STRICT field allowlist (req 51) — the int8 schema is demonstrated to
+    carry semantic-modifier fields (convrot rotations), so unknown fields
+    reject rather than log-and-ignore (D8 does NOT apply to this flavor).
+
+    v1 rules (security review I8-1..I8-9):
+      - weight-only: any `.input_scale` anywhere refuses (req 47)
+      - no fp8 tensors anywhere in an int8-flavored file (req 54)
+      - EVERY I8 tensor must be a 2D `.weight` with descriptor + scalar
+        {BF16,F32} weight_scale — no naked-int8 analog of PQ (raw int8
+        bytes have no float interpretation; "upcast" is garbage) (req 48)
+    """
+    w_sfx = _CA_SUFFIXES["weight_scale"]
+    i_sfx = _CA_SUFFIXES["input_scale"]
+
+    # req 47 — v1 is weight-only.
+    _in = sorted(k for k in keys if k.endswith(i_sfx))
+    if _in:
+        raise ScaledFp8FormatError(
+            f"int8_tensorwise file carries {_safe_name(_in[0])} — int8 "
+            f"support is weight-only (v1); input_scale is refused (req 47)"
+        )
+
+    # req 54 — bidirectional flavor exclusion: no fp8 tensors here.
+    _f8 = sorted(k for k in keys if dtypes[k] in _FP8_DTYPES)
+    if _f8:
+        raise ScaledFp8FormatError(
+            f"int8-flavored comfy_quant file carries fp8 tensor "
+            f"{_safe_name(_f8[0])} — refusing (I8 req 54; the PQ naked-fp8 "
+            f"coexistence does not extend to int8 files without real-file "
+            f"evidence)"
+        )
+
+    # req 48 — coverage matrix: every I8 tensor is a 2D .weight with
+    # descriptor + weight_scale; every other cell rejects, none upcast.
+    for k in keys:
+        if dtypes[k] != "I8":
+            continue
+        if not k.endswith(".weight"):
+            raise ScaledFp8FormatError(
+                f"int8 tensor {_safe_name(k)} is not a .weight — raw int8 "
+                f"has no float interpretation; refusing (req 48)"
+            )
+        base = k[: -len(".weight")]
+        if base not in cq_bases:
+            raise ScaledFp8FormatError(
+                f"int8 weight {_safe_name(k)} has no comfy_quant "
+                f"descriptor — naked int8 is refused (no valid upcast "
+                f"exists; req 48)"
+            )
+        if base + w_sfx not in key_set:
+            raise ScaledFp8FormatError(
+                f"int8 weight {_safe_name(k)} lacks {_safe_name(base + w_sfx)} "
+                f"— refusing (F6 analog, req 48)"
+            )
+        if len(shapes[k]) != 2:
+            raise ScaledFp8FormatError(
+                f"int8 weight {_safe_name(k)} has shape {shapes[k]} — only "
+                f"2D Linear weights are supported (req 48/I8-7)"
+            )
+
+    # req 50 — header scale rule: scalar {BF16,F32}, bound to a base.
+    for k in keys:
+        if k.endswith(w_sfx):
+            if k[: -len(w_sfx)] not in cq_bases:
+                raise ScaledFp8FormatError(
+                    f"scale key {_safe_name(k)} has no descriptored int8 "
+                    f"weight to bind to — refusing (dangling scale, F1/F6)"
+                )
+            if dtypes[k] not in _CI_SCALE_DTYPES or shapes[k] not in ((), (1,)):
+                raise ScaledFp8FormatError(
+                    f"scale {_safe_name(k)} is {dtypes[k]} shape {shapes[k]} "
+                    f"— int8_tensorwise scales must be SCALAR "
+                    f"{'/'.join(_CI_SCALE_DTYPES)} (req 50)"
+                )
+
+    # req 51 — bounded descriptor read (D2 gates already ran) with a STRICT
+    # field allowlist: exactly {"format"}, format exactly "int8_tensorwise".
+    # This closes convrot AND every future semantic modifier by construction
+    # — and enforces the req-46 cross-consistency (an I8-paired descriptor
+    # declaring an fp8 format rejects here).
+    from safetensors import safe_open
+    with safe_open(path, framework="pt") as f:
+        for k in cq_keys:
+            raw = bytes(f.get_tensor(k).numpy().tobytes())
+            try:
+                desc = json.loads(raw.decode("utf-8", errors="strict").strip())
+            except (UnicodeDecodeError, ValueError) as e:
+                raise ScaledFp8FormatError(
+                    f"descriptor {_safe_name(k)} is not valid UTF-8 JSON "
+                    f"({type(e).__name__}) — refusing (D4)"
+                ) from None
+            if not isinstance(desc, dict):
+                raise ScaledFp8FormatError(
+                    f"descriptor {_safe_name(k)} JSON root is "
+                    f"{type(desc).__name__}, expected object — refusing (D4)"
+                )
+            if set(desc) != {"format"}:
+                _extra = sorted(_safe_name(str(x))
+                                for x in set(desc) - {"format"}) or ["<none>"]
+                raise ScaledFp8FormatError(
+                    f"int8 descriptor {_safe_name(k)} carries fields beyond "
+                    f"'format' (e.g. {_extra[0]}) — the int8_tensorwise "
+                    f"schema is known to encode weight-semantics modifiers "
+                    f"(ConvRot rotations), so unknown fields are refused, "
+                    f"not ignored (req 51/I8-3)"
+                )
+            if desc.get("format") != "int8_tensorwise":
+                raise ScaledFp8FormatError(
+                    f"descriptor {_safe_name(k)} pairs with an int8 weight "
+                    f"but declares format "
+                    f"{_safe_name(str(desc.get('format')))} — dtype/format "
+                    f"mismatch; refusing (req 46)"
+                )
+
+    print(f"[EricDiffusion-fp8] comfy_quant: {len(cq_keys)} int8_tensorwise "
+          f"descriptors (ci-w, weight-only) — dequant-to-bf16 loader")
+    info = {"n_keys": len(keys), "n_fp8": 0, "n_int8": len(cq_bases),
+            "dtypes": dtypes, "shapes": shapes,
+            "formats": ["int8_tensorwise"]}
+    return "ci-w", info
+
+
+def _validate_scale(name: str, t: torch.Tensor,
+                    allowed_dtypes=(torch.float32,)) -> None:
+    """Scalar + finite-and-positive scale validation at load (F2/F3/F12).
 
     Runs ONCE, before either compute path (scaled_mm or bf16 dequant
-    fallback) can consume the value.
+    fallback) can consume the value. `allowed_dtypes` DEFAULTS to F32-only
+    so every fp8/DMR call site keeps the shipped D7 rule without edits
+    (I8 review req 50); the ci-w int8 call site opts into {bf16, f32}
+    (int8-tensorwise files ship BF16 scalar scales). The dtype is checked
+    on the RAW tensor before any upcast — upcast-then-validate would erase
+    the gate (I8-5).
     """
     if t.numel() != 1:
         raise ScaledFp8FormatError(
@@ -369,11 +571,12 @@ def _validate_scale(name: str, t: torch.Tensor) -> None:
             f"per-tensor SCALAR scales are supported (per-channel vectors "
             f"are rejected; see security review F3)"
         )
-    if t.dtype != torch.float32:
+    if t.dtype not in allowed_dtypes:
         raise ScaledFp8FormatError(
-            f"scale {_safe_name(name)} has dtype {t.dtype} — F32 required (F3)"
+            f"scale {_safe_name(name)} has dtype {t.dtype} — expected one "
+            f"of {tuple(str(d) for d in allowed_dtypes)} (F3/req 50)"
         )
-    v = t.item()
+    v = t.to(torch.float32).item()
     # Reject non-finite, non-positive, AND subnormal values (reviewer
     # finding: F2 lists denormals alongside 0/NaN/Inf — a subnormal scale
     # feeding _scaled_mm flushes to zero on most tensor-core paths).
@@ -600,7 +803,47 @@ def load_scaled_fp8_component(component_class, weights_path: str, dtype,
                            _CQ_SUFFIX)
     nonweight_naked = []
     for k, t in sd.items():
-        if k in scale_keys or k in cq_keys or t.dtype not in _TORCH_FP8:
+        if k in scale_keys or k in cq_keys:
+            continue
+        # ── ci-w (int8-tensorwise) pairing — slice I8 reqs 48/49/50/54 ──
+        # Loader RE-ASSERTION of the classify rules (PQ-2 two-point
+        # pattern): every int8 tensor must be a fully-paired 2D .weight;
+        # no fp8 tensor may appear in an int8 file. None of the fp8
+        # naked/non-weight relaxations (PQ/R1) apply — raw int8 has no
+        # float interpretation, so nothing int8 may fall through to the
+        # stage-2 upcast.
+        if variant == "ci-w":
+            if t.dtype in _TORCH_FP8:
+                raise ScaledFp8FormatError(
+                    f"int8-flavored file carries fp8 tensor {_safe_name(k)} "
+                    f"— refusing (I8 req 54)"
+                )
+            if t.dtype != torch.int8:
+                continue
+            if not k.endswith(".weight"):
+                raise ScaledFp8FormatError(
+                    f"int8 tensor {_safe_name(k)} is not a .weight — "
+                    f"refusing (req 48)"
+                )
+            base = k[: -len(".weight")]
+            ws_key = base + w_sfx
+            if ws_key not in sd or base + _CQ_SUFFIX not in sd:
+                raise ScaledFp8FormatError(
+                    f"int8 weight {_safe_name(k)} lacks its descriptor/"
+                    f"weight_scale pairing — naked int8 is refused "
+                    f"(req 48/49)"
+                )
+            _validate_scale(ws_key, sd[ws_key],
+                            allowed_dtypes=(torch.bfloat16, torch.float32))
+            if t.dim() != 2:
+                raise ScaledFp8FormatError(
+                    f"int8 weight {_safe_name(k)} has {t.dim()}D shape "
+                    f"{tuple(t.shape)} — only 2D Linear weights are "
+                    f"supported (req 48)"
+                )
+            fp8_entries[base] = (t, sd[ws_key], None)
+            continue
+        if t.dtype not in _TORCH_FP8:
             continue
         if not k.endswith(".weight"):
             for sfx in _NONWEIGHT_BINDINGS:
@@ -680,7 +923,8 @@ def load_scaled_fp8_component(component_class, weights_path: str, dtype,
             "classified as scaled-fp8 but no valid fp8 weight/scale "
             "clusters found — refusing"
         )
-    print(f"{log_prefix} {len(fp8_entries)} scaled-fp8 Linears in file "
+    _kind = "int8-tensorwise" if variant == "ci-w" else "scaled-fp8"
+    print(f"{log_prefix} {len(fp8_entries)} {_kind} Linears in file "
           f"(variant {variant})")
     if nonweight_naked:
         # req 41 — one aggregate line, never silent (PQ-4 pattern).
@@ -697,8 +941,21 @@ def load_scaled_fp8_component(component_class, weights_path: str, dtype,
         base = k[: -len(".weight")] if k.endswith(".weight") else None
         if base in fp8_entries:
             w, ws, _ = fp8_entries[base]
-            bf16_sd[k] = (w.to(torch.float32) * ws).to(dtype)
+            # ws upcast is explicit so BF16 int8-scales (ci-w) and F32
+            # fp8-scales dequantize identically in f32.
+            bf16_sd[k] = (w.to(torch.float32) * ws.to(torch.float32)).to(dtype)
         else:
+            # slice I8 req 49: NO int8 tensor may take the raw pass-through
+            # — load_state_dict's copy_() would silently cast integer values
+            # into float params (integer-valued garbage weights, no error).
+            # Active for ALL variants routed through this loader; only
+            # reachable on classify/loader divergence (direct calls).
+            if t.dtype == torch.int8:
+                raise ScaledFp8FormatError(
+                    f"unpaired int8 tensor {_safe_name(k)} reached the "
+                    f"upcast stage — raw int8 has no float interpretation; "
+                    f"refusing (I8 req 49)"
+                )
             bf16_sd[k] = t.to(dtype) if t.is_floating_point() else t
     del sd
 
@@ -730,6 +987,15 @@ def load_scaled_fp8_component(component_class, weights_path: str, dtype,
     # active so quantize_module receives plain nn.Linear modules and
     # re-quantizes into torchao Float8Tensor — the representation the DMR
     # LoRA merge is proven on (reqs 21-30).
+    # slice I8 req 53: ci-w is UNCONDITIONAL dequant — there is no int8
+    # residency op (no Int8Linear exists), so the model returns here
+    # regardless of dequant_fp8. With --quant fp8 the downstream torchao
+    # quantize re-quantizes (the proven LoRA-compatible path).
+    if variant == "ci-w":
+        print(f"{log_prefix} int8-tensorwise dequantized to bf16 "
+              f"(no int8 residency by design; --quant fp8 re-quantizes "
+              f"via torchao)")
+        return model
     if dequant_fp8:
         print(f"{log_prefix} dequant-fp8 mode: all-bf16 model returned "
               f"(no fp8 residency; --quant re-quantizes via torchao)")

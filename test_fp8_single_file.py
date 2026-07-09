@@ -515,6 +515,278 @@ finally:
 check("R2: dequant return covers the krea build branch (test 11)",
       _m11 is _sentinel)
 
+# ── slice I8: comfy int8-tensorwise (ci-w) — security reqs 46-56 ───────
+# docs/security/review-slice-I8-int8-tensorwise-2026-07-08.md. Flavor from
+# dtypes, strict descriptor-field allowlist, no naked-int8 in any cell,
+# loader re-assertion, unconditional dequant (no residency).
+print("── slice I8: int8-tensorwise ci-w (reqs 46-56) ────────────────")
+
+
+def _i8(shape, seed=0, lo=-100, hi=100):
+    g = torch.Generator().manual_seed(seed)
+    return torch.randint(lo, hi, shape, generator=g, dtype=torch.int8)
+
+
+_I8DESC = _desc({"format": "int8_tensorwise"})
+
+# Test 1+2+4+5(log): target-shaped file classifies ci-w, loads via the
+# stub, dequant numerics exact, no ScaledFp8Linear, unconditional dequant.
+_i8w = _i8((8, 4), seed=7)
+_i8file = _mk("i8_pos.safetensors", {
+    "a.weight": _i8w, "a.weight_scale": _scalar(0.02, torch.bfloat16),
+    "a.comfy_quant": _I8DESC,
+    "norm.gamma": torch.ones(4, dtype=torch.bfloat16),  # bf16 rest
+})
+v, _info = _classify(_i8file)
+check("I8: target-shaped file classifies ci-w (test 1)", v == "ci-w",
+      f"got {v}")
+check("I8: info reports int8 count", _info.get("n_int8") == 1)
+for _flag in (False, True):   # unconditional dequant (req 53, test 4)
+    _m = fp8ops.load_scaled_fp8_component(
+        _CaptureComp, _i8file, torch.bfloat16, "", "ci-w",
+        dequant_fp8=_flag)
+    check(f"I8: ci-w loads + returns before residency (dequant_fp8={_flag})",
+          hasattr(_m, "_received_sd")
+          and not any(isinstance(mm, fp8ops.ScaledFp8Linear)
+                      for mm in _m.modules()))
+_exp = (_i8w.to(torch.float32)
+        * torch.tensor(0.02, dtype=torch.bfloat16).to(torch.float32)
+        ).to(torch.bfloat16)
+check("I8: dequant numerics exact (int8 x bf16-scale -> bf16, test 2)",
+      torch.equal(_m._received_sd["a.weight"], _exp))
+check("I8: bf16 rest passes through as bf16",
+      _m._received_sd["norm.gamma"].dtype == torch.bfloat16)
+
+# Test 3: F32 scalar scale also accepted for int8.
+v, _ = _classify(_mk("i8_f32scale.safetensors", {
+    "a.weight": _i8((8, 4)), "a.weight_scale": _scalar(0.02),
+    "a.comfy_quant": _I8DESC}))
+check("I8: F32 scale accepted for int8 (test 3)", v == "ci-w", f"got {v}")
+
+# Test 6: mixed descriptored I8 + F8 in one file → reject (req 46).
+_expect_reject("I8: mixed int8/fp8 descriptored weights reject (test 6)",
+               _mk("i8_mixed.safetensors", {
+                   "a.weight": _i8((8, 4)),
+                   "a.weight_scale": _scalar(0.02, torch.bfloat16),
+                   "a.comfy_quant": _I8DESC,
+                   "b.weight": _fp8((8, 4)), "b.weight_scale": _scalar(0.01),
+                   "b.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+               }), "mixes int8")
+
+# Test 7: I8-paired descriptor declaring an fp8 format → reject (req 46).
+_expect_reject("I8: int8 weight + fp8-format descriptor rejects (test 7)",
+               _mk("i8_xfmt.safetensors", {
+                   "a.weight": _i8((8, 4)),
+                   "a.weight_scale": _scalar(0.02, torch.bfloat16),
+                   "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+               }), "mismatch")
+
+# Test 8: F8-paired descriptor declaring int8_tensorwise → reject (the fp8
+# allowlist was NOT widened).
+_expect_reject("I8: fp8 weight + int8-format descriptor rejects (test 8)",
+               _mk("i8_xfmt2.safetensors", {
+                   "a.weight": _fp8((8, 4)), "a.weight_scale": _scalar(0.01),
+                   "a.comfy_quant": _desc({"format": "int8_tensorwise"}),
+               }), "not in the supported set")
+
+# Test 9: descriptor paired with a BF16 weight → D1 message names dtype.
+_expect_reject("I8: descriptor on BF16 weight rejects naming dtype (test 9)",
+               _mk("i8_bf16w.safetensors", {
+                   "a.weight": torch.zeros(8, 4, dtype=torch.bfloat16),
+                   "a.weight_scale": _scalar(0.02, torch.bfloat16),
+                   "a.comfy_quant": _I8DESC,
+               }), "BF16")
+
+# Test 10: input_scale anywhere in an int8 file → reject (req 47).
+_expect_reject("I8: input_scale in int8 file rejects (test 10)",
+               _mk("i8_inscale.safetensors", {
+                   "a.weight": _i8((8, 4)),
+                   "a.weight_scale": _scalar(0.02, torch.bfloat16),
+                   "a.input_scale": _scalar(0.5),
+                   "a.comfy_quant": _I8DESC,
+               }), "weight-only")
+
+# Test 11: strict field allowlist — convrot, convrot_groupsize, and an
+# arbitrary unknown field each reject (req 51).
+for _fld, _val in [("convrot", True), ("convrot_groupsize", 256),
+                   ("zero_point", 0)]:
+    _expect_reject(
+        f"I8: descriptor field {_fld!r} rejects (strict allowlist, test 11)",
+        _mk("i8_fld.safetensors", {
+            "a.weight": _i8((8, 4)),
+            "a.weight_scale": _scalar(0.02, torch.bfloat16),
+            "a.comfy_quant": _desc({"format": "int8_tensorwise",
+                                    _fld: _val}),
+        }))
+
+# Test 12 (I8-4): convrot on an FP8-format descriptor now rejects too.
+_expect_reject("I8-4: convrot on fp8 descriptor rejects (test 12)",
+               _mk("i8_fp8rot.safetensors", {
+                   "a.weight": _fp8((8, 4)), "a.weight_scale": _scalar(0.01),
+                   "a.comfy_quant": _desc({"format": "float8_e4m3fn",
+                                           "convrot": True}),
+               }), "ConvRot")
+# (fp8 non-convrot unknown fields keep log-and-ignore — pinned by the
+# existing 'unknown descriptor field logged, not rejected' case above.)
+
+# Tests 13-15: naked/partial int8 cells all reject (req 48).
+_expect_reject("I8: naked int8 weight rejects (test 13)",
+               _mk("i8_naked.safetensors", {
+                   "a.weight": _i8((8, 4)),
+                   "a.weight_scale": _scalar(0.02, torch.bfloat16),
+                   "a.comfy_quant": _I8DESC,
+                   "b.weight": _i8((8, 4), seed=1),   # fully bare int8
+               }), "naked int8")
+_expect_reject("I8: int8 + scale, no descriptor rejects (test 14)",
+               _mk("i8_scale_nodesc.safetensors", {
+                   "a.weight": _i8((8, 4)),
+                   "a.weight_scale": _scalar(0.02, torch.bfloat16),
+                   "a.comfy_quant": _I8DESC,
+                   "b.weight": _i8((8, 4), seed=1),
+                   "b.weight_scale": _scalar(0.02, torch.bfloat16),
+               }))
+_expect_reject("I8: int8 + descriptor, no scale rejects (test 15)",
+               _mk("i8_desc_noscale.safetensors", {
+                   "a.weight": _i8((8, 4)), "a.comfy_quant": _I8DESC,
+               }))
+
+# Test 16: non-.weight int8 (bare) rejects — no R1 relaxation for int8.
+_expect_reject("I8: non-.weight int8 tensor rejects (test 16)",
+               _mk("i8_nonw.safetensors", {
+                   "a.weight": _i8((8, 4)),
+                   "a.weight_scale": _scalar(0.02, torch.bfloat16),
+                   "a.comfy_quant": _I8DESC,
+                   "b.bias": _i8((8,), seed=1),
+               }), "not a .weight")
+
+# Test 17 (req 49): loader re-assert — an fp8-variant load whose dict
+# carries an unpaired int8 tensor must reject at the pass-through guard,
+# never silently cast (classify/loader divergence simulation).
+_expect_reject("I8: loader pass-through guard refuses stray int8 (test 17)",
+               lambda: fp8ops.load_scaled_fp8_component(
+                   _CaptureComp, _mk("i8_stray.safetensors", {
+                       "a.weight": _fp8((8, 4)),
+                       "a.weight_scale": _scalar(0.01),
+                       "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+                       "sneak.weight": _i8((8, 4)),
+                   }), torch.bfloat16, "", "cq-w", dequant_fp8=True),
+               "unpaired int8")
+
+# Test 18: same fixture at CLASSIFY → fp8-flavored + I8 rejects (req 54).
+_expect_reject("I8: int8 tensor in fp8-flavored file rejects (test 18)",
+               _mk("i8_infp8.safetensors", {
+                   "a.weight": _fp8((8, 4)), "a.weight_scale": _scalar(0.01),
+                   "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+                   "sneak.weight": _i8((8, 4)),
+               }), "req 54")
+
+# Test 19: naked fp8 inside an int8-flavored file rejects (v1 polarity).
+_expect_reject("I8: naked fp8 in int8 file rejects (test 19)",
+               _mk("i8_nakedf8.safetensors", {
+                   "a.weight": _i8((8, 4)),
+                   "a.weight_scale": _scalar(0.02, torch.bfloat16),
+                   "a.comfy_quant": _I8DESC,
+                   "first.weight": _fp8((8, 4)),
+               }), "req 54")
+
+# Test 20: scale dtype F16 / vector-shaped BF16 scale reject at header.
+_expect_reject("I8: F16 scale rejects (test 20a)",
+               _mk("i8_f16s.safetensors", {
+                   "a.weight": _i8((8, 4)),
+                   "a.weight_scale": _scalar(0.02, torch.float16),
+                   "a.comfy_quant": _I8DESC,
+               }), "SCALAR")
+_expect_reject("I8: vector BF16 scale rejects (test 20b)",
+               _mk("i8_vecs.safetensors", {
+                   "a.weight": _i8((8, 4)),
+                   "a.weight_scale": torch.full((8,), 0.02,
+                                                dtype=torch.bfloat16),
+                   "a.comfy_quant": _I8DESC,
+               }), "SCALAR")
+
+# Test 21: BF16 scale VALUE battery — rejected at load (validated raw,
+# upcast for the value check).
+for _lbl, _v in [("NaN", float("nan")), ("Inf", float("inf")),
+                 ("zero", 0.0), ("negative", -1.0),
+                 ("subnormal", 2.0 ** -133)]:
+    _expect_reject(
+        f"I8: BF16 scale value {_lbl} rejects at load (test 21)",
+        lambda _v=_v: fp8ops.load_scaled_fp8_component(
+            _CaptureComp, _mk("i8_val.safetensors", {
+                "a.weight": _i8((8, 4)),
+                "a.weight_scale": _scalar(_v, torch.bfloat16),
+                "a.comfy_quant": _I8DESC,
+            }), torch.bfloat16, "", "ci-w"))
+
+# Test 22 regression: BF16 scale on an fp8 cq-w file STILL rejects (the
+# {BF16,F32} acceptance is int8-only; fp8 keeps D7 F32-only).
+_expect_reject("I8: BF16 scale on fp8 cq-w still rejects (test 22)",
+               _mk("i8_fp8bf16s.safetensors", {
+                   "a.weight": _fp8((8, 4)),
+                   "a.weight_scale": _scalar(0.01, torch.bfloat16),
+                   "a.comfy_quant": _desc({"format": "float8_e4m3fn"}),
+               }), "F32")
+
+# Test 23: non-2D descriptored int8 weight rejects.
+_expect_reject("I8: non-2D int8 weight rejects (test 23)",
+               _mk("i8_3d.safetensors", {
+                   "a.weight": _i8((2, 4, 4)),
+                   "a.weight_scale": _scalar(0.02, torch.bfloat16),
+                   "a.comfy_quant": _I8DESC,
+               }), "2D")
+
+# Test 24 regressions on int8-shaped inputs: nvfp4 second-level scale and
+# C-b co-presence fire their existing gates.
+_expect_reject("I8: weight_scale_2 on int8 file hits nvfp4 reject (test 24a)",
+               _mk("i8_ws2.safetensors", {
+                   "a.weight": _i8((8, 4)),
+                   "a.weight_scale": _scalar(0.02, torch.bfloat16),
+                   "a.weight_scale_2": _scalar(1.0),
+                   "a.comfy_quant": _I8DESC,
+               }), "weight_scale_2")
+_expect_reject("I8: C-b marker + int8 descriptors reject (test 24b)",
+               _mk("i8_cb.safetensors", {
+                   "a.weight": _i8((8, 4)),
+                   "a.weight_scale": _scalar(0.02, torch.bfloat16),
+                   "a.comfy_quant": _I8DESC,
+                   "scaled_fp8": torch.zeros(2, dtype=torch.float8_e4m3fn),
+               }), "C-b")
+_expect_reject("I8: oversize descriptor on int8 file hits D2 (test 24c)",
+               _mk("i8_bigdesc.safetensors", {
+                   "a.weight": _i8((8, 4)),
+                   "a.weight_scale": _scalar(0.02, torch.bfloat16),
+                   "a.comfy_quant": torch.zeros(5000, dtype=torch.uint8),
+               }), "D2")
+_expect_reject("I8: control-char key on int8 file rejects (test 24d)",
+               _mk("i8_ctrl.safetensors", {
+                   "a.weight": _i8((8, 4)),
+                   "a.weight_scale": _scalar(0.02, torch.bfloat16),
+                   "a.comfy_quant": _I8DESC,
+                   "b\x01d.weight": torch.zeros(2, dtype=torch.bfloat16),
+               }), "control")
+
+# Req 50(d) pin: _validate_scale's DEFAULT stays F32-only — this default is
+# what protects every legacy call site (incl. the DMR requant) unedited.
+_dmr_pin = False
+try:
+    fp8ops._validate_scale("pin", torch.tensor(0.1, dtype=torch.bfloat16))
+except fp8ops.ScaledFp8FormatError:
+    _dmr_pin = True
+check("I8: _validate_scale default rejects BF16 (F32-only pin, req 50d)",
+      _dmr_pin)
+
+# Test 5 (routing): ci-w routes through load_component with the
+# int8-tensorwise detection line.
+_buf = _io2.StringIO()
+with _cl2.redirect_stdout(_buf):
+    _m5 = edu.load_component(_CaptureComp, _i8file, torch.bfloat16,
+                             base_path=_TMP, subfolder_hint="transformer")
+check("I8: load_component routes ci-w + detection log (test 5)",
+      hasattr(_m5, "_received_sd")
+      and "int8-tensorwise" in _buf.getvalue(),
+      f"log: {_buf.getvalue()[:200]!r}")
+
+
 # R3/test 12 (threading): load_component → _load_single_weights →
 # load_scaled_fp8_component carries dequant_fp8 through the utils layer.
 _p12 = _mk("r3_thread.safetensors", {
