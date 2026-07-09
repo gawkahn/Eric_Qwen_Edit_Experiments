@@ -1324,6 +1324,40 @@ except krea2c.Krea2ConversionError:
 check("krea2-build: incomplete conversion → Krea2ConversionError (fail-closed)",
       _bc_raised)
 
+# ── Embedded-adapter stripping (x3n0-style checkpoints, 2026-07-08) ────
+# A checkpoint packing an un-merged LoRA (lora_A/B + .diff keys under a
+# bare diffusion_model. prefix) loads its BASE with a loud notice; the
+# adapter key shapes can never be model params so dropping them only
+# converts a guaranteed-fatal strict-gate hit into a visible warning.
+_adapter_sd = {
+    "first.weight": torch.zeros(3, 4), "first.bias": torch.zeros(3),
+    "diffusion_model.first.lora_A.weight": torch.zeros(2, 4),
+    "diffusion_model.first.lora_B.weight": torch.zeros(3, 2),
+    "diffusion_model.txtfusion.projector.diff": torch.zeros(3, 4),
+}
+_buf = _io2.StringIO()
+with _cl2.redirect_stdout(_buf):
+    _ma = krea2c.build_krea2_transformer(
+        _FakeKrea2, dict(_adapter_sd), "ignored", torch.float32)
+check("krea2-build: embedded adapter stripped, base loads",
+      hasattr(_ma, "img_in"))
+check("krea2-build: embedded-adapter notice fires (3 tensors named)",
+      "adapter" in _buf.getvalue() and "3 adapter tensors" in _buf.getvalue(),
+      f"log: {_buf.getvalue()[:200]!r}")
+# The strict gate is NOT loosened: a non-adapter unknown key still raises,
+# and the message now names the unexpected key (formatting fix).
+_ug_raised = ""
+try:
+    krea2c.build_krea2_transformer(
+        _FakeKrea2, {"first.weight": torch.zeros(3, 4),
+                     "first.bias": torch.zeros(3),
+                     "first.bogus": torch.zeros(3)}, "ignored", torch.float32)
+except krea2c.Krea2ConversionError as _e:
+    _ug_raised = str(_e)
+check("krea2-build: non-adapter unknown key still fail-closed, named",
+      "unexpected" in _ug_raised and "bogus" in _ug_raised,
+      f"msg: {_ug_raised[:160]!r}")
+
 shutil.rmtree(_TMP, ignore_errors=True)
 print("\n" + "─" * 50)
 print(f"  {passed} passed, {failed} failed")

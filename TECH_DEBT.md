@@ -966,6 +966,24 @@ vendoring option.
   the next time `catalog_db.py` is opened for a deliberate change, OR if a user ever reports a
   startup/search hang with `--catalog-db` pointed at a mergerfs path.
 
+## 2026-07-08 — Embedded checkpoint adapters are IGNORED (loud notice), not applied
+
+- **What:** community Krea-2 checkpoints can pack an UN-MERGED adapter inside the
+  checkpoint file (`x3n0_m4tr1xKrea2`: 256 lora_A/B pairs + one `.diff` under a bare
+  `diffusion_model.` prefix, next to the `model.diffusion_model.` int8 base).
+  `build_krea2_transformer` now strips these guaranteed-fatal key shapes with a loud
+  WARNING and loads the BASE model — matching ComfyUI's checkpoint loader, which also
+  ignores that half. The adapter's visual effect is therefore NOT reproduced.
+- **Why not now:** applying it correctly needs a scaling decision (no alpha stored;
+  B@A at 1.0 is a guess — a wrong scale is silent wrong-look output, the exact class
+  we refuse), and the cleaner UX is extracting it to a standalone LoRA file the user
+  stacks deliberately with a chosen weight. The direct-merge machinery for applying
+  it already exists (apply_merge_delta / convert path).
+- **Trigger:** Grant wants x3n0's embedded-adapter look specifically (compare with/
+  without in ComfyUI first — if ComfyUI ignores it too, the "intended look" already
+  IS the base), OR a second embedded-adapter checkpoint appears. Then: a small
+  extract-embedded-adapter tool (scripts/lora_audit family) beats loader auto-apply.
+
 ## 2026-07-07 — dequant-fp8 routing gaps: text-encoder slot + directory-fallback (slice R1/R2/R3 INFO deferrals)
 
 - **What:** two conscious scope limits from the R1/R2/R3 code review (both INFO, not blockers):

@@ -220,6 +220,40 @@ def extract_krea2_transformer_sd(state_dict):
             if _strip_known_prefix(k).startswith(_TRANSFORMER_ROOT_PREFIXES)}
 
 
+#: Adapter-tensor key suffixes (LoRA / LoKR / LoHa / direct-diff families).
+#: These attribute names NEVER exist on a transformer module, so a state-dict
+#: key matching this can never load — it is guaranteed-fatal at the strict
+#: gate. That guarantee is what makes dropping them safe by construction.
+_ADAPTER_KEY_RE = re.compile(
+    r"\.(?:lora_(?:A|B|down|up)\.weight|alpha|diff|diff_b|"
+    r"lokr_w1|lokr_w2|lokr_t2|hada_w1_a|hada_w1_b|hada_w2_a|hada_w2_b)$")
+
+
+def strip_embedded_adapter_keys(state_dict, log_prefix="[Krea2]"):
+    """Drop LoRA-style ADAPTER tensors embedded inside a checkpoint file.
+
+    Community checkpoints (e.g. x3n0_m4tr1xKrea2: 256 lora_A/B pairs + one
+    .diff under a bare `diffusion_model.` prefix, alongside the
+    `model.diffusion_model.` base) sometimes pack an un-merged adapter next
+    to the base weights. ComfyUI's checkpoint loader ignores that half; we
+    match that behavior LOUDLY — the base model loads, the notice names the
+    adapter so the operator can extract/stack it explicitly if they want its
+    effect. Only guaranteed-fatal key shapes are dropped (see
+    _ADAPTER_KEY_RE); every other unexpected key still hits the strict
+    fail-closed gate in build_krea2_transformer.
+
+    Returns (filtered_dict, n_dropped)."""
+    hits = sorted(k for k in state_dict if _ADAPTER_KEY_RE.search(k))
+    if not hits:
+        return state_dict, 0
+    print(f"{log_prefix} WARNING: checkpoint embeds a LoRA-style adapter "
+          f"({len(hits)} adapter tensors, e.g. {hits[0][:120]!r}) — adapter "
+          f"IGNORED; the BASE model is loaded. To apply its effect, extract "
+          f"the adapter to a standalone LoRA file and stack it via --lora.")
+    return ({k: v for k, v in state_dict.items()
+             if not _ADAPTER_KEY_RE.search(k)}, len(hits))
+
+
 def build_krea2_transformer(component_class, native_sd, config_path, dtype,
                             strip_prefix=None, log_prefix="[Krea2]"):
     """Build a diffusers Krea-2 transformer from a ComfyUI-native state dict
@@ -232,6 +266,10 @@ def build_krea2_transformer(component_class, native_sd, config_path, dtype,
     model on CPU (dtype, with `_keep_in_fp32_modules` restored to fp32)."""
     import torch
     native_sd = extract_krea2_transformer_sd(native_sd)
+    # Embedded un-merged adapters (lora_A/B, .diff, ...) are dropped LOUDLY
+    # — their key shapes can never be model params, so without this they are
+    # guaranteed-fatal at the strict gate below (x3n0-style checkpoints).
+    native_sd, _ = strip_embedded_adapter_keys(native_sd, log_prefix)
     diff_sd = convert_krea2_comfy_state_dict(native_sd, strip_prefix)
     config = component_class.load_config(config_path, local_files_only=True)
     model = component_class.from_config(config)
@@ -241,13 +279,15 @@ def build_krea2_transformer(component_class, native_sd, config_path, dtype,
     incompat = model.load_state_dict(diff_sd, strict=False, assign=True)
     if incompat.missing_keys or incompat.unexpected_keys:
         _miss = sorted(incompat.missing_keys)
+        _unex = sorted(incompat.unexpected_keys)
+        _ex = (f"missing {_miss[0][:120]!r}" if _miss
+               else f"unexpected {_unex[0][:120]!r}")
         raise Krea2ConversionError(
             f"Krea-2 key conversion mismatch "
             f"({len(incompat.missing_keys)} missing / "
             f"{len(incompat.unexpected_keys)} unexpected model params; rename "
-            f"table incomplete for this checkpoint) — e.g. missing "
-            f"{_miss[0] if _miss else '-'!r}; refusing rather than generate "
-            f"from random-init weights")
+            f"table incomplete for this checkpoint) — e.g. {_ex}; refusing "
+            f"rather than generate from random-init weights")
     model = model.to(dtype)
     # assign=True coerced _keep_in_fp32_modules norms to `dtype`; from_pretrained
     # keeps them fp32 for stability — restore that (base-model precision parity).
