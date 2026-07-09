@@ -112,7 +112,7 @@ from comfyless.params_schema import COMFYLESS_SCHEMA, _CLI_TO_CANONICAL  # noqa:
 # metrics don't leak into the next run.  Strictly narrower than the schema
 # filter — these are known-and-intentional non-params, not "unknown to us".
 _SKIP_SIDECAR_KEYS = {"timestamp", "elapsed_seconds", "contract_version",
-                      "lora_warnings", "model_family",
+                      "lora_warnings", "nag_warnings", "model_family",
                       # rebalance is a runtime CLI flag, not a schema param;
                       # recorded for provenance but re-pass --rebalance to replay.
                       "rebalance"}
@@ -572,6 +572,25 @@ def _apply_family_defaults(
         kv = ", ".join(f"{k}={v!r}" for k, v in applied.items())
         prefix = f"[comfyless] iter {idx}: " if idx is not None else "[comfyless] "
         _log(f"{prefix}family={family} defaults applied: {kv}")
+
+
+def _nag_gate(model_family: str, nag_scale: Optional[float]) -> tuple:
+    """Decide whether NAG activates (ADR-023: krea family only).
+
+    Returns (active, warning). nag_scale unset/<=1 is the documented off
+    state — dormant, no warning. A non-krea family with NAG requested stays
+    inactive and returns a loud warning naming the family (warn-don't-block;
+    a silent no-op is invariant N1's failure mode).
+    """
+    if nag_scale is None or nag_scale <= 1.0:
+        return False, None
+    if model_family in ("krea", "krea-turbo"):
+        return True, None
+    return False, (
+        f"--nag-scale {nag_scale} ignored — NAG is implemented for "
+        f"krea/krea-turbo only (model_family={model_family!r}). "
+        f"Generation proceeds WITHOUT negative guidance."
+    )
 
 
 def _build_call_kwargs(
@@ -1134,6 +1153,10 @@ def generate(
     quant: str = "none",
     quant_skip: tuple = (),
     quant_only: tuple = (),
+    nag_scale: float = 0.0,
+    nag_tau: float = 2.5,
+    nag_alpha: float = 0.25,
+    nag_end: float = 1.0,
     _cached_pipeline: Optional[Dict[str, Any]] = None,
     mcp_caller: bool = False,
 ) -> Dict[str, Any]:
@@ -1207,6 +1230,74 @@ def generate(
         true_cfg_scale, max_sequence_length, generator,
     )
 
+    # ── NAG negative guidance (ADR-023; krea family only) ────────────
+    # Every skip/oddity lands in nag_warnings AND stderr: generate() may run
+    # inside the daemon or MCP server, where this stderr is a server log the
+    # caller never sees — the metadata list is what crosses that boundary
+    # (invariant N1; the lora_warnings precedent). Recorded in the sidecar,
+    # printed client-side from the wire metadata, surfaced as MCP notices.
+    nag_warnings: List[str] = []
+    nag_active, nag_warning = _nag_gate(model_family, nag_scale)
+    if nag_warning:
+        nag_warnings.append(nag_warning)
+    if nag_active and cfg_scale > 0:
+        # Classic CFG already consumes the negative prompt at cfg>0 (krea
+        # Raw); NAG targets the distilled cfg<=0 checkpoints. The pipeline
+        # has the same guard for standalone users — gating here makes the
+        # skip visible across the daemon/MCP boundary.
+        nag_warnings.append(
+            f"nag_scale {nag_scale} skipped — classic CFG is active "
+            f"(cfg_scale={cfg_scale} > 0) and already consumes the negative "
+            f"prompt. NAG applies to distilled cfg<=0 checkpoints (Turbo)."
+        )
+        nag_active = False
+    if nag_active:
+        try:
+            from pipelines.nag_krea2 import nag_pipe_call
+        except Exception as e:
+            nag_warnings.append(
+                f"nag_scale {nag_scale} ignored — NAG module unavailable "
+                f"({e}). Generation proceeds WITHOUT negative guidance."
+            )
+            nag_active = False
+    if nag_active:
+        if not neg:
+            nag_warnings.append(
+                "NAG active with an EMPTY negative prompt — guidance runs "
+                "against the empty prompt, which is rarely what you want. "
+                "Pass --negative-prompt."
+            )
+        # Range sanity (warn-don't-block): a negative tau zeroes the guided
+        # term via min(ratio, tau)/ratio; alpha outside [0,1] extrapolates
+        # the blend; nag_end outside [0,1] is a window no-op or over-run.
+        if nag_tau <= 0:
+            nag_warnings.append(
+                f"nag_tau {nag_tau} <= 0 zeroes the guided term — NAG will "
+                f"suppress the positive signal, not the negative. Use > 0 "
+                f"(default 2.5).")
+        if not (0.0 <= nag_alpha <= 1.0):
+            nag_warnings.append(
+                f"nag_alpha {nag_alpha} outside [0, 1] extrapolates the "
+                f"blend (default 0.25).")
+        if not (0.0 <= nag_end <= 1.0):
+            nag_warnings.append(
+                f"nag_end {nag_end} outside [0, 1] — it is a fraction of "
+                f"steps (default 1.0).")
+        call_kwargs.update({
+            "nag_scale": nag_scale,
+            "nag_tau":   nag_tau,
+            "nag_alpha": nag_alpha,
+            "nag_end":   nag_end,
+        })
+        # The stock krea branch only forwards negative_prompt under CFG
+        # introspection rules; NAG consumes it regardless, so re-attach.
+        if neg:
+            call_kwargs["negative_prompt"] = neg
+        _log(f"[comfyless] NAG active: scale={nag_scale}, tau={nag_tau}, "
+             f"alpha={nag_alpha}, end={nag_end}")
+    for _w in nag_warnings:
+        print(f"[comfyless] WARNING: NAG — {_w}", file=sys.stderr)
+
     # ── Krea conditioning rebalance (optional) ────────────────────────
     if rebalance and model_family in ("krea", "krea-turbo"):
         weights = rebalance_weights if rebalance_weights is not None \
@@ -1246,7 +1337,14 @@ def generate(
     # ── Inference (with optional sampler swap) ────────────────────────
     t0 = time.monotonic()
     with swap_sampler(pipe, effective_sampler, log_prefix="[comfyless]"):
-        result = pipe(**call_kwargs)
+        if nag_active:
+            # Unbound Krea2NAGPipeline.__call__ on the (possibly cached)
+            # stock pipeline: NAG processors are installed per-call and
+            # restored in a finally, so the cached object's class and
+            # shape never change (cache keys stay NAG-free by design).
+            result = nag_pipe_call(pipe, **call_kwargs)
+        else:
+            result = pipe(**call_kwargs)
     elapsed = time.monotonic() - t0
     _log(f"[comfyless] Generated in {elapsed:.1f}s")
 
@@ -1277,6 +1375,12 @@ def generate(
         "quant": quant or "none",
         "quant_skip": list(quant_skip or ()),
         "quant_only": list(quant_only or ()),
+        # NAG quadruple (ADR-023) — sidecar-replayable like quant; NAG
+        # changes output content, so a --params replay must reproduce it.
+        "nag_scale": nag_scale,
+        "nag_tau": nag_tau,
+        "nag_alpha": nag_alpha,
+        "nag_end": nag_end,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "elapsed_seconds": round(elapsed, 2),
         "contract_version": CONTRACT_VERSION,
@@ -1284,6 +1388,11 @@ def generate(
     lora_warnings = lora_failure_warnings(lora_outcomes)
     if lora_warnings:
         metadata["lora_warnings"] = lora_warnings
+    # NAG skip/oddity warnings ride the metadata across the daemon/MCP
+    # boundary (invariant N1) — path-free by construction (family names,
+    # scales, exception text from a local import only).
+    if nag_warnings:
+        metadata["nag_warnings"] = nag_warnings
     if rebalance and model_family in ("krea", "krea-turbo"):
         metadata["rebalance"] = {
             "mult": rebalance_mult,
@@ -1331,7 +1440,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--prompt", type=str, default=None,
                    help="Generation prompt")
     p.add_argument("--negative-prompt", type=str, default=None,
-                   help="Negative prompt (qwen-image only)")
+                   help="Negative prompt (qwen-image CFG; models with "
+                        "classic CFG at cfg>0; krea-turbo via --nag-scale)")
     p.add_argument("--seed", type=int, default=None,
                    help="Random seed (-1 for random)")
     p.add_argument("--steps", type=int, default=None)
@@ -1379,6 +1489,24 @@ def _parse_args() -> argparse.Namespace:
                    help="Quantize exactly these component slots, overriding "
                         "the default eligible set. Repeatable. VAE is refused "
                         "even here.")
+    # NAG quadruple defaults are None SENTINELS (quant precedent): a
+    # sidecar's NAG params survive --params replay unless the CLI
+    # explicitly overrides them; resolved to schema defaults post-merge.
+    p.add_argument("--nag-scale", type=float, default=None,
+                   help="Normalized Attention Guidance scale (ADR-023). "
+                        ">1 activates NAG on krea/krea-turbo, making "
+                        "--negative-prompt work on distilled (cfg 0) "
+                        "checkpoints where CFG is dead. Try 4-5. Costs "
+                        "~2x wall time on the NAG'd steps. Recorded in "
+                        "the sidecar and replayed by --params.")
+    p.add_argument("--nag-tau", type=float, default=None,
+                   help="[--nag-scale] Norm-growth clip tau (default 2.5).")
+    p.add_argument("--nag-alpha", type=float, default=None,
+                   help="[--nag-scale] Blend alpha (default 0.25).")
+    p.add_argument("--nag-end", type=float, default=None,
+                   help="[--nag-scale] Fraction of steps NAG applies to "
+                        "(default 1.0 = full window; 0.5-0.75 trades "
+                        "guidance strength for speed).")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--offload-vae", action="store_true")
     p.add_argument("--attention-slicing", action="store_true",
@@ -1527,6 +1655,10 @@ def _run_json_mode() -> int:
             quant=params.get("quant") or "none",
             quant_skip=tuple(params.get("quant_skip") or ()),
             quant_only=tuple(params.get("quant_only") or ()),
+            nag_scale=params.get("nag_scale", 0.0),
+            nag_tau=params.get("nag_tau", 2.5),
+            nag_alpha=params.get("nag_alpha", 0.25),
+            nag_end=params.get("nag_end", 1.0),
         )
 
         sidecar_path = os.path.join(output_dir, f"{output_stem}.json")
@@ -1683,6 +1815,14 @@ def _build_server_request(
         "quant":               p.get("quant") or "none",
         "quant_skip":          list(p.get("quant_skip") or []),
         "quant_only":          list(p.get("quant_only") or []),
+        # NAG quadruple (ADR-023). Sidecar-replayable schema params;
+        # deliberately NOT in the daemon's pipeline cache key — NAG
+        # processors are installed per-call and restored, so pipeline
+        # shape is unchanged (see server._request_cache_key).
+        "nag_scale":           p.get("nag_scale", 0.0),
+        "nag_tau":             p.get("nag_tau", 2.5),
+        "nag_alpha":           p.get("nag_alpha", 0.25),
+        "nag_end":             p.get("nag_end", 1.0),
     }
     # Pre-expanded template (iteration tokens resolved client-side) takes
     # precedence over args.savepath when provided.
@@ -1745,6 +1885,11 @@ def _delegate_to_server(
             print(f"[comfyless] Metadata: {sidecar_path}")
         print(f"\nDone. seed={metadata.get('seed', '?')}, "
               f"time={metadata.get('elapsed_seconds', '?')}s")
+        # NAG skips/oddities happened in the DAEMON's process — its stderr
+        # is a log the user never watches. Surface them client-side from the
+        # wire metadata (invariant N1; mirrors lora_warnings below).
+        for _w in metadata.get("nag_warnings") or []:
+            print(f"[comfyless] WARNING: NAG — {_w}", file=sys.stderr)
         # Daemon already carries lora_warnings in the wire metadata — surface
         # them loudly client-side (ADR-015 2026-07-06).
         return _report_lora_outcome(metadata)
@@ -2226,6 +2371,10 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                 quant=p_cur.get("quant") or "none",
                 quant_skip=tuple(p_cur.get("quant_skip") or ()),
                 quant_only=tuple(p_cur.get("quant_only") or ()),
+                nag_scale=p_cur.get("nag_scale", 0.0),
+                nag_tau=p_cur.get("nag_tau", 2.5),
+                nag_alpha=p_cur.get("nag_alpha", 0.25),
+                nag_end=p_cur.get("nag_end", 1.0),
             )
             if iterate_batch_id:
                 metadata["iterate_batch_id"] = iterate_batch_id

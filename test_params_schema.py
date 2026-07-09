@@ -1007,6 +1007,84 @@ check("seeding comprehension copies list defaults (source pin)",
       "list(default) if isinstance(default, list) else default" in _qsrc)
 
 
+# ── NAG quadruple is sidecar-replayable (ADR-023) ──────────────────────
+# nag_scale/nag_tau/nag_alpha/nag_end joined SCHEMA_KIND with the quant
+# precedent: NAG changes output CONTENT, so --params replay must reproduce
+# it. Same three legs as quant, plus the schema defaults pin.
+print("\n── NAG sidecar round-trip (ADR-023) ───────────────────────────")
+
+# Leg 0: schema defaults are the documented dormant/paper values.
+check("nag schema defaults are 0.0/2.5/0.25/1.0",
+      (schema["nag_scale"][1], schema["nag_tau"][1],
+       schema["nag_alpha"][1], schema["nag_end"][1]) == (0.0, 2.5, 0.25, 1.0))
+check("nag kinds are all float",
+      all(schema[k][0] is float
+          for k in ("nag_scale", "nag_tau", "nag_alpha", "nag_end")))
+
+# Leg 1: a sidecar carrying the quadruple survives _load_params intact.
+_nd = _qtf.mkdtemp(prefix="nag_sidecar_test_")
+_np = _qos.path.join(_nd, "s.json")
+with open(_np, "w") as _nf:
+    json.dump({"model": "/m", "prompt": "p", "nag_scale": 4.0,
+               "nag_tau": 3.0, "nag_alpha": 0.5, "nag_end": 0.75}, _nf)
+_nl = g._load_params(_np)
+check("sidecar nag_scale survives _load_params", _nl.get("nag_scale") == 4.0,
+      f"got {_nl.get('nag_scale')!r}")
+check("sidecar nag_tau/alpha/end survive _load_params",
+      (_nl.get("nag_tau"), _nl.get("nag_alpha"), _nl.get("nag_end"))
+      == (3.0, 0.5, 0.75))
+
+# Leg 2: argparse defaults are None SENTINELS — an omitted --nag-scale must
+# not clobber a sidecar's value in the CLI merge.
+_nargv, sys.argv = sys.argv, ["comfyless"]
+try:
+    _nargs = g._parse_args()
+finally:
+    sys.argv = _nargv
+check("nag argparse defaults are None sentinels",
+      _nargs.nag_scale is None and _nargs.nag_tau is None
+      and _nargs.nag_alpha is None and _nargs.nag_end is None)
+check("_cli_value_for treats unset nag_scale as not-explicit",
+      g._cli_value_for(_nargs, "nag_scale") is None)
+
+# Positive precedence leg: an EXPLICIT `--nag-scale 0` is non-None (0.0),
+# so it wins the merge over a sidecar's 4.0 (turns NAG off on replay).
+_nargv, sys.argv = sys.argv, ["comfyless", "--nag-scale", "0"]
+try:
+    _nargs2 = g._parse_args()
+finally:
+    sys.argv = _nargv
+check("explicit --nag-scale 0 is non-None and explicit in the merge",
+      g._cli_value_for(_nargs2, "nag_scale") == 0.0)
+
+# Leg 3: nag keys are params, not skip-set metadata — sidecar load must
+# NOT drop them the way it drops timestamp/elapsed.
+check("nag keys are NOT in _SKIP_SIDECAR_KEYS",
+      not ({"nag_scale", "nag_tau", "nag_alpha", "nag_end"}
+           & g._SKIP_SIDECAR_KEYS))
+# ...while the nag_warnings provenance list IS skip-set metadata (like
+# lora_warnings): a replayed sidecar must not trip the unknown-key warning.
+check("nag_warnings IS in _SKIP_SIDECAR_KEYS (provenance, not a param)",
+      "nag_warnings" in g._SKIP_SIDECAR_KEYS)
+
+# Family gating helper (ADR-023: krea only; loud warning elsewhere).
+print("\n── NAG family gating (_nag_gate) ──────────────────────────────")
+check("krea accepts NAG", g._nag_gate("krea", 4.0) == (True, None))
+check("krea-turbo accepts NAG", g._nag_gate("krea-turbo", 4.0) == (True, None))
+_ng_off = g._nag_gate("krea-turbo", 1.0)
+check("nag_scale<=1 is dormant on krea (no warning)",
+      _ng_off == (False, None), f"got {_ng_off!r}")
+check("nag_scale None is dormant", g._nag_gate("krea", None) == (False, None))
+_ng_flux = g._nag_gate("flux", 4.0)
+check("non-krea family skips NAG", _ng_flux[0] is False)
+check("non-krea skip warning is loud and names the family",
+      bool(_ng_flux[1]) and "flux" in _ng_flux[1],
+      f"got {_ng_flux[1]!r}")
+_ng_dormant_flux = g._nag_gate("flux", 0.0)
+check("dormant NAG on non-krea family raises no warning (NEGATIVE)",
+      _ng_dormant_flux == (False, None), f"got {_ng_dormant_flux!r}")
+
+
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print("──────────────────────────────────────────────────")

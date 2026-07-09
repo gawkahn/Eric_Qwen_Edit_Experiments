@@ -69,6 +69,14 @@ SCHEMA_KIND = types.MappingProxyType({
     "quant":                _KIND_STR,
     "quant_skip":           _KIND_LIST,
     "quant_only":           _KIND_LIST,
+    # NAG negative guidance (ADR-023). nag_scale > 1 activates NAG on the
+    # krea family (the only family with a Krea2NAGPipeline port); it changes
+    # output CONTENT, so the quadruple is sidecar-persisted and
+    # --params-replayable like the quant triple above.
+    "nag_scale":            _KIND_FLOAT,
+    "nag_tau":              _KIND_FLOAT,
+    "nag_alpha":            _KIND_FLOAT,
+    "nag_end":              _KIND_FLOAT,
 })
 
 

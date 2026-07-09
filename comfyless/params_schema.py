@@ -76,6 +76,13 @@ _FIELD_DEFAULTS: Dict[str, object] = {
     "quant":                "none",
     "quant_skip":           [],
     "quant_only":           [],
+    # NAG negative guidance quadruple (ADR-023) — sidecar-replayable.
+    # nag_scale 0.0 = off (>1 activates); tau/alpha/end are the paper's
+    # few-step defaults.
+    "nag_scale":            0.0,
+    "nag_tau":              2.5,
+    "nag_alpha":            0.25,
+    "nag_end":              1.0,
 }
 
 

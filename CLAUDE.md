@@ -58,12 +58,12 @@ python -m py_compile nodes/<file>.py   # syntax check a single file
 ```bash
 python3 test_manual_loop.py                 # 186 tests: samplers, manual loop, encode helper, Qwen edit
 python3 test_multistage.py                  # 141 tests: multistage infrastructure
-python3 test_params_schema.py               # 222 tests: comfyless COMFYLESS_SCHEMA + adapters + krea routing/rebalance + Krea2 attention-backend pin + Z-Image base/Turbo name-hint detection & routing (ADR-009) + LoRA-failure surfacing (ADR-015) + quant sidecar round-trip (quant in SCHEMA_KIND, 2026-07-08)
+python3 test_params_schema.py               # 246 tests: comfyless COMFYLESS_SCHEMA + adapters + krea routing/rebalance + Krea2 attention-backend pin + Z-Image base/Turbo name-hint detection & routing (ADR-009) + LoRA-failure surfacing (ADR-015) + quant sidecar round-trip (quant in SCHEMA_KIND, 2026-07-08) + NAG quadruple sidecar round-trip & family gating (ADR-023)
 python3 test_cascade.py                     # 129 tests: comfyless Stable Cascade dispatch (ADR-010)
-python3 test_machine_boundary_validator.py  # 130 tests: machine-boundary validator (ADR-012)
+python3 test_machine_boundary_validator.py  # 138 tests: machine-boundary validator (ADR-012)
 python3 test_iterate.py                     #  92 tests: comfyless --iterate (ADR-008)
 python3 test_samplers.py                    #  41 tests: custom schedulers / sampler swap
-python3 test_server_robustness.py           # 105 tests: comfyless IPC timeouts + BrokenPipe survival + device-keyed socket routing + server-side device pinning + atomic output reservation (ADR-020) + daemon quant carriage (ADR-019 slice DQ: validation, cache-key discrimination, quant forwarding, H-1 symlink refusal) + multi-root _check_paths union (ADR-018)
+python3 test_server_robustness.py           # 114 tests: comfyless IPC timeouts + BrokenPipe survival + device-keyed socket routing + server-side device pinning + atomic output reservation (ADR-020) + daemon quant carriage (ADR-019 slice DQ: validation, cache-key discrimination, quant forwarding, H-1 symlink refusal) + multi-root _check_paths union (ADR-018) + NAG cache-key freedom & daemon/wire carriage (ADR-023)
 python3 test_mcp_server.py                  # 654 tests: comfyless MCP server (ADR-011 slice 1 + ADR-015 slice 2 catalog/list_models/list_loras + slice 2b list_transformers + slice 3 generate catalog-name migration + slice 3b cascade catalog-name migration + ADR-018 multi-root kind-typed scan + ADR-022 S5 catalog search/family filters + ADR-015 2026-07-06 LoRA-failure name-based notices)
 python3 test_quant.py                       # 101 tests: fp8 quantize-on-load (ADR-019 slice A) — eligibility policy, cache-key discrimination, DMR dispatcher routing, boundary hygiene
 python3 test_fp8_single_file.py             # 195 tests: ComfyUI scaled-fp8 single-file loader + DMR merge (ADR-019 slices C/C-d/DMR) — classifier variants, security-review negatives, ScaledFp8Linear numerics, dequant->merge->requant dispatcher + ComfyUI-native Krea-2 key converter (ADR-019 2026-07-07) + partial-quant naked-fp8 coexistence (slice PQ, reqs 31-38) + non-weight fp8 upcast & dequant-to-bf16 mode (slice R1/R2/R3, reqs 39-45) + int8-tensorwise ci-w consumption (slice I8, reqs 46-56)
@@ -72,8 +72,9 @@ python3 test_vae_override_class.py          #  10 tests: --vae override honors t
 python3 test_lora_audit.py                  # 197 tests: scripts/lora_audit.py classify / manifest / dry-load / convert / delete (ADR-014 S1–S4) + transformer audit (ADR-021: prognosis mapping, shape match, sampled dedupe, root disjointness, report-only)
 python3 test_lora_convert_krea.py           #  31 tests: Krea-2 LoRA format-conversion plan (krea_native → diffusers_krea) + fp8-resident buffer-visibility (LoRAs on ScaledFp8Linear bases — fix 7cc99ab)
 python3 test_catalog_db.py                  # 125 tests: catalog DB metadata plane (ADR-022 S1-S5) — schema, FUSE guard, sanitizer, upsert/stale semantics, manifest kind-branch join, families/sidecar/exclusion/search, civitai enrichment (mocked network), load-plane independence
+python3 test_nag.py                         #  50 tests: NAG negative guidance for Krea-2 (ADR-023) — formula vs reference equations (tau clip both branches), processor selection filter (transformer_blocks in / text_fusion out, cuDNN-pin inheritance), dormancy, lane re-sync, pipeline routing guards, N1 boundary-warning pins
 ```
-All sixteen suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 2385 unit tests; expect 0 failures.
+All seventeen suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 2476 unit tests; expect 0 failures.
 
 `test_flux2.py` is a live GPU smoke test that performs an actual Flux.2 generation — separate from the unit suites above. Run only when you need to verify end-to-end Flux.2 behavior.
 

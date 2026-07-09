@@ -411,6 +411,11 @@ detail and bypass the safety filter's quality dilution. Tune with
 `rebalance_mult` (default 4.0; try 1.5–2.0 for a gentler effect) and
 `rebalance_weights` (12 per-layer-tap gains). Ignored for non-Krea models.
 
+Negative prompts on krea-turbo: the distilled checkpoint runs cfg 0 and
+IGNORES negative_prompt by itself. Set `nag_scale` to 4-5 to activate NAG
+(Normalized Attention Guidance) — negative_prompt then works. Krea models
+only; other families warn and skip. Costs ~2x wall time on NAG'd steps.
+
 If `model` is omitted, the server uses the model configured at spawn time
 via --default-model. Omitting `model` without a configured default
 returns an error.
@@ -581,6 +586,30 @@ _GENERATE_INPUT_SCHEMA: dict[str, Any] = {
                 "Quantize exactly these component slots, overriding the "
                 "default eligible set. 'vae' is refused even here. Slot "
                 "names only — never paths."
+            ),
+        },
+        "nag_scale": {
+            "type": "number",
+            "description": (
+                "Normalized Attention Guidance scale (ADR-023). >1 "
+                "activates NAG on krea/krea-turbo, making negative_prompt "
+                "work on distilled (cfg 0) checkpoints where CFG is dead. "
+                "Try 4-5. Non-krea families warn and skip. Default 0 (off)."
+            ),
+        },
+        "nag_tau": {
+            "type": "number",
+            "description": "[nag_scale] Norm-growth clip tau (default 2.5).",
+        },
+        "nag_alpha": {
+            "type": "number",
+            "description": "[nag_scale] Blend alpha (default 0.25).",
+        },
+        "nag_end": {
+            "type": "number",
+            "description": (
+                "[nag_scale] Fraction of steps NAG applies to (default "
+                "1.0 = full window; 0.5-0.75 trades strength for speed)."
             ),
         },
     },
@@ -1905,10 +1934,23 @@ async def _handle_generate(
         text_encoder_path="",
         text_encoder_2_path="",
         vae_from_transformer=bool(payload.get("vae_from_transformer")),
+        # NAG quadruple (ADR-023): schema params, type-validated in step 1;
+        # krea-family-gated inside generate() (loud warn+skip elsewhere).
+        nag_scale=gen_params.get("nag_scale", 0.0),
+        nag_tau=gen_params.get("nag_tau", 2.5),
+        nag_alpha=gen_params.get("nag_alpha", 0.25),
+        nag_end=gen_params.get("nag_end", 1.0),
         allow_hf_download=False,
         _cached_pipeline=cached,
         mcp_caller=True,  # signals _save_with_metadata to apply MCP redaction
     )
+
+    # 8.5 — NAG skip/oddity warnings (ADR-023 invariant N1): generate()'s
+    # stderr is this server's log, invisible to the agent — the metadata
+    # list is the boundary-crossing signal. Path-free by construction
+    # (family names, scales, local-import exception text; no weight paths).
+    for _w in metadata.get("nag_warnings") or []:
+        notices.append(f"WARNING: NAG — {_w}")
 
     # 9 — Inline response (invariant 11: no sidecar on disk). resolved_params
     # renders weight references as catalog NAMES (invariant 5); the
@@ -2046,6 +2088,15 @@ async def _handle_generate_cascade(
         notices.append(
             "INFO: quant is not supported for Stable Cascade dispatch — "
             "ignored (generation proceeds unquantized)"
+        )
+    # NAG is krea-family-only (ADR-023); the cascade path never reaches
+    # generate()'s family gate, so mirror the quant ignore-loudly notice.
+    _nag_req = arguments.get("nag_scale")
+    if isinstance(_nag_req, (int, float)) and not isinstance(_nag_req, bool) \
+            and _nag_req > 1:
+        notices.append(
+            "INFO: nag_scale is not supported for Stable Cascade dispatch — "
+            "ignored (generation proceeds without negative guidance)"
         )
     resolved_cc = dict(cfg_cc)
     stage_names: dict = {}

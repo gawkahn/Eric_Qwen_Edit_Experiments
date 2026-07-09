@@ -399,6 +399,12 @@ def _request_cache_key(req: dict, precision: str, device: str) -> tuple:
     (LoRA set deliberately NOT in the key). Paths are client abspaths, not
     realpaths — over-eviction on symlink aliases is accepted by design.
     See docs/security/review-slice-DQ-daemon-quant-2026-07-03.md (F2/F3/F4).
+
+    NAG params (nag_scale/tau/alpha/end, ADR-023) are deliberately NOT in
+    the key: they change output content but not pipeline shape — the NAG
+    attention processors are installed per-call and restored in a finally
+    (pipelines/nag_krea2.py), so a cached pipeline serves any NAG config.
+    test_server_robustness pins this decision.
     """
     quant = str(req.get("quant") or "none")
     key = (
@@ -698,6 +704,10 @@ def _handle_generate(
             quant=req_quant,
             quant_skip=req_quant_skip,
             quant_only=req_quant_only,
+            nag_scale=req.get("nag_scale", 0.0),
+            nag_tau=req.get("nag_tau", 2.5),
+            nag_alpha=req.get("nag_alpha", 0.25),
+            nag_end=req.get("nag_end", 1.0),
             _cached_pipeline=cached,
         )
     except Exception as e:

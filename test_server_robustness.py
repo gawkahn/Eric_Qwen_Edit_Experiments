@@ -632,6 +632,84 @@ check("delegation guard present and quant-free",
       and 'args.quant != "none" and (args.savepath' not in _gen_src)
 
 
+print("\n── NAG (ADR-023): key freedom + forwarding + wire carriage ────")
+
+# DECIDED (Vision slice NAG): the NAG quadruple stays OUT of the pipeline
+# cache key. NAG changes output content but not pipeline shape — the NAG
+# attention processors are installed per-call and restored in a finally
+# (pipelines/nag_krea2.py), so a cached pipeline serves any NAG config.
+# A key that discriminated on nag_* would evict/reload on every NAG tweak.
+check("nag params do NOT change the cache key (per-request safe)",
+      _K(dict(_r0, nag_scale=5.0, nag_tau=3.0, nag_alpha=0.5, nag_end=0.75),
+         "bf16", "cuda") == _k_none)
+check("nag params do NOT change the cache key under quant either",
+      _K(dict(_r0, quant="fp8", nag_scale=5.0), "bf16", "cuda") == _k_fp8)
+
+# Daemon forwards the quadruple to generate(); omitted -> dormant defaults.
+_load_captured_n: dict = {}
+
+
+def _fake_load_n(model_path, **kw):
+    _load_captured_n.clear()
+    _load_captured_n.update(kw)
+    return object(), "krea-turbo", False
+
+
+_gen._load_pipeline = _fake_load_n
+_gen.generate = _fake_generate
+try:
+    _outdir_n = tempfile.mkdtemp()
+    _state_n: dict = {}
+    _resp_n = srv._handle_generate(
+        {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "p",
+         "nag_scale": 4.0, "nag_tau": 3.0, "nag_alpha": 0.5, "nag_end": 0.75},
+        _outdir_n, _outdir_n, "cuda", "bf16", _state_n)
+    check("daemon: NAG request succeeds", _resp_n.get("status") == "ok",
+          f"resp={_resp_n!r}")
+    check("daemon: nag_scale forwarded to generate()",
+          _captured.get("nag_scale") == 4.0,
+          f"got {_captured.get('nag_scale')!r}")
+    check("daemon: nag_tau/alpha/end forwarded to generate()",
+          (_captured.get("nag_tau"), _captured.get("nag_alpha"),
+           _captured.get("nag_end")) == (3.0, 0.5, 0.75))
+
+    # Same state, different NAG config: warm cache MUST be reused (this is
+    # the behavioral half of the key-freedom decision above).
+    _load_captured_n.clear()
+    srv._handle_generate(
+        {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "p2",
+         "nag_scale": 2.0},
+        _outdir_n, _outdir_n, "cuda", "bf16", _state_n)
+    check("daemon: NAG config change hits warm cache (no reload)",
+          not _load_captured_n, f"reloaded with {_load_captured_n!r}")
+
+    # Omitted quadruple -> the dormant schema defaults reach generate().
+    srv._handle_generate(
+        {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "p3"},
+        _outdir_n, _outdir_n, "cuda", "bf16", _state_n)
+    check("daemon: omitted nag quadruple -> dormant defaults",
+          (_captured.get("nag_scale"), _captured.get("nag_tau"),
+           _captured.get("nag_alpha"), _captured.get("nag_end"))
+          == (0.0, 2.5, 0.25, 1.0),
+          f"got {[_captured.get(k) for k in ('nag_scale', 'nag_tau', 'nag_alpha', 'nag_end')]!r}")
+finally:
+    _gen._load_pipeline = _orig_load
+    _gen.generate = _orig_generate
+
+# Wire request sources the quadruple from the MERGED PARAMS dict
+# (sidecar-replayable, quant precedent) and passes the boundary validator.
+_wire_n = _gen._build_server_request(
+    _args_q,
+    {"model": "/m", "prompt": "p", "nag_scale": 4.0, "nag_tau": 2.5,
+     "nag_alpha": 0.25, "nag_end": 1.0},
+    [])
+check("wire request carries nag_scale", _wire_n.get("nag_scale") == 4.0,
+      f"got {_wire_n.get('nag_scale')!r}")
+check("wire request nag params pass server validation end-to-end",
+      srv._validate_request(dict(_wire_n)) is None,
+      f"err={srv._validate_request(dict(_wire_n))!r}")
+
+
 print("\n── H-1: _socket_dir symlink rejection ─────────────────────────")
 
 # _socket_dir honors XDG_RUNTIME_DIR first; force the /tmp branch and plant
