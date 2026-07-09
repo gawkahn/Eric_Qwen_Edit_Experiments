@@ -14,7 +14,11 @@ Rules for ADRs, security reviews, and the tech debt register are in §12 of
 
 - **Repo:** `docs/decisions/`, `docs/security/`, `docs/vision/`, `TECH_DEBT.md` at project root
 - **Vault mirrors:** `Decisions/`, `Security/`, `Vision/`, `Tech_Debt.md`,
-  `Backlog.md`, `Comfyless_Manual.md` (all under the Vault project root above)
+  `Backlog.md` (all under the Vault project root above)
+- **Comfyless user docs (vault-ONLY, no repo copy — rewritten 2026-07-09):**
+  `Comfyless_Manual.md` (main) + `Comfyless_Models.md` + `Comfyless_MCP.md` +
+  `Comfyless_Catalog.md`, under the Vault project root. Obsidian wikilink
+  conventions. Update these when user-facing comfyless behavior changes.
 
 This is a solo personal project — `docs/` in the repo is the canonical store.
 Vault copies are a personal reference mirror.
