@@ -411,10 +411,13 @@ detail and bypass the safety filter's quality dilution. Tune with
 `rebalance_mult` (default 4.0; try 1.5–2.0 for a gentler effect) and
 `rebalance_weights` (12 per-layer-tap gains). Ignored for non-Krea models.
 
-Negative prompts on krea-turbo: the distilled checkpoint runs cfg 0 and
-IGNORES negative_prompt by itself. Set `nag_scale` to 4-5 to activate NAG
-(Normalized Attention Guidance) — negative_prompt then works. Krea models
-only; other families warn and skip. Costs ~2x wall time on NAG'd steps.
+Negative prompts on distilled models: guidance-distilled checkpoints
+(flux, flux2, flux2klein) and cfg-0 distills (krea-turbo, zimage-turbo)
+IGNORE negative_prompt by themselves. Set `nag_scale` to 4-5 to activate
+NAG (Normalized Attention Guidance) — negative_prompt then works. On
+krea/zimage families NAG needs cfg_scale 0 (at cfg>0 classic CFG already
+consumes the negative). Unsupported families warn and skip. Costs ~2x
+wall time on NAG'd steps.
 
 If `model` is omitted, the server uses the model configured at spawn time
 via --default-model. Omitting `model` without a configured default
@@ -591,10 +594,13 @@ _GENERATE_INPUT_SCHEMA: dict[str, Any] = {
         "nag_scale": {
             "type": "number",
             "description": (
-                "Normalized Attention Guidance scale (ADR-023). >1 "
-                "activates NAG on krea/krea-turbo, making negative_prompt "
-                "work on distilled (cfg 0) checkpoints where CFG is dead. "
-                "Try 4-5. Non-krea families warn and skip. Default 0 (off)."
+                "Normalized Attention Guidance scale (ADR-023/024). >1 "
+                "activates NAG on krea, flux, flux2, flux2klein, and "
+                "zimage families, making negative_prompt work where CFG "
+                "is dead (guidance-distilled / cfg-0 checkpoints). "
+                "krea/zimage families need cfg_scale 0 (at cfg>0 classic "
+                "CFG owns the negative). Try 4-5. Unsupported families "
+                "warn and skip. Default 0 (off)."
             ),
         },
         "nag_tau": {
@@ -2089,7 +2095,7 @@ async def _handle_generate_cascade(
             "INFO: quant is not supported for Stable Cascade dispatch — "
             "ignored (generation proceeds unquantized)"
         )
-    # NAG is krea-family-only (ADR-023); the cascade path never reaches
+    # NAG applies to the ADR-024 family set; the cascade path never reaches
     # generate()'s family gate, so mirror the quant ignore-loudly notice.
     _nag_req = arguments.get("nag_scale")
     if isinstance(_nag_req, (int, float)) and not isinstance(_nag_req, bool) \

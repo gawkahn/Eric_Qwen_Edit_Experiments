@@ -574,23 +574,62 @@ def _apply_family_defaults(
         _log(f"{prefix}family={family} defaults applied: {kv}")
 
 
-def _nag_gate(model_family: str, nag_scale: Optional[float]) -> tuple:
-    """Decide whether NAG activates (ADR-023: krea family only).
+# NAG family table (ADR-023 krea + ADR-024 expansion). Value = whether
+# classic CFG owns the negative prompt at cfg>0 for this family:
+#   True  → NAG is gated to the cfg<=0 regime (krea/zimage conventions:
+#           their pipelines run real CFG at guidance>0, which already
+#           consumes the negative — NAG on top is out of scope).
+#   False → always NAG-eligible (flux-family guidance EMBEDS are not CFG;
+#           comfyless never routes negatives to these families at all).
+# Each family's NAG machinery lives in the module named in _NAG_MODULES.
+_NAG_CFG_OWNS_NEGATIVE: Dict[str, bool] = {
+    "krea":         True,
+    "krea-turbo":   True,
+    "zimage":       True,
+    "zimage-turbo": True,
+    "flux":         False,
+    "flux2":        False,
+    "flux2klein":   False,
+}
+
+_NAG_MODULES: Dict[str, str] = {
+    "krea":         "pipelines.nag_krea2",
+    "krea-turbo":   "pipelines.nag_krea2",
+    "flux":         "pipelines.nag_flux",
+    "flux2":        "pipelines.nag_flux2",
+    "flux2klein":   "pipelines.nag_flux2",
+    "zimage":       "pipelines.nag_zimage",
+    "zimage-turbo": "pipelines.nag_zimage",
+}
+
+
+def _nag_gate(model_family: str, nag_scale: Optional[float],
+              cfg_scale: float = 0.0) -> tuple:
+    """Decide whether NAG activates (family table + CFG-interplay rule).
 
     Returns (active, warning). nag_scale unset/<=1 is the documented off
-    state — dormant, no warning. A non-krea family with NAG requested stays
-    inactive and returns a loud warning naming the family (warn-don't-block;
-    a silent no-op is invariant N1's failure mode).
+    state — dormant, no warning. An unsupported family, or a cfg-gated
+    family with classic CFG active, stays inactive with a loud warning
+    (warn-don't-block; a silent no-op is invariant N1's failure mode).
     """
     if nag_scale is None or nag_scale <= 1.0:
         return False, None
-    if model_family in ("krea", "krea-turbo"):
-        return True, None
-    return False, (
-        f"--nag-scale {nag_scale} ignored — NAG is implemented for "
-        f"krea/krea-turbo only (model_family={model_family!r}). "
-        f"Generation proceeds WITHOUT negative guidance."
-    )
+    cfg_owns = _NAG_CFG_OWNS_NEGATIVE.get(model_family)
+    if cfg_owns is None:
+        return False, (
+            f"--nag-scale {nag_scale} ignored — NAG is implemented for "
+            f"{'/'.join(sorted(_NAG_CFG_OWNS_NEGATIVE))} only "
+            f"(model_family={model_family!r}). Generation proceeds "
+            f"WITHOUT negative guidance."
+        )
+    if cfg_owns and cfg_scale > 0:
+        return False, (
+            f"nag_scale {nag_scale} skipped — classic CFG is active "
+            f"(cfg_scale={cfg_scale} > 0) and already consumes the "
+            f"negative prompt on {model_family}. Run --cfg 0 to use NAG "
+            f"(the distilled-checkpoint recommendation)."
+        )
+    return True, None
 
 
 def _build_call_kwargs(
@@ -650,7 +689,9 @@ def _build_call_kwargs(
 
     if model_family in ("sdxl", "sd3", "sd1", "zimage", "zimage-turbo"):
         # zimage-turbo shares Z-Image's guidance_scale routing; its
-        # FAMILY_DEFAULTS cfg 1.0 collapses CFG to a single forward pass.
+        # FAMILY_DEFAULTS cfg 1.0 runs REAL CFG at scale 1 (ZImagePipeline
+        # enables CFG at guidance_scale > 0 — ADR-024 correction; a prior
+        # comment here wrongly claimed single-pass collapse).
         # It MUST be listed here — the introspection fallback would route
         # true_cfg_scale (which ZImagePipeline.__call__ rejects) and drop
         # CFG entirely (ADR-009 2026-07-06).
@@ -1237,27 +1278,25 @@ def generate(
     # (invariant N1; the lora_warnings precedent). Recorded in the sidecar,
     # printed client-side from the wire metadata, surfaced as MCP notices.
     nag_warnings: List[str] = []
-    nag_active, nag_warning = _nag_gate(model_family, nag_scale)
+    # The gate owns the whole family table AND the CFG-interplay rule
+    # (ADR-024): cfg-gated families (krea/zimage — their pipelines run real
+    # CFG at cfg>0) skip loudly; flux-family guidance embeds are not CFG,
+    # so those are always eligible. The per-pipeline mirrors carry the same
+    # guards for standalone users — gating here makes every skip visible
+    # across the daemon/MCP boundary.
+    nag_active, nag_warning = _nag_gate(model_family, nag_scale, cfg_scale)
     if nag_warning:
         nag_warnings.append(nag_warning)
-    if nag_active and cfg_scale > 0:
-        # Classic CFG already consumes the negative prompt at cfg>0 (krea
-        # Raw); NAG targets the distilled cfg<=0 checkpoints. The pipeline
-        # has the same guard for standalone users — gating here makes the
-        # skip visible across the daemon/MCP boundary.
-        nag_warnings.append(
-            f"nag_scale {nag_scale} skipped — classic CFG is active "
-            f"(cfg_scale={cfg_scale} > 0) and already consumes the negative "
-            f"prompt. NAG applies to distilled cfg<=0 checkpoints (Turbo)."
-        )
-        nag_active = False
     if nag_active:
         try:
-            from pipelines.nag_krea2 import nag_pipe_call
+            import importlib
+            nag_pipe_call = importlib.import_module(
+                _NAG_MODULES[model_family]).nag_pipe_call
         except Exception as e:
             nag_warnings.append(
-                f"nag_scale {nag_scale} ignored — NAG module unavailable "
-                f"({e}). Generation proceeds WITHOUT negative guidance."
+                f"nag_scale {nag_scale} ignored — NAG module for "
+                f"{model_family} unavailable ({e}). Generation proceeds "
+                f"WITHOUT negative guidance."
             )
             nag_active = False
     if nag_active:
@@ -1289,8 +1328,9 @@ def generate(
             "nag_alpha": nag_alpha,
             "nag_end":   nag_end,
         })
-        # The stock krea branch only forwards negative_prompt under CFG
-        # introspection rules; NAG consumes it regardless, so re-attach.
+        # The family CFG-routing branches only forward negative_prompt when
+        # the stock pipeline consumes it (flux-family: never); NAG consumes
+        # it regardless, so re-attach unconditionally.
         if neg:
             call_kwargs["negative_prompt"] = neg
         _log(f"[comfyless] NAG active: scale={nag_scale}, tau={nag_tau}, "
@@ -1493,10 +1533,12 @@ def _parse_args() -> argparse.Namespace:
     # sidecar's NAG params survive --params replay unless the CLI
     # explicitly overrides them; resolved to schema defaults post-merge.
     p.add_argument("--nag-scale", type=float, default=None,
-                   help="Normalized Attention Guidance scale (ADR-023). "
-                        ">1 activates NAG on krea/krea-turbo, making "
-                        "--negative-prompt work on distilled (cfg 0) "
-                        "checkpoints where CFG is dead. Try 4-5. Costs "
+                   help="Normalized Attention Guidance scale (ADR-023/024). "
+                        ">1 activates NAG on krea/flux/flux2/flux2klein/"
+                        "zimage families, making --negative-prompt work "
+                        "where CFG is dead (guidance-distilled and cfg-0 "
+                        "checkpoints). krea/zimage need --cfg 0 (at cfg>0 "
+                        "classic CFG owns the negative). Try 4-5. Costs "
                         "~2x wall time on the NAG'd steps. Recorded in "
                         "the sidecar and replayed by --params.")
     p.add_argument("--nag-tau", type=float, default=None,

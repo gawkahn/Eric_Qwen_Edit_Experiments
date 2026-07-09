@@ -123,11 +123,13 @@ FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
     # ── zimage-turbo (Z-Image-Turbo) ────────────────────────────────────
     # Step-distilled variant. Z-Image ships NO is_distilled marker (unlike
     # Krea-2), so `infer_model_family` detects Turbo by "turbo" in the model
-    # path (ADR-009 2026-07-06). 8 steps / cfg 1.0 (guidance_scale <= 1.0 →
-    # single forward pass, no CFG). Base defaults (30/4.0) DESTROY this
-    # distill — empirically confirmed: a batch of Turbo LoRAs rendered pure
-    # noise under base params and cleanly at 8/1.0 (gen-validation
-    # 2026-07-06). Routes through the zimage guidance_scale branch in
-    # `_build_call_kwargs`.
+    # path (ADR-009 2026-07-06). 8 steps / cfg 1.0. NOTE (ADR-024
+    # correction): ZImagePipeline runs REAL classic CFG whenever
+    # guidance_scale > 0 — cfg 1.0 is a genuine double-pass at scale 1, not
+    # the single-pass collapse a prior comment claimed. Negative prompts DO
+    # work at this default via CFG; NAG (--nag-scale) requires --cfg 0.
+    # Base defaults (30/4.0) DESTROY this distill — empirically confirmed
+    # (gen-validation 2026-07-06). Routes through the zimage
+    # guidance_scale branch in `_build_call_kwargs`.
     "zimage-turbo": {"cfg_scale": 1.0, "steps": 8},
 }

@@ -58,33 +58,9 @@ logger = logging.get_logger(__name__)
 _NAG_BLOCK_PREFIX = "transformer_blocks."
 
 
-def nag_merge(
-    z_positive: torch.Tensor,
-    z_negative: torch.Tensor,
-    nag_scale: float,
-    nag_tau: float,
-    nag_alpha: float,
-) -> torch.Tensor:
-    """The NAG formula (paper Eqs. 7-10; reference attention_nag.py L103-110).
-
-    Extrapolate `Z+ * scale - Z- * (scale-1)`, clip the per-token L1-norm
-    growth ratio at `nag_tau`, then blend with `nag_alpha`. Norms are per
-    token over the feature dim (dim=-1, keepdim), L1 per the paper.
-    """
-    z_guidance = z_positive * nag_scale - z_negative * (nag_scale - 1.0)
-    norm_positive = torch.norm(
-        z_positive, p=1, dim=-1, keepdim=True
-    ).expand(*z_positive.shape)
-    norm_guidance = torch.norm(
-        z_guidance, p=1, dim=-1, keepdim=True
-    ).expand(*z_guidance.shape)
-
-    ratio = norm_guidance / norm_positive
-    z_guidance = z_guidance * torch.minimum(
-        ratio, ratio.new_ones(1) * nag_tau
-    ) / ratio
-
-    return z_guidance * nag_alpha + z_positive * (1.0 - nag_alpha)
+# The formula moved to nag_common with the ADR-024 family expansion;
+# re-exported here so existing importers (tests) keep working unchanged.
+from pipelines.nag_common import nag_merge  # noqa: F401
 
 
 class NAGKrea2AttnProcessor:

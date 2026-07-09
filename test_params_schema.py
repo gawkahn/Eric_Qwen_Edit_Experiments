@@ -1067,22 +1067,42 @@ check("nag keys are NOT in _SKIP_SIDECAR_KEYS",
 check("nag_warnings IS in _SKIP_SIDECAR_KEYS (provenance, not a param)",
       "nag_warnings" in g._SKIP_SIDECAR_KEYS)
 
-# Family gating helper (ADR-023: krea only; loud warning elsewhere).
-print("\n── NAG family gating (_nag_gate) ──────────────────────────────")
-check("krea accepts NAG", g._nag_gate("krea", 4.0) == (True, None))
-check("krea-turbo accepts NAG", g._nag_gate("krea-turbo", 4.0) == (True, None))
+# Family gating table (ADR-023 krea + ADR-024 expansion; loud warning on
+# unsupported families and on CFG-owned configs).
+print("\n── NAG family gating (_nag_gate, ADR-024 table) ───────────────")
+check("krea accepts NAG at cfg 0", g._nag_gate("krea", 4.0) == (True, None))
+check("krea-turbo accepts NAG at cfg 0",
+      g._nag_gate("krea-turbo", 4.0, 0.0) == (True, None))
+check("zimage-turbo accepts NAG at cfg 0",
+      g._nag_gate("zimage-turbo", 4.0, 0.0) == (True, None))
+check("zimage (base) accepts NAG at cfg 0",
+      g._nag_gate("zimage", 4.0, 0.0) == (True, None))
+check("flux accepts NAG (guidance embeds are not CFG)",
+      g._nag_gate("flux", 4.0) == (True, None))
+check("flux2 accepts NAG even at cfg>0 (guidance embed rides along)",
+      g._nag_gate("flux2", 4.0, 4.0) == (True, None))
+check("flux2klein accepts NAG",
+      g._nag_gate("flux2klein", 4.0, 3.5) == (True, None))
 _ng_off = g._nag_gate("krea-turbo", 1.0)
-check("nag_scale<=1 is dormant on krea (no warning)",
+check("nag_scale<=1 is dormant (no warning)",
       _ng_off == (False, None), f"got {_ng_off!r}")
 check("nag_scale None is dormant", g._nag_gate("krea", None) == (False, None))
-_ng_flux = g._nag_gate("flux", 4.0)
-check("non-krea family skips NAG", _ng_flux[0] is False)
-check("non-krea skip warning is loud and names the family",
-      bool(_ng_flux[1]) and "flux" in _ng_flux[1],
-      f"got {_ng_flux[1]!r}")
-_ng_dormant_flux = g._nag_gate("flux", 0.0)
-check("dormant NAG on non-krea family raises no warning (NEGATIVE)",
-      _ng_dormant_flux == (False, None), f"got {_ng_dormant_flux!r}")
+# cfg-gated families: classic CFG owns the negative at cfg>0.
+for _fam in ("krea", "krea-turbo", "zimage", "zimage-turbo"):
+    _ng_cfg = g._nag_gate(_fam, 4.0, 1.0)
+    check(f"{_fam} at cfg>0 skips NAG with a loud CFG warning",
+          _ng_cfg[0] is False and bool(_ng_cfg[1]) and "CFG" in _ng_cfg[1],
+          f"got {_ng_cfg!r}")
+_ng_sdxl = g._nag_gate("sdxl", 4.0)
+check("unsupported family skips NAG", _ng_sdxl[0] is False)
+check("unsupported-family warning is loud and names the family",
+      bool(_ng_sdxl[1]) and "sdxl" in _ng_sdxl[1],
+      f"got {_ng_sdxl[1]!r}")
+_ng_dormant = g._nag_gate("sdxl", 0.0)
+check("dormant NAG on unsupported family raises no warning (NEGATIVE)",
+      _ng_dormant == (False, None), f"got {_ng_dormant!r}")
+check("gate table and dispatch map cover the same families",
+      set(g._NAG_CFG_OWNS_NEGATIVE) == set(g._NAG_MODULES))
 
 
 print("\n──────────────────────────────────────────────────")
