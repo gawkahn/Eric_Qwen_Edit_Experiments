@@ -163,6 +163,17 @@ sharing (unchanged from ADR-023); separate `--nag-negative`.
 
 ## Changelog
 
+- 2026-07-09 (verification) — VERIFIED live by Grant on flux, flux2, and
+  zimage: effects present (not guaranteed per-image — expected for
+  attention-space guidance), zimage confirmed to need cfg 0 (the gate's
+  loud skip at cfg>0 is correct — Z-Image's real CFG owns the negative
+  there), flux families confirmed working at their default guidance
+  (guidance embeds ≠ CFG; no gate, as designed). `--quant fp8` + NAG
+  coexist (H5 held) and fit Flux.2-dev on one GPU. Flux effect strength
+  noted as softer than Krea — consistent with HF1-1 (negative flows via
+  T5 tokens only; positive pooled shared) plus the strong distillation
+  prior at guidance 3.5; tuning order: scale 5-6 → alpha 0.3-0.4 → lower
+  guidance. flux2klein live check still pending.
 - 2026-07-09 (later) — IMPLEMENTED. `pipelines/nag_common.py` (shared
   formula + tail/front/full lane-merge helpers), `pipelines/nag_flux.py`,
   `pipelines/nag_flux2.py` (two processor variants + shared denoise loop +
