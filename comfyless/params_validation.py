@@ -1,10 +1,15 @@
 """Canonical machine-boundary input validator for comfyless.
 
 Per ADR-012 (accepted 2026-05-15). ONE function defines input-type rules for
-every machine-facing comfyless surface: the daemon socket (server.py), the
-future MCP server (mcp_server.py), and iterate's per-LoRA validation in
-generate.py. No type predicate (isinstance) outside this module's two
-public callables.
+every machine-facing comfyless surface: the daemon socket (server.py) and the
+MCP server (mcp_server.py). No type predicate (isinstance) outside this
+module's two public callables.
+
+The `--iterate lora` file was RECLASSIFIED off this validator on 2026-07-10
+(ADR-012 amendment): it is a hand-authored replay artifact, not a machine
+boundary, and gets lenient normalization in generate.py
+(`_normalize_iterate_lora_element`, missing weight → 1.0) rather than this
+strict, fail-closed validation.
 
 Boundary-asymmetry rule (ADR-012 §4): machine boundaries fail closed; the
 CLI's _validate_params stays warn-and-keep for human replay. This module

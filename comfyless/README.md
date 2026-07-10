@@ -405,18 +405,23 @@ Each `--iterate PARAM FILE` expects a flat JSON list. Element shape must match t
 | `seed`, `steps`, `width`, `height` | int | `[42, 1337, 9999]` |
 | `cfg_scale` | number (int or float) | `[3.5, 4.0, 4.5]` |
 | `model`, `transformer_path`, `vae_path`, `text_encoder_path`, `text_encoder_2_path` | string (absolute path OR HuggingFace repo ID) | `["/hf-local/Qwen-Image-2512", "black-forest-labs/FLUX.1-dev"]` |
-| `lora` | list of `{path, weight}` dicts — each iteration replaces the entire LoRA stack | see below |
+| `lora` | each element is one iteration's LoRA stack — a `"path"` / `"path:weight"` string, a `{path, weight?}` dict, or a list of those | see below |
 
-LoRA stack iteration replaces the full `--lora` stack per run; if `--lora` is also supplied on the command line, `--iterate lora` wins and `--lora` is ignored (with a stderr warning). Empty list `[]` means "no LoRA this iteration."
+Each iteration replaces the full `--lora` stack; if `--lora` is also supplied on the command line, `--iterate lora` wins and `--lora` is ignored (with a stderr warning).
+
+Unlike the machine-facing IPC/MCP surface, the `--iterate` file is a hand-authored replay artifact, so it is lenient — **a missing `weight` defaults to `1.0`** (matching `--lora` and sidecar `loras`), and each element may be written in whichever form is least ornate:
 
 ```json
 [
-  [],
-  [{"path": "/loras/style_a.safetensors", "weight": 0.8}],
-  [{"path": "/loras/style_a.safetensors", "weight": 0.8},
-   {"path": "/loras/detail_boost.safetensors", "weight": 0.5}]
+  "/loras/style_a.safetensors",
+  "/loras/style_a.safetensors:0.8",
+  {"path": "/loras/style_a.safetensors"},
+  ["/loras/style_a.safetensors:0.8", "/loras/detail_boost.safetensors:0.5"],
+  []
 ]
 ```
+
+That file runs five iterations: `style_a` at weight 1.0, `style_a` at 0.8, `style_a` at 1.0 (dict form), a two-LoRA stack, and one with no LoRA (`[]`). Use the list form to define a reusable multi-LoRA stack; a bare string or dict is enough for the common single-LoRA-per-run sweep. A present `weight` must be a real number — a garbled value (`"heavy"`, `true`) is a hard error, not silently coerced.
 
 ### Multiple axes = Cartesian product
 

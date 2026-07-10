@@ -63,7 +63,6 @@ from nodes.eric_diffusion_samplers import sampler_choices, swap_sampler
 from nodes.eric_qwen_edit_lora import load_lora_with_key_fix
 
 from comfyless.family_defaults import DISTILLED_FAMILIES, FAMILY_DEFAULTS
-from comfyless.params_validation import validate_lora_entry
 
 CONTRACT_VERSION = 1
 SAMPLER_NAMES = sampler_choices()
@@ -2000,30 +1999,103 @@ def _positive_int(s: str) -> int:
 
 
 def _validate_iterate_value(value: Any, expected: Any) -> bool:
-    """True if `value` matches the expected iteration-element shape."""
+    """True if `value` matches the expected iteration-element shape.
+
+    Scalar axes only (str / int / number). The `lora` axis is NOT handled
+    here — it is a human-authored replay surface with lenient normalization,
+    routed through `_normalize_iterate_lora_element` from `_plan_iterations`
+    (ADR-012 amendment 2026-07-10). Keep this function isinstance-clean for
+    the machine-boundary N19 AST scan that still covers scalar axes.
+    """
     if expected == "number":
         return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if expected == "lora_stack":
-        if not isinstance(value, list):
-            return False
-        # Per-entry validation delegates to the canonical machine-boundary
-        # validator per ADR-012 §6 / Vision invariant 5 (step 4 of validator
-        # slice). One bad entry rejects the whole axis (matches the
-        # fail-closed posture of machine-boundary surfaces).
-        #
-        # Contract tightening vs the prior local check: missing 'weight' now
-        # rejects (was previously accepted; downstream code at lines 855, 927,
-        # and 1276 defaulted to 1.0 — those defaults no longer rescue an
-        # under-specified iterate input file).
-        for i, item in enumerate(value):
-            if not validate_lora_entry(item, i).ok:
-                return False
-        return True
     if expected is int:
         return isinstance(value, int) and not isinstance(value, bool)
     if expected is str:
         return isinstance(value, str)
     return False
+
+
+def _normalize_iterate_lora_dict(entry: Any, where: str) -> Dict[str, Any]:
+    """Normalize one LoRA dict for the `--iterate lora` file (human surface).
+
+    `path` is required and must be a non-empty string. `weight` is OPTIONAL:
+    absent → 1.0 (matches `_parse_lora_arg` and `_apply_loras`' `.get("weight",
+    1.0)` — the iterate file must not be the ecosystem's lone outlier). A
+    PRESENT weight must be a real number (int cast to float), never bool / str
+    / None — a garbled weight is an authoring mistake worth surfacing, not
+    silently coercing. Unknown keys pass through (kohya `rank`/`alpha` etc.).
+
+    Unlike the canonical machine-boundary `validate_lora_entry`, this is
+    deliberately lenient about a missing weight. See ADR-012 amendment
+    2026-07-10 for why the iterate file is a human-replay surface, not a wire.
+    """
+    if not isinstance(entry, dict):
+        raise ValueError(f"{where}: expected a path string or a "
+                         f"{{path, weight}} dict, got {type(entry).__name__}")
+    if "path" not in entry:
+        raise ValueError(f"{where}: LoRA entry missing required 'path'")
+    path = entry["path"]
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError(f"{where}: 'path' must be a non-empty string, "
+                         f"got {path!r}")
+    out = dict(entry)
+    if "weight" not in entry or entry["weight"] is None:
+        out["weight"] = 1.0
+    else:
+        w = entry["weight"]
+        if isinstance(w, bool) or not isinstance(w, (int, float)):
+            raise ValueError(f"{where}: 'weight' must be a number, "
+                             f"got {type(w).__name__}={w!r}")
+        out["weight"] = float(w)
+    return out
+
+
+def _normalize_iterate_lora_element(value: Any, index: int) -> List[Dict[str, Any]]:
+    """Normalize one `--iterate lora` list element into a canonical LoRA stack.
+
+    Accepts three ergonomic shapes (ADR-012 amendment 2026-07-10):
+      - str  "path" or "path:weight"  → single-LoRA stack (via _parse_lora_arg)
+      - dict {path, weight?}          → single-LoRA stack (weight defaults 1.0)
+      - list of the above             → an explicit reusable stack ([] = no LoRA)
+
+    Returns the canonical `[{path: str, weight: float}, …]` shape stored in the
+    iteration plan, so everything downstream of `_plan_iterations` is unchanged.
+    Raises ValueError with an element-scoped message on malformed input.
+    """
+    where = f"element [{index}]"
+    if isinstance(value, str):
+        return [_parse_iterate_lora_string(value, where)]
+    if isinstance(value, dict):
+        return [_normalize_iterate_lora_dict(value, where)]
+    if isinstance(value, list):
+        stack: List[Dict[str, Any]] = []
+        for j, item in enumerate(value):
+            item_where = f"{where} stack entry [{j}]"
+            if isinstance(item, str):
+                stack.append(_parse_iterate_lora_string(item, item_where))
+            else:
+                stack.append(_normalize_iterate_lora_dict(item, item_where))
+        return stack
+    raise ValueError(f"{where}: expected a path string, a {{path, weight}} "
+                     f"dict, or a list of those, got {type(value).__name__}")
+
+
+def _parse_iterate_lora_string(spec: str, where: str) -> Dict[str, Any]:
+    """Parse a `"path"` / `"path:weight"` iterate string into a LoRA dict.
+
+    Wraps `_parse_lora_arg` (the CLI `--lora` grammar) and rejects a path that
+    is empty after the optional `:weight` split — e.g. `":0.8"` — so the string
+    form fails as loudly as the dict form does on a blank path, rather than
+    deferring to a load-time no-op (reviewer LOW, 2026-07-10).
+    """
+    if not spec.strip():
+        raise ValueError(f"{where}: empty LoRA path string")
+    parsed = _parse_lora_arg(spec)
+    if not parsed["path"].strip():
+        raise ValueError(f"{where}: 'path' must be a non-empty string, "
+                         f"got {spec!r}")
+    return parsed
 
 
 def _plan_iterations(args: argparse.Namespace) -> Optional[dict]:
@@ -2070,13 +2142,27 @@ def _plan_iterations(args: argparse.Namespace) -> Optional[dict]:
         if not values:
             raise ValueError(f"--iterate {param} {filepath!r}: empty list")
         expected = _ITERATE_SHAPES[param]
-        for i, v in enumerate(values):
-            if not _validate_iterate_value(v, expected):
-                shape_name = expected if isinstance(expected, str) else expected.__name__
-                raise ValueError(
-                    f"--iterate {param} {filepath!r} element [{i}]: "
-                    f"expected {shape_name}, got {type(v).__name__}={v!r}"
-                )
+        if expected == "lora_stack":
+            # Human-authored replay surface: normalize each element into a
+            # canonical [{path, weight}, …] stack (weight defaults to 1.0,
+            # "path:weight" strings accepted). ADR-012 amendment 2026-07-10.
+            normalized: List[Any] = []
+            for i, v in enumerate(values):
+                try:
+                    normalized.append(_normalize_iterate_lora_element(v, i))
+                except ValueError as e:
+                    raise ValueError(
+                        f"--iterate {param} {filepath!r} {e}"
+                    ) from e
+            values = normalized
+        else:
+            for i, v in enumerate(values):
+                if not _validate_iterate_value(v, expected):
+                    shape_name = expected if isinstance(expected, str) else expected.__name__
+                    raise ValueError(
+                        f"--iterate {param} {filepath!r} element [{i}]: "
+                        f"expected {shape_name}, got {type(v).__name__}={v!r}"
+                    )
         axes.append((param, Path(filepath).stem, values))
 
     cartesian = 1

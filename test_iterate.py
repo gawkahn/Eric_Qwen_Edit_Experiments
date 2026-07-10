@@ -76,34 +76,73 @@ check("number shape rejects bool",
 check("number shape rejects str",
       g._validate_iterate_value("4.5", "number") is False)
 
-check("lora_stack accepts empty list",
-      g._validate_iterate_value([], "lora_stack") is True,
-      "empty stack == 'no LoRA this iteration'")
-check("lora_stack accepts single-item stack",
-      g._validate_iterate_value(
-          [{"path": "/x.safetensors", "weight": 0.8}],
-          "lora_stack",
-      ) is True)
-# Behavior tightening per ADR-012 §6 / Vision invariant 5 (validator slice
-# step 4, 2026-05-16): missing 'weight' now rejects. Was previously accepted
-# (downstream code defaulted to 1.0); the canonical validator requires both
-# 'path' and 'weight' explicit.
-check("lora_stack rejects stack without weight (ADR-012 §6)",
-      g._validate_iterate_value(
-          [{"path": "/x.safetensors"}],
-          "lora_stack",
-      ) is False)
-check("lora_stack rejects non-list top-level",
-      g._validate_iterate_value({"path": "/x.safetensors"}, "lora_stack") is False)
-check("lora_stack rejects item without path",
-      g._validate_iterate_value([{"weight": 0.8}], "lora_stack") is False)
-check("lora_stack rejects non-str path",
-      g._validate_iterate_value([{"path": 42}], "lora_stack") is False)
-check("lora_stack rejects bool weight",
-      g._validate_iterate_value(
-          [{"path": "/x.safetensors", "weight": True}],
-          "lora_stack",
-      ) is False)
+# ── _normalize_iterate_lora_element (human replay surface) ──────────────
+# ADR-012 amendment 2026-07-10: the --iterate lora file is a hand-authored
+# replay artifact, NOT the machine boundary. It is lenient — weight defaults
+# to 1.0, "path:weight" strings and bare dicts are accepted — decoupled from
+# the strict wire validator (validate_lora_entry), which is unchanged.
+print("\n── _normalize_iterate_lora_element ────────────────────────────")
+
+check("string path → single-LoRA stack, weight defaults 1.0",
+      g._normalize_iterate_lora_element("/x.safetensors", 0)
+      == [{"path": "/x.safetensors", "weight": 1.0}],
+      "the ecosystem-wide 1.0 default now holds here too")
+check("string path:weight → parsed weight",
+      g._normalize_iterate_lora_element("/x.safetensors:0.8", 0)
+      == [{"path": "/x.safetensors", "weight": 0.8}])
+check("bare dict without weight → weight defaults 1.0",
+      g._normalize_iterate_lora_element({"path": "/x.safetensors"}, 0)
+      == [{"path": "/x.safetensors", "weight": 1.0}])
+check("bare dict with int weight → cast to float",
+      g._normalize_iterate_lora_element({"path": "/x.safetensors", "weight": 1}, 0)
+      == [{"path": "/x.safetensors", "weight": 1.0}])
+check("empty list → empty stack (no LoRA this iteration)",
+      g._normalize_iterate_lora_element([], 0) == [])
+check("list of dicts → multi-LoRA stack, weights defaulted per-entry",
+      g._normalize_iterate_lora_element(
+          [{"path": "/a.safetensors", "weight": 0.8}, {"path": "/b.safetensors"}], 0)
+      == [{"path": "/a.safetensors", "weight": 0.8},
+          {"path": "/b.safetensors", "weight": 1.0}])
+check("list of path:weight strings → stack (reusable, ergonomic)",
+      g._normalize_iterate_lora_element(["/a.safetensors:0.8", "/b.safetensors"], 0)
+      == [{"path": "/a.safetensors", "weight": 0.8},
+          {"path": "/b.safetensors", "weight": 1.0}])
+check("extra keys preserved (kohya rank/alpha)",
+      g._normalize_iterate_lora_element({"path": "/x.safetensors", "rank": 64}, 0)
+      == [{"path": "/x.safetensors", "rank": 64, "weight": 1.0}])
+check("None weight treated as absent → 1.0",
+      g._normalize_iterate_lora_element({"path": "/x.safetensors", "weight": None}, 0)
+      == [{"path": "/x.safetensors", "weight": 1.0}])
+
+
+def _rejects(value, needle):
+    """True if normalizing `value` raises ValueError mentioning `needle`."""
+    try:
+        g._normalize_iterate_lora_element(value, 0)
+        return False
+    except ValueError as e:
+        return needle in str(e)
+
+
+check("rejects int element (not str/dict/list)",
+      _rejects(42, "element [0]"))
+check("rejects dict without path",
+      _rejects({"weight": 0.8}, "missing required 'path'"))
+check("rejects non-str path",
+      _rejects({"path": 42, "weight": 0.8}, "non-empty string"))
+check("rejects empty path string",
+      _rejects("", "empty LoRA path"))
+check("rejects weight-only string (':0.8' → empty path)",
+      _rejects(":0.8", "non-empty string"),
+      "string form must fail as loudly as the dict form on a blank path")
+check("rejects weight-only string inside a stack list",
+      _rejects([":0.8"], "non-empty string"))
+check("rejects bool weight (garbled authoring, not silent coercion)",
+      _rejects({"path": "/x.safetensors", "weight": True}, "must be a number"))
+check("rejects str weight",
+      _rejects({"path": "/x.safetensors", "weight": "heavy"}, "must be a number"))
+check("error message is element-scoped for stack entries",
+      _rejects([{"weight": 0.8}], "stack entry [0]"))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -121,6 +160,19 @@ with tempfile.TemporaryDirectory() as tmp:
         [],
         [{"path": "/loras/style_a.safetensors", "weight": 0.8}],
     ], loras)
+
+    # Mixed lenient forms in one file (ADR-012 amendment 2026-07-10): a bare
+    # string, a string:weight, a weightless dict, and an explicit stack.
+    loras_mixed = os.path.join(tmp, "loras_mixed.json")
+    write_json([
+        "/loras/style_a.safetensors",
+        "/loras/style_a.safetensors:0.6",
+        {"path": "/loras/style_a.safetensors"},
+        ["/loras/style_a.safetensors:0.8", {"path": "/loras/detail.safetensors"}],
+    ], loras_mixed)
+
+    loras_bad = os.path.join(tmp, "loras_bad.json")
+    write_json([{"path": "/loras/style_a.safetensors", "weight": "heavy"}], loras_bad)
 
     bad_shape = os.path.join(tmp, "bad_shape.json")
     write_json([42, "not a number", 100], bad_shape)
@@ -157,6 +209,30 @@ with tempfile.TemporaryDirectory() as tmp:
     plan = g._plan_iterations(make_args(iterate=[["lora", loras]]))
     check("lora-axis plan accepts stacks",
           plan is not None and plan["total"] == 2)
+
+    # Lenient mixed forms normalize into canonical stacks stored in the plan.
+    plan = g._plan_iterations(make_args(iterate=[["lora", loras_mixed]]))
+    _lora_values = plan["axes"][0][2] if plan else None
+    check("lora-axis plan: mixed forms → 4 normalized stacks",
+          plan is not None and plan["total"] == 4)
+    check("lora-axis plan: bare string normalized with weight 1.0",
+          _lora_values[0] == [{"path": "/loras/style_a.safetensors", "weight": 1.0}])
+    check("lora-axis plan: string:weight normalized",
+          _lora_values[1] == [{"path": "/loras/style_a.safetensors", "weight": 0.6}])
+    check("lora-axis plan: weightless dict defaulted",
+          _lora_values[2] == [{"path": "/loras/style_a.safetensors", "weight": 1.0}])
+    check("lora-axis plan: explicit stack normalized per-entry",
+          _lora_values[3] == [{"path": "/loras/style_a.safetensors", "weight": 0.8},
+                              {"path": "/loras/detail.safetensors", "weight": 1.0}])
+
+    # Error: garbled weight in a lora file element is element-scoped and named.
+    try:
+        g._plan_iterations(make_args(iterate=[["lora", loras_bad]]))
+        check("lora-axis plan: bad weight raises ValueError", False, "did not raise")
+    except ValueError as e:
+        check("lora-axis plan: bad weight raises ValueError",
+              "element [0]" in str(e) and "must be a number" in str(e)
+              and loras_bad in str(e))
 
     # No --iterate → None
     check("no --iterate returns None",
