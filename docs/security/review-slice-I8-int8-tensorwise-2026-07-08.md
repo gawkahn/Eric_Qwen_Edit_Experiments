@@ -63,3 +63,82 @@ Variables: D = `.comfy_quant`, W = `.weight_scale`, suffix = `.weight`-named. Fi
 **APPROVABLE WITH CHANGES.** The design's core choices are right: dequant-only (no residency) removes whole finding classes; polarity on naked int8 is correct; the D5-compatible flavor inference is preserved. Merge is gated on **I8-1** (flavor from dtypes with two-way cross-consistency), **I8-2** (loader re-assertion closing the pre-existing step-2 int8 pass-through — the single highest-consequence gap, a live silent-cast channel today), and **I8-3** (strict field allowlist replacing the convrot-specific reject); I8-4 must be explicitly scoped in or out before merge. I8-5 through I8-7 are required but mechanical; I8-8 through I8-10 are confirmations.
 
 **Scope decision recorded at implementation (parent session, declared per req 52): I8-4 is FOLDED INTO this slice** — the fp8 descriptor loop rejects convrot-prefixed fields (all flavors); other unknown fields on fp8 descriptors keep log-and-ignore.
+
+---
+
+## Amendment 2026-07-10 — req 50 corrected: `int8_tensorwise` scales are scalar OR per-output-channel
+
+AI-Disclosure: Claude (Opus 4.8) authored; Grant reviewed.
+
+**Trigger.** `greed_int8.safetensors` (community Krea checkpoint, 170 quantized
+Linears) refused to load: every `weight_scale` is F32 `[out_features, 1]`, not the
+scalar req 50 mandates. The file is otherwise pristine — descriptors byte-exactly
+`{"format": "int8_tensorwise"}`, no `input_scale`, no `convrot`, no fp8 tensors,
+every I8 tensor a fully-paired 2D `.weight`.
+
+**Finding: the original req 50 was wrong, not the file.** `int8_tensorwise` names
+comfy-kitchen's *layout class* (`TensorWiseINT8Layout`), not the scale granularity.
+One format string covers both. Evidence, from `comfy-kitchen==0.2.18` (the version
+pinned by ComfyUI master's `requirements.txt`; PR #14636 has since merged, so this
+is shipped upstream behavior, not a proposal):
+
+- `TensorWiseINT8Layout.quantize(..., per_channel: bool)` — *"If True and is_weight,
+  use per-channel (row-wise) scaling."*
+- `quantize_int8_rowwise` returns *"scales: Float32 tensor `[..., 1]` with per-row
+  scales."*
+- `dequantize_int8_simple(q, scale) -> q.float() * scale` — plain broadcast multiply.
+- `requantize_kwargs`: `per_channel = bool(is_weight and (convrot or params.scale.dim() > 0))`
+  — the scalar/per-channel discriminator is `scale.dim()`, i.e. both are in-format.
+- Upstream `ops.py` performs **no** shape validation on the popped `weight_scale`.
+
+Our dequant (`_load` step 2, `w.to(f32) * ws.to(f32)`) is already numerically
+identical to upstream's. Only the two validation gates were over-tight.
+
+**New hazard introduced by widening (the reason this is not a one-line loosening).**
+A `[rows, 1]` scale broadcasts row-wise (correct). A `[1, in_features]` scale
+broadcasts **column-wise, silently, with no shape error** — same total element count
+as no dimension check would catch, wrong semantics, corrupted weights. A bare
+`(rows,)` 1-D scale likewise broadcasts along the *last* axis, not the row axis.
+Both are silent numerical corruption of exactly the class F2/F3 exist to prevent.
+Therefore the widened rule must **pin the shape exactly**, not merely admit
+`numel() > 1`.
+
+**Requirements delta (57-60).**
+
+57. **req 50 superseded for the int8 flavor.** ci-w `weight_scale` is accepted iff
+    dtype ∈ {BF16, F32} (unchanged, still checked on the RAW tensor pre-upcast) AND
+    shape ∈ { `()`, `(1,)`, `(rows, 1)` } where `rows == weight.shape[0]` of the
+    bound I8 weight. Every other shape — including `(1, in_features)`, `(rows,)`,
+    and any `(r, 1)` with `r != rows` — is a loud reject. The rows binding is
+    enforced at classify (from the safetensors header, no tensor read) and
+    re-asserted at load against the actual weight tensor (PQ-2 two-point pattern).
+
+58. **fp8 flavors unchanged, byte-identical.** `_validate_scale` keeps its
+    scalar-only, F32-only default; every fp8/cq/DMR-requant call site is untouched.
+    Per-channel scales remain rejected on all fp8 paths (original finding F3 stands
+    — it was always an fp8 finding; it was over-generalized to int8 in error). The
+    ci-w call site moves to a separate validator rather than parameterizing
+    `_validate_scale` further, so no fp8 gate can be loosened by a future edit to
+    the int8 path.
+
+59. **Value policy generalized elementwise.** The finite-positive-normal check (F2:
+    reject NaN/Inf/0/negative/subnormal) applies to EVERY element of a per-channel
+    scale vector, after upcast to F32, not just to `.item()`. A single poisoned row
+    scale is a corrupted output row. The rejection message names the first offending
+    flat index and its value.
+
+60. **`convrot` remains refused** (req 51 strict allowlist stands). `greed_int8`
+    carries no `convrot`, so per-channel support does not imply rotation support;
+    rotated weights change what the bytes *mean* and stay out of scope. Note upstream
+    couples them (`convrot` requires `per_channel`), so a future convrot slice
+    inherits this amendment's shape rule as a precondition, not a conflict.
+
+**Review of the implementing change:** `docs/security/review-i8-perchannel-scales-2026-07-10.md`
+(security-auditor, Opus — no findings at CRITICAL/HIGH/MEDIUM; one accepted [INFO]).
+
+**Threat model unchanged.** Same-uid solo-desktop operator loading a checkpoint they
+chose; ceiling remains silent numerical corruption of the operator's own generation.
+Widening the shape allowlist does not add a new capability — the bytes were always
+going to be multiplied into weights; the question is only whether the multiply is
+row-correct. Reqs 57/59 convert two previously-silent corruption paths (column
+broadcast, poisoned row scale) into loud rejects that upstream ComfyUI does not have.

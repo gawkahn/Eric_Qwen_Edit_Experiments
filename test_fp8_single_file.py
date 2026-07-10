@@ -689,20 +689,89 @@ _expect_reject("I8: naked fp8 in int8 file rejects (test 19)",
                    "first.weight": _fp8((8, 4)),
                }), "req 54")
 
-# Test 20: scale dtype F16 / vector-shaped BF16 scale reject at header.
+# Test 20: scale dtype F16 rejects; a bare 1-D (rows,) scale rejects because
+# it would broadcast along the LAST axis, not the row axis (req 57).
 _expect_reject("I8: F16 scale rejects (test 20a)",
                _mk("i8_f16s.safetensors", {
                    "a.weight": _i8((8, 4)),
                    "a.weight_scale": _scalar(0.02, torch.float16),
                    "a.comfy_quant": _I8DESC,
-               }), "SCALAR")
-_expect_reject("I8: vector BF16 scale rejects (test 20b)",
+               }), "BF16/F32")
+_expect_reject("I8: bare 1-D (rows,) scale rejects (test 20b)",
                _mk("i8_vecs.safetensors", {
                    "a.weight": _i8((8, 4)),
                    "a.weight_scale": torch.full((8,), 0.02,
                                                 dtype=torch.bfloat16),
                    "a.comfy_quant": _I8DESC,
-               }), "SCALAR")
+               }), "per-output-channel")
+
+# ── req 57: per-output-channel (rows, 1) scales — the greed_int8.safetensors
+# shape. `int8_tensorwise` names comfy-kitchen's LAYOUT class, not the scale
+# granularity: quantize_int8_rowwise emits [..., 1] per-row scales under the
+# same format string, and dequantize_int8_simple is `q.float() * scale`.
+_pcw = _i8((8, 4), seed=11)
+_pcs = torch.rand(8, 1, generator=torch.Generator().manual_seed(3)) * 0.05 + 0.01
+_pcfile = _mk("i8_perchannel.safetensors", {
+    "a.weight": _pcw, "a.weight_scale": _pcs.to(torch.float32),
+    "a.comfy_quant": _I8DESC,
+})
+v, _info = _classify(_pcfile)
+check("I8: per-channel (rows,1) F32 scale classifies ci-w (req 57)",
+      v == "ci-w", f"got {v}")
+_m_pc = fp8ops.load_scaled_fp8_component(
+    _CaptureComp, _pcfile, torch.bfloat16, "", "ci-w")
+_exp_pc = (_pcw.to(torch.float32) * _pcs.to(torch.float32)).to(torch.bfloat16)
+check("I8: per-channel dequant broadcasts ROW-wise (req 57)",
+      torch.equal(_m_pc._received_sd["a.weight"], _exp_pc))
+# Guard the fixture itself: scales must actually differ across rows, else a
+# wrong-axis broadcast would still produce the expected tensor and the
+# numerics check above would pass vacuously.
+check("I8: per-channel fixture discriminates row vs column broadcast",
+      _pcs.min().item() != _pcs.max().item())
+
+# BF16 per-channel also accepted.
+v, _ = _classify(_mk("i8_pc_bf16.safetensors", {
+    "a.weight": _i8((8, 4)),
+    "a.weight_scale": torch.full((8, 1), 0.02, dtype=torch.bfloat16),
+    "a.comfy_quant": _I8DESC}))
+check("I8: per-channel BF16 scale accepted (req 57)", v == "ci-w", f"got {v}")
+
+# NEGATIVE: (1, in_features) broadcasts COLUMN-wise, silently, with no shape
+# error from torch. This is the corruption path req 57 exists to close.
+_expect_reject("I8: (1, in) column-broadcast scale rejects (req 57)",
+               _mk("i8_colscale.safetensors", {
+                   "a.weight": _i8((8, 4)),
+                   "a.weight_scale": torch.full((1, 4), 0.02,
+                                                dtype=torch.float32),
+                   "a.comfy_quant": _I8DESC,
+               }), "per-output-channel")
+
+# NEGATIVE: (r, 1) with r != rows — right rank, wrong binding.
+_expect_reject("I8: (rows+1, 1) mismatched scale rejects (req 57)",
+               _mk("i8_wrongrows.safetensors", {
+                   "a.weight": _i8((8, 4)),
+                   "a.weight_scale": torch.full((9, 1), 0.02,
+                                                dtype=torch.float32),
+                   "a.comfy_quant": _I8DESC,
+               }), "per-output-channel")
+
+# NEGATIVE: one poisoned element in an otherwise-valid per-channel vector —
+# the value policy is elementwise, not `.item()` (req 59).
+for _lbl, _v in [("NaN", float("nan")), ("Inf", float("inf")),
+                 ("zero", 0.0), ("negative", -1.0),
+                 ("subnormal", 2.0 ** -133)]:
+    def _poison(_v=_v):
+        _s = torch.full((8, 1), 0.02, dtype=torch.float32)
+        _s[5, 0] = _v
+        return fp8ops.load_scaled_fp8_component(
+            _CaptureComp, _mk("i8_pcval.safetensors", {
+                "a.weight": _i8((8, 4)),
+                "a.weight_scale": _s,
+                "a.comfy_quant": _I8DESC,
+            }), torch.bfloat16, "", "ci-w")
+    _expect_reject(
+        f"I8: per-channel scale with one {_lbl} row rejects (req 59)",
+        _poison, "element [5]")
 
 # Test 21: BF16 scale VALUE battery — rejected at load (validated raw,
 # upcast for the value check).

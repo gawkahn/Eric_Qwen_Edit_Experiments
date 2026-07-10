@@ -68,7 +68,11 @@ convrot-prefixed fields reject on fp8 descriptors too, I8-4). No naked-
 int8 analog of PQ exists — raw int8 bytes have no float interpretation,
 so every I8 tensor must be a fully-paired 2D .weight (both classify and
 load enforce it; the stage-2 pass-through refuses int8 in all variants).
-int8 scales are scalar {BF16,F32}; fp8 scales stay F32-only. ci-w has NO
+int8 scales are {BF16,F32}, either scalar or per-output-channel (rows, 1)
+pinned to the bound weight's row count — "tensorwise" names comfy-kitchen's
+layout class, not the scale granularity (review Amendment 2026-07-10, req
+57); any other shape broadcasts along the wrong axis and rejects. fp8
+scales stay scalar F32-only, via a separate validator. ci-w has NO
 residency op (no Int8Linear): it always dequantizes to bf16 — with
 --quant fp8, torchao re-quantizes downstream. Marker-less all-int8 files
 never enter this parser (entry condition) and keep their standard-path
@@ -419,8 +423,68 @@ def _classify_cq(path: str, keys, dtypes, shapes, fp8_keys, cq_keys, cb_hits):
 
 #: int8-tensorwise scale dtypes (header names). BF16 is the observed
 #: ComfyUI convention; F32 is a strict-superset-in-precision emitter
-#: variation. fp8 flavors stay F32-only (D7 untouched). (I8 req 50.)
+#: variation. fp8 flavors stay F32-only (D7 untouched). (I8 req 50 — the
+#: dtype clause only; the scale SHAPE rule is req 57, see _is_ci_scale_shape.)
 _CI_SCALE_DTYPES = ("BF16", "F32")
+
+#: Smallest positive NORMAL float32. Subnormal scales flush to zero on most
+#: tensor-core paths, so they are rejected alongside 0/NaN/Inf (finding F2).
+_F32_MIN_NORMAL = 1.1754943508222875e-38
+
+
+def _is_ci_scale_shape(shape, rows: int) -> bool:
+    """True iff `shape` is a legal int8-tensorwise weight-scale shape.
+
+    Legal: scalar (`()` / `(1,)`) or per-output-channel `(rows, 1)`, where
+    `rows` is the bound weight's dim-0. `int8_tensorwise` names comfy-kitchen's
+    LAYOUT class, not the scale granularity — upstream `quantize_int8_rowwise`
+    emits `[..., 1]` per-row scales under the same format string, and
+    `dequantize_int8_simple` is `q.float() * scale` (req 57).
+
+    Everything else rejects, and the near-misses are the whole point: a
+    `(1, in_features)` scale broadcasts COLUMN-wise and a bare `(rows,)` scale
+    broadcasts along the LAST axis — both silently, with no shape error, both
+    corrupting the weight. Shape is pinned exactly rather than admitting any
+    `numel() > 1` vector.
+    """
+    shape = tuple(shape)
+    return shape in ((), (1,)) or shape == (rows, 1)
+
+
+def _validate_ci_scale(name: str, t: torch.Tensor, rows: int) -> None:
+    """Shape + elementwise value validation for an int8-tensorwise scale.
+
+    The ci-w counterpart to `_validate_scale`, kept SEPARATE rather than
+    parameterizing that function further: `_validate_scale` stays scalar-only
+    and F32-only for every fp8/cq/DMR-requant call site, so no future edit to
+    the int8 path can loosen an fp8 gate (req 58; original finding F3 is an
+    fp8 finding and stands).
+
+    Dtype is checked on the RAW tensor before upcast (I8-5). The
+    finite-positive-normal policy (F2) then applies to EVERY element — one
+    poisoned row scale is one corrupted output row (req 59).
+    """
+    if t.dtype not in (torch.bfloat16, torch.float32):
+        raise ScaledFp8FormatError(
+            f"scale {_safe_name(name)} has dtype {t.dtype} — int8_tensorwise "
+            f"scales must be bfloat16/float32 (F3/req 50)"
+        )
+    if not _is_ci_scale_shape(t.shape, rows):
+        raise ScaledFp8FormatError(
+            f"scale {_safe_name(name)} has shape {tuple(t.shape)} for a weight "
+            f"with {rows} rows — int8_tensorwise scales must be SCALAR or "
+            f"per-output-channel ({rows}, 1); any other shape broadcasts along "
+            f"the wrong axis and silently corrupts the weight (req 57)"
+        )
+    v = t.to(torch.float32)
+    bad = ~(torch.isfinite(v) & (v >= _F32_MIN_NORMAL))
+    if bool(bad.any()):
+        i = int(torch.nonzero(bad.reshape(-1), as_tuple=False)[0])
+        raise ScaledFp8FormatError(
+            f"scale {_safe_name(name)} element [{i}] is "
+            f"{v.reshape(-1)[i].item()!r} — not finite-positive-normal; "
+            f"refusing to load (silent numerical corruption guard, F2/req 59)"
+        )
 
 
 def _classify_ci(path: str, keys, dtypes, shapes, cq_keys, cq_bases,
@@ -438,9 +502,10 @@ def _classify_ci(path: str, keys, dtypes, shapes, cq_keys, cq_bases,
     v1 rules (security review I8-1..I8-9):
       - weight-only: any `.input_scale` anywhere refuses (req 47)
       - no fp8 tensors anywhere in an int8-flavored file (req 54)
-      - EVERY I8 tensor must be a 2D `.weight` with descriptor + scalar
-        {BF16,F32} weight_scale — no naked-int8 analog of PQ (raw int8
-        bytes have no float interpretation; "upcast" is garbage) (req 48)
+      - EVERY I8 tensor must be a 2D `.weight` with descriptor + a {BF16,F32}
+        scalar-or-(rows,1) weight_scale (req 48; shape rule is req 57) — no
+        naked-int8 analog of PQ (raw int8 bytes have no float
+        interpretation; "upcast" is garbage)
     """
     w_sfx = _CA_SUFFIXES["weight_scale"]
     i_sfx = _CA_SUFFIXES["input_scale"]
@@ -491,19 +556,36 @@ def _classify_ci(path: str, keys, dtypes, shapes, cq_keys, cq_bases,
                 f"2D Linear weights are supported (req 48/I8-7)"
             )
 
-    # req 50 — header scale rule: scalar {BF16,F32}, bound to a base.
+    # req 57 — header scale rule: {BF16,F32}, scalar OR per-output-channel
+    # (rows, 1) bound to its weight's row count. Supersedes the original
+    # scalar-only req 50 (see review Amendment 2026-07-10).
     for k in keys:
         if k.endswith(w_sfx):
-            if k[: -len(w_sfx)] not in cq_bases:
+            base = k[: -len(w_sfx)]
+            if base not in cq_bases:
                 raise ScaledFp8FormatError(
                     f"scale key {_safe_name(k)} has no descriptored int8 "
                     f"weight to bind to — refusing (dangling scale, F1/F6)"
                 )
-            if dtypes[k] not in _CI_SCALE_DTYPES or shapes[k] not in ((), (1,)):
+            w_shape = shapes.get(base + ".weight")
+            if w_shape is None:
                 raise ScaledFp8FormatError(
-                    f"scale {_safe_name(k)} is {dtypes[k]} shape {shapes[k]} "
-                    f"— int8_tensorwise scales must be SCALAR "
-                    f"{'/'.join(_CI_SCALE_DTYPES)} (req 50)"
+                    f"scale key {_safe_name(k)} has a descriptor but no "
+                    f"{_safe_name(base + '.weight')} to bind to — refusing "
+                    f"(dangling scale, F1/F6)"
+                )
+            if dtypes[k] not in _CI_SCALE_DTYPES:
+                raise ScaledFp8FormatError(
+                    f"scale {_safe_name(k)} is {dtypes[k]} — int8_tensorwise "
+                    f"scales must be {'/'.join(_CI_SCALE_DTYPES)} (req 50)"
+                )
+            if not _is_ci_scale_shape(shapes[k], w_shape[0]):
+                raise ScaledFp8FormatError(
+                    f"scale {_safe_name(k)} has shape {shapes[k]} for a "
+                    f"weight with {w_shape[0]} rows — int8_tensorwise scales "
+                    f"must be SCALAR or per-output-channel ({w_shape[0]}, 1); "
+                    f"any other shape broadcasts along the wrong axis and "
+                    f"silently corrupts the weight (req 57)"
                 )
 
     # req 51 — bounded descriptor read (D2 gates already ran) with a STRICT
@@ -560,10 +642,13 @@ def _validate_scale(name: str, t: torch.Tensor,
     Runs ONCE, before either compute path (scaled_mm or bf16 dequant
     fallback) can consume the value. `allowed_dtypes` DEFAULTS to F32-only
     so every fp8/DMR call site keeps the shipped D7 rule without edits
-    (I8 review req 50); the ci-w int8 call site opts into {bf16, f32}
-    (int8-tensorwise files ship BF16 scalar scales). The dtype is checked
-    on the RAW tensor before any upcast — upcast-then-validate would erase
-    the gate (I8-5).
+    (I8 review req 50). The dtype is checked on the RAW tensor before any
+    upcast — upcast-then-validate would erase the gate (I8-5).
+
+    This is the fp8 validator: scalar-only, F32-only. int8-tensorwise scales
+    may be per-output-channel and go through `_validate_ci_scale` instead —
+    deliberately a separate function so the fp8 gates here cannot be loosened
+    by a future edit to the int8 path (req 58).
     """
     if t.numel() != 1:
         raise ScaledFp8FormatError(
@@ -580,7 +665,6 @@ def _validate_scale(name: str, t: torch.Tensor,
     # Reject non-finite, non-positive, AND subnormal values (reviewer
     # finding: F2 lists denormals alongside 0/NaN/Inf — a subnormal scale
     # feeding _scaled_mm flushes to zero on most tensor-core paths).
-    _F32_MIN_NORMAL = 1.1754943508222875e-38
     if (not (v > 0.0) or v != v or v == float("inf")
             or v < _F32_MIN_NORMAL):
         raise ScaledFp8FormatError(
@@ -833,14 +917,16 @@ def load_scaled_fp8_component(component_class, weights_path: str, dtype,
                     f"weight_scale pairing — naked int8 is refused "
                     f"(req 48/49)"
                 )
-            _validate_scale(ws_key, sd[ws_key],
-                            allowed_dtypes=(torch.bfloat16, torch.float32))
             if t.dim() != 2:
                 raise ScaledFp8FormatError(
                     f"int8 weight {_safe_name(k)} has {t.dim()}D shape "
                     f"{tuple(t.shape)} — only 2D Linear weights are "
                     f"supported (req 48)"
                 )
+            # req 57 — re-assert the scale's row binding against the ACTUAL
+            # weight tensor, not just the header (PQ-2 two-point pattern).
+            # Runs after the 2D check so `t.shape[0]` is the row count.
+            _validate_ci_scale(ws_key, sd[ws_key], t.shape[0])
             fp8_entries[base] = (t, sd[ws_key], None)
             continue
         if t.dtype not in _TORCH_FP8:
