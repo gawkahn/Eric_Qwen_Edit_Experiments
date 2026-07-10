@@ -1103,3 +1103,41 @@ reference-image (kontext) inputs skip NAG loudly (HF2-1). Triggers unchanged.
   hand-written sidecar / iterate list fails the allowed-roots check. Check whether
   `cascade.py` and `mcp_server.py` build path fields the same way — if so the fix is one
   shared helper, not three copies.
+
+## 2026-07-10 — `--quant fp8` produces garbage output on Z-Image
+
+- **What:** `--quant fp8` on a Z-Image model yields a structurally-correct but heavily
+  speckled image (composition survives; every patch carries high-frequency noise).
+  Root-caused by an A/B/C matrix on 2026-07-10: (1) `--transformer greed_int8.safetensors`
+  onto `Z-Image-base` **without** `--quant` → clean; (2) stock `Z-Image-base` **with**
+  `--quant fp8` and no override → garbage; (3) stock `Z-Image-base` alone → clean. So the
+  fault is `--quant fp8` on this architecture, independent of the int8 single-file loader,
+  the `--transformer` override path, and the checkpoint itself.
+- **Suspected cause (unverified):** `_torchao_fp8_config()` (`nodes/eric_diffusion_utils.py:1557`)
+  returns a bare `Float8DynamicActivationFloat8WeightConfig()` with **no `filter_fn`**, so
+  torchao converts *every* `nn.Linear` — including `final_layer.linear` (tokens → output
+  patches), the per-block `adaLN_modulation` projections, and the `t_embedder` /
+  `cap_embedder` stacks. diffusers' own `ZImageTransformer2DModel` declares
+  `_skip_layerwise_casting_patterns = ['t_embedder', 'cap_embedder']`, i.e. upstream
+  considers those precision-sensitive. fp8-e4m3 has a 3-bit mantissa, and the recipe also
+  quantizes **activations** dynamically. Per-patch speckle is what a damaged `final_layer`
+  or modulation path would look like. Both the override path (`quantize_module`) and the
+  `from_pretrained` path (`build_quant_config`) share this recipe, which matches the
+  observation that the bug reproduces without any override.
+- **Not the cause (ruled out numerically, same session):** int8 dequant is correct
+  (cos 0.9998–0.9999/layer vs `Z-Image-base`, all 170 layers use the full ±127 range);
+  the fused-qkv split is correct (0.9999 on-diagonal, ~0.07/0.00 off-diagonal); diffusers'
+  Z-Image converter emits all 521 keys with 0 missing / 0 unexpected, prefixed or stripped;
+  embedders and pad tokens match base at cos 1.000000; stacking fp8 on int8 costs almost
+  nothing (cos 0.99945 vs 0.99965 for fp8-on-base).
+- **Why not now:** the fix is a `filter_fn` (or `module_fqn_to_config`) excluding the
+  precision-sensitive modules, but *which* modules is an empirical question needing a GPU
+  A/B sweep per family, and `_torchao_fp8_config` is shared by every family plus the DMR
+  LoRA merge path (`_merge_into_torchao`) — narrowing it silently changes quant behavior
+  for Qwen/Flux/Krea, which are currently verified-good. Needs its own slice with a
+  before/after image matrix, not a drive-by.
+- **Trigger:** next `--quant` work, or the next report of degraded output under quant on any
+  family. Until then `--quant fp8` should be treated as unsupported on Z-Image. Check first
+  whether `zimage.png` / the `gen-validation 2026-07-06` Phase-A images were produced with
+  quant off — if so, Z-Image + quant was never actually exercised and this is not a
+  regression but an untested combination.
