@@ -1137,7 +1137,7 @@ reference-image (kontext) inputs skip NAG loudly (HF2-1). Triggers unchanged.
   for Qwen/Flux/Krea, which are currently verified-good. Needs its own slice with a
   before/after image matrix, not a drive-by.
 - **Trigger:** next `--quant` work, or the next report of degraded output under quant on any
-  family. Until then `--quant fp8` should be treated as unsupported on Z-Image. Check first
-  whether `zimage.png` / the `gen-validation 2026-07-06` Phase-A images were produced with
-  quant off — if so, Z-Image + quant was never actually exercised and this is not a
-  regression but an untested combination.
+  family. Until then `--quant fp8` should be treated as unsupported on Z-Image.
+- **Answered 2026-07-10:** the `zimage.json` sidecar from the prior verified run carries no
+  `quant` key, so Z-Image had only ever been exercised unquantized. This is an **untested
+  combination, not a regression** — nothing broke it; it never worked.
