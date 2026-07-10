@@ -1104,7 +1104,7 @@ reference-image (kontext) inputs skip NAG loudly (HF2-1). Triggers unchanged.
   `cascade.py` and `mcp_server.py` build path fields the same way — if so the fix is one
   shared helper, not three copies.
 
-## 2026-07-10 — `--quant fp8` produces garbage output on Z-Image-base (NOT Turbo)
+## 2026-07-10 — `--quant fp8` transformer quant destroys Z-Image-base (NOT Turbo)
 
 - **What:** `--quant fp8` on a Z-Image model yields a structurally-correct but heavily
   speckled image (composition survives; every patch carries high-frequency noise).
@@ -1124,16 +1124,36 @@ reference-image (kontext) inputs skip NAG loudly (HF2-1). Triggers unchanged.
   *still speckled*. **The schedule is not the variable — cfg and steps are both exonerated.**
   fp8 is a floating format whose relative precision is ~constant with magnitude, so the
   weight-outlier reasoning was measuring the wrong property for this quantizer anyway.
-- **What remains:** base + fp8 is broken at every schedule; Turbo + fp8 is fine at every
-  schedule; base without fp8 is fine. The difference is the WEIGHTS, or the per-component
-  quant split. Not yet separated: `resolve_quant_components` quantizes **transformer AND
-  text_encoder** (Z-Image's TE is a `Qwen3Model` → "large LM" role; VAE is never quantized
-  by invariant). Degraded conditioning from a quantized TE is an untested cause of
-  noise-like texture. One asymmetry noted, significance unknown: Turbo's transformer ships
-  **F32** on disk, base's ships **BF16** (TE and VAE are BF16 in both).
-- **Next, before any code change** (two runs, existing flags, no code):
-  `--quant fp8 --quant-only transformer` and `--quant fp8 --quant-skip transformer` on
-  Z-Image-base. Localizes the fault to the transformer or the text encoder.
+- **LOCALIZED 2026-07-10:** `--quant fp8 --quant-only transformer` on Z-Image-base **speckles**.
+  So it is quantization of the `ZImageTransformer2DModel` denoiser. The `Qwen3Model` text
+  encoder is **exonerated** (consistent with the operator's prior: quantizing this TE has
+  never caused problems on any family). One run, not two.
+- **Current best explanation: the recipe uses PER-TENSOR granularity.**
+  `_torchao_fp8_config()` returns `Float8DynamicActivationFloat8WeightConfig()` whose default
+  is `granularity=[PerTensor(), PerTensor()]` (torchao 0.17.0, confirmed by introspection) —
+  per-tensor scales for BOTH the dynamic activations and the weights. Per-tensor *activation*
+  scaling lets one outlier token set the scale for the whole tensor and crush the rest toward
+  zero. Non-distilled models are known to carry heavier activation outliers than their
+  distills, which fits base-breaks / Turbo-survives on identical modules. It also explains
+  why the weight-side numbers looked innocent: per-tensor fp8 *weight* quant of a base tensor
+  is cos 0.99965 vs the original — the damage is on the activation side, invisible without a
+  forward pass. NOTE this remains a hypothesis: weight-vs-activation was NOT separated, and
+  cannot be from CPU. `PerRow` (per-token activations, per-output-channel weights) is the
+  standard remedy and changes both at once.
+- **Fix is structurally safe** (checked, not assumed): `_merge_into_torchao`
+  (`eric_diffusion_fp8_ops.py:1324`) is granularity-agnostic — it `dequantize()`s and
+  requantizes through `_torchao_fp8_config()` itself, so it inherits any recipe change.
+  `quant_cache_fragment` keys on quant MODE, not granularity, so no stale-cache hazard.
+  fp8 already gates on compute capability >= 8.9, which is also PerRow's requirement.
+  The real risk is behavioral: the recipe is shared by Qwen / Flux / Krea (currently
+  verified-good) and by the DMR LoRA merge, so the change needs a before/after image matrix
+  across families, not a drive-by.
+- **Also found:** `--quant-only model` is a silent no-op footgun. `model` is not a
+  `model_index.json` component, so it is ignored with a notice and `build_quant_config` then
+  bails with "no eligible components" and loads UNQUANTIZED. A clean image results and the
+  operator concludes quant was fine. Valid component names for Z-Image are `transformer`,
+  `text_encoder`, `vae` (VAE refused by invariant). Consider promoting the notice to a loud
+  warning, or failing when `--quant-only` selects nothing.
   Run those two before touching any code.
 - **Weight-outlier hypothesis — WEAKENED (measured 2026-07-10):** base and turbo have nearly
   identical outlier severity across all 276 2-D weights (median `|w|max/rms` 17.6 vs 16.1,
