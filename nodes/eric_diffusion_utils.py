@@ -577,6 +577,86 @@ def _diagnose_slot_mismatch(ckpt_keys: set, target_slot: str) -> str:
     )
 
 
+#: Architecture signatures for transformer checkpoints, keyed by arch id. Each
+#: arch carries one or more ALTERNATIVE marker sets (an arch matches when every
+#: marker in ANY one set is present as a key-path prefix), since the same
+#: architecture ships under both diffusers-native and ComfyUI-native key names.
+#: Prefix-tolerant. Deliberately narrow: an arch is listed ONLY where a real
+#: checkpoint proved the signature, so an unrecognized file returns None and
+#: stays on the permissive path.
+#:
+#: flux/flux2 are absent on purpose — they share `double_blocks`/`single_blocks`
+#: and cannot be told apart by key names, so a guess would be worse than
+#: silence.
+_ARCH_MARKERS = {
+    # Z-Image ships the same top-level names in both conventions.
+    "zimage": (("cap_embedder.", "context_refiner.", "noise_refiner."),),
+    # diffusers-native Krea-2; the ComfyUI-native form is matched separately by
+    # is_krea2_comfy_checkpoint (blocks.N.attn.wq / mod.lin).
+    "krea2": (("text_fusion.", "time_mod_proj.", "img_in."),),
+}
+
+#: Transformer class name -> arch id. Only classes whose arch is in
+#: `_ARCH_MARKERS` can be cross-checked; anything else never blocks.
+_CLASS_ARCH = {
+    "ZImageTransformer2DModel": "zimage",
+    "Krea2Transformer2DModel": "krea2",
+}
+
+
+def detect_transformer_arch(keys):
+    """Best-effort architecture id from a transformer checkpoint's key names.
+
+    Returns an arch id (`"zimage"`, `"krea2"`, ...) or None when the keys match
+    no signature we have real-file evidence for. None means "don't know", never
+    "mismatch" — callers must not treat it as a failure.
+    """
+    from .eric_krea2_convert import _strip_known_prefix, is_krea2_comfy_checkpoint
+
+    stripped = {_strip_known_prefix(k) for k in keys}
+    for arch, marker_sets in _ARCH_MARKERS.items():
+        for markers in marker_sets:
+            if all(any(s.startswith(m) for s in stripped) for m in markers):
+                return arch
+    if is_krea2_comfy_checkpoint(keys):
+        return "krea2"
+    return None
+
+
+def _check_transformer_arch(component_class, keys, weights_path: str) -> None:
+    """Refuse a transformer override whose architecture contradicts the pipeline.
+
+    A Z-Image transformer loaded into a Krea pipeline cannot work: it fails deep
+    inside a converter or a load_state_dict with an error that names neither the
+    file nor the mismatch. Catch it at the door instead.
+
+    Fails ONLY on a positive contradiction — both the checkpoint's arch and the
+    target class's arch are known AND they differ. An unknown checkpoint or an
+    un-mapped class proceeds silently; the loader stays permissive by default
+    (a wrong guess here would block a legitimate load, which is worse than the
+    confusing error this replaces).
+    """
+    from .eric_diffusion_fp8_ops import _safe_name
+
+    expected = _CLASS_ARCH.get(getattr(component_class, "__name__", ""))
+    if expected is None:
+        return
+    found = detect_transformer_arch(keys)
+    if found is None or found == expected:
+        return
+    # The basename is attacker-influenced (it ships with the checkpoint) and
+    # this message reaches a terminal and the MCP/daemon log — sanitize it, per
+    # the fp8 surface's F7 rule. `found`/`expected` come from fixed dicts and
+    # the class name from an imported class, so neither needs wrapping.
+    raise ValueError(
+        f"Architecture mismatch: {_safe_name(os.path.basename(weights_path))} "
+        f"looks like a '{found}' transformer, but the pipeline expects "
+        f"'{expected}' ({component_class.__name__}). A transformer override "
+        f"must match the base model's family — load this file against a "
+        f"'{found}' base model."
+    )
+
+
 def _load_single_weights(component_class, weights_path: str, dtype,
                          base_path: str, subfolder_hint: str,
                          pipeline_class=None, dequant_fp8: bool = False):
@@ -612,19 +692,19 @@ def _load_single_weights(component_class, weights_path: str, dtype,
     #
     # Detection is the same logic used by the direct-load fallback below:
     # a prefix is "dominant" if it appears on >=50% of checkpoint keys.
-    def _peek_dominant_prefix(path: str):
+    def _peek_keys(path: str):
         try:
             if path.lower().endswith(".safetensors"):
                 from safetensors import safe_open
                 with safe_open(path, framework="pt") as f:
-                    peek_keys = list(f.keys())
-            else:
-                peek_keys = list(
-                    torch.load(path, map_location="cpu", weights_only=True).keys()
-                )
+                    return list(f.keys())
+            return list(
+                torch.load(path, map_location="cpu", weights_only=True).keys()
+            )
         except Exception:
-            return None
+            return []
 
+    def _peek_dominant_prefix(peek_keys):
         if not peek_keys:
             return None
 
@@ -640,7 +720,18 @@ def _load_single_weights(component_class, weights_path: str, dtype,
                 return prefix
         return None
 
-    detected_prefix = _peek_dominant_prefix(weights_path)
+    # Read keys ONCE and share: the non-safetensors branch of _peek_keys does a
+    # full torch.load, so peeking twice would materialize a whole state dict an
+    # extra time.
+    _peeked_keys = _peek_keys(weights_path)
+    detected_prefix = _peek_dominant_prefix(_peeked_keys)
+
+    # Refuse an override whose architecture contradicts the target class BEFORE
+    # any converter runs — otherwise the mismatch surfaces as a converter
+    # KeyError or a missing-from_single_file AttributeError that names neither
+    # the file nor the real problem.
+    if _peeked_keys:
+        _check_transformer_arch(component_class, _peeked_keys, weights_path)
 
     # ── ComfyUI scaled-fp8 routing (ADR-019 slice C) ─────────────────────
     # Header-only classification (safe_open, names + dtypes only). Variants:

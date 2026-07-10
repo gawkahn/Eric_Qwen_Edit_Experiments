@@ -1060,6 +1060,20 @@ def load_scaled_fp8_component(component_class, weights_path: str, dtype,
             component_class, bf16_sd, config_path, dtype, strip_prefix, log_prefix)
         del bf16_sd
     else:
+        # Classes whose only construction path is a bespoke converter (Krea2)
+        # have no from_single_file. Reaching here with one means the file's
+        # keys did not match that converter's signature — i.e. the checkpoint
+        # is a DIFFERENT architecture than the pipeline expects. Say that,
+        # rather than letting `AttributeError: no attribute 'from_single_file'`
+        # surface and read as a diffusers bug.
+        if not hasattr(component_class, "from_single_file"):
+            raise ScaledFp8FormatError(
+                f"{component_class.__name__} has no from_single_file, and this "
+                f"checkpoint's keys do not match its native-format converter — "
+                f"the file is very likely a different architecture than the "
+                f"pipeline expects. Check that the transformer override matches "
+                f"the base model's family."
+            )
         model = component_class.from_single_file(
             bf16_sd, config=config_path, torch_dtype=dtype, local_files_only=True,
         )

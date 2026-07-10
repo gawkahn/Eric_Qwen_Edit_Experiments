@@ -1427,6 +1427,141 @@ check("krea2-build: non-adapter unknown key still fail-closed, named",
       "unexpected" in _ug_raised and "bogus" in _ug_raised,
       f"msg: {_ug_raised[:160]!r}")
 
+# ── Usability fixes 2026-07-10: arch-mismatch diagnostics ────────────────
+# Driven by a real incident: greed_int8.safetensors (a Z-Image transformer)
+# was loaded as a --transformer override against a Krea base pipeline. The
+# mismatch surfaced as `Krea2Transformer2DModel has no attribute
+# from_single_file`, naming neither the file nor the real problem.
+
+# Fix 1: a component_class with no from_single_file, reached with keys its
+# native converter did not claim, reports the ARCHITECTURE mismatch.
+class _NoSingleFileComp(nn.Module):
+    """Stands in for Krea2Transformer2DModel: converter-only, no
+    from_single_file."""
+
+
+_expect_reject(
+    "arch: converter-only class + unmatched keys names the mismatch (fix 1)",
+    lambda: fp8ops.load_scaled_fp8_component(
+        _NoSingleFileComp, _i8file, torch.bfloat16, "", "ci-w"),
+    "different architecture")
+
+# ...and the same converter-only class still loads its OWN native format: the
+# krea2 branch must short-circuit BEFORE the hasattr raise, or fix 1 would have
+# broken every native-Krea load. Driving a krea2-native file through the loader
+# with the converter stubbed proves the ordering — reaching the stub means the
+# hasattr raise was never consulted.
+_k2_sentinel = object()
+_real_build = krea2c.build_krea2_transformer
+try:
+    krea2c.build_krea2_transformer = lambda *a, **k: _k2_sentinel  # noqa: E731
+    _k2file = _mk("i8_krea2_native.safetensors", {
+        "blocks.0.attn.wq.weight": _i8((8, 4)),
+        "blocks.0.attn.wq.weight_scale": _scalar(0.02, torch.bfloat16),
+        "blocks.0.attn.wq.comfy_quant": _I8DESC,
+        "blocks.0.mod.lin": torch.zeros(4, dtype=torch.bfloat16),
+    })
+    _k2out = fp8ops.load_scaled_fp8_component(
+        _NoSingleFileComp, _k2file, torch.bfloat16, "", "ci-w")
+finally:
+    krea2c.build_krea2_transformer = _real_build
+check("arch: krea2 native branch short-circuits before hasattr raise (fix 1)",
+      _k2out is _k2_sentinel)
+
+# Fix 2: detect_transformer_arch + _check_transformer_arch.
+_ZIMAGE_KEYS = ["model.diffusion_model.cap_embedder.0.weight",
+                "model.diffusion_model.context_refiner.0.attention.qkv.weight",
+                "model.diffusion_model.noise_refiner.0.attention.out.weight"]
+_KREA_NATIVE_KEYS = ["blocks.0.attn.wq.weight", "blocks.0.mod.lin"]
+_KREA_DIFFUSERS_KEYS = ["text_fusion.0.weight", "time_mod_proj.weight",
+                        "img_in.weight"]
+_UNKNOWN_KEYS = ["double_blocks.0.img_attn.qkv.weight", "final_layer.linear.weight"]
+
+check("arch: detects zimage (prefixed, ComfyUI-native)",
+      edu.detect_transformer_arch(_ZIMAGE_KEYS) == "zimage")
+check("arch: detects krea2 from ComfyUI-native markers",
+      edu.detect_transformer_arch(_KREA_NATIVE_KEYS) == "krea2")
+check("arch: detects krea2 from diffusers-native markers",
+      edu.detect_transformer_arch(_KREA_DIFFUSERS_KEYS) == "krea2")
+check("arch: unknown keys -> None, never a false 'mismatch'",
+      edu.detect_transformer_arch(_UNKNOWN_KEYS) is None)
+check("arch: flux-shaped keys stay unknown (ambiguous by design)",
+      edu.detect_transformer_arch(
+          ["double_blocks.0.x", "single_blocks.0.y"]) is None)
+
+
+class ZImageTransformer2DModel(nn.Module):
+    pass
+
+
+class Krea2Transformer2DModel(nn.Module):
+    pass
+
+
+class _UnmappedTransformer(nn.Module):
+    pass
+
+
+# POSITIVE contradiction -> loud, and the message names file, found, expected.
+_blocked = ""
+try:
+    edu._check_transformer_arch(Krea2Transformer2DModel, _ZIMAGE_KEYS,
+                                "/models/Krea/greed_int8.safetensors")
+except ValueError as _e:
+    _blocked = str(_e)
+check("arch: zimage file + krea2 class is BLOCKED (fix 2)", bool(_blocked))
+check("arch: message names the file, found arch, and expected arch",
+      all(s in _blocked for s in ("greed_int8.safetensors", "'zimage'",
+                                  "'krea2'", "Krea2Transformer2DModel")),
+      _blocked)
+
+# F7: the basename ships with the checkpoint and reaches a terminal / the MCP
+# log — it must be _safe_name'd, so control chars never emit verbatim.
+_evil = ""
+try:
+    edu._check_transformer_arch(Krea2Transformer2DModel, _ZIMAGE_KEYS,
+                                "/m/pwn\x1b[31m\n.safetensors")
+except ValueError as _e:
+    _evil = str(_e)
+check("arch: mismatch message sanitizes the basename (F7)",
+      bool(_evil) and "\x1b" not in _evil and "\n" not in _evil,
+      repr(_evil[:120]))
+
+# NEGATIVES — the guard must never block a legitimate load.
+for _lbl, _cls, _keys in [
+    ("matching zimage", ZImageTransformer2DModel, _ZIMAGE_KEYS),
+    ("matching krea2 (native)", Krea2Transformer2DModel, _KREA_NATIVE_KEYS),
+    ("matching krea2 (diffusers)", Krea2Transformer2DModel,
+     _KREA_DIFFUSERS_KEYS),
+    ("unknown checkpoint + mapped class", ZImageTransformer2DModel,
+     _UNKNOWN_KEYS),
+    ("known checkpoint + unmapped class", _UnmappedTransformer, _ZIMAGE_KEYS),
+]:
+    _ok = True
+    try:
+        edu._check_transformer_arch(_cls, _keys, "x.safetensors")
+    except ValueError:
+        _ok = False
+    check(f"arch: {_lbl} proceeds (permissive, fix 2)", _ok)
+
+# The guard runs on the real loader seam, before any converter.
+_zfile = _mk("arch_zimage.safetensors", {
+    "model.diffusion_model.cap_embedder.0.weight": torch.zeros(2, 2),
+    "model.diffusion_model.context_refiner.0.attention.qkv.weight":
+        torch.zeros(6, 2),
+    "model.diffusion_model.noise_refiner.0.attention.out.weight":
+        torch.zeros(2, 2),
+})
+_seam = ""
+try:
+    edu.load_component(Krea2Transformer2DModel, _zfile, torch.bfloat16,
+                       base_path=_TMP, subfolder_hint="transformer")
+except ValueError as _e:
+    _seam = str(_e)
+check("arch: load_component blocks the mismatch at the door (fix 2)",
+      "Architecture mismatch" in _seam, _seam[:160])
+
+
 shutil.rmtree(_TMP, ignore_errors=True)
 print("\n" + "─" * 50)
 print(f"  {passed} passed, {failed} failed")
