@@ -1104,7 +1104,7 @@ reference-image (kontext) inputs skip NAG loudly (HF2-1). Triggers unchanged.
   `cascade.py` and `mcp_server.py` build path fields the same way — if so the fix is one
   shared helper, not three copies.
 
-## 2026-07-10 — `--quant fp8` produces garbage output on Z-Image
+## 2026-07-10 — `--quant fp8` produces garbage output on Z-Image-base (NOT Turbo)
 
 - **What:** `--quant fp8` on a Z-Image model yields a structurally-correct but heavily
   speckled image (composition survives; every patch carries high-frequency noise).
@@ -1113,15 +1113,34 @@ reference-image (kontext) inputs skip NAG loudly (HF2-1). Triggers unchanged.
   `--quant fp8` and no override → garbage; (3) stock `Z-Image-base` alone → clean. So the
   fault is `--quant fp8` on this architecture, independent of the int8 single-file loader,
   the `--transformer` override path, and the checkpoint itself.
-- **Suspected cause (unverified):** `_torchao_fp8_config()` (`nodes/eric_diffusion_utils.py:1557`)
-  returns a bare `Float8DynamicActivationFloat8WeightConfig()` with **no `filter_fn`**, so
+- **CORRECTION 2026-07-10 (same day):** the title above is too broad. **Z-Image-*Turbo* +
+  `--quant fp8` works fine** — verified during NAG testing and re-verified after this entry
+  was written. Same architecture, same recipe, opposite outcome. So the fault is NOT
+  "quant on Z-Image" and NOT the module set. Turbo and base differ in exactly two ways:
+  weights, and schedule (turbo `cfg 1.0 / 8 steps`; base `cfg 4.0 / 30 steps`).
+- **Leading hypothesis (unverified): CFG amplifies fp8 activation-quantization noise.**
+  Classifier-free guidance computes `eps_u + s*(eps_c - eps_u)`. Dynamic *activation* fp8
+  quantization makes the cond and uncond passes noisy independently, so their difference
+  carries ~sqrt(2)x the per-pass noise and is then scaled by `s`. At turbo's `s = 1.0` there is
+  zero amplification; at base's `s = 4.0` it is ~4x. This explains every observation without
+  invoking the module set, and predicts: **Turbo + `--quant fp8` + `--cfg 4.0` should be
+  speckled**, and **base + `--quant fp8` + `--cfg 1.0` should be clean** (if under-guided).
+  Run those two before touching any code.
+- **Weight-outlier hypothesis — WEAKENED (measured 2026-07-10):** base and turbo have nearly
+  identical outlier severity across all 276 2-D weights (median `|w|max/rms` 17.6 vs 16.1,
+  p95 52.3 vs 47.9). Base's single worst tensor is larger (47.8 vs 14.0 `|w|max`) but the
+  distributions overlap heavily. Does not on its own explain clean-vs-garbage.
+- **Original suspected cause — NOT RULED OUT, but no longer leading:** `_torchao_fp8_config()`
+  (`nodes/eric_diffusion_utils.py:1557`) returns a bare
+  `Float8DynamicActivationFloat8WeightConfig()` with **no `filter_fn`**, so
   torchao converts *every* `nn.Linear` — including `final_layer.linear` (tokens → output
   patches), the per-block `adaLN_modulation` projections, and the `t_embedder` /
   `cap_embedder` stacks. diffusers' own `ZImageTransformer2DModel` declares
   `_skip_layerwise_casting_patterns = ['t_embedder', 'cap_embedder']`, i.e. upstream
   considers those precision-sensitive. fp8-e4m3 has a 3-bit mantissa, and the recipe also
-  quantizes **activations** dynamically. Per-patch speckle is what a damaged `final_layer`
-  or modulation path would look like. Both the override path (`quantize_module`) and the
+  quantizes **activations** dynamically. This would still be a contributing factor — a
+  noisier per-pass eps is exactly what CFG then amplifies. Both the override path
+  (`quantize_module`) and the
   `from_pretrained` path (`build_quant_config`) share this recipe, which matches the
   observation that the bug reproduces without any override.
 - **Not the cause (ruled out numerically, same session):** int8 dequant is correct
@@ -1137,7 +1156,10 @@ reference-image (kontext) inputs skip NAG loudly (HF2-1). Triggers unchanged.
   for Qwen/Flux/Krea, which are currently verified-good. Needs its own slice with a
   before/after image matrix, not a drive-by.
 - **Trigger:** next `--quant` work, or the next report of degraded output under quant on any
-  family. Until then `--quant fp8` should be treated as unsupported on Z-Image.
-- **Answered 2026-07-10:** the `zimage.json` sidecar from the prior verified run carries no
-  `quant` key, so Z-Image had only ever been exercised unquantized. This is an **untested
-  combination, not a regression** — nothing broke it; it never worked.
+  family. Until then `--quant fp8` should be treated as unsupported on Z-Image-base;
+  Z-Image-Turbo + quant is verified working.
+- **Answered 2026-07-10:** not a regression. Z-Image + quant HAS been exercised — on
+  **Turbo**, during NAG testing and again after this entry was written, and it works. The
+  one archived `zimage.json` sidecar carries no `quant` key, but that is a single run and
+  proves nothing on its own. What was never exercised is **base + quant**, i.e. quant at
+  `cfg 4.0 / 30 steps`. Nothing broke it; that combination never ran.
