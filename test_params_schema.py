@@ -569,6 +569,76 @@ check("overlay: mixed — explicit true_cfg_scale preserved at 6.0",
 check("overlay: mixed — non-explicit steps still gets family value 50",
       _p["steps"] == 50)
 
+# ── distilled-schedule warning on --transformer override (2026-07-10) ────
+# Family resolves from the BASE model path (ADR-009 name-hint); --transformer
+# is never inspected. So a base-weights override against a *-Turbo directory
+# silently inherits a few-step distilled schedule. FAMILY_DEFAULTS already
+# records that the two are mutually destructive ("Base defaults (30/4.0)
+# DESTROY this distill"), and the reverse costs denoising steps the weights
+# need. Neither direction raises, so the only symptom is a degraded image.
+
+
+def _make_fake_model_named(family_class_name: str, prefix: str) -> str:
+    """Fake model whose DIRECTORY NAME carries a name hint (ADR-009)."""
+    d = tempfile.mkdtemp(prefix=prefix)
+    _tmpdirs_to_cleanup.append(d)
+    with open(Path(d) / "model_index.json", "w") as f:
+        json.dump({"_class_name": family_class_name}, f)
+    return d
+
+
+_zturbo = _make_fake_model_named("ZImagePipeline", "zimg_turbo_test_")
+_zbase = _make_fake_model_named("ZImagePipeline", "zimg_base_test_")
+
+
+def _warned(p, explicit=frozenset()):
+    _, err = _capture_stderr(g._apply_family_defaults, p, set(explicit), set())
+    return "WARNING" in err and "--transformer override inherited" in err
+
+
+check("distilled-warn: turbo base + transformer override WARNS",
+      _warned({"model": _zturbo, "transformer_path": "/x/greed_int8.safetensors"}))
+check("distilled-warn: warning names the family and both schedule values",
+      all(s in _capture_stderr(
+          g._apply_family_defaults,
+          {"model": _zturbo, "transformer_path": "/x/g.safetensors"},
+          set(), set())[1]
+          for s in ("zimage-turbo", "cfg_scale=1.0", "steps=8")))
+
+# Negatives — the warning must not cry wolf.
+check("distilled-warn: turbo base, NO override stays quiet (legit turbo use)",
+      not _warned({"model": _zturbo}))
+check("distilled-warn: non-distilled base + override stays quiet",
+      not _warned({"model": _zbase, "transformer_path": "/x/g.safetensors"}))
+check("distilled-warn: override + BOTH cfg and steps explicit stays quiet",
+      not _warned({"model": _zturbo, "transformer_path": "/x/g.safetensors",
+                   "cfg_scale": 4.0, "steps": 30},
+                  explicit={"cfg_scale", "steps"}))
+# ...but an inherited 8-step budget ruins the image even when cfg is chosen,
+# so a partially-explicit schedule must STILL warn.
+check("distilled-warn: only cfg explicit -> still warns (steps inherited)",
+      _warned({"model": _zturbo, "transformer_path": "/x/g.safetensors",
+               "cfg_scale": 4.0}, explicit={"cfg_scale"}))
+check("distilled-warn: only steps explicit -> still warns (cfg inherited)",
+      _warned({"model": _zturbo, "transformer_path": "/x/g.safetensors",
+               "steps": 30}, explicit={"steps"}))
+
+# Table sync: every distilled family is a real FAMILY_DEFAULTS row, and the
+# membership is not derivable from cfg_scale (krea-turbo 0.0, zimage-turbo 1.0)
+# — which is exactly why it is declared rather than inferred.
+from comfyless.family_defaults import DISTILLED_FAMILIES  # noqa: E402
+
+check("distilled-warn: DISTILLED_FAMILIES all present in FAMILY_DEFAULTS",
+      all(f in g.FAMILY_DEFAULTS for f in DISTILLED_FAMILIES),
+      f"orphans: {sorted(set(DISTILLED_FAMILIES) - set(g.FAMILY_DEFAULTS))}")
+check("distilled-warn: membership is not a cfg_scale==0 rule",
+      g.FAMILY_DEFAULTS["krea-turbo"]["cfg_scale"] == 0.0
+      and g.FAMILY_DEFAULTS["zimage-turbo"]["cfg_scale"] == 1.0
+      and {"krea-turbo", "zimage-turbo"} <= set(DISTILLED_FAMILIES))
+check("distilled-warn: flux2klein excluded (ordinary 24-step schedule)",
+      "flux2klein" not in DISTILLED_FAMILIES
+      and g.FAMILY_DEFAULTS["flux2klein"]["steps"] == 24)
+
 # 6. Unknown family → no-op (class not in diffusers).
 _unknown = _make_fake_model("ThisPipelineClassDoesNotExist__zzz")
 _p = {"model": _unknown, "cfg_scale": 3.5}

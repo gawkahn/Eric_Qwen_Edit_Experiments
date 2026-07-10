@@ -62,7 +62,7 @@ python -m py_compile nodes/<file>.py   # syntax check a single file
 ```bash
 python3 test_manual_loop.py                 # 186 tests: samplers, manual loop, encode helper, Qwen edit
 python3 test_multistage.py                  # 141 tests: multistage infrastructure
-python3 test_params_schema.py               # 256 tests: comfyless COMFYLESS_SCHEMA + adapters + krea routing/rebalance + Krea2 attention-backend pin + Z-Image base/Turbo name-hint detection & routing (ADR-009) + LoRA-failure surfacing (ADR-015) + quant sidecar round-trip (quant in SCHEMA_KIND, 2026-07-08) + NAG quadruple sidecar round-trip & family gating (ADR-023)
+python3 test_params_schema.py               # 266 tests: comfyless COMFYLESS_SCHEMA + adapters + krea routing/rebalance + Krea2 attention-backend pin + Z-Image base/Turbo name-hint detection & routing (ADR-009) + LoRA-failure surfacing (ADR-015) + quant sidecar round-trip (quant in SCHEMA_KIND, 2026-07-08) + NAG quadruple sidecar round-trip & family gating (ADR-023)
 python3 test_cascade.py                     # 129 tests: comfyless Stable Cascade dispatch (ADR-010)
 python3 test_machine_boundary_validator.py  # 138 tests: machine-boundary validator (ADR-012)
 python3 test_iterate.py                     #  92 tests: comfyless --iterate (ADR-008)
@@ -78,7 +78,7 @@ python3 test_lora_convert_krea.py           #  31 tests: Krea-2 LoRA format-conv
 python3 test_catalog_db.py                  # 125 tests: catalog DB metadata plane (ADR-022 S1-S5) — schema, FUSE guard, sanitizer, upsert/stale semantics, manifest kind-branch join, families/sidecar/exclusion/search, civitai enrichment (mocked network), load-plane independence
 python3 test_nag.py                         # 101 tests: NAG negative guidance (ADR-023 Krea-2 + ADR-024 flux/flux2/flux2klein/zimage expansion) — formula vs reference equations, per-arch processor selection/dormancy/lane re-sync on tiny transformers (incl. Z-Image hand-swap + ragged captions, Flux2 dual/parallel variants, HF1-1 pooled-tiling negative control), pipeline routing guards, N1 boundary-warning pins
 ```
-All seventeen suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 2595 unit tests; expect 0 failures.
+All seventeen suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Total 2605 unit tests; expect 0 failures.
 
 `test_flux2.py` is a live GPU smoke test that performs an actual Flux.2 generation — separate from the unit suites above. Run only when you need to verify end-to-end Flux.2 behavior.
 

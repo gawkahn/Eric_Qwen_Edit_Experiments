@@ -62,7 +62,7 @@ from nodes.eric_diffusion_utils import (
 from nodes.eric_diffusion_samplers import sampler_choices, swap_sampler
 from nodes.eric_qwen_edit_lora import load_lora_with_key_fix
 
-from comfyless.family_defaults import FAMILY_DEFAULTS
+from comfyless.family_defaults import DISTILLED_FAMILIES, FAMILY_DEFAULTS
 from comfyless.params_validation import validate_lora_entry
 
 CONTRACT_VERSION = 1
@@ -568,10 +568,30 @@ def _apply_family_defaults(
             continue
         p_cur[key] = value
         applied[key] = value
+    prefix = f"[comfyless] iter {idx}: " if idx is not None else "[comfyless] "
     if applied:
         kv = ", ".join(f"{k}={v!r}" for k, v in applied.items())
-        prefix = f"[comfyless] iter {idx}: " if idx is not None else "[comfyless] "
         _log(f"{prefix}family={family} defaults applied: {kv}")
+
+    # Family is resolved from the BASE model path (ADR-009 name-hint), never
+    # from --transformer. A few-step distilled schedule applied to override
+    # weights that turn out to be non-distilled yields an under-denoised image
+    # and NO error — the failure is silent and reads as model corruption or a
+    # broken loader. Warn exactly where the hint is least trustworthy: an
+    # override is present, the family is distilled, and at least one schedule
+    # key was INHERITED rather than chosen. If the user set both cfg and steps
+    # explicitly, they have already made the call — stay quiet.
+    # "transformer_path" is the canonical schema key; "--transformer" is only
+    # the CLI spelling (_CLI_TO_CANONICAL). p_cur holds canonical keys.
+    if (p_cur.get("transformer_path") and family in DISTILLED_FAMILIES
+            and ({"cfg_scale", "steps"} & set(applied))):
+        _log(f"{prefix}WARNING: --transformer override inherited '{family}' "
+             f"defaults (cfg_scale={p_cur.get('cfg_scale')!r}, "
+             f"steps={p_cur.get('steps')!r}) from the BASE model path — the "
+             f"override itself was not inspected. This is a few-step distilled "
+             f"schedule; if the override is a non-distilled checkpoint the "
+             f"image will be noisy and under-denoised. Pass --cfg/--steps "
+             f"explicitly, or point --model at a non-turbo base.")
 
 
 # NAG family table (ADR-023 krea + ADR-024 expansion). Value = whether

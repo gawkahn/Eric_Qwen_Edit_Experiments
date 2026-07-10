@@ -133,3 +133,18 @@ FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
     # guidance_scale branch in `_build_call_kwargs`.
     "zimage-turbo": {"cfg_scale": 1.0, "steps": 8},
 }
+
+
+#: Families whose FAMILY_DEFAULTS encode a FEW-STEP DISTILLED schedule — one
+#: that produces an under-denoised, noisy image if applied to non-distilled
+#: weights. Membership is NOT derivable from the values: krea-turbo disables
+#: CFG (0.0) while zimage-turbo runs real CFG at 1.0; what they share is the
+#: 8-step budget that only a distill can close.
+#:
+#: flux2klein is distilled but is deliberately ABSENT: its 24-step / cfg 3.5
+#: schedule is an ordinary one that a non-distilled override survives.
+#:
+#: Consumed by _apply_family_defaults to warn when a --transformer override
+#: silently inherits one of these schedules from the base model's path.
+#: Keep in sync with the table above.
+DISTILLED_FAMILIES = frozenset({"krea-turbo", "zimage-turbo"})
