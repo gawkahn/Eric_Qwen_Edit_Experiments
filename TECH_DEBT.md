@@ -1118,13 +1118,22 @@ reference-image (kontext) inputs skip NAG loudly (HF2-1). Triggers unchanged.
   was written. Same architecture, same recipe, opposite outcome. So the fault is NOT
   "quant on Z-Image" and NOT the module set. Turbo and base differ in exactly two ways:
   weights, and schedule (turbo `cfg 1.0 / 8 steps`; base `cfg 4.0 / 30 steps`).
-- **Leading hypothesis (unverified): CFG amplifies fp8 activation-quantization noise.**
-  Classifier-free guidance computes `eps_u + s*(eps_c - eps_u)`. Dynamic *activation* fp8
-  quantization makes the cond and uncond passes noisy independently, so their difference
-  carries ~sqrt(2)x the per-pass noise and is then scaled by `s`. At turbo's `s = 1.0` there is
-  zero amplification; at base's `s = 4.0` it is ~4x. This explains every observation without
-  invoking the module set, and predicts: **Turbo + `--quant fp8` + `--cfg 4.0` should be
-  speckled**, and **base + `--quant fp8` + `--cfg 1.0` should be clean** (if under-guided).
+- **CFG-amplification hypothesis — FALSIFIED 2026-07-10.** Predicted Turbo + quant + `--cfg 4.0`
+  would speckle and base + quant + `--cfg 1.0` would be clean. Both predictions failed:
+  Turbo@cfg4 is *blurry* (ordinary over-guidance on a distill, no speckle) and base@cfg1 is
+  *still speckled*. **The schedule is not the variable — cfg and steps are both exonerated.**
+  fp8 is a floating format whose relative precision is ~constant with magnitude, so the
+  weight-outlier reasoning was measuring the wrong property for this quantizer anyway.
+- **What remains:** base + fp8 is broken at every schedule; Turbo + fp8 is fine at every
+  schedule; base without fp8 is fine. The difference is the WEIGHTS, or the per-component
+  quant split. Not yet separated: `resolve_quant_components` quantizes **transformer AND
+  text_encoder** (Z-Image's TE is a `Qwen3Model` → "large LM" role; VAE is never quantized
+  by invariant). Degraded conditioning from a quantized TE is an untested cause of
+  noise-like texture. One asymmetry noted, significance unknown: Turbo's transformer ships
+  **F32** on disk, base's ships **BF16** (TE and VAE are BF16 in both).
+- **Next, before any code change** (two runs, existing flags, no code):
+  `--quant fp8 --quant-only transformer` and `--quant fp8 --quant-skip transformer` on
+  Z-Image-base. Localizes the fault to the transformer or the text encoder.
   Run those two before touching any code.
 - **Weight-outlier hypothesis — WEAKENED (measured 2026-07-10):** base and turbo have nearly
   identical outlier severity across all 276 2-D weights (median `|w|max/rms` 17.6 vs 16.1,
