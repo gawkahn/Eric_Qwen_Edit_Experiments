@@ -1554,9 +1554,45 @@ def resolve_quant_components(
     return selected, notices
 
 
-def _torchao_fp8_config():
-    """The single fp8 recipe used everywhere (spike-verified on sm_120)."""
-    from torchao.quantization import Float8DynamicActivationFloat8WeightConfig
+#: Model families whose fp8 quant MUST be weight-only. Dynamic per-tensor
+#: activation fp8 lets a single outlier token set the scale for a whole
+#: activation tensor and crush the rest toward zero; on Z-Image-base this
+#: produces speckled-then-NaN output (empirically confirmed 2026-07-10 by an
+#: A/B/C matrix + a --quant-only transformer localization). Weight-only keeps
+#: activations in bf16 — clean output — at the cost of the fast fp8 matmul
+#: (weights dequant at compute time; the VRAM saving on weights is retained).
+#: Distilled variants (zimage-turbo) carry smoother activation outliers and
+#: run fine on the fast dynamic-activation path, so they are NOT listed.
+#: See ADR-019 Changelog 2026-07-10 and TECH_DEBT.
+_FP8_WEIGHT_ONLY_FAMILIES = frozenset({"zimage"})
+
+
+def _fp8_recipe_for_family(family):
+    """Recipe id for `family`: 'weight_only' or 'dynamic_activation'."""
+    return ("weight_only" if family in _FP8_WEIGHT_ONLY_FAMILIES
+            else "dynamic_activation")
+
+
+def _torchao_fp8_config(family=None):
+    """The fp8 recipe, selected per model family (ADR-019; sm_120-verified).
+
+    Default is dynamic-activation fp8 (fast _scaled_mm path). Families in
+    `_FP8_WEIGHT_ONLY_FAMILIES` get weight-only fp8 instead — weights fp8,
+    activations left bf16 — because dynamic activation quant destroys their
+    output. `family=None` keeps the historical dynamic-activation behavior.
+
+    Both recipes store the SAME fp8 weight (identical qdata + scale) and differ
+    only in the tensor's `act_quant_kwargs` (None for weight-only). That is why
+    the LoRA-merge path can stay family-free and match the base recipe by
+    reading `act_quant_kwargs` back off the quantized weight — see
+    `_merge_into_torchao` in eric_diffusion_fp8_ops.
+    """
+    from torchao.quantization import (
+        Float8DynamicActivationFloat8WeightConfig,
+        Float8WeightOnlyConfig,
+    )
+    if _fp8_recipe_for_family(family) == "weight_only":
+        return Float8WeightOnlyConfig()
     return Float8DynamicActivationFloat8WeightConfig()
 
 
@@ -1620,7 +1656,20 @@ def build_quant_config(
         from diffusers import TorchAoConfig as _DiffusersTorchAoConfig
         from diffusers.quantizers import PipelineQuantizationConfig
         from transformers import TorchAoConfig as _TransformersTorchAoConfig
-        ao_config = _torchao_fp8_config()
+        # Recipe is family-aware: some families (Z-Image-base) require
+        # weight-only fp8 or their output is destroyed. Derive family the same
+        # way the load path does; fall back to the fast default if detection
+        # fails (never block quant on a family-lookup error).
+        _fam = None
+        try:
+            _, _, _fam = detect_pipeline_class(model_path)
+        except Exception:  # noqa: BLE001
+            _fam = None
+        ao_config = _torchao_fp8_config(_fam)
+        _recipe = _fp8_recipe_for_family(_fam)
+        _rmsg = f"quant: fp8 recipe={_recipe} (family {_fam!r})"
+        print(f"{log_prefix} {_rmsg}")
+        notices.append(_rmsg)
     except ImportError as e:
         msg = (f"quant: torchao/quant configs unavailable ({e}) — "
                f"FALLING BACK to unquantized load")
@@ -1653,18 +1702,24 @@ def build_quant_config(
     return PipelineQuantizationConfig(quant_mapping=quant_mapping), selected, notices
 
 
-def quantize_module(module, quant_mode: str, log_prefix: str = "[EricDiffusion]"):
+def quantize_module(module, quant_mode: str, family: str = None,
+                    log_prefix: str = "[EricDiffusion]"):
     """In-place torchao quantization of an already-instantiated component.
 
     Used for component overrides (e.g. --transformer-path single-file loads),
     which bypass from_pretrained's quantization_config path.  Warn-and-skip on
     failure, never raise (invariant 6).  Returns True if quantized.
+
+    `family` selects the fp8 recipe (weight-only vs dynamic-activation); pass
+    the model family so override components match the from_pretrained path.
     """
     if not quant_mode or quant_mode == "none":
         return False
     try:
         from torchao.quantization import quantize_
-        quantize_(module, _torchao_fp8_config())
+        quantize_(module, _torchao_fp8_config(family))
+        print(f"{log_prefix} quant: fp8 recipe="
+              f"{_fp8_recipe_for_family(family)} (family {family!r})")
         return True
     except Exception as e:  # noqa: BLE001
         print(f"{log_prefix} WARNING: quant: in-place quantization of "

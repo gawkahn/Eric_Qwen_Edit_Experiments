@@ -103,6 +103,10 @@ import torch.nn as nn
 _FP8_DTYPES = ("F8_E4M3", "F8_E5M2")
 _TORCH_FP8 = (torch.float8_e4m3fn, torch.float8_e5m2)
 
+#: Sentinel distinguishing "attribute absent" from a real None value on a
+#: getattr probe (used by the LoRA-merge recipe readback).
+_MISSING = object()
+
 #: Suffix conventions for the two scaled variants. A file must use exactly
 #: one convention (security review F5 — mixing is a loud reject).
 _CA_SUFFIXES = {"weight_scale": ".weight_scale", "input_scale": ".input_scale"}
@@ -1321,6 +1325,35 @@ def _merge_into_scaled_fp8(owner: "ScaledFp8Linear", target_key: str,
     return "scaled_fp8"
 
 
+def _requant_config_matching_base(data, target_key: str, log_prefix: str):
+    """Pick the torchao config to requantize a merged layer, matching the base.
+
+    The fp8 recipe is family-aware (weight-only vs dynamic-activation, ADR-019
+    2026-07-10). Rather than thread the family into the deep LoRA-merge path,
+    read the recipe back off the base quantized tensor: the two recipes store
+    identical fp8 weights and differ ONLY in `act_quant_kwargs` (None ⇒
+    weight-only). That attribute is a torchao Float8Tensor internal — if it ever
+    disappears, GUESSING would silently requantize a weight-only (Z-Image) base
+    as dynamic-activation and reintroduce the exact speckle/NaN bug the recipe
+    split fixes, so refuse loudly instead (test_quant pins the attribute, so a
+    torchao change trips the suite first).
+    """
+    from torchao.quantization import (
+        Float8DynamicActivationFloat8WeightConfig,
+        Float8WeightOnlyConfig,
+    )
+    _akw = getattr(data, "act_quant_kwargs", _MISSING)
+    if _akw is _MISSING:
+        raise RuntimeError(
+            f"{log_prefix} base fp8 tensor for {_safe_name(target_key)} has no "
+            f"act_quant_kwargs — torchao's Float8Tensor API changed; cannot "
+            f"infer the base's quant recipe to match on requantize (refusing "
+            f"rather than risk a recipe mismatch)"
+        )
+    return (Float8WeightOnlyConfig() if _akw is None
+            else Float8DynamicActivationFloat8WeightConfig())
+
+
 def _merge_into_torchao(root, owner, leaf: str, p: nn.Parameter,
                         target_key: str, delta: torch.Tensor, backup: dict,
                         log_prefix: str) -> str:
@@ -1347,19 +1380,7 @@ def _merge_into_torchao(root, owner, leaf: str, p: nn.Parameter,
             f"ALL ZERO — refusing to requantize a degenerate layer (req 22)"
         )
     from torchao.quantization import quantize_
-    try:
-        # Source of truth: the slice-A quantize-on-load recipe, so merged
-        # layers match the surrounding quantization scheme exactly.
-        from .eric_diffusion_utils import _torchao_fp8_config
-        _cfg = _torchao_fp8_config()
-    except ImportError:
-        # Spec-loaded contexts (test harnesses load this module by file
-        # path, no package). MUST stay in sync with
-        # eric_diffusion_utils._torchao_fp8_config.
-        from torchao.quantization import (
-            Float8DynamicActivationFloat8WeightConfig,
-        )
-        _cfg = Float8DynamicActivationFloat8WeightConfig()
+    _cfg = _requant_config_matching_base(data, target_key, log_prefix)
     out_f, in_f = merged.shape
     tmp = nn.Linear(in_f, out_f, bias=False, device=merged.device,
                     dtype=torch.bfloat16)

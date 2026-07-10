@@ -1562,6 +1562,45 @@ check("arch: load_component blocks the mismatch at the door (fix 2)",
       "Architecture mismatch" in _seam, _seam[:160])
 
 
+# ── family-aware requant recipe match on the LoRA-merge path (2026-07-10) ──
+# _requant_config_matching_base reads the base tensor's act_quant_kwargs to
+# requantize a merged layer with the SAME recipe (weight-only vs dynamic-
+# activation). None ⇒ weight-only; set ⇒ dynamic; ABSENT ⇒ loud raise (a
+# torchao API change must never silently requantize a Z-Image weight-only base
+# as dynamic-activation and reintroduce the speckle bug).
+from torchao.quantization import (                       # noqa: E402
+    Float8DynamicActivationFloat8WeightConfig as _DynActCfg,
+    Float8WeightOnlyConfig as _WOnlyCfg,
+)
+
+
+class _FakeAkwNone:
+    act_quant_kwargs = None
+
+
+class _FakeAkwSet:
+    act_quant_kwargs = object()  # any non-None ⇒ dynamic-activation base
+
+
+class _FakeNoAkw:
+    pass  # attribute absent ⇒ API drift ⇒ must raise
+
+
+check("requant-match: base act_quant_kwargs=None -> weight-only config",
+      isinstance(fp8ops._requant_config_matching_base(
+          _FakeAkwNone(), "layer.weight", "[t]"), _WOnlyCfg))
+check("requant-match: base act_quant_kwargs set -> dynamic-activation config",
+      isinstance(fp8ops._requant_config_matching_base(
+          _FakeAkwSet(), "layer.weight", "[t]"), _DynActCfg))
+_raised = False
+try:
+    fp8ops._requant_config_matching_base(_FakeNoAkw(), "layer.weight", "[t]")
+except RuntimeError as _e:
+    _raised = "act_quant_kwargs" in str(_e)
+check("requant-match: absent act_quant_kwargs RAISES (no silent mismatch)",
+      _raised)
+
+
 shutil.rmtree(_TMP, ignore_errors=True)
 print("\n" + "─" * 50)
 print(f"  {passed} passed, {failed} failed")

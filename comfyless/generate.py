@@ -1031,7 +1031,8 @@ def _load_pipeline(
 
     for slot, component in comp_kwargs.items():
         if slot in quant_selected and hasattr(component, "parameters"):
-            if quantize_module(component, quant, log_prefix="[comfyless]"):
+            if quantize_module(component, quant, family=model_family,
+                               log_prefix="[comfyless]"):
                 _log(f"[comfyless] quant: override component {slot!r} "
                      f"quantized in place ({quant})")
 

@@ -481,6 +481,57 @@ check("MCP cache key: skip sets discriminate",
 
 
 # ──────────────────────────────────────────────────────────────────────
+print("\n── family-aware fp8 recipe (weight-only vs dyn-activation) ────")
+
+# Z-Image-base needs weight-only fp8: dynamic per-tensor activation quant
+# destroys its output (speckle→NaN, confirmed 2026-07-10). Everything else,
+# incl. the distilled zimage-turbo and an unknown family, stays on the fast
+# dynamic-activation path so no verified-good family regresses.
+check("recipe: zimage -> weight_only",
+      edu._fp8_recipe_for_family("zimage") == "weight_only")
+check("recipe: zimage-turbo -> dynamic_activation (fast path kept)",
+      edu._fp8_recipe_for_family("zimage-turbo") == "dynamic_activation")
+for _fam in ("qwen-image", "flux", "flux2", "krea", "krea-turbo", "sdxl",
+             "chroma", None):
+    check(f"recipe: {_fam!r} -> dynamic_activation (unchanged)",
+          edu._fp8_recipe_for_family(_fam) == "dynamic_activation")
+
+# The config objects match the recipe. Both are torchao configs; weight-only
+# is a distinct class (no activation quant).
+from torchao.quantization import (                      # noqa: E402
+    Float8DynamicActivationFloat8WeightConfig as _DynAct,
+    Float8WeightOnlyConfig as _WOnly,
+)
+check("config: zimage -> Float8WeightOnlyConfig",
+      isinstance(edu._torchao_fp8_config("zimage"), _WOnly))
+check("config: zimage-turbo -> DynamicActivation",
+      isinstance(edu._torchao_fp8_config("zimage-turbo"), _DynAct))
+check("config: default (None) -> DynamicActivation (back-compat)",
+      isinstance(edu._torchao_fp8_config(), _DynAct))
+check("config: unknown family -> DynamicActivation",
+      isinstance(edu._torchao_fp8_config("nonesuch"), _DynAct))
+
+# The merge-path consistency contract (eric_diffusion_fp8_ops._merge_into_
+# torchao): it picks the recipe by reading `act_quant_kwargs` off the base
+# tensor, so it must be True that the two configs differ ONLY there and agree
+# on the stored fp8 weight. Prove the discriminator exists and splits the two.
+import torch.nn as _nn                                  # noqa: E402
+from torchao.quantization import quantize_ as _q        # noqa: E402
+
+
+def _akw(cfg):
+    m = _nn.Linear(64, 128, bias=False)
+    _q(m, cfg)
+    return getattr(m.weight, "act_quant_kwargs", "MISSING")
+
+
+check("merge-discriminator: weight-only base has act_quant_kwargs=None",
+      _akw(edu._torchao_fp8_config("zimage")) is None)
+check("merge-discriminator: dyn-activation base has act_quant_kwargs set",
+      _akw(edu._torchao_fp8_config("flux")) is not None)
+
+
+# ──────────────────────────────────────────────────────────────────────
 print("\n" + "─" * 50)
 print(f"  {passed} passed, {failed} failed")
 print("─" * 50)
