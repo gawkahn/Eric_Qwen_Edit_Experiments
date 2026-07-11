@@ -83,6 +83,11 @@ _FIELD_DEFAULTS: Dict[str, object] = {
     "nag_tau":              2.5,
     "nag_alpha":            0.25,
     "nag_end":              1.0,
+    # Hunyuan-Image refiner chain (ADR-016 §(d)). Tencent refiner README
+    # authoritative (cfg=3.5, steps=4). No-ops when refiner_path is unset.
+    "refiner_path":         "",
+    "refiner_steps":        4,
+    "refiner_cfg":          3.5,
 }
 
 
@@ -128,4 +133,5 @@ _CLI_TO_CANONICAL: Dict[str, str] = {
     "te1":         "text_encoder_path",
     "te2":         "text_encoder_2_path",
     "lora":        "loras",
+    "refiner":     "refiner_path",
 }

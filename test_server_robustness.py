@@ -601,6 +601,7 @@ import argparse as _ap
 # regresses to reading args, the checks fail loudly.
 _args_q = _ap.Namespace(precision="bf16", device="cuda", offload_vae=False,
                         attention_slicing=False, sequential_offload=False,
+                        vae_tiling="auto",
                         savepath=None, quant=None,
                         quant_skip=None, quant_only=None,
                         # krea-testing's builder also reads the rebalance

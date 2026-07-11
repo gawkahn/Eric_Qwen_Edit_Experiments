@@ -7,6 +7,20 @@ Format: **Item** — why deferred, what triggers revisiting.
 
 ## Security
 
+**MCP: `refiner_path` not covered by output-metadata basename redaction** *(2026-07-11)*
+The Hunyuan-Image refiner writes an absolute `refiner_path` into the PNG/sidecar
+metadata (`comfyless/generate.py`), consistent with the pre-existing absolute
+`model`/`transformer_path`/`vae_path`/`text_encoder_path` entries. The caller
+supplied `refiner_path` itself, so this is not a new cross-boundary leak on the
+CLI/daemon path. The MCP `generate` handler does NOT thread refiner today
+(`test_hunyuan` Inv 12), so nothing is exposed to an untrusted agent yet.
+**Why not now:** no MCP refiner surface exists; adding a redaction hook for a key
+that never crosses the MCP boundary would be dead code. **Trigger:** the slice
+that threads refiner through the MCP `generate` handler — fold `refiner_path`
+into the same basename redaction the other path keys receive. Surfaced by the
+`security-auditor` re-apply review INFO-2, 2026-07-11
+(`docs/security/review-hunyuan-refiner-reapply-2026-07-11.md`).
+
 **extract_params: free-string fields (`model_family`/`prompt`/`negative_prompt`) echo verbatim** *(2026-07-09)*
 Both `_render_extracted_cascade_params` (step 4d) and the core-step
 `_render_extracted_params` (`comfyless/mcp_server.py:382-383`) re-emit these
@@ -1192,3 +1206,22 @@ reference-image (kontext) inputs skip NAG loudly (HF2-1). Triggers unchanged.
   one archived `zimage.json` sidecar carries no `quant` key, but that is a single run and
   proves nothing on its own. What was never exercised is **base + quant**, i.e. quant at
   `cfg 4.0 / 30 steps`. Nothing broke it; that combination never ran.
+
+---
+
+## Hunyuan-Image
+
+**ComfyUI Generate node re-loads the refiner on every execution** *(2026-07-11)*
+The `EricDiffusionGenerate` node calls `load_refiner_pipeline(...)` inline in its
+`generate` method, so the refiner transformer + VAE are re-loaded from disk each
+run (the base pipe is loader-cached; the shared text_encoder is injected, so it's
+not a full reload). The comfyless in-process and daemon paths cache the refiner
+(`_cached_pipeline["refiner_pipeline"]` / `server_state["refiner_pipeline"]`); the
+node path does not. **Why not now:** intentional per ADR-016 Vision OQ4 — the node
+exposes only `refiner_path` on the Generate node (not a separate refiner-loader
+node), so there is no node-side cache slot to hold it; the operator's ComfyUI
+session is the operator's own trust domain and the reload is a per-run latency
+cost, not a correctness issue. **Trigger:** if the per-execution refiner reload
+becomes a real workflow bottleneck, add a refiner cache to the loader node (mirror
+the base-pipe cache) or a dedicated `EricDiffusion Load Refiner` node. Surfaced by
+the re-apply `code-reviewer` observation, 2026-07-11.

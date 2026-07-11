@@ -57,6 +57,8 @@ from nodes.eric_diffusion_utils import (
     detect_component_format,
     load_component,
     resolve_hf_path,
+    resolve_vae_tiling,
+    VAE_TILING_CHOICES,
     _is_hf_repo_id,
 )
 from nodes.eric_diffusion_samplers import sampler_choices, swap_sampler
@@ -685,6 +687,17 @@ def _build_call_kwargs(
             kwargs["negative_prompt"] = negative_prompt
         return kwargs
 
+    if model_family == "hunyuan-image":
+        # Hunyuan-Image 2.1: guidance-distilled — distilled_guidance_scale is
+        # the documented call kwarg, NOT guidance_scale or true_cfg_scale
+        # (ADR-025 §2). negative_prompt forwarded when set; the pipeline
+        # decides whether to use it (ADR-025 §5). max_sequence_length is not
+        # in this pipeline's signature, so it is not passed.
+        kwargs = {**base, "distilled_guidance_scale": cfg_scale}
+        if negative_prompt:
+            kwargs["negative_prompt"] = negative_prompt
+        return kwargs
+
     if model_family in ("flux", "flux2", "flux2klein", "chroma"):
         kwargs = {**base, "guidance_scale": cfg_scale}
         sig = inspect.signature(pipe.__call__)
@@ -867,6 +880,7 @@ def _load_pipeline(
     vae_from_transformer: bool = False,
     attention_slicing: bool = False,
     sequential_offload: bool = False,
+    vae_tiling: str = "auto",
     allow_hf_download: bool = False,
     quant: str = "none",
     quant_skip: tuple = (),
@@ -1045,7 +1059,15 @@ def _load_pipeline(
             _log("[comfyless] VAE offloaded to CPU")
 
     if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
-        pipe.vae.enable_tiling()
+        if resolve_vae_tiling(model_family, vae_tiling):
+            pipe.vae.enable_tiling()
+            _log(f"[comfyless] VAE tiling enabled (vae_tiling={vae_tiling})")
+        else:
+            # Defensive disable in case a future diffusers default flips
+            # use_tiling=True at construct time.
+            if hasattr(pipe.vae, "disable_tiling"):
+                pipe.vae.disable_tiling()
+            _log(f"[comfyless] VAE tiling disabled (vae_tiling={vae_tiling})")
 
     if attention_slicing:
         # enable_attention_slicing only drives components that implement
@@ -1207,6 +1229,14 @@ def generate(
     vae_from_transformer: bool = False,
     attention_slicing: bool = False,
     sequential_offload: bool = False,
+    vae_tiling: str = "auto",
+    # Hunyuan-Image refiner chain (ADR-016). refiner_path activates the
+    # base+refiner chain (only for the hunyuan-image family); refiner_steps
+    # / refiner_cfg tune the refiner stage. Sidecar-replayable via the
+    # family-defaults overlay; all no-ops when refiner_path is empty.
+    refiner_path: str = "",
+    refiner_steps: int = 4,
+    refiner_cfg: float = 3.5,
     allow_hf_download: bool = False,
     rebalance: bool = False,
     rebalance_mult: float = KREA_REBALANCE_DEFAULT_MULT,
@@ -1266,8 +1296,52 @@ def generate(
             transformer_path=transformer_path, vae_path=vae_path,
             text_encoder_path=text_encoder_path, text_encoder_2_path=text_encoder_2_path,
             vae_from_transformer=vae_from_transformer, attention_slicing=attention_slicing,
-            sequential_offload=sequential_offload, allow_hf_download=allow_hf_download,
+            sequential_offload=sequential_offload, vae_tiling=vae_tiling,
+            allow_hf_download=allow_hf_download,
             quant=quant, quant_skip=quant_skip, quant_only=quant_only,
+        )
+
+    # ── Hunyuan-Image refiner gate + load (ADR-016) ───────────────────
+    # The chain activates when family is hunyuan-image AND refiner_path
+    # is non-empty. Three other cases are handled here too:
+    #   - refiner_path set on a non-hunyuan family → clean error
+    #     (Vision Inv 10 negative; failure-semantics §5)
+    #   - hunyuan-image + refiner_path unset → loud stderr warning +
+    #     base-only run (Vision Inv 2; failure-semantics §1)
+    #   - any other family with refiner_path unset → no-op
+    # Empty string is the unset state per ADR-016 §(c) — sidecar replay
+    # of an empty string lands here as falsy.
+    refiner_pipe = None
+    if refiner_path:
+        if model_family != "hunyuan-image":
+            raise ValueError(
+                f"--refiner is only supported for the hunyuan-image family; "
+                f"--model resolved to family {model_family!r}. Drop --refiner "
+                f"or point --model at a HunyuanImage-2.1-Diffusers checkpoint."
+            )
+        from comfyless import hunyuan_chain
+        # Daemon path may pre-load both base and refiner (server cache);
+        # accept a pre-loaded refiner from the cache when the server
+        # provides one, otherwise load fresh.
+        if _cached_pipeline is not None and _cached_pipeline.get("refiner_pipeline") is not None:
+            refiner_pipe = _cached_pipeline["refiner_pipeline"]
+            _log("[comfyless] Reusing cached refiner pipeline")
+        else:
+            refiner_pipe = hunyuan_chain.load_refiner_pipeline(
+                refiner_path, base_pipe=pipe,
+                precision=precision, device=device,
+                vae_tiling=vae_tiling,
+                allow_hf_download=allow_hf_download,
+            )
+    elif model_family == "hunyuan-image":
+        # Warn-don't-block per `feedback_warn_dont_block` + Vision Inv 2.
+        # The exact warning text is locked at runtime by test_hunyuan.py
+        # Inv 2; changing it requires a paired test edit.
+        print(
+            "WARNING: hunyuan-image quality requires a refiner; pass "
+            "--refiner <path>; download with huggingface-cli download "
+            "hunyuanvideo-community/HunyuanImage-2.1-Refiner-Diffusers",
+            file=sys.stderr,
         )
 
     # ── Load LoRAs ────────────────────────────────────────────────────
@@ -1395,16 +1469,32 @@ def generate(
         effective_sampler = "default"
 
     # ── Inference (with optional sampler swap) ────────────────────────
+    # When the Hunyuan-Image refiner chain is active, run_chain handles both
+    # pipeline calls under a single swap_sampler context. The swap is per-pipe
+    # (base only), so the refiner's scheduler is untouched — pinned per
+    # ADR-016 §(g) / Vision Inv 8. hunyuan-image is not a NAG family, so the
+    # refiner and NAG paths are mutually exclusive.
     t0 = time.monotonic()
-    with swap_sampler(pipe, effective_sampler, log_prefix="[comfyless]"):
-        if nag_active:
-            # Unbound Krea2NAGPipeline.__call__ on the (possibly cached)
-            # stock pipeline: NAG processors are installed per-call and
-            # restored in a finally, so the cached object's class and
-            # shape never change (cache keys stay NAG-free by design).
-            result = nag_pipe_call(pipe, **call_kwargs)
-        else:
-            result = pipe(**call_kwargs)
+    if refiner_pipe is not None:
+        from comfyless import hunyuan_chain
+        with swap_sampler(pipe, effective_sampler, log_prefix="[comfyless]"):
+            final_pil = hunyuan_chain.run_chain(
+                pipe, refiner_pipe, call_kwargs,
+                prompt=prompt, negative_prompt=neg,
+                refiner_steps=refiner_steps, refiner_cfg=refiner_cfg,
+                generator=generator,
+            )
+    else:
+        with swap_sampler(pipe, effective_sampler, log_prefix="[comfyless]"):
+            if nag_active:
+                # Unbound Krea2NAGPipeline.__call__ on the (possibly cached)
+                # stock pipeline: NAG processors are installed per-call and
+                # restored in a finally, so the cached object's class and
+                # shape never change (cache keys stay NAG-free by design).
+                result = nag_pipe_call(pipe, **call_kwargs)
+            else:
+                result = pipe(**call_kwargs)
+        final_pil = result.images[0]
     elapsed = time.monotonic() - t0
     _log(f"[comfyless] Generated in {elapsed:.1f}s")
 
@@ -1459,9 +1549,18 @@ def generate(
             "weights": rebalance_weights if rebalance_weights is not None
                        else KREA_REBALANCE_DEFAULT_WEIGHTS,
         }
+    if refiner_pipe is not None:
+        # Two-stage metadata extension per ADR-016 §(h). The four keys are
+        # absent (not present-and-empty) on base-only runs — Vision Inv 4.
+        # Sidecar replay of a pre-refiner image carries no `pipeline` key →
+        # the base-only branch reactivates correctly.
+        metadata["pipeline"]      = "base+refiner"
+        metadata["refiner_path"]  = refiner_path
+        metadata["refiner_steps"] = refiner_steps
+        metadata["refiner_cfg"]   = refiner_cfg
 
     # ── Save PNG with embedded metadata ──────────────────────────────
-    pil_image = result.images[0]
+    pil_image = final_pil
     _save_with_metadata(pil_image, output_path, metadata, mcp_caller=mcp_caller)
     _log(f"[comfyless] Saved: {output_path}")
 
@@ -1527,6 +1626,16 @@ def _parse_args() -> argparse.Namespace:
                    help="Custom text encoder slot 1 (CLIP-L for Flux; Qwen2.5-VL for Qwen)")
     p.add_argument("--te2", type=str, default=None, metavar="PATH",
                    help="Custom text encoder slot 2 (T5-XXL for Flux/Chroma)")
+    p.add_argument("--refiner", type=str, default=None, metavar="PATH",
+                   help="Hunyuan-Image 2.1 refiner pipeline path (opt-in two-stage "
+                        "chained generation). When set on a hunyuan-image --model, "
+                        "the base output is passed through "
+                        "HunyuanImageRefinerPipeline for the documented quality "
+                        "pass (Tencent README, ADR-016). Unset on hunyuan-image: "
+                        "loud stderr warning + base-only run. Unset on other "
+                        "families: no-op. Set on a non-hunyuan family: clean "
+                        "error. Download with: huggingface-cli download "
+                        "hunyuanvideo-community/HunyuanImage-2.1-Refiner-Diffusers")
     p.add_argument("--vae-from-transformer", action="store_true", default=None,
                    help="Extract VAE from the --transformer AIO checkpoint")
     p.add_argument("--precision", choices=["bf16", "fp16", "fp32"], default="bf16")
@@ -1575,6 +1684,12 @@ def _parse_args() -> argparse.Namespace:
                    help="Trade speed for lower peak VRAM")
     p.add_argument("--sequential-offload", action="store_true",
                    help="Extreme VRAM savings via sequential CPU offload — very slow")
+    p.add_argument("--vae-tiling", choices=list(VAE_TILING_CHOICES), default="auto",
+                   help="VAE tiling policy at decode time. 'auto' (default) is "
+                        "family-aware: off for Hunyuan-Image (32× VAE, tiling adds "
+                        "seam artifacts without memory benefit), on for every other "
+                        "family (preserves prior behavior). 'on'/'off' force the "
+                        "choice regardless of family.")
     # ── Krea conditioning rebalance (ports ComfyUI-Conditioning-Rebalance) ──
     p.add_argument("--rebalance", action="store_true",
                    help="Krea only: rebalance Qwen3-VL conditioning layer-taps to "
@@ -1707,6 +1822,11 @@ def _run_json_mode() -> int:
             offload_vae=params.get("offload_vae", False),
             attention_slicing=params.get("attention_slicing", False),
             sequential_offload=params.get("sequential_offload", False),
+            vae_tiling=params.get("vae_tiling", "auto"),
+            # Hunyuan-Image refiner chain (ADR-016).
+            refiner_path=params.get("refiner_path", ""),
+            refiner_steps=params.get("refiner_steps", 4),
+            refiner_cfg=params.get("refiner_cfg", 3.5),
             transformer_path=params.get("transformer_path", ""),
             vae_path=params.get("vae_path", ""),
             text_encoder_path=params.get("text_encoder_path", ""),
@@ -1863,6 +1983,18 @@ def _build_server_request(
         "offload_vae":         args.offload_vae,
         "attention_slicing":   args.attention_slicing,
         "sequential_offload":  args.sequential_offload,
+        "vae_tiling":          args.vae_tiling,
+        # Hunyuan-Image refiner chain (ADR-016). refiner_path is a path →
+        # _abspath so the daemon's _check_paths sees it absolute. The daemon
+        # fully consumes these: server.py's _check_paths validates
+        # refiner_path against --model-base, _request_cache_key carries it as
+        # the trailing entry, and _maybe_load_refiner loads the chain
+        # server-side. Threading them client-side keeps in-process and daemon
+        # requests in lockstep so a sidecar replay does not silently drop them
+        # at the wire boundary.
+        "refiner_path":        _abspath(p.get("refiner_path", "")),
+        "refiner_steps":       p.get("refiner_steps", 4),
+        "refiner_cfg":         p.get("refiner_cfg", 3.5),
         "rebalance":           args.rebalance,
         "rebalance_mult":      args.rebalance_mult,
         "transformer_path":    _abspath(p.get("transformer_path", "")),
@@ -2508,6 +2640,14 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                 offload_vae=args.offload_vae,
                 attention_slicing=args.attention_slicing,
                 sequential_offload=args.sequential_offload,
+                vae_tiling=args.vae_tiling,
+                # Hunyuan-Image refiner chain (ADR-016). refiner_path is a
+                # canonical schema key resolved via _CLI_TO_CANONICAL
+                # (--refiner → refiner_path) into p_cur; steps/cfg ride the
+                # family-defaults overlay.
+                refiner_path=p_cur.get("refiner_path", ""),
+                refiner_steps=p_cur.get("refiner_steps", 4),
+                refiner_cfg=p_cur.get("refiner_cfg", 3.5),
                 allow_hf_download=args.allow_hf_download,
                 rebalance=args.rebalance,
                 rebalance_mult=args.rebalance_mult,

@@ -132,6 +132,39 @@ FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
     # (gen-validation 2026-07-06). Routes through the zimage
     # guidance_scale branch in `_build_call_kwargs`.
     "zimage-turbo": {"cfg_scale": 1.0, "steps": 8},
+
+    # ── hunyuan-image (Hunyuan-Image 2.1) ───────────────────────────────
+    # Guidance-distilled. cfg_scale routes to distilled_guidance_scale at
+    # call-build time per ADR-025 §2; the family-defaults overlay still
+    # operates on the canonical cfg_scale schema key (ADR-025 §4 — same
+    # pattern as the flux family). cfg=3.25 / steps=50 match both the
+    # HunyuanImagePipeline.__call__ signature defaults and the Tencent
+    # Hunyuan-Image 2.1 model card.
+    # **2K-native**: width=2048, height=2048 is mandatory, not optional —
+    # Tencent README (Usage §): "HunyuanImage-2.1 only supports 2K image
+    # generation (e.g. 2048x2048 for 1:1 images, 2560x1536 for 16:9 images,
+    # etc.). Generating images with 1K resolution will result in artifacts."
+    # The 32× spatial compression VAE was trained on 64×64 latents → 2048
+    # decoded images; sub-2K renders are out-of-distribution. Documented
+    # aspect buckets: 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3. cfg_scale and
+    # steps keep their schema-overlay semantics; width/height are this
+    # family's first defaults-overlay entries for dimensions (other
+    # families let the caller choose). ADR-025 Changelog 2026-05-24
+    # amendment carries the empirical evidence + README citation.
+    # Source: HunyuanImage-2.1 README (Usage §); ADR-025 §4 amendment.
+    "hunyuan-image": {
+        "cfg_scale":     3.25,
+        "steps":         50,
+        "width":         2048,
+        "height":        2048,
+        # Refiner-stage defaults per ADR-016 §(d): Tencent refiner README
+        # is authoritative (cfg=3.5, steps=4); diffusers signature default
+        # for refiner cfg is 3.25 but the README wins, same lesson as the
+        # 2K-mandatory amendment. Both keys are no-ops when --refiner is
+        # unset (chained dispatch path skipped → these never read).
+        "refiner_steps": 4,
+        "refiner_cfg":   3.5,
+    },
 }
 
 

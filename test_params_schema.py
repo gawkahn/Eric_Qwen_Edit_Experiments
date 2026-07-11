@@ -117,6 +117,11 @@ _generate_canonical = {
         # Runtime-only params, not sidecar-shaped; documented in schema comment.
         "output_path", "precision", "device", "offload_vae",
         "attention_slicing", "sequential_offload", "allow_hf_download",
+        # VAE tiling policy — runtime knob (declared in _RUNTIME_KIND, not
+        # sidecar-persisted); the family-aware default is resolved at load
+        # time by resolve_vae_tiling(). refiner_path/steps/cfg, by contrast,
+        # ARE sidecar-persisted (SCHEMA_KIND) so they are NOT exempt here.
+        "vae_tiling",
         # Krea conditioning rebalance — runtime-only CLI flags (in-process
         # path), recorded in metadata when active but not sidecar input params.
         "rebalance", "rebalance_mult", "rebalance_weights",

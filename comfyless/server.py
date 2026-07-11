@@ -58,6 +58,7 @@ _PATH_FIELDS = frozenset({
     "vae_path",
     "text_encoder_path",
     "text_encoder_2_path",
+    "refiner_path",
     "savepath",
 })
 
@@ -237,7 +238,13 @@ def _check_paths(req: dict, roots: Union[str, Sequence[str]]) -> Optional[str]:
     if not _in_any(model):
         return f"model path outside the allowed roots: {model!r}"
 
-    for field in ("transformer_path", "vae_path", "text_encoder_path", "text_encoder_2_path"):
+    # refiner_path is included here per security-auditor 2026-06-01 CRITICAL
+    # finding: the operator's --model-base policy (which directories
+    # pickle-deserialization is allowed against) applies to the refiner (also
+    # a model). The `_within` realpath+containment check enforces that
+    # invariant for the refiner identically to every other model-path field.
+    for field in ("transformer_path", "vae_path", "text_encoder_path",
+                  "text_encoder_2_path", "refiner_path"):
         p = req.get(field, "") or ""
         if p:
             if not p.startswith("/"):
@@ -356,13 +363,11 @@ def _handle_connection(
         return True
 
     if req_type == "unload":
-        # Clean up any loaded pipeline (Step 3 will populate this)
-        pipeline = server_state.get("pipeline")
-        if pipeline is not None:
-            _log("Unloading pipeline from VRAM")
-            del pipeline
-            import torch; torch.cuda.empty_cache()
-            server_state.clear()
+        # Clean up any loaded pipeline. _evict_chain drops the refiner first
+        # then the base (chain eviction order matters for CUDA release timing).
+        if "pipeline" in server_state:
+            _log("Unloading pipeline (and refiner if any) from VRAM")
+            _evict_chain(server_state)
         _send_safe(conn, {"status": "ok", "message": "unloaded"})
         return False  # signal server loop to stop
 
@@ -419,9 +424,18 @@ def _request_cache_key(req: dict, precision: str, device: str) -> tuple:
         bool(req.get("offload_vae")),
         bool(req.get("attention_slicing")),
         bool(req.get("sequential_offload")),
+        # vae_tiling in the key so a client toggling the flag mid-session
+        # invalidates the cached pipeline. Non-string values are rejected at
+        # the IPC boundary by _RUNTIME_KIND ("vae_tiling": _KIND_STR); empty
+        # / None collapse to "auto".
+        req.get("vae_tiling") or "auto",
         quant,
         tuple(sorted(req.get("quant_skip") or ())),
         tuple(sorted(req.get("quant_only") or ())),
+        # refiner_path trailing entry per ADR-016 §(i). Whitespace-only
+        # normalizes to "" (matches _maybe_load_refiner's .strip()), so
+        # toggling refiner on/off flips the key and evicts the chain.
+        (req.get("refiner_path") or "").strip(),
     )
     if quant != "none":
         key += (tuple(sorted(
@@ -429,6 +443,65 @@ def _request_cache_key(req: dict, precision: str, device: str) -> tuple:
             for l in (req.get("loras") or [])
         )),)
     return key
+
+
+def _maybe_load_refiner(
+    req: dict,
+    base_pipe,
+    model_family: str,
+    req_precision: str,
+    req_device: str,
+):
+    """Load the Hunyuan-Image refiner pipeline when the request opts in.
+
+    Returns the loaded refiner pipeline, or None when the request did not
+    set ``refiner_path``. Raises on (a) refiner_path set on a non-hunyuan
+    family (no silent fallback; the opt-in signal was explicit), or (b) any
+    error in the underlying HunyuanImageRefinerPipeline construction (wrong
+    _class_name, missing weights, OOM during load, etc.).
+
+    Caller passes the BASE pipeline so the asymmetric shared-encoder
+    optimization per ADR-016 §(e) can inject base_pipe.text_encoder +
+    tokenizer into the refiner construction.
+
+    Wire-field-name note: the canonical key is ``refiner_path`` (matches the
+    schema, ``_delegate_to_server`` output, and the
+    transformer_path/vae_path/text_encoder_path convention).
+    """
+    refiner_path = (req.get("refiner_path") or "").strip()
+    if not refiner_path:
+        return None
+    if model_family != "hunyuan-image":
+        raise ValueError(
+            f"refiner_path is only supported for the hunyuan-image family; "
+            f"--model resolved to family {model_family!r}. Drop refiner_path "
+            f"or point --model at a HunyuanImage-2.1-Diffusers checkpoint."
+        )
+    from comfyless.hunyuan_chain import load_refiner_pipeline
+    return load_refiner_pipeline(
+        refiner_path, base_pipe=base_pipe,
+        precision=req_precision, device=req_device,
+        vae_tiling=req.get("vae_tiling") or "auto",
+        allow_hf_download=False,
+    )
+
+
+def _evict_chain(server_state: dict) -> None:
+    """Drop both cached pipelines and clear remaining server_state.
+
+    Drop ``refiner_pipeline`` FIRST so any Python reference cycle or
+    partial-setup state on the chain releases before the base pipeline
+    eviction triggers CUDA frees. ``server_state.clear()`` at the end is a
+    belt-and-suspenders reset for non-pipeline keys (``cache_key``,
+    ``model_family``, ``loaded_loras``, etc.).
+    """
+    if server_state.get("refiner_pipeline") is not None:
+        del server_state["refiner_pipeline"]
+    if "pipeline" in server_state:
+        del server_state["pipeline"]
+    import torch
+    torch.cuda.empty_cache()
+    server_state.clear()
 
 
 def _handle_generate(
@@ -490,10 +563,8 @@ def _handle_generate(
 
     # ── Evict on config change ────────────────────────────────────────
     if server_state.get("cache_key") != cache_key and "pipeline" in server_state:
-        _log("Model config changed — evicting cached pipeline")
-        del server_state["pipeline"]
-        import torch; torch.cuda.empty_cache()
-        server_state.clear()
+        _log("Model config changed — evicting cached refiner + pipeline")
+        _evict_chain(server_state)
 
     # ── Load if not cached ────────────────────────────────────────────
     if "pipeline" not in server_state:
@@ -510,18 +581,35 @@ def _handle_generate(
                 vae_from_transformer=bool(req.get("vae_from_transformer")),
                 attention_slicing=bool(req.get("attention_slicing")),
                 sequential_offload=bool(req.get("sequential_offload")),
+                vae_tiling=req.get("vae_tiling") or "auto",
                 quant=req_quant,
                 quant_skip=req_quant_skip,
                 quant_only=req_quant_only,
             )
         except Exception as e:
             return {"status": "error", "error_type": "LoadError", "error": str(e)}
+        # Refiner load AFTER base — pipe must be loaded for the shared
+        # text_encoder injection (ADR-016 §e). Failure here means the base is
+        # already loaded but the chain promise can't be honored; roll back to
+        # avoid a half-cached state where cache_key includes refiner_path but
+        # server_state.refiner_pipeline is None.
+        try:
+            refiner_pipe = _maybe_load_refiner(
+                req, pipe, model_family, req_precision, req_device,
+            )
+        except Exception as e:
+            del pipe
+            import torch
+            torch.cuda.empty_cache()
+            err_type = "RefinerLoadError" if isinstance(e, ValueError) else "LoadError"
+            return {"status": "error", "error_type": err_type, "error": str(e)}
         server_state.update({
-            "pipeline":        pipe,
-            "model_family":    model_family,
-            "guidance_embeds": guidance_embeds,
-            "cache_key":       cache_key,
-            "loaded_loras":    [],  # list of {"path", "weight", "adapter_name"}
+            "pipeline":         pipe,
+            "model_family":     model_family,
+            "guidance_embeds":  guidance_embeds,
+            "cache_key":        cache_key,
+            "loaded_loras":     [],  # list of {"path", "weight", "adapter_name"}
+            "refiner_pipeline": refiner_pipe,
         })
 
     pipe         = server_state["pipeline"]
@@ -541,10 +629,8 @@ def _handle_generate(
             loaded_paths.discard(lora_rec["path"])
             _log(f"[server] LoRA removed: {lora_rec['path']}")
         except Exception as e:
-            _log(f"[server] LoRA removal failed ({e}) — evicting pipeline and reloading")
-            del server_state["pipeline"]
-            import torch; torch.cuda.empty_cache()
-            server_state.clear()
+            _log(f"[server] LoRA removal failed ({e}) — evicting refiner + pipeline and reloading")
+            _evict_chain(server_state)
             try:
                 pipe, model_family, guidance_embeds = _load_pipeline(
                     req["model"],
@@ -558,18 +644,32 @@ def _handle_generate(
                     vae_from_transformer=bool(req.get("vae_from_transformer")),
                     attention_slicing=bool(req.get("attention_slicing")),
                     sequential_offload=bool(req.get("sequential_offload")),
+                    vae_tiling=req.get("vae_tiling") or "auto",
                     quant=req_quant,
                     quant_skip=req_quant_skip,
                     quant_only=req_quant_only,
                 )
             except Exception as e2:
                 return {"status": "error", "error_type": "LoadError", "error": str(e2)}
+            # Re-load refiner if the request set refiner_path. Same rollback
+            # policy as the initial-load path above.
+            try:
+                refiner_pipe = _maybe_load_refiner(
+                    req, pipe, model_family, req_precision, req_device,
+                )
+            except Exception as e3:
+                del pipe
+                import torch
+                torch.cuda.empty_cache()
+                err_type = "RefinerLoadError" if isinstance(e3, ValueError) else "LoadError"
+                return {"status": "error", "error_type": err_type, "error": str(e3)}
             server_state.update({
-                "pipeline":        pipe,
-                "model_family":    model_family,
-                "guidance_embeds": guidance_embeds,
-                "cache_key":       cache_key,
-                "loaded_loras":    [],
+                "pipeline":         pipe,
+                "model_family":     model_family,
+                "guidance_embeds":  guidance_embeds,
+                "cache_key":        cache_key,
+                "loaded_loras":     [],
+                "refiner_pipeline": refiner_pipe,
             })
             loaded_loras = server_state["loaded_loras"]
             loaded_paths = set()
@@ -667,10 +767,14 @@ def _handle_generate(
                 "error": f"Resolved output path escaped output_dir: {output_path!r}"}
 
     # ── Generate ──────────────────────────────────────────────────────
+    # The cached dict carries both pipelines forward into generate()'s refiner
+    # gate; when refiner_path is non-empty AND refiner_pipeline is non-None,
+    # generate() reuses the cached refiner instead of re-loading.
     cached = {
-        "pipeline":        pipe,
-        "model_family":    server_state["model_family"],
-        "guidance_embeds": server_state["guidance_embeds"],
+        "pipeline":         pipe,
+        "model_family":     server_state["model_family"],
+        "guidance_embeds":  server_state["guidance_embeds"],
+        "refiner_pipeline": server_state.get("refiner_pipeline"),
     }
     try:
         metadata = generate(
@@ -708,6 +812,13 @@ def _handle_generate(
             nag_tau=req.get("nag_tau", 2.5),
             nag_alpha=req.get("nag_alpha", 0.25),
             nag_end=req.get("nag_end", 1.0),
+            # Refiner thread-through per ADR-016 §(i). The refiner_path match
+            # between request and cached refiner is enforced by cache_key — a
+            # mismatch evicted + reloaded the chain above. generate() reuses
+            # cached["refiner_pipeline"] rather than re-loading.
+            refiner_path=req.get("refiner_path", "") or "",
+            refiner_steps=req.get("refiner_steps", 4),
+            refiner_cfg=req.get("refiner_cfg", 3.5),
             _cached_pipeline=cached,
         )
     except Exception as e:

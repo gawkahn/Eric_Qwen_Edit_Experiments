@@ -82,6 +82,13 @@ SCHEMA_KIND = types.MappingProxyType({
     "nag_tau":              _KIND_FLOAT,
     "nag_alpha":            _KIND_FLOAT,
     "nag_end":              _KIND_FLOAT,
+    # Hunyuan-Image refiner chain (ADR-016). Sidecar-persisted and
+    # --params-replayable: refiner_path activates the base+refiner chain
+    # (only for the hunyuan-image family); refiner_steps/cfg tune the
+    # refiner stage. All no-ops when refiner_path is unset.
+    "refiner_path":         _KIND_STR,
+    "refiner_steps":        _KIND_INT,
+    "refiner_cfg":          _KIND_FLOAT,
 })
 
 
@@ -96,6 +103,11 @@ _RUNTIME_KIND = types.MappingProxyType({
     "attention_slicing":  _KIND_BOOL,
     "sequential_offload": _KIND_BOOL,
     "savepath":           _KIND_STR,
+    # VAE tiling override (--vae-tiling {auto,on,off}). Runtime knob, not
+    # sidecar-persisted (ADR-025): the family-aware default is resolved at
+    # load time by resolve_vae_tiling(); this only carries an explicit
+    # operator override across the IPC boundary.
+    "vae_tiling":         _KIND_STR,
     # Krea conditioning rebalance — runtime knobs (not sidecar-shaped).
     # Type-checked here so a malformed mult/weights is rejected before the
     # expensive generate path. rebalance_weights is a list of floats (or

@@ -198,6 +198,18 @@ def _build_call_kwargs(
             kwargs["negative_prompt"] = negative_prompt
         return kwargs
 
+    if model_family == "hunyuan-image":
+        # Hunyuan-Image 2.1: guidance-distilled — distilled_guidance_scale is
+        # the documented call kwarg, NOT guidance_scale or true_cfg_scale
+        # (see ADR-025 §2). negative_prompt is accepted by the pipeline; its
+        # docstring says "Ignored when not using guidance" — forward it when
+        # set and let the pipeline decide (ADR-025 §5). max_sequence_length
+        # is not in this pipeline's signature, so it is not passed.
+        kwargs = {**base, "distilled_guidance_scale": cfg_scale}
+        if negative_prompt:
+            kwargs["negative_prompt"] = negative_prompt
+        return kwargs
+
     if model_family in ("flux", "flux2", "flux2klein"):
         # Flux: guidance-distilled — one forward pass, no negative prompts.
         # guidance_scale typical range 3.5–7.0.
@@ -354,6 +366,21 @@ class EricDiffusionGenerate:
                         "All samplers work with Flux, Flux2, Chroma, and Qwen-Image."
                     ),
                 }),
+                "refiner_path": ("STRING", {
+                    "default": "",
+                    "tooltip": (
+                        "Hunyuan-Image 2.1 refiner pipeline path (opt-in two-stage "
+                        "chained generation). When set on a hunyuan-image pipeline, "
+                        "the base output is passed through HunyuanImageRefinerPipeline "
+                        "for the documented quality pass (Tencent README, ADR-016).\n\n"
+                        "• Empty (default) on hunyuan-image — loud warning + "
+                        "base-only run.\n"
+                        "• Empty on other families — no-op.\n"
+                        "• Set on a non-hunyuan family — clean error.\n\n"
+                        "Download with: huggingface-cli download "
+                        "hunyuanvideo-community/HunyuanImage-2.1-Refiner-Diffusers"
+                    ),
+                }),
             },
         }
 
@@ -369,11 +396,79 @@ class EricDiffusionGenerate:
         max_sequence_length: int = 512,
         seed: int = 0,
         sampler: str = "default",
+        refiner_path: str = "",
     ) -> Tuple[torch.Tensor]:
         pipe          = pipeline["pipeline"]
         model_family  = pipeline.get("model_family", "unknown")
         guidance_embeds = pipeline.get("guidance_embeds", False)
         offload_vae   = pipeline.get("offload_vae", False)
+
+        # ── Hunyuan-Image refiner gate + load (ADR-016) ───────────────────
+        # Parallels the comfyless gate (comfyless/generate.py: same shape).
+        # Branches:
+        #   - refiner_path set + non-hunyuan family → clean ValueError
+        #   - refiner_path set + hunyuan-image     → load refiner pipe
+        #   - refiner_path unset + hunyuan-image   → loud stderr warning,
+        #                                            base-only run
+        #   - any other family + unset             → no-op
+        # Empty string is the unset state per ADR-016 §(c).
+        refiner_path = (refiner_path or "").strip()
+        refiner_pipe = None
+        refiner_steps = 0
+        refiner_cfg = 0.0
+        if refiner_path:
+            if model_family != "hunyuan-image":
+                raise ValueError(
+                    f"refiner_path is only supported for the hunyuan-image "
+                    f"family; loaded pipeline resolved to family "
+                    f"{model_family!r}. Clear refiner_path or load a "
+                    f"HunyuanImage-2.1-Diffusers checkpoint in the loader."
+                )
+            from comfyless.hunyuan_chain import load_refiner_pipeline
+            from comfyless.family_defaults import FAMILY_DEFAULTS
+            # Pull refiner_steps / refiner_cfg from FAMILY_DEFAULTS — the
+            # ComfyUI node exposes only refiner_path (per Vision OQ4) and
+            # reads the operating point from the same source of truth the
+            # comfyless precedence ladder uses. Defaults: 4 / 3.5
+            # (Tencent refiner README, ADR-016 §(d)).
+            hunyuan_defaults = FAMILY_DEFAULTS.get("hunyuan-image", {})
+            refiner_steps = int(hunyuan_defaults.get("refiner_steps", 4))
+            refiner_cfg = float(hunyuan_defaults.get("refiner_cfg", 3.5))
+            # Match the base pipe's dtype + device for the refiner load.
+            # No new INPUT_TYPES knobs — the operator picked precision /
+            # device at loader time, refiner inherits that choice.
+            denoiser = getattr(pipe, "transformer", None) or getattr(pipe, "unet", None)
+            if denoiser is not None:
+                base_param = next(denoiser.parameters())
+                _dtype_to_precision = {
+                    torch.bfloat16: "bf16",
+                    torch.float16:  "fp16",
+                    torch.float32:  "fp32",
+                }
+                precision = _dtype_to_precision.get(base_param.dtype, "bf16")
+                refiner_device = str(base_param.device)
+            else:
+                precision = "bf16"
+                refiner_device = "cuda"
+            refiner_pipe = load_refiner_pipeline(
+                refiner_path, base_pipe=pipe,
+                precision=precision, device=refiner_device,
+                vae_tiling="auto",
+                allow_hf_download=False,
+            )
+        elif model_family == "hunyuan-image":
+            # Warn-don't-block per `feedback_warn_dont_block` + Vision Inv 2.
+            # ComfyUI-flavored: references the node's refiner_path input
+            # rather than the CLI --refiner flag. Locked at runtime by the
+            # Step 3 ComfyUI-parity structural assertions in test_hunyuan.py.
+            import sys as _sys
+            print(
+                "[EricDiffusion] WARNING: hunyuan-image quality requires a refiner; "
+                "set refiner_path on the Generate node; download with "
+                "huggingface-cli download "
+                "hunyuanvideo-community/HunyuanImage-2.1-Refiner-Diffusers",
+                file=_sys.stderr,
+            )
 
         # ── Dimensions ─────────────────────────────────────────────────────
         w_ratio, h_ratio = ASPECT_RATIOS.get(aspect_ratio, (1, 1))
@@ -426,17 +521,31 @@ class EricDiffusionGenerate:
             print(f"[EricDiffusion] Custom samplers require flow-match schedulers — "
                   f"ignoring sampler={sampler!r} for {model_family}")
             effective_sampler = "default"
+        # When the Hunyuan-Image refiner chain is active, run_chain handles
+        # both pipeline calls under a single swap_sampler context. The swap
+        # is per-pipe (operates on base only); the refiner's scheduler is
+        # untouched (ADR-016 §(g) / Vision Inv 8).
         try:
-            with swap_sampler(pipe, effective_sampler):
-                result = pipe(**call_kwargs)
+            if refiner_pipe is not None:
+                from comfyless.hunyuan_chain import run_chain
+                with swap_sampler(pipe, effective_sampler):
+                    final_pil = run_chain(
+                        pipe, refiner_pipe, call_kwargs,
+                        prompt=prompt, negative_prompt=neg,
+                        refiner_steps=refiner_steps, refiner_cfg=refiner_cfg,
+                        generator=generator,
+                    )
+            else:
+                with swap_sampler(pipe, effective_sampler):
+                    result = pipe(**call_kwargs)
+                final_pil = result.images[0]
         finally:
             if offload_vae and not using_device_map and hasattr(pipe, "vae"):
                 pipe.vae = pipe.vae.to("cpu")
                 torch.cuda.empty_cache()
 
         # ── Convert to ComfyUI tensor [B, H, W, C] ─────────────────────────
-        pil_image = result.images[0]
-        tensor = pil_to_tensor(pil_image).unsqueeze(0)
+        tensor = pil_to_tensor(final_pil).unsqueeze(0)
 
         # ── Build GEN_METADATA ─────────────────────────────────────────────
         metadata = {
@@ -454,5 +563,12 @@ class EricDiffusionGenerate:
             "height":          height,
             "timestamp":       datetime.now().isoformat(),
         }
+        if refiner_pipe is not None:
+            # Two-stage metadata extension per ADR-016 §(h). Keys are absent
+            # (not present-and-empty) on base-only runs — Vision Inv 4.
+            metadata["pipeline"]      = "base+refiner"
+            metadata["refiner_path"]  = refiner_path
+            metadata["refiner_steps"] = refiner_steps
+            metadata["refiner_cfg"]   = refiner_cfg
 
         return (tensor, metadata)

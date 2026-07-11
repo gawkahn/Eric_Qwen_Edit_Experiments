@@ -27,6 +27,8 @@ from .eric_diffusion_utils import (
     get_gen_pipeline_cache,
     clear_gen_pipeline_cache,
     resolve_hf_path,
+    resolve_vae_tiling,
+    VAE_TILING_CHOICES,
 )
 from .eric_diffusion_component_loader import (
     available_device_options,
@@ -119,6 +121,20 @@ class EricDiffusionLoader:
                     "default": False,
                     "tooltip": "Extreme VRAM savings via sequential CPU offload — very slow.",
                 }),
+                "vae_tiling": (list(VAE_TILING_CHOICES), {
+                    "default": "auto",
+                    "tooltip": (
+                        "VAE tiling at decode time.\n\n"
+                        "• auto — family-aware default. Off for Hunyuan-Image "
+                        "(32× VAE produces small latents; tiling adds seam "
+                        "artifacts without memory benefit). On for every other "
+                        "family (preserves the prior always-tiled behavior on "
+                        "8×/16× VAEs).\n"
+                        "• on — force tiling on regardless of family. Use if "
+                        "Hunyuan decode OOMs on a small-VRAM card.\n"
+                        "• off — force tiling off regardless of family."
+                    ),
+                }),
                 "allow_hf_download": ("BOOLEAN", {
                     "default": False,
                     "tooltip": (
@@ -140,6 +156,7 @@ class EricDiffusionLoader:
         offload_vae: bool = False,
         attention_slicing: bool = False,
         sequential_offload: bool = False,
+        vae_tiling: str = "auto",
         allow_hf_download: bool = False,
     ) -> Tuple:
         model_path = resolve_hf_path(model_path.strip(), allow_download=allow_hf_download)
@@ -148,7 +165,7 @@ class EricDiffusionLoader:
         # any quant change evicts and reloads (invariant 4).
         cache_key = (
             f"{model_path}_{precision}_{device}_{offload_vae}"
-            f"_{attention_slicing}_{sequential_offload}"
+            f"_{attention_slicing}_{sequential_offload}_{vae_tiling}"
             f"{quant_cache_fragment(quant)}"
         )
         cache = get_gen_pipeline_cache()
@@ -214,8 +231,15 @@ class EricDiffusionLoader:
                 pipeline.vae = pipeline.vae.to("cpu")
 
         if hasattr(pipeline, "vae") and hasattr(pipeline.vae, "enable_tiling"):
-            pipeline.vae.enable_tiling()
-            print("[EricDiffusion] VAE tiling enabled")
+            if resolve_vae_tiling(model_family, vae_tiling):
+                pipeline.vae.enable_tiling()
+                print(f"[EricDiffusion] VAE tiling enabled (vae_tiling={vae_tiling})")
+            else:
+                # Defensive disable in case a future diffusers default flips
+                # use_tiling=True at construct time.
+                if hasattr(pipeline.vae, "disable_tiling"):
+                    pipeline.vae.disable_tiling()
+                print(f"[EricDiffusion] VAE tiling disabled (vae_tiling={vae_tiling})")
 
         if attention_slicing:
             try:
