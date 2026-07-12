@@ -1250,6 +1250,7 @@ def generate(
     nag_end: float = 1.0,
     _cached_pipeline: Optional[Dict[str, Any]] = None,
     mcp_caller: bool = False,
+    extra_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Generate a single image and save it.
 
@@ -1535,6 +1536,11 @@ def generate(
         "elapsed_seconds": round(elapsed, 2),
         "contract_version": CONTRACT_VERSION,
     }
+    # Caller-supplied provenance (e.g. inline prompt-enhancement: original
+    # prompt + backend/recipe, ADR-026 §7). Non-schema keys; recorded in the
+    # sidecar but not part of COMFYLESS_SCHEMA.
+    if extra_metadata:
+        metadata.update(extra_metadata)
     lora_warnings = lora_failure_warnings(lora_outcomes)
     if lora_warnings:
         metadata["lora_warnings"] = lora_warnings
@@ -1703,6 +1709,21 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--allow-hf-download", action="store_true", default=False,
                    help="Allow downloading models from HuggingFace if not in local cache. "
                         "By default only the local cache is used (no network access)")
+    p.add_argument("--enhance-prompt", type=str, default=None, metavar="BACKEND",
+                   help="Enhance the prompt through an LLM before generating (ADR-026). "
+                        "BACKEND is a name from the enhancer registry (see "
+                        "enhancers.example.toml): e.g. 'hunyuan' (local Tencent reprompt) "
+                        "or an openai-endpoint name. Enhanced once per unique prompt; the "
+                        "enhanced text is what gets generated + recorded in the sidecar. "
+                        "For offline batch enhancement of a prompt-list JSON use "
+                        "'python -m comfyless.enhance'.")
+    p.add_argument("--enhance-recipe", type=str, default=None, metavar="RECIPE",
+                   help="Recipe name for openai-endpoint enhancement (generic / "
+                        "preserve-subject / vary-setting / <family>-generic). Ignored by "
+                        "the hunyuan backend. Default: the 'generic' recipe.")
+    p.add_argument("--enhance-config", type=str, default=None, metavar="PATH",
+                   help="Enhancer registry TOML path (default: $COMFYLESS_ENHANCERS → "
+                        "./enhancers.toml → ~/.config/comfyless/enhancers.toml).")
     p.add_argument("--output", "-o", type=str, default="/tmp/comfyless.png",
                    help="Output image path (exact; overwrites). "
                         "Ignored when a server is running — use --savepath instead.")
@@ -2552,6 +2573,13 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
     iterate_batch_id = str(uuid.uuid4()) if plan is not None else None
     iterate_inputs = plan["input_tokens"] if plan is not None else None
 
+    # Inline prompt-enhancement state (ADR-026). Memoized per unique input
+    # prompt across the whole run so a fixed prompt over a lora/transformer
+    # sweep is enhanced ONCE (clean A/B; no wasted LLM calls), while a
+    # --iterate prompt axis enhances each distinct prompt. Backends loaded once.
+    _enhance_memo: Dict[str, str] = {}
+    _enhance_backends: List[Optional[dict]] = [None]
+
     def _run_one(p_cur: dict, loras_cur: list,
                  idx: Optional[int] = None, total: Optional[int] = None) -> int:
         """Run a single generation from the effective params. Returns exit code."""
@@ -2577,6 +2605,47 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
         # HF resolution (model_index.json must be readable) and BEFORE the
         # daemon delegation / generate() call so values flow through unchanged.
         _apply_family_defaults(p_cur, explicit_keys, iterated_axes, idx=idx)
+
+        _enh_provenance = None
+        # ── Inline prompt enhancement (ADR-026) ───────────────────────────
+        # Enhance the effective prompt just before dispatch, so it flows
+        # unchanged into BOTH the daemon-delegate and in-process paths and is
+        # recorded as `prompt` in the sidecar (a --params replay then reuses
+        # the enhanced text and never re-calls the LLM). Memoized per unique
+        # input prompt. Fail loud — never silently generate on the un-enhanced
+        # prompt once the operator asked for enhancement.
+        if getattr(args, "enhance_prompt", None):
+            _raw = p_cur.get("prompt", "") or ""
+            if _raw and _raw not in _enhance_memo:
+                try:
+                    from comfyless.enhance import (load_backends as _lb,
+                                                   enhance as _enh)
+                    if _enhance_backends[0] is None:
+                        _enhance_backends[0] = _lb(getattr(args, "enhance_config", None))
+                    _enhance_memo[_raw] = _enh(
+                        _raw, args.enhance_prompt,
+                        backends=_enhance_backends[0],
+                        recipe_name=getattr(args, "enhance_recipe", None),
+                        family=None, n=1,
+                    )[0]
+                    _log(f"[comfyless] prompt enhanced via {args.enhance_prompt!r} "
+                         f"(recipe={getattr(args, 'enhance_recipe', None) or 'default'})")
+                except Exception as e:
+                    print(f"Error: prompt enhancement via "
+                          f"{args.enhance_prompt!r} failed: {e}", file=sys.stderr)
+                    return 1
+            if _raw:
+                p_cur["prompt"] = _enhance_memo[_raw]
+                # Provenance for the sidecar (ADR-026 §7): the original prompt +
+                # which backend/recipe produced the enhancement. Recorded on the
+                # in-process path via generate(extra_metadata=...). (Daemon-path
+                # provenance is a documented follow-up — A10; replay
+                # determinism holds on both paths regardless.)
+                _enh_provenance = {
+                    "original_prompt": _raw,
+                    "enhance_backend": args.enhance_prompt,
+                    "enhance_recipe": getattr(args, "enhance_recipe", None) or "default",
+                }
 
         # Delegate to daemon when --savepath or default --output; skip on explicit --output.
         # quant delegates too since slice DQ: the wire request carries the
@@ -2623,6 +2692,7 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
             metadata = generate(
                 model_path=p_cur["model"],
                 prompt=p_cur["prompt"],
+                extra_metadata=_enh_provenance,
                 output_path=output_path,
                 negative_prompt=p_cur.get("negative_prompt", ""),
                 seed=p_cur.get("seed", -1),

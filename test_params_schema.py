@@ -133,6 +133,10 @@ _generate_canonical = {
         # MCP-internal call-shape flag; signals _save_with_metadata to apply
         # invariant-12 PNG redaction. Not user-facing; not a sidecar param.
         "mcp_caller",
+        # Caller-supplied provenance dict merged into the sidecar (e.g. inline
+        # prompt-enhancement original prompt + backend/recipe, ADR-026 §7).
+        # Not a sidecar-input schema key.
+        "extra_metadata",
     }
 }
 _missing_from_schema = _generate_canonical - set(schema.keys())

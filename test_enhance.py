@@ -205,5 +205,51 @@ with tempfile.TemporaryDirectory() as tmp:
         _u.urlopen = _orig_urlopen
 
 
+print("── fail-loud on empty / bad config (review fixes) ──")
+# empty enhancement → EnhanceError (never degrade to empty prompt)
+def _empty_urlopen(req, timeout=None):
+    if req.full_url.endswith("/models"):
+        return _Resp({"data": [{"id": "m"}]})
+    return _Resp({"choices": [{"message": {"content": "   <answer></answer>  "}}]})
+with tempfile.TemporaryDirectory() as tmp:
+    _write(tmp, "generic.toml", 'system_prompt="S"\n')
+    _u.urlopen = _empty_urlopen
+    try:
+        E.enhance("x", "g", backends={"g": {"type": "openai-endpoint", "url": "http://x/v1", "model": "m"}}, recipes_dir=tmp)
+        check("empty enhancement → EnhanceError", False)
+    except E.EnhanceError as e:
+        check("empty enhancement → EnhanceError", "empty" in str(e))
+    finally:
+        _u.urlopen = _orig_urlopen
+# non-numeric temperature → EnhanceError (not a raw ValueError)
+with tempfile.TemporaryDirectory() as tmp:
+    _write(tmp, "bad.toml", 'system_prompt="S"\ntemperature="hot"\n')
+    try:
+        E.load_recipe("bad", tmp); check("non-numeric temperature → EnhanceError", False)
+    except E.EnhanceError as e:
+        check("non-numeric temperature → EnhanceError", "temperature" in str(e))
+# _clean_output drops an unclosed <think> tail
+check("unclosed <think> tail dropped", E._clean_output("<think>reasoning without close") == "")
+check("closed think then answer still works", E._clean_output("<think>a</think><answer>keep</answer>") == "keep")
+
+
+print("── offline enhance_prompt_list ──")
+_orig_h2 = E.enhance_hunyuan_reprompt
+# deterministic mock: variant vi of prompt p -> "p#vi"
+E.enhance_hunyuan_reprompt = lambda text, cfg, n: [f"{text}#{i}" for i in range(n)]
+try:
+    bk = {"h": {"type": "hunyuan-reprompt", "model": "/m"}}
+    enh, prov = E.enhance_prompt_list(["a", "b"], "h", backends=bk, variations=3)
+    check("list×variations length", len(enh) == 6 and len(prov) == 6)
+    check("source-major variation-minor order", enh == ["a#0", "a#1", "a#2", "b#0", "b#1", "b#2"])
+    check("provenance source_index", [p["source_index"] for p in prov] == [0, 0, 0, 1, 1, 1])
+    check("provenance variation_index", [p["variation_index"] for p in prov] == [0, 1, 2, 0, 1, 2])
+    check("provenance source_prompt", prov[4]["source_prompt"] == "b")
+    enh1, _ = E.enhance_prompt_list(["x"], "h", backends=bk, variations=1)
+    check("variations=1 → 1:1", enh1 == ["x#0"])
+finally:
+    E.enhance_hunyuan_reprompt = _orig_h2
+
+
 print(f"\n{'='*50}\n  {_passed} passed, {_failed} failed\n{'='*50}")
 sys.exit(1 if _failed else 0)

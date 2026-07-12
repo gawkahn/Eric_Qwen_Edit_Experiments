@@ -1,7 +1,7 @@
 # ADR-026: comfyless Prompt Enhancement Subsystem
 
 **Date:** 2026-07-11
-**Status:** proposed
+**Status:** accepted
 
 ---
 
@@ -148,5 +148,17 @@ vendored, on-disk reprompt tokenizer, and only under these constraints:
 - 2026-07-11 — proposed. Design settled in session; enhancement architecture
   (backend/recipe decoupling, inline memoization, offline list→list transform,
   sidecar/replay contract, `trust_remote_code` policy) captured before any code.
+- 2026-07-11 — **accepted; implemented.** `comfyless/enhance.py` +
+  `comfyless/recipes/*` + inline `--enhance-prompt` (`generate.py`) + offline
+  `python -m comfyless.enhance`. Both backends live/mock-validated. Deviations
+  from the proposal, all in `implementation_details.md`: A1 (uniform TOML backend
+  entries, no "reserved name"); A5 (reprompt output language follows input); A9
+  (inline recipe family-default is best-effort → `generic`; use `--enhance-recipe`
+  or the offline `--family` for family-specific). Deferred: A10 (VRAM
+  co-residency + daemon-path provenance; `free_reprompt_cache()` provided, offline
+  transform is the recommended hunyuan batch path), A11 (redirect auth hardening,
+  LOW), slice 5c regional markers. §8 trust_remote_code implemented + reviewed:
+  `docs/security/review-enhancer-trust-remote-code-2026-07-11.md` (CLEAN after the
+  auto_map/config-pin MEDIUM was folded). code-reviewer findings #3/#4/#6/#7 folded.
 
 **AI-Disclosure:** Claude (Opus 4.8) authored; Grant reviewed.

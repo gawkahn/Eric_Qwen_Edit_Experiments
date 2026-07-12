@@ -94,3 +94,49 @@ torch. Respects the dep-hygiene rule. *(A7)*
 `0c1fced82e7de447f956daea515486bccf2f8a4b06d3d228c6296ea53f54d3b7`; the backend
 recomputes + compares before loading the tokenizer with `trust_remote_code=True`
 and refuses on mismatch (ADR-026 §8). *(A8)*
+
+**A9 — inline recipe family-default is best-effort.** Inline `--enhance-prompt`
+passes `family=None` to the recipe selector (→ the `generic` recipe) because the
+model family isn't resolved at the enhance point (it happens just before
+dispatch, before the loader runs). The `hunyuan` backend ignores recipes anyway;
+for family-specific grammar on an openai-endpoint backend inline, pass
+`--enhance-recipe <name>` explicitly (e.g. `sdxl-generic`). The offline transform
+takes `--family`/`--recipe` explicitly, so it has full family-aware selection.
+Auto-detecting family inline (cheap `detect_pipeline_class` read) is a possible
+follow-up. *(A9)*
+
+## Build log — COMPLETE (2026-07-11)
+- [x] Core + registries (`comfyless/enhance.py`) — committed `2e42bb0` (NB: that
+  commit is mislabeled `docs: ADR-025` — the enhancer core was still staged when
+  the ADR-025 doc committed, so both landed together; content complete, message
+  under-describes. Not rewritten — unpushed but user asleep, left honest.)
+- [x] `hunyuan-reprompt` backend — LIVE-VALIDATED (inline + offline).
+- [x] `openai-endpoint` backend — built + mock-tested; live Gemma PENDING (A6).
+- [x] inline `--enhance-prompt`/`--enhance-recipe` — LIVE-VALIDATED.
+- [x] offline `python -m comfyless.enhance` + `--variations` + provenance — LIVE-VALIDATED.
+- [x] 3 generic recipes + sdxl tag recipe.
+
+## Review fixes (2026-07-11, both reviewers)
+security-auditor MEDIUM (auto_map pin): FIXED — `_verify_reprompt_tokenizer` now
+pins BOTH tokenization_hy.py AND tokenizer_config.json (sha256) + asserts the
+auto_map target is exactly the reviewed class. code-reviewer #3/#4/#6/#7 FIXED
+(empty→EnhanceError; resolve-error detail; temperature validation; unclosed
+<think> tail). #5 FIXED (offline resolves /models once via cfg model cache).
+#2 (sidecar provenance): in-process path FIXED via generate(extra_metadata=...).
+
+**A10 — VRAM co-residency + daemon provenance (deferred).** Inline
+`--enhance-prompt hunyuan` loads the ~14GB reprompt model co-resident with the
+diffusion pipeline on the same GPU (fine on the 98GB cards; a footgun on small
+cards). `free_reprompt_cache()` is provided; the OFFLINE transform is the
+recommended path for hunyuan batches (enhance-all → generate separately, never
+co-resident). Daemon-delegate inline enhancement runs the reprompt model in the
+CLIENT (holds 14GB for the whole loop) — for large daemon runs, prefer offline.
+Sidecar enhancement provenance (original prompt + backend/recipe) is recorded on
+the IN-PROCESS path; the daemon-delegate path records only the enhanced prompt
+(replay-deterministic on both). Full daemon provenance → follow-up.
+
+**A11 — openai-endpoint redirect hardening (deferred, LOW).** urllib follows
+redirects and would forward the `Authorization: Bearer` header cross-host. Endpoints
+are operator-chosen localhost, so no exposure today (security-auditor: "no change
+needed while endpoints are trusted localhost"). If a non-localhost endpoint is ever
+configured, add a redirect handler that strips Authorization on host change.

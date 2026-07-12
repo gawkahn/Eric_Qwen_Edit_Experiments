@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import tomllib
 import urllib.error
 import urllib.request
@@ -42,13 +43,23 @@ _HUNYUAN_REPROMPT_SYSTEM = (
 )
 
 # trust_remote_code hash pin (ADR-026 §8). The reprompt tokenizer requires
-# trust_remote_code=True (auto_map → tokenization_hy.HYTokenizer). The file was
-# reviewed 2026-07-11 (benign tiktoken BPE wrapper); we refuse to execute it if
-# the on-disk bytes no longer match this reviewed snapshot.
+# trust_remote_code=True. transformers decides WHICH file to execute from the
+# `auto_map` in tokenizer_config.json — so §8's "reviewed + pinned, silent swap
+# detectable" invariant requires pinning BOTH the executed .py AND the config
+# that names it, and asserting the auto_map still points at the reviewed class.
+# Both files reviewed 2026-07-11 (tokenization_hy.py = benign tiktoken wrapper;
+# auto_map = tokenization_hy.HYTokenizer). Refuse to execute on any drift.
 _REPROMPT_TOKENIZER_FILE = "tokenization_hy.py"
 _REPROMPT_TOKENIZER_SHA256 = (
     "0c1fced82e7de447f956daea515486bccf2f8a4b06d3d228c6296ea53f54d3b7"
 )
+_REPROMPT_CONFIG_FILE = "tokenizer_config.json"
+_REPROMPT_CONFIG_SHA256 = (
+    "560d14d33de1d2e090913620b89bf8377f0f791bd0656f793be6adcf346eee7a"
+)
+# The only auto_map target we have reviewed. Module component must be the pinned
+# tokenizer file's stem; class is HYTokenizer.
+_REPROMPT_AUTO_MAP_TARGET = "tokenization_hy.HYTokenizer"
 
 # Tencent reprompt runtime knobs (their reprompt.py + generation_config.json).
 _REPROMPT_MAX_NEW_TOKENS = 2048
@@ -148,6 +159,13 @@ def load_recipe(name: str, recipes_dir: Optional[str] = None) -> dict:
     if not r.get("system_prompt"):
         raise EnhanceError(f"recipe {candidate} missing 'system_prompt'")
     r.setdefault("temperature", 0.8)
+    try:
+        r["temperature"] = float(r["temperature"])
+    except (TypeError, ValueError):
+        raise EnhanceError(
+            f"recipe {candidate}: temperature must be numeric, got "
+            f"{r['temperature']!r}"
+        )
     r.setdefault("target", "")
     return r
 
@@ -158,23 +176,47 @@ _reprompt_cache: Dict[str, Any] = {}
 
 
 def _verify_reprompt_tokenizer(model_dir: str) -> None:
-    """Refuse to load if the vendored tokenizer file no longer matches the
-    reviewed snapshot (ADR-026 §8). This is what makes trust_remote_code=True
-    safe: we execute only bytes we have reviewed and pinned."""
-    f = Path(model_dir) / _REPROMPT_TOKENIZER_FILE
-    if not f.is_file():
-        raise EnhanceError(
-            f"reprompt tokenizer {f} missing — cannot verify trust_remote_code "
-            f"pin (ADR-026 §8)"
-        )
-    got = hashlib.sha256(f.read_bytes()).hexdigest()
-    if got != _REPROMPT_TOKENIZER_SHA256:
-        raise EnhanceError(
-            f"reprompt tokenizer {f} sha256 {got} does not match the reviewed "
-            f"pin {_REPROMPT_TOKENIZER_SHA256} — refusing trust_remote_code "
-            f"execution (ADR-026 §8). If this change is intentional, re-review "
-            f"the file and update _REPROMPT_TOKENIZER_SHA256."
-        )
+    """Refuse to load unless BOTH the vendored tokenizer file AND the config
+    that selects it (via ``auto_map``) match the reviewed snapshots, and the
+    auto_map still names only the reviewed class (ADR-026 §8).
+
+    This is what makes trust_remote_code=True safe: transformers executes
+    whatever ``auto_map`` in tokenizer_config.json points at, so pinning the
+    .py alone is insufficient — a silently-swapped config could redirect
+    execution to un-reviewed code while the pinned .py stays byte-identical.
+    We pin both files and additionally assert the auto_map target."""
+    md = Path(model_dir)
+    for fname, pin in ((_REPROMPT_TOKENIZER_FILE, _REPROMPT_TOKENIZER_SHA256),
+                       (_REPROMPT_CONFIG_FILE, _REPROMPT_CONFIG_SHA256)):
+        f = md / fname
+        if not f.is_file():
+            raise EnhanceError(
+                f"reprompt {f} missing — cannot verify trust_remote_code pin "
+                f"(ADR-026 §8)"
+            )
+        got = hashlib.sha256(f.read_bytes()).hexdigest()
+        if got != pin:
+            raise EnhanceError(
+                f"reprompt {f} sha256 {got} does not match the reviewed pin "
+                f"{pin} — refusing trust_remote_code execution (ADR-026 §8). If "
+                f"this change is intentional, re-review the file and update the pin."
+            )
+    # Defense in depth: assert auto_map still names ONLY the reviewed class
+    # (belt-and-suspenders over the config hash — makes the intent explicit and
+    # gives a targeted error if a future config bump adds another target).
+    try:
+        cfg = json.loads((md / _REPROMPT_CONFIG_FILE).read_text(encoding="utf-8"))
+        am = cfg.get("auto_map", {}).get("AutoTokenizer")
+    except (OSError, json.JSONDecodeError, AttributeError) as e:
+        raise EnhanceError(f"reprompt tokenizer_config.json unreadable: {e}") from e
+    targets = am if isinstance(am, list) else [am]
+    for t in targets:
+        if t and t != _REPROMPT_AUTO_MAP_TARGET:
+            raise EnhanceError(
+                f"reprompt auto_map targets {t!r}, not the reviewed "
+                f"{_REPROMPT_AUTO_MAP_TARGET!r} — refusing trust_remote_code "
+                f"(ADR-026 §8)"
+            )
 
 
 def _load_reprompt(model_dir: str, device: str, precision: str):
@@ -216,6 +258,10 @@ def _clean_output(text: str) -> str:
     """
     import re
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    # tolerate an unclosed <think> (generation truncated mid-reasoning) — drop
+    # the tail so raw reasoning never leaks into the prompt (mirrors the
+    # unclosed-<answer> tolerance below)
+    text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)
     m = re.search(r"<answer>(.*?)</answer>", text, flags=re.DOTALL)
     if m:
         text = m.group(1)
@@ -266,10 +312,36 @@ def enhance_hunyuan_reprompt(text: str, cfg: dict, n: int) -> List[str]:
                 )
             new = gen[0][in_len:]
             decoded = tok.decode(new, skip_special_tokens=True)
-            out.append(_clean_output(decoded))
+            cleaned = _clean_output(decoded)
+        except EnhanceError:
+            raise
         except Exception as e:
             raise EnhanceError(f"hunyuan-reprompt generation failed: {e}") from e
+        if not cleaned:
+            # fail loud rather than degrade to an empty prompt (ADR-026 —
+            # never silently proceed on an un-enhanced prompt)
+            raise EnhanceError("hunyuan-reprompt returned an empty enhancement")
+        out.append(cleaned)
     return out
+
+
+def free_reprompt_cache() -> None:
+    """Drop any cached reprompt model(s) and free GPU memory.
+
+    The ~14 GB reprompt model loaded for inline ``--enhance-prompt hunyuan`` is
+    co-resident with the diffusion pipeline on the same GPU during a run (a VRAM
+    footgun on small cards — see implementation_details.md A10). Callers that
+    know enhancement is finished can reclaim it. For large batches the offline
+    ``python -m comfyless.enhance`` transform is preferred: enhance all prompts,
+    then generate separately, so the two models are never co-resident."""
+    if not _reprompt_cache:
+        return
+    _reprompt_cache.clear()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 # ── Backend: openai-endpoint (OpenAI-compatible HTTP) ────────────────────────
@@ -283,14 +355,17 @@ def _resolve_endpoint_model(url: str, key: str, requested: str) -> str:
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        ids = [m["id"] for m in data.get("data", []) if "id" in m]
-        if ids:
-            return ids[0]
-    except Exception:
-        pass
+    except Exception as e:
+        raise EnhanceError(
+            f"openai-endpoint: no 'model' configured and GET {url}/models "
+            f"failed: {e!r}"
+        ) from e
+    ids = [m["id"] for m in data.get("data", []) if "id" in m]
+    if ids:
+        return ids[0]
     raise EnhanceError(
-        f"openai-endpoint: no 'model' configured and could not resolve one "
-        f"from {url}/models"
+        f"openai-endpoint: no 'model' configured and {url}/models returned "
+        f"no models"
     )
 
 
@@ -306,6 +381,9 @@ def enhance_openai_endpoint(text: str, cfg: dict, recipe: dict, n: int) -> List[
     if key_env:
         key = os.environ.get(key_env, "")
     model = _resolve_endpoint_model(url, key, cfg.get("model", ""))
+    # Cache the resolved id back so a multi-prompt offline batch (which calls
+    # this per source prompt with the same cfg dict) resolves /models once.
+    cfg["model"] = model
     temperature = float(recipe.get("temperature", 0.8))
     system_prompt = recipe["system_prompt"]
 
@@ -345,7 +423,12 @@ def enhance_openai_endpoint(text: str, cfg: dict, recipe: dict, n: int) -> List[
                 f"openai-endpoint response missing choices[0].message.content: "
                 f"{str(data)[:200]}"
             ) from e
-        out.append(_clean_output(content or ""))
+        cleaned = _clean_output(content or "")
+        if not cleaned:
+            raise EnhanceError(
+                "openai-endpoint returned an empty enhancement"
+            )
+        out.append(cleaned)
     return out
 
 
@@ -381,3 +464,101 @@ def enhance(
         recipe = load_recipe(rn, recipes_dir)
         return enhance_openai_endpoint(text, cfg, recipe, n)
     raise EnhanceError(f"backend {backend_name!r}: unsupported type {t!r}")
+
+
+# ── Offline list→list transform (ADR-026 §6) ─────────────────────────────────
+def enhance_prompt_list(
+    prompts: List[str],
+    backend_name: str,
+    *,
+    backends: Dict[str, dict],
+    recipe_name: Optional[str] = None,
+    recipes_dir: Optional[str] = None,
+    family: Optional[str] = None,
+    variations: int = 1,
+) -> tuple:
+    """Enhance a flat list of prompts → (flat enhanced list, provenance list).
+
+    Output length is len(prompts) × variations, in source-major then
+    variation-minor order, so the result is directly consumable by one
+    ``--iterate prompt`` run. Provenance[i] = {source_prompt, source_index,
+    variation_index} for enhanced[i]."""
+    enhanced: List[str] = []
+    provenance: List[dict] = []
+    for si, src in enumerate(prompts):
+        variants = enhance(
+            src, backend_name, backends=backends, recipe_name=recipe_name,
+            recipes_dir=recipes_dir, family=family, n=variations,
+        )
+        for vi, v in enumerate(variants):
+            enhanced.append(v)
+            provenance.append({
+                "source_prompt": src, "source_index": si, "variation_index": vi,
+            })
+    return enhanced, provenance
+
+
+def _cli(argv: Optional[List[str]] = None) -> int:
+    """`python -m comfyless.enhance in.json --backend B [-o out.json] ...` —
+    read a JSON list of prompts, write an iterate-ready JSON list of enhanced
+    prompts (+ optional provenance sidecar)."""
+    import argparse
+    p = argparse.ArgumentParser(
+        prog="comfyless.enhance",
+        description="Offline prompt-list enhancer (ADR-026). Input and output "
+                    "are flat JSON string lists, directly --iterate prompt-able.",
+    )
+    p.add_argument("input", help="input JSON file: a flat list of prompt strings")
+    p.add_argument("--backend", required=True, help="enhancer backend name (from the registry)")
+    p.add_argument("--recipe", default=None, help="recipe name (openai-endpoint only; default: family/generic)")
+    p.add_argument("--family", default=None, help="target model family for default recipe selection")
+    p.add_argument("--variations", type=int, default=1, help="variants per input prompt (default 1)")
+    p.add_argument("-o", "--output", default=None, help="output JSON file (default: <input>.enhanced.json)")
+    p.add_argument("--config", default=None, help="enhancer registry path (default: registry search)")
+    p.add_argument("--no-provenance", action="store_true", help="skip the .provenance.json sidecar")
+    p.add_argument("--recipes-dir", default=None, help="override recipes directory")
+    args = p.parse_args(argv)
+
+    try:
+        with open(args.input, "r", encoding="utf-8") as f:
+            prompts = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"error: cannot read input {args.input!r}: {e}", file=sys.stderr)
+        return 2
+    if not isinstance(prompts, list) or not all(isinstance(x, str) for x in prompts):
+        print(f"error: {args.input!r} must be a JSON list of strings", file=sys.stderr)
+        return 2
+    if not prompts:
+        print(f"error: {args.input!r} is an empty list", file=sys.stderr)
+        return 2
+    if args.variations < 1:
+        print("error: --variations must be >= 1", file=sys.stderr)
+        return 2
+
+    try:
+        backends = load_backends(args.config)
+        enhanced, provenance = enhance_prompt_list(
+            prompts, args.backend, backends=backends, recipe_name=args.recipe,
+            recipes_dir=args.recipes_dir, family=args.family,
+            variations=args.variations,
+        )
+    except EnhanceError as e:
+        print(f"error [{args.backend}]: {e}", file=sys.stderr)
+        return 1
+
+    out_path = args.output or (str(Path(args.input).with_suffix("")) + ".enhanced.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(enhanced, f, ensure_ascii=False, indent=2)
+    msg = f"wrote {len(enhanced)} prompts ({len(prompts)}×{args.variations}) → {out_path}"
+    if not args.no_provenance:
+        prov_path = str(Path(out_path).with_suffix("")) + ".provenance.json"
+        with open(prov_path, "w", encoding="utf-8") as f:
+            json.dump(provenance, f, ensure_ascii=False, indent=2)
+        msg += f"  (+ {prov_path})"
+    print(msg, file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    _sys.exit(_cli())
