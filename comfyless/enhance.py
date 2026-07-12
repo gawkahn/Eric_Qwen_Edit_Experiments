@@ -281,6 +281,13 @@ def enhance_hunyuan_reprompt(text: str, cfg: dict, n: int) -> List[str]:
         raise EnhanceError("hunyuan-reprompt backend missing 'model' path")
     device = cfg.get("device", "cuda")
     precision = cfg.get("precision", "bf16")
+    # Sampling knobs are tunable from the backend cfg (enhancers.toml) — raise
+    # `temperature`/`top_p` for more diverse --variations. Defaults are
+    # Tencent's. do_sample stays on so variations actually differ.
+    gen_kwargs = dict(_REPROMPT_GEN)
+    for _k in ("temperature", "top_p", "top_k", "repetition_penalty"):
+        if _k in cfg:
+            gen_kwargs[_k] = cfg[_k]
     try:
         model, tok = _load_reprompt(model_dir, device, precision)
     except EnhanceError:
@@ -308,7 +315,7 @@ def enhance_hunyuan_reprompt(text: str, cfg: dict, n: int) -> List[str]:
             with torch.no_grad():
                 gen = model.generate(
                     **enc, max_new_tokens=_REPROMPT_MAX_NEW_TOKENS,
-                    **_REPROMPT_GEN,
+                    **gen_kwargs,
                 )
             new = gen[0][in_len:]
             decoded = tok.decode(new, skip_special_tokens=True)
@@ -385,11 +392,12 @@ def enhance_openai_endpoint(text: str, cfg: dict, recipe: dict, n: int) -> List[
     # this per source prompt with the same cfg dict) resolves /models once.
     cfg["model"] = model
     temperature = float(recipe.get("temperature", 0.8))
+    top_p = recipe.get("top_p")
     system_prompt = recipe["system_prompt"]
 
     out: List[str] = []
     endpoint = url.rstrip("/") + "/chat/completions"
-    for _ in range(max(1, n)):
+    for i in range(max(1, n)):
         payload = {
             "model": model,
             "messages": [
@@ -399,6 +407,15 @@ def enhance_openai_endpoint(text: str, cfg: dict, recipe: dict, n: int) -> List[
             "temperature": temperature,
             "stream": False,
         }
+        if top_p is not None:
+            payload["top_p"] = float(top_p)
+        # Distinct seed per variation so a deterministic / prompt-caching server
+        # returns DIFFERENT text across variations — the usual cause of
+        # identical --variations output. Index-based (reproducible across runs);
+        # OpenAI-compatible servers ignore 'seed' if unsupported. Real diversity
+        # still needs temperature > 0 in the recipe.
+        if n > 1:
+            payload["seed"] = i
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(endpoint, data=body, method="POST")
         req.add_header("Content-Type", "application/json")

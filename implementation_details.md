@@ -140,3 +140,13 @@ redirects and would forward the `Authorization: Bearer` header cross-host. Endpo
 are operator-chosen localhost, so no exposure today (security-auditor: "no change
 needed while endpoints are trusted localhost"). If a non-localhost endpoint is ever
 configured, add a redirect handler that strips Authorization on host change.
+
+**A12 — variation diversity + sampling tunability (2026-07-12).** `--variations 5`
+came out identical against an openai-endpoint. Root cause: N identical requests
+with no per-request seed → a deterministic / prompt-caching server returns the
+same text. Fixes: openai-endpoint now sends a **distinct `seed` per variation**
+(index-based, reproducible; servers ignore `seed` if unsupported) and honors a
+`top_p` recipe key; temperature was already a recipe key. hunyuan-reprompt now
+reads `temperature`/`top_p`/`top_k`/`repetition_penalty` from its **backend cfg**
+(enhancers.toml) — it ignores recipes, so that's where its sampling is tuned
+(defaults stay Tencent's). Shipped `vary-setting` recipe bumped to top_p 0.95.

@@ -205,6 +205,26 @@ with tempfile.TemporaryDirectory() as tmp:
         _u.urlopen = _orig_urlopen
 
 
+print("── openai variation diversity (seed per variation + top_p) ──")
+with tempfile.TemporaryDirectory() as tmp:
+    _write(tmp, "generic.toml", 'system_prompt="S"\ntemperature=0.9\ntop_p=0.95\n')
+    _calls.clear()
+    _u.urlopen = _mock_urlopen
+    try:
+        bk = {"g": {"type": "openai-endpoint", "url": "http://x/v1", "model": "m"}}
+        E.enhance("a cat", "g", backends=bk, recipes_dir=tmp, n=3)
+        posts = [json.loads(d) for u, d in _calls if u.endswith("/chat/completions")]
+        check("distinct seed per variation", [p.get("seed") for p in posts] == [0, 1, 2])
+        check("top_p from recipe sent", all(p.get("top_p") == 0.95 for p in posts))
+        check("temperature from recipe sent", all(p.get("temperature") == 0.9 for p in posts))
+        _calls.clear()
+        E.enhance("a dog", "g", backends=bk, recipes_dir=tmp, n=1)
+        p1 = [json.loads(d) for u, d in _calls if u.endswith("/chat/completions")][0]
+        check("n=1 (inline) sends no seed", "seed" not in p1)
+    finally:
+        _u.urlopen = _orig_urlopen
+
+
 print("── fail-loud on empty / bad config (review fixes) ──")
 # empty enhancement → EnhanceError (never degrade to empty prompt)
 def _empty_urlopen(req, timeout=None):

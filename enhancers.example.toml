@@ -15,6 +15,12 @@ type      = "hunyuan-reprompt"
 model     = "/path/to/hf-local/HunyuanImage-2.1/reprompt"
 device    = "cuda"     # optional (default "cuda")
 precision = "bf16"     # optional (bf16|fp16|fp32; default bf16)
+# Sampling knobs (optional; defaults are Tencent's). Raise temperature/top_p
+# for more diverse --variations. hunyuan ignores recipes, so tune it HERE:
+# temperature = 0.9    # default 0.7
+# top_p       = 0.95   # default 0.8
+# top_k       = 20
+# repetition_penalty = 1.05
 
 [gemma-dense]
 type    = "openai-endpoint"
