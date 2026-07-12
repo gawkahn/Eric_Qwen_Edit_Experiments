@@ -1,0 +1,383 @@
+"""comfyless prompt-enhancement subsystem (ADR-026).
+
+Backend ⟂ recipe decoupled. Two backends:
+
+  - ``hunyuan-reprompt`` — local Tencent HunYuanDenseV1 reprompt model. Uses
+    Tencent's baked Chinese system prompt; IGNORES ``--enhance-recipe``.
+  - ``openai-endpoint`` — any OpenAI-compatible ``/v1/chat/completions`` server
+    (LM Studio, vLLM, Gemma, …). Uses the selected recipe's system prompt.
+
+Core entry point: ``enhance(text, backend_name, ...) -> list[str]``. Inline
+callers pass ``n=1``; the offline transform passes ``n=N`` for variations.
+
+Design + assumptions: ``implementation_details.md`` (A1-A8) and ADR-026.
+Only stdlib (``tomllib``, ``urllib``) + existing transformers/torch — no new deps.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import tomllib
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+
+# ── Tencent reprompt system prompt ───────────────────────────────────────────
+# Verbatim from Tencent-Hunyuan/HunyuanImage-2.1 `hyimage/models/reprompt/
+# reprompt.py` (sourced 2026-07-11). Instructs the model to rewrite an image
+# prompt preserving subject/action/count/style/layout/relation/attribute/text
+# intent, in a 总-分-总 (macro-micro-macro) structure, objective, important→
+# secondary, spatial/hierarchical logic, ending with a one-sentence style summary.
+_HUNYUAN_REPROMPT_SYSTEM = (
+    "你是一位图像生成提示词撰写专家，请根据用户输入的提示词，改写生成新的提示词，"
+    "改写后的提示词要求：1 改写后提示词包含的主体/动作/数量/风格/布局/关系/属性/文字等 "
+    "必须和改写前的意图一致； 2 在宏观上遵循“总-分-总”的结构，确保信息的层次清晰；"
+    "3 客观中立，避免主观臆断和情感评价；4 由主到次，始终先描述最重要的元素，再描述次要和背景元素；"
+    "5 逻辑清晰，严格遵循空间逻辑或主次逻辑，使读者能在大脑中重建画面；"
+    "6 结尾点题，必须用一句话总结图像的整体风格或类型。"
+)
+
+# trust_remote_code hash pin (ADR-026 §8). The reprompt tokenizer requires
+# trust_remote_code=True (auto_map → tokenization_hy.HYTokenizer). The file was
+# reviewed 2026-07-11 (benign tiktoken BPE wrapper); we refuse to execute it if
+# the on-disk bytes no longer match this reviewed snapshot.
+_REPROMPT_TOKENIZER_FILE = "tokenization_hy.py"
+_REPROMPT_TOKENIZER_SHA256 = (
+    "0c1fced82e7de447f956daea515486bccf2f8a4b06d3d228c6296ea53f54d3b7"
+)
+
+# Tencent reprompt runtime knobs (their reprompt.py + generation_config.json).
+_REPROMPT_MAX_NEW_TOKENS = 2048
+_REPROMPT_GEN = dict(do_sample=True, temperature=0.7, top_p=0.8, top_k=20,
+                     repetition_penalty=1.05)
+
+_VALID_TYPES = ("hunyuan-reprompt", "openai-endpoint")
+
+
+class EnhanceError(RuntimeError):
+    """Raised on any enhancement failure. Carries the backend name so the
+    caller can surface a loud, actionable message (ADR-026 — never silently
+    proceed on an un-enhanced prompt without the caller deciding to)."""
+
+
+# ── Backend registry ─────────────────────────────────────────────────────────
+def _default_config_path() -> Optional[Path]:
+    """Resolve the enhancer registry file: $COMFYLESS_ENHANCERS → ./enhancers.toml
+    → ~/.config/comfyless/enhancers.toml. Returns the first that exists."""
+    env = os.environ.get("COMFYLESS_ENHANCERS")
+    candidates = []
+    if env:
+        candidates.append(Path(env))
+    candidates.append(Path.cwd() / "enhancers.toml")
+    candidates.append(Path.home() / ".config" / "comfyless" / "enhancers.toml")
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def load_backends(path: Optional[str] = None) -> Dict[str, dict]:
+    """Load + validate the backend registry TOML → {name: cfg}.
+
+    Each entry must have a ``type`` in _VALID_TYPES. Fail-closed on a malformed
+    file or an unknown type (a typo shouldn't silently yield "no such backend").
+    """
+    p = Path(path) if path else _default_config_path()
+    if p is None:
+        raise EnhanceError(
+            "no enhancer registry found (set $COMFYLESS_ENHANCERS, or create "
+            "./enhancers.toml — see enhancers.example.toml)"
+        )
+    if not p.is_file():
+        raise EnhanceError(f"enhancer registry not found: {p}")
+    try:
+        with open(p, "rb") as f:
+            data = tomllib.load(f)
+    except (tomllib.TOMLDecodeError, OSError) as e:
+        raise EnhanceError(f"malformed enhancer registry {p}: {e}") from e
+    backends: Dict[str, dict] = {}
+    for name, cfg in data.items():
+        if not isinstance(cfg, dict):
+            continue  # skip top-level scalars, if any
+        t = cfg.get("type")
+        if t not in _VALID_TYPES:
+            raise EnhanceError(
+                f"enhancer {name!r}: type must be one of {_VALID_TYPES}, got {t!r}"
+            )
+        backends[name] = dict(cfg)
+    if not backends:
+        raise EnhanceError(f"enhancer registry {p} defines no backends")
+    return backends
+
+
+# ── Recipes ──────────────────────────────────────────────────────────────────
+_RECIPES_DIR = Path(__file__).resolve().parent / "recipes"
+
+
+def default_recipe_name(family: Optional[str]) -> str:
+    """Family's default recipe name: ``<family>-generic`` (e.g.
+    ``qwen-image-generic``). Falls back to ``generic`` when family is unknown."""
+    if not family or family == "unknown":
+        return "generic"
+    return f"{family}-generic"
+
+
+def load_recipe(name: str, recipes_dir: Optional[str] = None) -> dict:
+    """Load a recipe TOML (``{system_prompt, target, temperature}``) by name.
+
+    Falls back to the family-agnostic ``generic`` recipe if the named one is
+    absent, and errors only if neither exists (so a family without a bespoke
+    recipe still enhances)."""
+    d = Path(recipes_dir) if recipes_dir else _RECIPES_DIR
+    candidate = d / f"{name}.toml"
+    if not candidate.is_file() and name != "generic":
+        fallback = d / "generic.toml"
+        if fallback.is_file():
+            candidate = fallback
+    if not candidate.is_file():
+        raise EnhanceError(f"recipe {name!r} not found in {d}")
+    try:
+        with open(candidate, "rb") as f:
+            r = tomllib.load(f)
+    except (tomllib.TOMLDecodeError, OSError) as e:
+        raise EnhanceError(f"malformed recipe {candidate}: {e}") from e
+    if not r.get("system_prompt"):
+        raise EnhanceError(f"recipe {candidate} missing 'system_prompt'")
+    r.setdefault("temperature", 0.8)
+    r.setdefault("target", "")
+    return r
+
+
+# ── Backend: hunyuan-reprompt (local Tencent model) ──────────────────────────
+# Module-level cache: the reprompt model is ~14 GB; never reload per call.
+_reprompt_cache: Dict[str, Any] = {}
+
+
+def _verify_reprompt_tokenizer(model_dir: str) -> None:
+    """Refuse to load if the vendored tokenizer file no longer matches the
+    reviewed snapshot (ADR-026 §8). This is what makes trust_remote_code=True
+    safe: we execute only bytes we have reviewed and pinned."""
+    f = Path(model_dir) / _REPROMPT_TOKENIZER_FILE
+    if not f.is_file():
+        raise EnhanceError(
+            f"reprompt tokenizer {f} missing — cannot verify trust_remote_code "
+            f"pin (ADR-026 §8)"
+        )
+    got = hashlib.sha256(f.read_bytes()).hexdigest()
+    if got != _REPROMPT_TOKENIZER_SHA256:
+        raise EnhanceError(
+            f"reprompt tokenizer {f} sha256 {got} does not match the reviewed "
+            f"pin {_REPROMPT_TOKENIZER_SHA256} — refusing trust_remote_code "
+            f"execution (ADR-026 §8). If this change is intentional, re-review "
+            f"the file and update _REPROMPT_TOKENIZER_SHA256."
+        )
+
+
+def _load_reprompt(model_dir: str, device: str, precision: str):
+    """Load (model, tokenizer), cached by (model_dir, device, precision)."""
+    import torch  # local import — heavy dep, only when this backend runs
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    key = f"{model_dir}|{device}|{precision}"
+    if key in _reprompt_cache:
+        return _reprompt_cache[key]
+
+    _verify_reprompt_tokenizer(model_dir)  # HARD gate before TRC execution
+
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16,
+             "fp32": torch.float32}.get(precision, torch.bfloat16)
+    # Model: NATIVE (transformers ≥5.5 supports hunyuan_v1_dense) — no TRC.
+    model = AutoModelForCausalLM.from_pretrained(
+        model_dir, torch_dtype=dtype, local_files_only=True,
+        trust_remote_code=False,
+    ).to(device).eval()
+    # Tokenizer: requires TRC (custom HYTokenizer via auto_map); gated by the
+    # hash check above.
+    tok = AutoTokenizer.from_pretrained(
+        model_dir, local_files_only=True, trust_remote_code=True,
+    )
+    _reprompt_cache[key] = (model, tok)
+    return model, tok
+
+
+def _clean_output(text: str) -> str:
+    """Normalize a model's raw output into a bare prompt string.
+
+    - Drops any ``<think>…</think>`` channel (defensive; the reprompt model with
+      enable_thinking=False pre-closes an empty one, and abliterated OpenAI
+      endpoints reason in plain content — but hardens against markup leakage).
+    - Extracts the inner text of an ``<answer>…</answer>`` wrapper — the Tencent
+      reprompt model wraps its rewrite in one. An unclosed ``<answer>`` (output
+      truncated at max_new_tokens) still yields everything after the open tag.
+    """
+    import re
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    m = re.search(r"<answer>(.*?)</answer>", text, flags=re.DOTALL)
+    if m:
+        text = m.group(1)
+    else:
+        # tolerate an unclosed <answer> (truncated generation)
+        m2 = re.search(r"<answer>(.*)", text, flags=re.DOTALL)
+        if m2:
+            text = m2.group(1)
+    return text.strip()
+
+
+def enhance_hunyuan_reprompt(text: str, cfg: dict, n: int) -> List[str]:
+    """Enhance via the local Tencent reprompt model. `n` variations via sampling."""
+    import torch
+    model_dir = cfg.get("model")
+    if not model_dir:
+        raise EnhanceError("hunyuan-reprompt backend missing 'model' path")
+    device = cfg.get("device", "cuda")
+    precision = cfg.get("precision", "bf16")
+    try:
+        model, tok = _load_reprompt(model_dir, device, precision)
+    except EnhanceError:
+        raise
+    except Exception as e:
+        raise EnhanceError(f"hunyuan-reprompt load failed: {e}") from e
+
+    messages = [
+        {"role": "system", "content": _HUNYUAN_REPROMPT_SYSTEM},
+        {"role": "user", "content": text},
+    ]
+    try:
+        prompt_str = tok.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        enc = tok(prompt_str, return_tensors="pt").to(device)
+    except Exception as e:
+        raise EnhanceError(f"hunyuan-reprompt chat-template failed: {e}") from e
+
+    in_len = enc["input_ids"].shape[1]
+    out: List[str] = []
+    for _ in range(max(1, n)):
+        try:
+            with torch.no_grad():
+                gen = model.generate(
+                    **enc, max_new_tokens=_REPROMPT_MAX_NEW_TOKENS,
+                    **_REPROMPT_GEN,
+                )
+            new = gen[0][in_len:]
+            decoded = tok.decode(new, skip_special_tokens=True)
+            out.append(_clean_output(decoded))
+        except Exception as e:
+            raise EnhanceError(f"hunyuan-reprompt generation failed: {e}") from e
+    return out
+
+
+# ── Backend: openai-endpoint (OpenAI-compatible HTTP) ────────────────────────
+def _resolve_endpoint_model(url: str, key: str, requested: str) -> str:
+    """If no model configured, GET {url}/models and use the first served id."""
+    if requested:
+        return requested
+    req = urllib.request.Request(url.rstrip("/") + "/models", method="GET")
+    if key:
+        req.add_header("Authorization", f"Bearer {key}")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        ids = [m["id"] for m in data.get("data", []) if "id" in m]
+        if ids:
+            return ids[0]
+    except Exception:
+        pass
+    raise EnhanceError(
+        f"openai-endpoint: no 'model' configured and could not resolve one "
+        f"from {url}/models"
+    )
+
+
+def enhance_openai_endpoint(text: str, cfg: dict, recipe: dict, n: int) -> List[str]:
+    """Enhance via an OpenAI-compatible chat endpoint using the recipe system
+    prompt. `n` variations via `n` independent requests (local servers do not
+    reliably honor the OpenAI `n` param)."""
+    url = cfg.get("url")
+    if not url:
+        raise EnhanceError("openai-endpoint backend missing 'url'")
+    key = ""
+    key_env = cfg.get("key_env")
+    if key_env:
+        key = os.environ.get(key_env, "")
+    model = _resolve_endpoint_model(url, key, cfg.get("model", ""))
+    temperature = float(recipe.get("temperature", 0.8))
+    system_prompt = recipe["system_prompt"]
+
+    out: List[str] = []
+    endpoint = url.rstrip("/") + "/chat/completions"
+    for _ in range(max(1, n)):
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ],
+            "temperature": temperature,
+            "stream": False,
+        }
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(endpoint, data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        if key:
+            req.add_header("Authorization", f"Bearer {key}")
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:300]
+            raise EnhanceError(
+                f"openai-endpoint HTTP {e.code} from {endpoint}: {detail}"
+            ) from e
+        except (urllib.error.URLError, OSError) as e:
+            raise EnhanceError(
+                f"openai-endpoint cannot reach {endpoint}: {e}"
+            ) from e
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as e:
+            raise EnhanceError(
+                f"openai-endpoint response missing choices[0].message.content: "
+                f"{str(data)[:200]}"
+            ) from e
+        out.append(_clean_output(content or ""))
+    return out
+
+
+# ── Dispatch ─────────────────────────────────────────────────────────────────
+def enhance(
+    text: str,
+    backend_name: str,
+    *,
+    backends: Dict[str, dict],
+    recipe_name: Optional[str] = None,
+    recipes_dir: Optional[str] = None,
+    family: Optional[str] = None,
+    n: int = 1,
+) -> List[str]:
+    """Enhance ``text`` via the named backend, returning ``n`` variants.
+
+    - ``hunyuan-reprompt`` ignores recipe (baked Tencent system prompt).
+    - ``openai-endpoint`` selects the recipe: explicit ``recipe_name`` →
+      family default (``<family>-generic``) → ``generic``.
+    Raises EnhanceError (with the backend name) on any failure.
+    """
+    if backend_name not in backends:
+        raise EnhanceError(
+            f"unknown enhance backend {backend_name!r}; known: "
+            f"{sorted(backends)}"
+        )
+    cfg = backends[backend_name]
+    t = cfg.get("type")
+    if t == "hunyuan-reprompt":
+        return enhance_hunyuan_reprompt(text, cfg, n)
+    if t == "openai-endpoint":
+        rn = recipe_name or default_recipe_name(family)
+        recipe = load_recipe(rn, recipes_dir)
+        return enhance_openai_endpoint(text, cfg, recipe, n)
+    raise EnhanceError(f"backend {backend_name!r}: unsupported type {t!r}")

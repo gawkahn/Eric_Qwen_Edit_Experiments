@@ -1,0 +1,27 @@
+# comfyless prompt-enhancer backend registry (ADR-026).
+# Copy to ./enhancers.toml (gitignored) and edit, or point $COMFYLESS_ENHANCERS
+# at your own file. Each [name] is a backend; --enhance-prompt <name> selects it.
+#
+# type = "hunyuan-reprompt"  → local Tencent HunYuanDenseV1 reprompt model.
+#   Uses Tencent's baked Chinese system prompt; IGNORES --enhance-recipe.
+# type = "openai-endpoint"   → any OpenAI-compatible /v1 chat server (LM Studio,
+#   vLLM, Gemma, …). Uses the selected recipe's system prompt.
+#
+# Secrets: never put an API key inline. Use key_env = "ENV_VAR_NAME" and export
+# the key in your environment. Local endpoints usually need no key.
+
+[hunyuan]
+type      = "hunyuan-reprompt"
+model     = "/path/to/hf-local/HunyuanImage-2.1/reprompt"
+device    = "cuda"     # optional (default "cuda")
+precision = "bf16"     # optional (bf16|fp16|fp32; default bf16)
+
+[gemma-dense]
+type    = "openai-endpoint"
+url     = "http://localhost:8016/v1"
+# model = "gemma-3-dense"   # optional; if omitted, resolved from /v1/models
+# key_env = "OPENAI_API_KEY"  # optional; env-var NAME holding the key
+
+[gemma-moe]
+type = "openai-endpoint"
+url  = "http://localhost:8017/v1"

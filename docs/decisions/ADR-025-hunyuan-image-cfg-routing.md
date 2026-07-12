@@ -391,6 +391,18 @@ explicitly preserves consolidation as Queued.
   docs/vision/epic-hunyuan-2-1-plus-enhancer.md) must empirically confirm
   1-pass vs 2-pass and negative-prompt efficacy against 0.39.0, and correct
   the "distilled / negatives-ignored" framing here if it no longer holds.
+- 2026-07-11 — RE-VERIFY RESOLVED (live smoke, `hunyuan-smoke/RESULTS.md`).
+  On diffusers 0.39.0 the negative prompt is **live and strong**: a base gen
+  with a strong negative vs the same seed/prompt with an EMPTY negative differ
+  by MSE 1272.6 (mean abs 21.6/channel). The pipeline's enabled
+  `AdaptiveProjectedMixGuidance` guider runs real guidance that consumes the
+  negative prompt — the 0.36-dev "guidance-distilled / 1× pass / negatives
+  ignored" framing is **incorrect for 0.39.0** and should be read as historical.
+  Practical upshot for this codebase is unchanged: `cfg_scale` still routes to
+  `distilled_guidance_scale` (the documented call kwarg) and `negative_prompt`
+  is forwarded when set — both already implemented. This also **confirms NAG
+  was correctly excluded** for hunyuan-image (negatives already work; NAG would
+  be redundant) per ADR-024's lens.
 
 ## AI-Disclosure
 

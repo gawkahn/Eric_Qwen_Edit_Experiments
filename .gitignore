@@ -51,3 +51,6 @@ workflows/component loader dev testing.json
 # Test harness — local config and generated outputs (the example IS tracked)
 tests/lora_test_config.toml
 tests/output/
+
+# comfyless enhancer registry (real; example is enhancers.example.toml)
+enhancers.toml
