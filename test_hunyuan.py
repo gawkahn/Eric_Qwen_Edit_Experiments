@@ -2015,6 +2015,18 @@ check(
 )
 
 
+# ── Refiner quantization threading (2026-07-12) ───────────────────────
+print("── Refiner fp8 quant threading ──")
+check("hunyuan_chain.load_refiner_pipeline accepts quant param",
+      "quant: str = \"none\"" in chain_src and "quant_skip" in chain_src)
+check("hunyuan_chain quantizes the refiner via quantize_module",
+      "quantize_module(comp, quant" in chain_src)
+check("generate.py threads quant into the refiner load",
+      "quant=quant, quant_skip=quant_skip, quant_only=quant_only," in cg_src)
+check("server.py _maybe_load_refiner threads quant into the refiner load",
+      "quant=str(req.get(\"quant\")" in server_src)
+
+
 # ──────────────────────────────────────────────────────────────────────
 print(f"\n────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")

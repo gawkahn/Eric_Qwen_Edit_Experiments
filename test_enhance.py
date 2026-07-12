@@ -306,5 +306,16 @@ finally:
     E.enhance_hunyuan_reprompt = _orig_h2
 
 
+print("── reprompt fp8 quant plumbing ──")
+import inspect as _insp
+_esrc = _insp.getsource(E)
+check("reprompt cache key includes quant", "precision}|{quant}" in _esrc)
+check("reprompt fp8 = weight-only recipe", "Float8WeightOnlyConfig" in _esrc)
+check("reprompt rejects non-fp8 quant (hard)", "unsupported (only 'fp8')" in _esrc)
+check("reprompt fp8 application failure warns-and-skips (not raises)", "reprompt model left in" in _esrc)
+check("enhance_hunyuan_reprompt reads cfg quant", 'cfg.get("quant"' in _esrc)
+check("reprompt quant passed to loader", "_load_reprompt(model_dir, device, precision, quant)" in _esrc)
+
+
 print(f"\n{'='*50}\n  {_passed} passed, {_failed} failed\n{'='*50}")
 sys.exit(1 if _failed else 0)

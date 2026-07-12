@@ -1333,6 +1333,7 @@ def generate(
                 precision=precision, device=device,
                 vae_tiling=vae_tiling,
                 allow_hf_download=allow_hf_download,
+                quant=quant, quant_skip=quant_skip, quant_only=quant_only,
             )
     elif model_family == "hunyuan-image":
         # Warn-don't-block per `feedback_warn_dont_block` + Vision Inv 2.

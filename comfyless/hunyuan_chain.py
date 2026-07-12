@@ -60,6 +60,9 @@ def load_refiner_pipeline(
     device: str = "cuda",
     vae_tiling: str = "auto",
     allow_hf_download: bool = False,
+    quant: str = "none",
+    quant_skip: tuple = (),
+    quant_only: tuple = (),
 ):
     """Load HunyuanImageRefinerPipeline alongside an already-loaded base.
 
@@ -115,6 +118,26 @@ def load_refiner_pipeline(
         torch_dtype=dtype,
         local_files_only=True,
     )
+
+    # Quantize the refiner's own transformer (its dominant VRAM) to match the
+    # base — the shared text_encoder inherits the base's quant state. Quantize
+    # on CPU BEFORE .to(device) so the fp8 weights (not bf16) land on the GPU,
+    # which matters when the base+refiner+reprompt stack barely fits. Uses the
+    # refiner family's fp8 recipe (same quantize_module the base override path
+    # uses); quant_skip/quant_only name refiner component slots.
+    if quant and quant != "none":
+        from nodes.eric_diffusion_utils import quantize_module
+        skip = set(quant_skip or ())
+        only = set(quant_only or ())
+        for slot in ("transformer",):
+            if (only and slot not in only) or slot in skip:
+                continue
+            comp = getattr(refiner, slot, None)
+            if comp is not None and hasattr(comp, "parameters"):
+                if quantize_module(comp, quant, family=family,
+                                   log_prefix="[comfyless]"):
+                    _log(f"[comfyless] quant: refiner {slot!r} quantized ({quant})")
+
     refiner = refiner.to(device)
 
     if hasattr(refiner, "vae") and hasattr(refiner.vae, "enable_tiling"):

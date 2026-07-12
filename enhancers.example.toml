@@ -15,6 +15,8 @@ type      = "hunyuan-reprompt"
 model     = "/path/to/hf-local/HunyuanImage-2.1/reprompt"
 device    = "cuda"     # optional (default "cuda")
 precision = "bf16"     # optional (bf16|fp16|fp32; default bf16)
+# quant   = "fp8"      # weight-only fp8 → ~14 GB down to ~7 GB (halves the
+                       #   reprompt model; helps the base+refiner+reprompt stack fit)
 # Sampling knobs (optional; defaults are Tencent's). Raise temperature/top_p
 # for more diverse --variations. hunyuan ignores recipes, so tune it HERE:
 # temperature = 0.9    # default 0.7
@@ -25,12 +27,12 @@ precision = "bf16"     # optional (bf16|fp16|fp32; default bf16)
 [gemma-dense]
 type    = "openai-endpoint"
 url     = "http://localhost:8016/v1"
+temperature = 0.9    # default 0.7
+top_p       = 0.95   # default 0.8
+top_k       = 20
+repetition_penalty = 1.05
 # model = "gemma-3-dense"   # optional; if omitted, resolved from /v1/models
 # key_env = "OPENAI_API_KEY"  # optional; env-var NAME holding the key
-# batch_variations = true   # THROUGHPUT: request all --variations in ONE call
-                            # via the OpenAI `n` param (needs a server that
-                            # honors it — vLLM does; LM Studio may not). Off =
-                            # one seeded request per variation.
 
 [gemma-moe]
 type = "openai-endpoint"

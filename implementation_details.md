@@ -160,3 +160,18 @@ param (needs a server that honors `n`, e.g. vLLM; a server that returns fewer
 choices errors clearly). Default openai path stays one seeded request per
 variation. Cross-PROMPT concurrency (the M dimension) is not yet parallelized —
 a further lever if wanted (request concurrency + server continuous batching).
+
+**A14 — full-stack fp8 quant (2026-07-12).** `--quant fp8` previously only
+quantized the base pipeline; refiner + reprompt stayed full precision (~82 GB
+stack). Now:
+- Refiner: `load_refiner_pipeline` quantizes `refiner.transformer` in-place via
+  `quantize_module` (family `hunyuan-image-refiner`, same recipe as the base) on
+  CPU before `.to(device)`. quant/quant_skip/quant_only threaded from generate()
+  and server._maybe_load_refiner (the request's already-validated fields).
+- Reprompt: `[hunyuan]` backend `quant = "fp8"` → weight-only fp8
+  (`Float8WeightOnlyConfig`) on the causal LM (weight-only, NOT dynamic-
+  activation, which can degrade LLM output). Its own config key — the generation
+  `--quant` flag does not reach the enhance subsystem.
+Live-verified: base+refiner+reprompt all fp8, ~82→~41 GB, clean generate.
+Deferred: ComfyUI Generate node doesn't quantize the refiner (TECH_DEBT — no quant
+handle in the node path).

@@ -1225,3 +1225,15 @@ cost, not a correctness issue. **Trigger:** if the per-execution refiner reload
 becomes a real workflow bottleneck, add a refiner cache to the loader node (mirror
 the base-pipe cache) or a dedicated `EricDiffusion Load Refiner` node. Surfaced by
 the re-apply `code-reviewer` observation, 2026-07-11.
+
+**ComfyUI Generate node does not quantize the refiner** *(2026-07-12)*
+`nodes/eric_diffusion_generate.py` calls `load_refiner_pipeline(...)` without
+threading `quant` (defaults to "none"), so in the ComfyUI node path a
+`--quant`-loaded base is paired with a full-precision refiner. The comfyless CLI
+and daemon paths thread quant correctly (base+refiner+reprompt all fp8).
+**Why not now:** the node has no quant handle at that point — the loader node
+quantizes the base and the GEN_PIPELINE dict doesn't carry the quant mode
+forward; the operator uses the comfyless CLI for VRAM-tight hunyuan runs.
+**Trigger:** node-path refiner VRAM becomes a real constraint — thread the quant
+mode through GEN_PIPELINE (or detect the base's torchao state) into the node's
+refiner load. Surfaced with the refiner-quant slice, 2026-07-12.

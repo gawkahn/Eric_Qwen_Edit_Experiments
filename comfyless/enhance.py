@@ -219,12 +219,12 @@ def _verify_reprompt_tokenizer(model_dir: str) -> None:
             )
 
 
-def _load_reprompt(model_dir: str, device: str, precision: str):
-    """Load (model, tokenizer), cached by (model_dir, device, precision)."""
+def _load_reprompt(model_dir: str, device: str, precision: str, quant: str = "none"):
+    """Load (model, tokenizer), cached by (model_dir, device, precision, quant)."""
     import torch  # local import — heavy dep, only when this backend runs
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    key = f"{model_dir}|{device}|{precision}"
+    key = f"{model_dir}|{device}|{precision}|{quant}"
     if key in _reprompt_cache:
         return _reprompt_cache[key]
 
@@ -236,7 +236,28 @@ def _load_reprompt(model_dir: str, device: str, precision: str):
     model = AutoModelForCausalLM.from_pretrained(
         model_dir, torch_dtype=dtype, local_files_only=True,
         trust_remote_code=False,
-    ).to(device).eval()
+    )
+    if quant and quant != "none":
+        if quant != "fp8":
+            raise EnhanceError(
+                f"hunyuan-reprompt quant {quant!r} unsupported (only 'fp8')"
+            )
+        # Weight-only fp8 (safe for a causal LM; dynamic-activation fp8 can
+        # degrade LLM output). Quantize on CPU BEFORE .to(device) so the fp8
+        # weights (~7 GB, not 14) land on the GPU. Same torchao path as the
+        # diffusion side, weight-only recipe.
+        try:
+            from torchao.quantization import quantize_, Float8WeightOnlyConfig
+            quantize_(model, Float8WeightOnlyConfig())
+        except Exception as e:
+            # Warn-and-skip on APPLICATION failure (parity with the refiner's
+            # quantize_module + feedback_warn_dont_block): a bf16 reprompt is
+            # still full-quality enhancement, just more VRAM — don't abort. The
+            # invalid-value check above (quant != "fp8") stays a hard error.
+            print(f"[comfyless] WARNING: hunyuan-reprompt fp8 quantization "
+                  f"failed ({e}) — reprompt model left in {precision}",
+                  file=sys.stderr)
+    model = model.to(device).eval()
     # Tokenizer: requires TRC (custom HYTokenizer via auto_map); gated by the
     # hash check above.
     tok = AutoTokenizer.from_pretrained(
@@ -281,6 +302,7 @@ def enhance_hunyuan_reprompt(text: str, cfg: dict, n: int) -> List[str]:
         raise EnhanceError("hunyuan-reprompt backend missing 'model' path")
     device = cfg.get("device", "cuda")
     precision = cfg.get("precision", "bf16")
+    quant = cfg.get("quant", "none")  # e.g. "fp8" → weight-only fp8 (~14→7 GB)
     # Sampling knobs are tunable from the backend cfg (enhancers.toml) — raise
     # `temperature`/`top_p` for more diverse --variations. Defaults are
     # Tencent's. do_sample stays on so variations actually differ.
@@ -289,7 +311,7 @@ def enhance_hunyuan_reprompt(text: str, cfg: dict, n: int) -> List[str]:
         if _k in cfg:
             gen_kwargs[_k] = cfg[_k]
     try:
-        model, tok = _load_reprompt(model_dir, device, precision)
+        model, tok = _load_reprompt(model_dir, device, precision, quant)
     except EnhanceError:
         raise
     except Exception as e:

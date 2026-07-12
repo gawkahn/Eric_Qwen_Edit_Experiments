@@ -483,6 +483,12 @@ def _maybe_load_refiner(
         precision=req_precision, device=req_device,
         vae_tiling=req.get("vae_tiling") or "auto",
         allow_hf_download=False,
+        # Quantize the refiner to match the base (the request's quant triple is
+        # already validated + drives the base load). Values are the same
+        # SCHEMA_KIND-typed fields the base uses.
+        quant=str(req.get("quant") or "none"),
+        quant_skip=tuple(req.get("quant_skip") or ()),
+        quant_only=tuple(req.get("quant_only") or ()),
     )
 
 
