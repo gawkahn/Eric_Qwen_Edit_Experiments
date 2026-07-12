@@ -309,21 +309,22 @@ def enhance_hunyuan_reprompt(text: str, cfg: dict, n: int) -> List[str]:
         raise EnhanceError(f"hunyuan-reprompt chat-template failed: {e}") from e
 
     in_len = enc["input_ids"].shape[1]
+    # Throughput: generate all `n` variations in ONE batched forward pass via
+    # num_return_sequences (do_sample=True in gen_kwargs makes them differ)
+    # instead of n sequential calls. VRAM scales ~n× the KV cache during decode
+    # — fine for typical --variations on a large card; drop --variations if a
+    # small card OOMs.
+    try:
+        with torch.no_grad():
+            gen = model.generate(
+                **enc, max_new_tokens=_REPROMPT_MAX_NEW_TOKENS,
+                num_return_sequences=max(1, n), **gen_kwargs,
+            )
+    except Exception as e:
+        raise EnhanceError(f"hunyuan-reprompt generation failed: {e}") from e
     out: List[str] = []
-    for _ in range(max(1, n)):
-        try:
-            with torch.no_grad():
-                gen = model.generate(
-                    **enc, max_new_tokens=_REPROMPT_MAX_NEW_TOKENS,
-                    **gen_kwargs,
-                )
-            new = gen[0][in_len:]
-            decoded = tok.decode(new, skip_special_tokens=True)
-            cleaned = _clean_output(decoded)
-        except EnhanceError:
-            raise
-        except Exception as e:
-            raise EnhanceError(f"hunyuan-reprompt generation failed: {e}") from e
+    for row in gen:  # gen shape [n, total_len]
+        cleaned = _clean_output(tok.decode(row[in_len:], skip_special_tokens=True))
         if not cleaned:
             # fail loud rather than degrade to an empty prompt (ADR-026 —
             # never silently proceed on an un-enhanced prompt)
@@ -376,10 +377,42 @@ def _resolve_endpoint_model(url: str, key: str, requested: str) -> str:
     )
 
 
+def _post_chat(endpoint: str, payload: dict, key: str) -> List[str]:
+    """POST one chat/completions request; return the message content of every
+    returned choice (one for a plain request, N when the payload set `n`)."""
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(endpoint, data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    if key:
+        req.add_header("Authorization", f"Bearer {key}")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:300]
+        raise EnhanceError(
+            f"openai-endpoint HTTP {e.code} from {endpoint}: {detail}"
+        ) from e
+    except (urllib.error.URLError, OSError) as e:
+        raise EnhanceError(f"openai-endpoint cannot reach {endpoint}: {e}") from e
+    try:
+        return [c["message"]["content"] for c in data["choices"]]
+    except (KeyError, IndexError, TypeError) as e:
+        raise EnhanceError(
+            f"openai-endpoint response missing choices[].message.content: "
+            f"{str(data)[:200]}"
+        ) from e
+
+
 def enhance_openai_endpoint(text: str, cfg: dict, recipe: dict, n: int) -> List[str]:
-    """Enhance via an OpenAI-compatible chat endpoint using the recipe system
-    prompt. `n` variations via `n` independent requests (local servers do not
-    reliably honor the OpenAI `n` param)."""
+    """Enhance via an OpenAI-compatible chat endpoint using the recipe system prompt.
+
+    `n` variations: by default `n` independent requests, each with a distinct
+    seed (so a deterministic/caching server still returns different text). Set
+    `batch_variations = true` on the backend to instead request all `n` in ONE
+    call via the OpenAI `n` param — a big throughput win on a server that honors
+    `n` (e.g. vLLM); a server that ignores it returns one choice and we error
+    clearly rather than silently under-deliver."""
     url = cfg.get("url")
     if not url:
         raise EnhanceError("openai-endpoint backend missing 'url'")
@@ -394,11 +427,11 @@ def enhance_openai_endpoint(text: str, cfg: dict, recipe: dict, n: int) -> List[
     temperature = float(recipe.get("temperature", 0.8))
     top_p = recipe.get("top_p")
     system_prompt = recipe["system_prompt"]
-
-    out: List[str] = []
     endpoint = url.rstrip("/") + "/chat/completions"
-    for i in range(max(1, n)):
-        payload = {
+    n = max(1, n)
+
+    def _base_payload() -> dict:
+        p = {
             "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -408,44 +441,40 @@ def enhance_openai_endpoint(text: str, cfg: dict, recipe: dict, n: int) -> List[
             "stream": False,
         }
         if top_p is not None:
-            payload["top_p"] = float(top_p)
-        # Distinct seed per variation so a deterministic / prompt-caching server
-        # returns DIFFERENT text across variations — the usual cause of
-        # identical --variations output. Index-based (reproducible across runs);
-        # OpenAI-compatible servers ignore 'seed' if unsupported. Real diversity
-        # still needs temperature > 0 in the recipe.
+            p["top_p"] = float(top_p)
+        return p
+
+    def _finalize(contents: List[str]) -> List[str]:
+        cleaned = []
+        for c in contents:
+            v = _clean_output(c or "")
+            if not v:
+                raise EnhanceError("openai-endpoint returned an empty enhancement")
+            cleaned.append(v)
+        return cleaned
+
+    # Batch path: one request with n=N. Opt-in per backend (needs server `n`).
+    if n > 1 and cfg.get("batch_variations"):
+        payload = _base_payload()
+        payload["n"] = n
+        contents = _post_chat(endpoint, payload, key)
+        if len(contents) < n:
+            raise EnhanceError(
+                f"batch_variations: server returned {len(contents)} of {n} "
+                f"choices — this endpoint may not support the OpenAI 'n' param; "
+                f"remove batch_variations from the backend config to use "
+                f"per-request variations"
+            )
+        return _finalize(contents[:n])
+
+    # Default path: n independent requests, distinct seed each so a
+    # deterministic/prompt-caching server still returns different text.
+    out: List[str] = []
+    for i in range(n):
+        payload = _base_payload()
         if n > 1:
             payload["seed"] = i
-        body = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(endpoint, data=body, method="POST")
-        req.add_header("Content-Type", "application/json")
-        if key:
-            req.add_header("Authorization", f"Bearer {key}")
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", "replace")[:300]
-            raise EnhanceError(
-                f"openai-endpoint HTTP {e.code} from {endpoint}: {detail}"
-            ) from e
-        except (urllib.error.URLError, OSError) as e:
-            raise EnhanceError(
-                f"openai-endpoint cannot reach {endpoint}: {e}"
-            ) from e
-        try:
-            content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as e:
-            raise EnhanceError(
-                f"openai-endpoint response missing choices[0].message.content: "
-                f"{str(data)[:200]}"
-            ) from e
-        cleaned = _clean_output(content or "")
-        if not cleaned:
-            raise EnhanceError(
-                "openai-endpoint returned an empty enhancement"
-            )
-        out.append(cleaned)
+        out.extend(_finalize(_post_chat(endpoint, payload, key)[:1]))
     return out
 
 

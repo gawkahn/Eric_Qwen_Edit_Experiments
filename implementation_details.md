@@ -150,3 +150,13 @@ same text. Fixes: openai-endpoint now sends a **distinct `seed` per variation**
 reads `temperature`/`top_p`/`top_k`/`repetition_penalty` from its **backend cfg**
 (enhancers.toml) — it ignores recipes, so that's where its sampling is tuned
 (defaults stay Tencent's). Shipped `vary-setting` recipe bumped to top_p 0.95.
+
+**A13 — variation batching (throughput, 2026-07-12).** `--variations N` now
+generates all N in ONE batched call instead of N sequential ones.
+hunyuan-reprompt: single `model.generate(num_return_sequences=N)` (batched GPU
+decode; VRAM ~N× KV cache during decode — fine on large cards). openai-endpoint:
+opt-in `batch_variations = true` backend key → one request with the OpenAI `n`
+param (needs a server that honors `n`, e.g. vLLM; a server that returns fewer
+choices errors clearly). Default openai path stays one seeded request per
+variation. Cross-PROMPT concurrency (the M dimension) is not yet parallelized —
+a further lever if wanted (request concurrency + server continuous batching).

@@ -27,7 +27,15 @@ type    = "openai-endpoint"
 url     = "http://localhost:8016/v1"
 # model = "gemma-3-dense"   # optional; if omitted, resolved from /v1/models
 # key_env = "OPENAI_API_KEY"  # optional; env-var NAME holding the key
+# batch_variations = true   # THROUGHPUT: request all --variations in ONE call
+                            # via the OpenAI `n` param (needs a server that
+                            # honors it — vLLM does; LM Studio may not). Off =
+                            # one seeded request per variation.
 
 [gemma-moe]
 type = "openai-endpoint"
 url  = "http://localhost:8017/v1"
+temperature = 0.9    # default 0.7
+top_p       = 0.95   # default 0.8
+top_k       = 20
+repetition_penalty = 1.05

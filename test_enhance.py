@@ -225,6 +225,41 @@ with tempfile.TemporaryDirectory() as tmp:
         _u.urlopen = _orig_urlopen
 
 
+print("── openai batch_variations (n-param throughput) ──")
+def _batch_urlopen(req, timeout=None):
+    _calls.append((req.full_url, req.data))
+    if req.full_url.endswith("/models"):
+        return _Resp({"data": [{"id": "m"}]})
+    b = json.loads(req.data)
+    nreq = b.get("n", 1)  # honor n → nreq distinct choices
+    return _Resp({"choices": [{"message": {"content": f"V{k}:" + b["messages"][1]["content"]}} for k in range(nreq)]})
+with tempfile.TemporaryDirectory() as tmp:
+    _write(tmp, "generic.toml", 'system_prompt="S"\ntemperature=0.9\n')
+    _calls.clear(); _u.urlopen = _batch_urlopen
+    try:
+        bk = {"g": {"type": "openai-endpoint", "url": "http://x/v1", "model": "m", "batch_variations": True}}
+        out = E.enhance("a cat", "g", backends=bk, recipes_dir=tmp, n=4)
+        posts = [json.loads(d) for u, d in _calls if u.endswith("/chat/completions")]
+        check("batch: ONE request for N variations", len(posts) == 1 and posts[0].get("n") == 4)
+        check("batch: N choices unpacked", out == ["V0:a cat", "V1:a cat", "V2:a cat", "V3:a cat"])
+    finally:
+        _u.urlopen = _orig_urlopen
+def _ignores_n_urlopen(req, timeout=None):
+    if req.full_url.endswith("/models"):
+        return _Resp({"data": [{"id": "m"}]})
+    return _Resp({"choices": [{"message": {"content": "only one"}}]})  # ignores n
+with tempfile.TemporaryDirectory() as tmp:
+    _write(tmp, "generic.toml", 'system_prompt="S"\n')
+    _u.urlopen = _ignores_n_urlopen
+    try:
+        E.enhance("x", "g", backends={"g": {"type": "openai-endpoint", "url": "http://x/v1", "model": "m", "batch_variations": True}}, recipes_dir=tmp, n=3)
+        check("batch: server ignoring n → clear error", False)
+    except E.EnhanceError as e:
+        check("batch: server ignoring n → clear error", "1 of 3" in str(e))
+    finally:
+        _u.urlopen = _orig_urlopen
+
+
 print("── fail-loud on empty / bad config (review fixes) ──")
 # empty enhancement → EnhanceError (never degrade to empty prompt)
 def _empty_urlopen(req, timeout=None):
