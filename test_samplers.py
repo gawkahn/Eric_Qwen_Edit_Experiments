@@ -322,6 +322,95 @@ with samplers_mod.swap_sampler(stub, "bogus_xyz"):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  comfyless --schedule gate (ADR-028): _sigma_schedule_gate
+# ═══════════════════════════════════════════════════════════════════════
+print("\n── comfyless _sigma_schedule_gate (ADR-028) ──────────────────")
+import comfyless.generate as _cg  # noqa: E402
+
+
+class _GatePipe:
+    """Fake pipe whose __call__ accepts a sigmas= kwarg (like every modern
+    diffusers pipeline)."""
+    def __init__(self, scheduler):
+        self.scheduler = scheduler
+
+    def __call__(self, prompt=None, num_inference_steps=None, sigmas=None):
+        pass
+
+
+class _NoSigmasPipe:
+    def __init__(self, scheduler):
+        self.scheduler = scheduler
+
+    def __call__(self, prompt=None):
+        pass
+
+
+_flow = _GatePipe(diffusers.FlowMatchEulerDiscreteScheduler())
+_classic = _GatePipe(diffusers.EulerDiscreteScheduler())
+
+# linear / unset are silent no-ops (the pipeline default needs no reshaping).
+check("schedule 'linear' is a silent no-op",
+      _cg._sigma_schedule_gate(_flow, "linear", "default", "flux", 20) == (None, None))
+check("schedule '' (unset) is a silent no-op",
+      _cg._sigma_schedule_gate(_flow, "", "default", "flux", 20) == (None, None))
+
+# Happy path: flow-match + default sampler → real sigmas, no warning.
+_sig, _w = _cg._sigma_schedule_gate(_flow, "karras", "default", "flux", 20)
+check("flow-match + default sampler: karras yields sigmas, no warning",
+      _w is None and _sig is not None and len(_sig) == 20)
+check("karras sigmas descend from 1.0 toward sigma_min",
+      _sig[0] == 1.0 and _sig[0] > _sig[-1])
+_sig_b, _ = _cg._sigma_schedule_gate(_flow, "balanced", "default", "flux", 20)
+check("balanced and karras produce different spacings", _sig_b != _sig)
+
+# Gate rejections all warn-and-ignore (sigmas None, reason string set).
+_s, _w = _cg._sigma_schedule_gate(_flow, "karras", "multistep2", "flux", 20)
+check("non-default --sampler → schedule ignored with a reason",
+      _s is None and _w is not None and "custom --sampler" in _w)
+_s, _w = _cg._sigma_schedule_gate(_classic, "karras", "default", "sdxl", 20)
+check("classic (non-flow-match) scheduler → schedule ignored with a reason",
+      _s is None and _w is not None and "non-flow-match" in _w)
+_heun = _GatePipe(diffusers.FlowMatchHeunDiscreteScheduler())
+_s, _w = _cg._sigma_schedule_gate(_heun, "karras", "default", "flux", 20)
+check("FlowMatchHeun → schedule ignored (set_timesteps lacks sigmas)",
+      _s is None and _w is not None and "set_timesteps" in _w)
+_s, _w = _cg._sigma_schedule_gate(
+    _NoSigmasPipe(diffusers.FlowMatchEulerDiscreteScheduler()),
+    "karras", "default", "flux", 20)
+check("pipeline without a sigmas= kwarg → schedule ignored",
+      _s is None and _w is not None and "does not accept" in _w)
+check("scheduler=None → warn-and-ignore, no crash",
+      _cg._sigma_schedule_gate(_GatePipe(None), "karras", "default", "x", 20)[0] is None)
+
+# The wiring seam _apply_sigma_schedule is what generate() actually calls — it
+# injects call_kwargs["sigmas"] on the happy path and returns the warning
+# otherwise (the wiring gap this slice closed).
+_ck = {"prompt": "x", "num_inference_steps": 20}
+_w = _cg._apply_sigma_schedule(_ck, _flow, "karras", "default", "flux", 20)
+check("_apply_sigma_schedule injects sigmas into call_kwargs on the happy path",
+      _w is None and "sigmas" in _ck and len(_ck["sigmas"]) == 20)
+_ck2 = {"prompt": "x"}
+_w2 = _cg._apply_sigma_schedule(_ck2, _classic, "karras", "default", "sdxl", 20)
+check("_apply_sigma_schedule returns a warning + injects nothing on reject",
+      _w2 is not None and "sigmas" not in _ck2)
+_ck3 = {"prompt": "x"}
+_w3 = _cg._apply_sigma_schedule(_ck3, _flow, "linear", "default", "flux", 20)
+check("_apply_sigma_schedule is a silent no-op for linear",
+      _w3 is None and "sigmas" not in _ck3)
+
+# The set_timesteps root-cause gate: FlowMatchHeun's real set_timesteps has no
+# sigmas parameter (the property the gate now checks directly).
+import inspect as _inspect  # noqa: E402
+check("FlowMatchHeun.set_timesteps genuinely lacks a sigmas param (gate basis)",
+      "sigmas" not in _inspect.signature(
+          diffusers.FlowMatchHeunDiscreteScheduler.set_timesteps).parameters)
+check("FlowMatchEuler.set_timesteps has a sigmas param",
+      "sigmas" in _inspect.signature(
+          diffusers.FlowMatchEulerDiscreteScheduler.set_timesteps).parameters)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  Summary
 # ═══════════════════════════════════════════════════════════════════════
 

@@ -1203,6 +1203,62 @@ def _iterate_combo_disposition(rc: int) -> str:
 #  Core generate function
 # ════════════════════════════════════════════════════════════════════════
 
+def _sigma_schedule_gate(pipe, schedule: str, effective_sampler: str,
+                         model_family: str, steps: int):
+    """Decide whether a custom sigma `schedule` can be applied to this pipe call
+    (ADR-028). Returns (sigmas_list_or_None, warning_or_None).
+
+    A non-linear schedule is honored ONLY when a default sampler is in play AND the
+    pipeline's scheduler is a non-Heun flow-match scheduler that accepts a `sigmas=`
+    kwarg. Any other case with a non-linear schedule returns (None, "<reason>") so
+    the caller warns-and-ignores (warn-don't-block). `linear` (the pipeline default)
+    and an unset schedule return (None, None) silently — no reshaping needed."""
+    if not schedule or schedule == "linear":
+        return None, None
+    if effective_sampler != "default":
+        return None, f"a custom --sampler ({effective_sampler}) owns the sigma schedule"
+    from nodes.eric_diffusion_scheduler import is_flow_match
+    sched = getattr(pipe, "scheduler", None)
+    sched_name = type(sched).__name__ if sched is not None else "None"
+    # is_flow_match gates on CORRECT interpretation (classic schedulers would
+    # misread flow sigmas); the set_timesteps signature gates on ACCEPTANCE — the
+    # root-cause property (subsumes the FlowMatchHeun special case, future-proof
+    # against a new flow-match scheduler that lacks sigmas support). Both needed.
+    if not is_flow_match(sched):
+        return None, f"{model_family} uses a non-flow-match scheduler ({sched_name})"
+    try:
+        _st_params = inspect.signature(sched.set_timesteps).parameters
+    except (TypeError, ValueError):
+        _st_params = {}
+    if "sigmas" not in _st_params:
+        return None, f"{sched_name}.set_timesteps does not accept custom sigmas"
+    # Signature check is on the STOCK pipe.__call__; on the NAG path the actual
+    # callable is an unbound NAG*Pipeline.__call__ — every current NAG mirror also
+    # takes+forwards sigmas (test_nag pins this), so the two stay in lockstep.
+    if "sigmas" not in inspect.signature(pipe.__call__).parameters:
+        return None, f"{model_family}'s pipeline does not accept custom sigmas"
+    from nodes.eric_qwen_image_multistage import build_sigma_schedule
+    # comfyless is full-denoise txt2img: denoise=1.0 → keep == steps, so the
+    # schedule only reshapes spacing across the full sigma range.
+    return build_sigma_schedule(steps, 1.0, schedule=schedule), None
+
+
+def _apply_sigma_schedule(call_kwargs: dict, pipe, schedule: str,
+                          effective_sampler: str, model_family: str,
+                          steps: int) -> Optional[str]:
+    """Wire the schedule gate into the pipe call: inject `call_kwargs["sigmas"]`
+    when the schedule is honored, else return the warning string (ADR-028). This is
+    the testable seam over the one-line injection — the wiring gap this slice
+    closed. A returned warning is BOTH printed to stderr (in-process visibility)
+    AND carried in the sidecar `schedule_warnings` so a daemon/MCP client sees it
+    across the wire (invariant N1; stderr alone doesn't cross that boundary)."""
+    sigmas, warn = _sigma_schedule_gate(pipe, schedule, effective_sampler,
+                                        model_family, steps)
+    if sigmas is not None:
+        call_kwargs["sigmas"] = sigmas
+    return warn
+
+
 def generate(
     model_path: str,
     prompt: str,
@@ -1258,7 +1314,9 @@ def generate(
         loras: List of {"path": str, "weight": float} dicts.  Applied
             in order.  LoRA load failures are non-fatal (warned, skipped).
         sampler: One of SAMPLER_NAMES ("default", "multistep2", "multistep3").
-        schedule: Sigma schedule — reserved for future manual-loop use.
+        schedule: Sigma-spacing schedule ("linear"/"balanced"/"karras", ADR-028).
+            Applied on the default sampler when the pipeline's scheduler is a
+            non-Heun flow-match scheduler; warn-and-ignored otherwise.
 
     Returns a metadata dict suitable for the sidecar JSON / bridge output.
     Raises on fatal errors (model not found, inference failure).
@@ -1470,6 +1528,20 @@ def generate(
         )
         effective_sampler = "default"
 
+    # ── Sigma schedule (ADR-028): reshape flow-match sigma spacing ────
+    # `schedule` was long recorded-but-ignored; apply it here via the node
+    # path's build_sigma_schedule, gated to non-Heun flow-match schedulers on
+    # the default sampler. Warn-and-ignore everywhere else — the warning is
+    # carried in metadata (schedule_warnings) so the daemon/MCP client sees it.
+    _sched_warn = _apply_sigma_schedule(
+        call_kwargs, pipe, schedule, effective_sampler, model_family, steps)
+    schedule_warnings = [_sched_warn] if _sched_warn else []
+    if "sigmas" in call_kwargs:
+        _log(f"[comfyless] sigma schedule: {schedule} (flow-match, {steps} steps)")
+    elif _sched_warn is not None:
+        print(f"[comfyless] WARNING: --schedule {schedule!r} ignored — "
+              f"{_sched_warn}; using the pipeline default", file=sys.stderr)
+
     # ── Inference (with optional sampler swap) ────────────────────────
     # When the Hunyuan-Image refiner chain is active, run_chain handles both
     # pipeline calls under a single swap_sampler context. The swap is per-pipe
@@ -1521,6 +1593,11 @@ def generate(
         "height": height,
         "sampler": sampler,
         "schedule": schedule,
+        # Loud-across-the-wire: a --schedule that was warn-and-ignored (wrong
+        # family/scheduler/sampler) records WHY here, so a daemon/MCP client sees
+        # it — the daemon's stderr never reaches the client (invariant N1; mirrors
+        # nag_warnings / lora_warnings). Empty on a clean apply or plain linear.
+        "schedule_warnings": schedule_warnings,
         # Quantize-on-load triple — sidecar-replayable (2026-07-08): quant
         # affects output correctness for some transformer/LoRA combos, so a
         # --params replay must reproduce it.
@@ -1622,7 +1699,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sampler", choices=SAMPLER_NAMES, default=None,
                    help="Sampler algorithm")
     p.add_argument("--schedule", choices=SCHEDULE_NAMES, default=None,
-                   help="Sigma schedule (reserved for future manual-loop use)")
+                   help="Sigma-spacing schedule (ADR-028): linear (uniform), "
+                        "balanced (Karras ρ=3), karras (Karras ρ=7, steps toward "
+                        "fine detail). Applied on the default --sampler when the "
+                        "model uses a flow-match scheduler (Flux/Qwen/Chroma/Krea/"
+                        "Z-Image/Flux.2); warn-and-ignored for classic schedulers "
+                        "(SDXL/SD1) or a non-default --sampler.")
     p.add_argument("--max-seq-len", type=int, default=None,
                    help="Max sequence length for text encoder")
     p.add_argument("--transformer", type=str, default=None, metavar="PATH",
@@ -2118,6 +2200,11 @@ def _delegate_to_server(
         # wire metadata (invariant N1; mirrors lora_warnings below).
         for _w in metadata.get("nag_warnings") or []:
             print(f"[comfyless] WARNING: NAG — {_w}", file=sys.stderr)
+        # A --schedule that the daemon warn-and-ignored (wrong family/scheduler/
+        # sampler) is likewise surfaced client-side from the wire metadata — the
+        # daemon's stderr never reaches here (ADR-028; invariant N1).
+        for _w in metadata.get("schedule_warnings") or []:
+            print(f"[comfyless] WARNING: --schedule ignored — {_w}", file=sys.stderr)
         # Daemon already carries lora_warnings in the wire metadata — surface
         # them loudly client-side (ADR-015 2026-07-06).
         return _report_lora_outcome(metadata)

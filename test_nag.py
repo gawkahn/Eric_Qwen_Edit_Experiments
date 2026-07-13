@@ -893,6 +893,21 @@ for _mod, _restore in (
           and "if nag_applied:" not in _tail_src[1])
 
 
+# ── ADR-028 coupling: every NAG pipeline __call__ accepts `sigmas` ─────────────
+# comfyless's sigma-schedule gate (ADR-028) inspects the STOCK pipe.__call__ for a
+# `sigmas` param, but on the NAG path the callable that actually runs is the
+# unbound NAG*Pipeline.__call__. They must stay in lockstep: a NAG mirror that
+# dropped `sigmas` from its signature would TypeError at generation despite a
+# passing gate. Pin the invariant here (the gate's named assumption).
+print("\n── ADR-028: NAG __call__ signatures accept sigmas ─────────────")
+import inspect as _inspect_nag  # noqa: E402
+for _cls in (nag.Krea2NAGPipeline, nag_flux.NAGFluxPipeline,
+             nag_flux2.NAGFlux2Pipeline, nag_flux2.NAGFlux2KleinPipeline,
+             nag_zimage.NAGZImagePipeline):
+    check(f"{_cls.__name__}.__call__ accepts a sigmas= param (ADR-028 coupling)",
+          "sigmas" in _inspect_nag.signature(_cls.__call__).parameters)
+
+
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print("──────────────────────────────────────────────────")
