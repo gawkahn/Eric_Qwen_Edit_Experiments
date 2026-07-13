@@ -289,6 +289,25 @@ Security section. The binding invariants the review established:
   (2) catalog-name resolution + planner-context assembly (F2/F3); (3) loop
   controller (greedy hill-climb, candidates/winners, daemon reuse); (4)
   seed-image entry (F4/F5).
+- 2026-07-13 (slice 1 landed) — commits b0d3549 (this ADR + review) + 89ca9c5
+  (`comfyless/refine.py` verdict boundary + `test_refine.py`, 72 tests). Both
+  Fable reviewers confirmed the F1 keystone; folded critique allowlisting,
+  huge-int OverflowError→RefineError, and the seed-image pixel guard. Pushed.
+- 2026-07-13 (slice 2 landed) — catalog-name resolution + planner-context
+  assembly. code-reviewer + security-auditor (both Fable) confirmed F2 (name→path
+  ONLY via the ADR-015 resolver; the ADR-022 DB's abs_path is never read) and F3
+  (closed allowlist projection; path columns never reach the planner) both hold.
+  Folded: a structural AST guard so a future `SELECT abs_path`/`row["abs_path"]`
+  regresses loudly (was the F2-disposition's promised enforcement); broadened
+  `open_catalog_db` to warn-and-degrade on a corrupt/schema-mismatched DB instead
+  of crashing. **Forward constraints for slices 3/4 (from the slice-2 reviews):**
+  (a) `ResolvedLoraOp.abs_path` MUST NOT be serialized into any planner-visible
+  artifact (sidecar, `*.verdict.json`, next-call context); (b) resolver notices
+  carry `res.cause`/`path_was_discarded` — keep them operator/stderr-only, or
+  flatten to a uniform "not resolvable" string before any text re-enters LLM
+  context (else `PathMoved`/`WithinFailure` leak filesystem-drift state the search
+  plane never exposes); (c) slice 4 seed-image LoRA refs can be path-shaped, so
+  honor the `path_was_discarded` INFO notice there.
 
 **AI-Disclosure:** Claude (Fable 5) authored the design record from a design
 conversation with Grant; Grant reviewed.

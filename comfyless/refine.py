@@ -24,6 +24,8 @@ import io
 import json
 import math
 import os
+import sqlite3
+import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -386,3 +388,142 @@ def _post_judge(endpoint: str, payload: dict, key: str = "",
     except (KeyError, IndexError, TypeError) as e:
         raise RefineError(
             f"judge response missing choices[0].message.content: {str(data)[:200]}") from e
+
+
+# ── Catalog integration (ADR-027 F2/F3) ──────────────────────────────────────
+#
+# Two planes, kept strictly separate (security review F2):
+#   • name→path resolution goes through the ADR-015 in-memory resolver ONLY
+#     (basename-strip, forbidden-char gate, kind enforcement, existence,
+#     union-containment). refine.py never reads a load path from the DB and never
+#     trusts a path from the LLM.
+#   • the ADR-022 SQLite DB is consulted for METADATA/FTS only. Its rows carry
+#     abs_path/root/relative_path; those NEVER reach the planner. `_safe_lora_view`
+#     and the exact-name query below are an ALLOWLIST — path columns can't leak (F3).
+
+#: Entry columns the planner may see. Allowlist — abs_path/root/relative_path and
+#: audit columns (sha256, classification, reason, ...) are excluded by omission.
+_SAFE_ENTRY_FIELDS = ("name", "kind", "model_family")
+#: Description columns the planner may see.
+_SAFE_DESC_FIELDS = ("description", "usage_tips", "trigger_words", "strength_rec",
+                     "sampler_rec")
+
+
+@dataclass
+class ResolvedLoraOp:
+    """A planner LoraOp whose catalog name has been resolved to a server-side path
+    via the ADR-015 resolver. `abs_path` is the load target for the generate wiring
+    (a later slice) — it is NEVER sent to the LLM. `resolved_name` is the NFC
+    catalog name."""
+    op: LoraOp
+    resolved_name: str
+    abs_path: str
+
+
+def resolve_lora_ops(catalog, roots, lora_ops: List[LoraOp],
+                     notices: Optional[List[str]] = None):
+    """Resolve each planner LoRA op's NAME to a path via the ADR-015 in-memory
+    resolver (F2) — the ONLY name→path path in the loop. Unresolvable, wrong-kind,
+    or path-shaped names are dropped with an operator notice (warn-don't-block);
+    a name is never fabricated into a path.
+
+    Returns (resolved: List[ResolvedLoraOp], notices)."""
+    if notices is None:
+        notices = []
+    from comfyless.catalog import resolve_reference
+    roots_t = (roots,) if isinstance(roots, str) else tuple(roots)
+    resolved: List[ResolvedLoraOp] = []
+    for op in lora_ops:
+        res = resolve_reference(catalog, op.name, roots_t, expected_kind="lora")
+        if not res.ok or res.abs_path is None or res.name is None:
+            notices.append(
+                f"lora {op.name!r}: not resolvable as a catalog LoRA "
+                f"(cause: {res.cause}) — dropped")
+            continue
+        resolved.append(ResolvedLoraOp(op=op, resolved_name=res.name,
+                                       abs_path=res.abs_path))
+    return resolved, notices
+
+
+def open_catalog_db(db_path: str):
+    """Open the ADR-022 metadata DB read-only, or return None. Metadata is
+    best-effort: the loop resolves and generates fine without it, the planner just
+    gets no LoRA descriptions.
+
+    An ABSENT DB is normal — return None quietly. A PRESENT-but-unusable DB
+    (schema mismatch, or a corrupt/foreign non-SQLite file, which makes
+    connect_readonly's PRAGMA probe raise sqlite3.DatabaseError, not CatalogDBError)
+    degrades to name-only but WARNS — running the planner blind on a DB the operator
+    thinks is live should not be silent (warn-don't-block)."""
+    from comfyless import catalog_db
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        return catalog_db.connect_readonly(db_path)
+    except (catalog_db.CatalogDBError, sqlite3.Error) as e:
+        print(f"[refine] WARNING: catalog metadata DB {db_path!r} is unusable "
+              f"({e}); planner will see LoRA names only", file=sys.stderr)
+        return None
+
+
+def _safe_desc_view(desc: Optional[dict], view: dict) -> None:
+    """Merge the allowlisted description fields of `desc` (a dict) into `view`."""
+    if not desc:
+        return
+    for f in _SAFE_DESC_FIELDS:
+        val = desc.get(f)
+        # Skip empties incl. the "[]"/"{}" that trigger_words sanitizes to when a
+        # LoRA has no triggers — don't feed empty-container noise to the planner.
+        if val and val not in ("[]", "{}"):
+            view[f] = val
+
+
+def _safe_lora_view(row: dict) -> dict:
+    """Project a catalog_db.search() row (entries.* + best_description) to the
+    planner allowlist (F3). Path/audit columns are dropped by omission."""
+    view = {f: row[f] for f in _SAFE_ENTRY_FIELDS if row.get(f) is not None}
+    _safe_desc_view(row.get("best_description"), view)
+    return view
+
+
+def lora_metadata(conn, name: str) -> Optional[dict]:
+    """Safe metadata for an exact LoRA name (F3). The SELECT lists ONLY allowlisted
+    columns — abs_path/root/relative_path are never queried. Returns a safe dict, or
+    None if the name isn't in the DB (best-effort)."""
+    row = conn.execute(
+        "SELECT id, name, kind, model_family FROM entries "
+        "WHERE kind = 'lora' AND name = ? AND excluded = 0 AND stale = 0",
+        (name,)).fetchone()
+    if row is None:
+        return None
+    view = {"name": row["name"], "kind": row["kind"]}
+    if row["model_family"]:
+        view["model_family"] = row["model_family"]
+    desc = conn.execute(
+        "SELECT description, usage_tips, trigger_words, strength_rec, sampler_rec "
+        "FROM descriptions WHERE entry_id = ? "
+        "ORDER BY CASE source WHEN 'sidecar' THEN 0 WHEN 'civitai_api' THEN 1 "
+        "WHEN 'web' THEN 2 ELSE 3 END LIMIT 1",
+        (row["id"],)).fetchone()
+    _safe_desc_view(dict(desc) if desc else None, view)
+    return view
+
+
+def search_loras(conn, term: str, *, limit: int = 5) -> List[dict]:
+    """Search LoRAs by effect/name via the ADR-022 FTS (reused). Every row is
+    projected through `_safe_lora_view` before return — search() SELECTs e.* incl.
+    abs_path, so the allowlist is what keeps paths out of the planner (F3)."""
+    from comfyless import catalog_db
+    rows = catalog_db.search(conn, term, kind="lora", limit=limit)
+    return [_safe_lora_view(r) for r in rows]
+
+
+def assemble_planner_loras(conn, names) -> List[dict]:
+    """Safe metadata for a set of in-play LoRA names, for the planner context. A
+    name with no DB row still yields a name-only entry so the planner knows it is
+    active. `conn` may be None (no metadata DB) — then every entry is name-only."""
+    out: List[dict] = []
+    for n in names:
+        md = lora_metadata(conn, n) if conn is not None else None
+        out.append(md if md is not None else {"name": n})
+    return out

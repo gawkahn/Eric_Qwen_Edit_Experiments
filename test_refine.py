@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Tests for comfyless/refine.py slice 1 — ADR-027 LLM-as-judge verdict boundary.
+"""Tests for comfyless/refine.py slices 1-2 — ADR-027 LLM-as-judge.
 
-CPU-only, no GPU, no model weights, no network. Exercises the security-critical
+CPU-only, no GPU, no model weights, no network. Slice 1: the security-critical
 verdict parser (closed two-key allowlist F1, numeric bounds F6, reject-unknown
-F7) and the judge request-building pieces (image downscale + payload F5). The
-thin HTTP POST wrapper (`_post_judge`) needs a live endpoint and is not tested.
+F7) and the judge request-building pieces (image downscale + payload F5). Slice 2:
+catalog-name resolution (F2 — names resolved ONLY via the ADR-015 hardened
+resolver) and path-stripped planner metadata (F3), incl. a structural AST guard
+that refine.py never selects a load-plane column. The thin HTTP POST wrapper
+(`_post_judge`) needs a live endpoint and is not tested.
 
 The negative cases are the point: an LLM must not be able to smuggle a path
-(via an override key or a LoRA `path` field), a non-finite number, or an
-out-of-range weight/score past this boundary.
+(via an override key, a LoRA `path` field, or an unresolved name), a non-finite
+number, or an out-of-range weight/score past this boundary — and no filesystem
+path may reach the planner's LLM context.
 """
 
 import json
@@ -303,6 +307,123 @@ raises("over-pixel-cap seed image rejected", lambda: refine.load_seed_image_capp
 img_ok = refine.load_seed_image_capped(_bomb_path, max_pixels=200 * 200)
 check("at-pixel-cap seed image loads (RGB)", img_ok.mode == "RGB" and img_ok.size == (200, 200))
 os.unlink(_bomb_path)
+
+# ── Slice 2: catalog-name resolution (F2) + safe planner metadata (F3) ───────
+import tempfile  # noqa: E402
+from comfyless.refine import LoraOp  # noqa: E402
+from comfyless.catalog import build_catalog  # noqa: E402
+from comfyless import catalog_db  # noqa: E402
+
+print("== F2: LoRA name → path via ADR-015 resolver (names only, never a path) ==")
+_root = tempfile.mkdtemp()
+_mb = os.path.join(_root, "mb"); os.makedirs(_mb)
+_ld = os.path.join(_root, "loras"); os.makedirs(_ld)
+_td = os.path.join(_root, "tf"); os.makedirs(_td)
+open(os.path.join(_ld, "detail-tweaker.safetensors"), "wb").close()
+open(os.path.join(_td, "some-transformer.safetensors"), "wb").close()
+_cat = build_catalog(_mb, lora_paths=(_ld,), transformer_paths=(_td,))
+_roots = (_mb, _ld, _td)
+
+_res, _notes = refine.resolve_lora_ops(_cat, _roots, [
+    LoraOp("detail-tweaker", "add"),
+    LoraOp("nonexistent-lora", "add"),
+    LoraOp("some-transformer", "set_weight", 0.8),  # exists but wrong kind
+])
+check("known lora resolves to exactly one op", len(_res) == 1)
+check("resolved abs_path is real + under a root",
+      _res[0].abs_path.endswith("detail-tweaker.safetensors")
+      and os.path.exists(_res[0].abs_path), detail=str(_res))
+check("resolved op carries the original action/weight", _res[0].op.action == "add")
+check("unknown lora dropped with notice", any("nonexistent-lora" in n for n in _notes))
+check("wrong-kind (transformer) dropped as KindMismatch",
+      all("some-transformer" != r.resolved_name for r in _res)
+      and any("some-transformer" in n and "KindMismatch" in n for n in _notes),
+      detail=str(_notes))
+
+print("== F3: catalog metadata is a path-stripped allowlist ==")
+_dbp = os.path.join(_root, "cat.sqlite")
+_conn = catalog_db.connect(_dbp)
+_eid = catalog_db.upsert_entry(_conn, name="detail-tweaker", kind="lora",
+    abs_path="/secret/place/detail-tweaker.safetensors", root="/secret",
+    relative_path="detail-tweaker.safetensors")
+_conn.execute("UPDATE entries SET model_family = ? WHERE id = ?", ("qwen-image", _eid))
+catalog_db.upsert_description(_conn, entry_id=_eid, source="civitai_api",
+    description="adds crisp fine detail to skin and fabric", usage_tips="use 0.6-0.9",
+    trigger_words=["detailed"], strength_rec="0.7")  # trigger_words is a list
+catalog_db.rebuild_fts(_conn)
+_conn.commit()
+
+_md = refine.lora_metadata(_conn, "detail-tweaker")
+check("metadata present", _md is not None)
+check("metadata has description", "fine detail" in (_md or {}).get("description", ""))
+check("metadata has usage_tips/trigger/strength",
+      "0.6-0.9" in (_md or {}).get("usage_tips", "")
+      and "detailed" in (_md or {}).get("trigger_words", "")
+      and "0.7" in (_md or {}).get("strength_rec", ""))
+check("metadata has model_family", (_md or {}).get("model_family") == "qwen-image")
+_SAFE_KEYS = set(refine._SAFE_ENTRY_FIELDS) | set(refine._SAFE_DESC_FIELDS)
+check("metadata keys are a closed subset of the safe allowlist (F3)",
+      set((_md or {}).keys()) <= _SAFE_KEYS, detail=str(set((_md or {}).keys()) - _SAFE_KEYS))
+check("missing lora → None", refine.lora_metadata(_conn, "no-such-lora") is None)
+
+print("== F3: search-by-effect returns path-stripped safe views ==")
+_hits = refine.search_loras(_conn, "fine detail", limit=5)
+check("search finds the lora by effect", any(h.get("name") == "detail-tweaker" for h in _hits))
+check("search results are a closed subset of the safe allowlist (F3)",
+      all(set(h.keys()) <= _SAFE_KEYS for h in _hits), detail=str(_hits))
+
+print("== planner-loras assembly (known + unknown + no-DB) ==")
+_pl = refine.assemble_planner_loras(_conn, ["detail-tweaker", "unknown-lora"])
+check("known name enriched", "0.6-0.9" in _pl[0].get("usage_tips", ""))
+check("unknown name → name-only", _pl[1] == {"name": "unknown-lora"})
+check("assemble tolerates conn=None", refine.assemble_planner_loras(None, ["x"]) == [{"name": "x"}])
+_conn.close()
+
+print("== open_catalog_db degrades (no crash) on absent / corrupt DB ==")
+check("absent DB → None", refine.open_catalog_db(os.path.join(_root, "nope.sqlite")) is None)
+_corrupt = os.path.join(_root, "corrupt.sqlite")
+with open(_corrupt, "wb") as _cf:
+    _cf.write(b"this is definitely not a sqlite database header!!")
+check("corrupt non-sqlite DB → None (not an uncaught crash)",
+      refine.open_catalog_db(_corrupt) is None)
+check("valid DB opens read-only", refine.open_catalog_db(_dbp) is not None)
+
+print("== F2/F3 structural guard: refine.py never selects a load-plane column ==")
+# ADR-027 F2 disposition promise: refine.py is held to a structural check that a
+# future `SELECT abs_path` / `row["abs_path"]` shortcut regresses loudly, not just
+# a behavioral test of today's functions. (refine.py legitimately holds abs_path
+# on ResolvedLoraOp — a resolver-sourced LOAD target — and legitimately imports
+# catalog_db, so the guard is COLUMN-shaped, not an import ban.)
+import ast as _ast  # noqa: E402
+_LOAD_PLANE_COLS = {"abs_path", "root", "relative_path"}
+_src = (Path(__file__).parent / "comfyless" / "refine.py").read_text()
+_tree = _ast.parse(_src)
+
+# (a) no SQL string literal names a load-plane column
+_sql_viol = []
+for _n in _ast.walk(_tree):
+    if isinstance(_n, _ast.Constant) and isinstance(_n.value, str):
+        _low = _n.value.lower()
+        if "select" in _low and "from" in _low:
+            for _c in _LOAD_PLANE_COLS:
+                if _c in _low:
+                    _sql_viol.append((_c, _n.value[:70]))
+check("no load-plane column in any SQL literal", _sql_viol == [], detail=str(_sql_viol))
+
+# (b) no string-literal subscript reads a load-plane column (row["abs_path"] etc.)
+_sub_viol = []
+for _n in _ast.walk(_tree):
+    if isinstance(_n, _ast.Subscript) and isinstance(_n.slice, _ast.Constant):
+        if _n.slice.value in _LOAD_PLANE_COLS:
+            _sub_viol.append(_n.slice.value)
+check("no dict/row subscript reads a load-plane column", _sub_viol == [], detail=str(_sub_viol))
+
+# (c) the safe-field allowlists are disjoint from load-plane + audit columns
+_FORBIDDEN_ALL = _LOAD_PLANE_COLS | {
+    "sha256", "size_bytes", "classification", "reason", "duplicate_of",
+    "excluded_reason", "family_conflict"}
+check("safe field allowlists disjoint from path/audit columns",
+      not (_SAFE_KEYS & _FORBIDDEN_ALL), detail=str(_SAFE_KEYS & _FORBIDDEN_ALL))
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 print(f"\n{passed} passed, {failed} failed")
