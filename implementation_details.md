@@ -185,3 +185,19 @@ in bf16 under `--quant fp8` (loud log), base + reprompt still quantize. Verified
 by VIEWING the output (copper teapot, correct). TECH_DEBT `refiner-fp8-black`
 holds the per-layer investigation. Lesson: always view generated pixels, never
 trust "Saved" + VRAM as proof of a working image.
+
+**A15 — enhancer device follows the run + offline concurrency (2026-07-12).**
+Two things Grant hit:
+- The local hunyuan reprompt model loaded on the hardcoded `enhancers.toml`
+  device regardless of the generation `--device` — so a gen on cuda:1 with the
+  config pinned to cuda:1 piled 14 GB onto the same card (OOM), while a config
+  device on the OTHER GPU let it fit. Fix: inline `--enhance-prompt` passes the
+  generation `--device` (overrides the backend cfg device); offline takes
+  `--device`. openai-endpoint ignores device (HTTP to a separately-hosted server;
+  those stay wherever Grant starts them). hunyuan-only concern.
+- Offline `comfyless.enhance` processed M prompts sequentially. Added
+  `--concurrency N` (`-j`): a thread pool enhances N prompts in parallel,
+  output order preserved. HTTP is I/O-bound (GIL released during urlopen) so it
+  scales — timing proof 12 prompts × 0.2 s: 2.40 s → 0.41 s at concurrency 6.
+  Best for openai-endpoint (server continuous-batching); keep 1 for local hunyuan.
+  Composes with --variations and batch_variations.

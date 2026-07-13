@@ -294,13 +294,18 @@ def _clean_output(text: str) -> str:
     return text.strip()
 
 
-def enhance_hunyuan_reprompt(text: str, cfg: dict, n: int) -> List[str]:
-    """Enhance via the local Tencent reprompt model. `n` variations via sampling."""
+def enhance_hunyuan_reprompt(text: str, cfg: dict, n: int,
+                             device_override: Optional[str] = None) -> List[str]:
+    """Enhance via the local Tencent reprompt model. `n` variations via sampling.
+
+    `device_override` (the generation `--device` for the inline path) wins over
+    the backend cfg `device`, so the reprompt model co-locates with the run's GPU
+    instead of a hardcoded one — required to run independent gens on two GPUs."""
     import torch
     model_dir = cfg.get("model")
     if not model_dir:
         raise EnhanceError("hunyuan-reprompt backend missing 'model' path")
-    device = cfg.get("device", "cuda")
+    device = device_override or cfg.get("device", "cuda")
     precision = cfg.get("precision", "bf16")
     quant = cfg.get("quant", "none")  # e.g. "fp8" → weight-only fp8 (~14→7 GB)
     # Sampling knobs are tunable from the backend cfg (enhancers.toml) — raise
@@ -510,10 +515,14 @@ def enhance(
     recipes_dir: Optional[str] = None,
     family: Optional[str] = None,
     n: int = 1,
+    device: Optional[str] = None,
 ) -> List[str]:
     """Enhance ``text`` via the named backend, returning ``n`` variants.
 
-    - ``hunyuan-reprompt`` ignores recipe (baked Tencent system prompt).
+    - ``hunyuan-reprompt`` ignores recipe (baked Tencent system prompt). ``device``
+      (the run's generation GPU on the inline path) overrides its cfg device so the
+      local model co-locates with the run. openai-endpoint ignores ``device`` — it
+      is an HTTP client to a separately-hosted server.
     - ``openai-endpoint`` selects the recipe: explicit ``recipe_name`` →
       family default (``<family>-generic``) → ``generic``.
     Raises EnhanceError (with the backend name) on any failure.
@@ -526,7 +535,7 @@ def enhance(
     cfg = backends[backend_name]
     t = cfg.get("type")
     if t == "hunyuan-reprompt":
-        return enhance_hunyuan_reprompt(text, cfg, n)
+        return enhance_hunyuan_reprompt(text, cfg, n, device_override=device)
     if t == "openai-endpoint":
         rn = recipe_name or default_recipe_name(family)
         recipe = load_recipe(rn, recipes_dir)
@@ -544,24 +553,49 @@ def enhance_prompt_list(
     recipes_dir: Optional[str] = None,
     family: Optional[str] = None,
     variations: int = 1,
+    concurrency: int = 1,
+    device: Optional[str] = None,
 ) -> tuple:
     """Enhance a flat list of prompts → (flat enhanced list, provenance list).
 
     Output length is len(prompts) × variations, in source-major then
     variation-minor order, so the result is directly consumable by one
     ``--iterate prompt`` run. Provenance[i] = {source_prompt, source_index,
-    variation_index} for enhanced[i]."""
+    variation_index} for enhanced[i].
+
+    ``concurrency`` prompts are enhanced in parallel via a thread pool — a real
+    throughput win for the openai-endpoint backend (HTTP is I/O-bound, the GIL is
+    released during the request, and the server's continuous batching absorbs the
+    concurrent load). Push it until the server OOMs. For the local hunyuan backend
+    it just serializes on one GPU and adds memory pressure — keep concurrency=1.
+    Output order is preserved regardless of completion order."""
+    n = len(prompts)
+    results: List[Optional[List[str]]] = [None] * n
+
+    def _one(si: int) -> None:
+        results[si] = enhance(
+            prompts[si], backend_name, backends=backends, recipe_name=recipe_name,
+            recipes_dir=recipes_dir, family=family, n=variations, device=device,
+        )
+
+    if concurrency <= 1:
+        for si in range(n):
+            _one(si)
+    else:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=concurrency) as ex:
+            futs = [ex.submit(_one, si) for si in range(n)]
+            for f in as_completed(futs):
+                f.result()  # propagate the first EnhanceError (cancels the rest on exit)
+
     enhanced: List[str] = []
     provenance: List[dict] = []
-    for si, src in enumerate(prompts):
-        variants = enhance(
-            src, backend_name, backends=backends, recipe_name=recipe_name,
-            recipes_dir=recipes_dir, family=family, n=variations,
-        )
-        for vi, v in enumerate(variants):
+    for si, variants in enumerate(results):
+        for vi, v in enumerate(variants or ()):
             enhanced.append(v)
             provenance.append({
-                "source_prompt": src, "source_index": si, "variation_index": vi,
+                "source_prompt": prompts[si], "source_index": si,
+                "variation_index": vi,
             })
     return enhanced, provenance
 
@@ -581,6 +615,13 @@ def _cli(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--recipe", default=None, help="recipe name (openai-endpoint only; default: family/generic)")
     p.add_argument("--family", default=None, help="target model family for default recipe selection")
     p.add_argument("--variations", type=int, default=1, help="variants per input prompt (default 1)")
+    p.add_argument("--concurrency", "-j", type=int, default=1, metavar="N",
+                   help="enhance N prompts in parallel (default 1). Throughput lever "
+                        "for openai-endpoint backends — push it until the server OOMs. "
+                        "Keep at 1 for the local hunyuan backend (single GPU).")
+    p.add_argument("--device", default=None,
+                   help="GPU for a local (hunyuan) backend, overriding its config "
+                        "device (ignored by openai-endpoint).")
     p.add_argument("-o", "--output", default=None, help="output JSON file (default: <input>.enhanced.json)")
     p.add_argument("--config", default=None, help="enhancer registry path (default: registry search)")
     p.add_argument("--no-provenance", action="store_true", help="skip the .provenance.json sidecar")
@@ -602,13 +643,17 @@ def _cli(argv: Optional[List[str]] = None) -> int:
     if args.variations < 1:
         print("error: --variations must be >= 1", file=sys.stderr)
         return 2
+    if args.concurrency < 1:
+        print("error: --concurrency must be >= 1", file=sys.stderr)
+        return 2
 
     try:
         backends = load_backends(args.config)
         enhanced, provenance = enhance_prompt_list(
             prompts, args.backend, backends=backends, recipe_name=args.recipe,
             recipes_dir=args.recipes_dir, family=args.family,
-            variations=args.variations,
+            variations=args.variations, concurrency=args.concurrency,
+            device=args.device,
         )
     except EnhanceError as e:
         print(f"error [{args.backend}]: {e}", file=sys.stderr)

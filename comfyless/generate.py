@@ -2628,6 +2628,9 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                         backends=_enhance_backends[0],
                         recipe_name=getattr(args, "enhance_recipe", None),
                         family=None, n=1,
+                        # co-locate a local (hunyuan) reprompt model on the run's
+                        # GPU; openai-endpoint ignores device (it's HTTP)
+                        device=args.device,
                     )[0]
                     _log(f"[comfyless] prompt enhanced via {args.enhance_prompt!r} "
                          f"(recipe={getattr(args, 'enhance_recipe', None) or 'default'})")

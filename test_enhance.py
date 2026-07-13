@@ -127,7 +127,7 @@ except E.EnhanceError:
 
 # hunyuan dispatch → mock the backend fn
 _orig_h = E.enhance_hunyuan_reprompt
-E.enhance_hunyuan_reprompt = lambda text, cfg, n: [f"H:{text}"] * n
+E.enhance_hunyuan_reprompt = lambda text, cfg, n, device_override=None: [f"H:{text}"] * n
 try:
     out = E.enhance("cat", "hunyuan", backends=BK, n=2)
     check("hunyuan dispatch + n", out == ["H:cat", "H:cat"])
@@ -291,7 +291,7 @@ check("closed think then answer still works", E._clean_output("<think>a</think><
 print("── offline enhance_prompt_list ──")
 _orig_h2 = E.enhance_hunyuan_reprompt
 # deterministic mock: variant vi of prompt p -> "p#vi"
-E.enhance_hunyuan_reprompt = lambda text, cfg, n: [f"{text}#{i}" for i in range(n)]
+E.enhance_hunyuan_reprompt = lambda text, cfg, n, device_override=None: [f"{text}#{i}" for i in range(n)]
 try:
     bk = {"h": {"type": "hunyuan-reprompt", "model": "/m"}}
     enh, prov = E.enhance_prompt_list(["a", "b"], "h", backends=bk, variations=3)
@@ -304,6 +304,36 @@ try:
     check("variations=1 → 1:1", enh1 == ["x#0"])
 finally:
     E.enhance_hunyuan_reprompt = _orig_h2
+
+
+print("── offline concurrency (order-preserving) ──")
+with tempfile.TemporaryDirectory() as tmp:
+    _write(tmp, "generic.toml", 'system_prompt="S"\n')
+    _u.urlopen = _mock_urlopen  # echoes "ENH:<user content>"
+    try:
+        bk = {"g": {"type": "openai-endpoint", "url": "http://x/v1", "model": "m"}}
+        prompts = [f"p{i}" for i in range(8)]
+        enh, prov = E.enhance_prompt_list(prompts, "g", backends=bk, recipes_dir=tmp, concurrency=4)
+        check("concurrency preserves source order", enh == [f"ENH:p{i}" for i in range(8)])
+        check("concurrency processes all + provenance ordered",
+              len(enh) == 8 and [p["source_index"] for p in prov] == list(range(8)))
+        enh2, _ = E.enhance_prompt_list(["a", "b"], "g", backends=bk, recipes_dir=tmp, variations=2, concurrency=2)
+        check("concurrency + variations flat length", len(enh2) == 4)
+    finally:
+        _u.urlopen = _orig_urlopen
+
+print("── hunyuan device override ──")
+_cap = {}
+_orig_h3 = E.enhance_hunyuan_reprompt
+E.enhance_hunyuan_reprompt = lambda text, cfg, n, device_override=None: (_cap.update(dev=device_override), ["x"])[1]
+try:
+    E.enhance("p", "h", backends={"h": {"type": "hunyuan-reprompt", "model": "/m", "device": "cuda:0"}}, device="cuda:1")
+    check("gen --device overrides hunyuan backend device", _cap.get("dev") == "cuda:1")
+    _cap.clear()
+    E.enhance("p", "h", backends={"h": {"type": "hunyuan-reprompt", "model": "/m", "device": "cuda:0"}})
+    check("no override → backend device used (None passed, cfg wins downstream)", _cap.get("dev") is None)
+finally:
+    E.enhance_hunyuan_reprompt = _orig_h3
 
 
 print("── reprompt fp8 quant plumbing ──")
