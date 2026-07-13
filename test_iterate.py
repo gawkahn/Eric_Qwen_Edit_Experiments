@@ -542,6 +542,150 @@ with tempfile.TemporaryDirectory() as tmp:
 
 
 # ──────────────────────────────────────────────────────────────────────
+print("\n── _plan_iterations / _iteration_combos: --limit-per ─────────")
+
+with tempfile.TemporaryDirectory() as tmp:
+    tf = os.path.join(tmp, "tf.json")
+    pr = os.path.join(tmp, "pr.json")
+    write_json(["T0", "T1", "T2"], tf)                 # 3 transformers
+    write_json([f"P{i}" for i in range(10)], pr)       # 10 prompts
+
+    # N per group value, cycling the OTHER axis: 3 transformers × first 4 prompts.
+    plan = g._plan_iterations(make_args(
+        iterate=[["transformer_path", tf], ["prompt", pr]],
+        limit_per=["transformer_path", "4"]))
+    check("--limit-per: cartesian unchanged (3×10)", plan["cartesian"] == 30)
+    check("--limit-per transformer_path 4: effective = 3×4 = 12",
+          plan["effective_combos"] == 12 and plan["total"] == 12)
+    check("--limit-per records the group axis + N",
+          plan["limit_per_axis"] == "transformer_path" and plan["limit_per_n"] == 4)
+
+    combos = list(g._iteration_combos(plan))
+    seq = [(c["transformer_path"], c["prompt"]) for c in combos]
+    check("--limit-per yields exactly effective_combos generations", len(seq) == 12)
+    check("--limit-per: group axis varies SLOWEST (first 4 are T0×P0..P3)",
+          seq[:4] == [("T0", "P0"), ("T0", "P1"), ("T0", "P2"), ("T0", "P3")])
+    check("--limit-per: next group value restarts the cycled axis",
+          seq[4] == ("T1", "P0") and seq[8] == ("T2", "P0"))
+    from collections import Counter as _Counter
+    check("--limit-per: every group value gets exactly N runs",
+          _Counter(t for t, _ in seq) == _Counter({"T0": 4, "T1": 4, "T2": 4}))
+    check("--limit-per: cycled axis is the SAME chunk (first N) per group",
+          {p for _, p in seq} == {"P0", "P1", "P2", "P3"})
+
+    # N larger than the inner Cartesian clamps (ceiling, like --limit).
+    plan = g._plan_iterations(make_args(
+        iterate=[["transformer_path", tf], ["prompt", pr]],
+        limit_per=["transformer_path", "99"]))
+    check("--limit-per N > inner: clamps to full inner (3×10 = 30)",
+          plan["total"] == 30)
+
+    # --limit-per multiplies with --batch.
+    plan = g._plan_iterations(make_args(
+        iterate=[["transformer_path", tf], ["prompt", pr]],
+        limit_per=["transformer_path", "4"], batch=2))
+    check("--limit-per with --batch 2: total = 3×4×2 = 24", plan["total"] == 24)
+    check("--limit-per + batch: each combo repeated batch times",
+          [(c["transformer_path"], c["prompt"]) for c in g._iteration_combos(plan)][:2]
+          == [("T0", "P0"), ("T0", "P0")])
+
+    # --limit-per applies BEFORE the max-iterations check (12 <= 12 passes).
+    plan = g._plan_iterations(make_args(
+        iterate=[["transformer_path", tf], ["prompt", pr]],
+        limit_per=["transformer_path", "4"], max_iterations=12))
+    check("--limit-per capped total is what the max-iterations gate sees",
+          plan["total"] == 12)
+    try:
+        g._plan_iterations(make_args(
+            iterate=[["transformer_path", tf], ["prompt", pr]],
+            limit_per=["transformer_path", "4"], max_iterations=11))
+        check("--limit-per total over --max-iterations fails closed", False,
+              "did not raise")
+    except ValueError as e:
+        check("--limit-per total over --max-iterations fails closed",
+              "max-iterations" in str(e))
+
+    # A lone group axis (no other axis to cycle) runs each value once; N is inert.
+    plan = g._plan_iterations(make_args(
+        iterate=[["transformer_path", tf]],
+        limit_per=["transformer_path", "4"]))
+    check("--limit-per on the only axis: runs each value once (N inert)",
+          plan["total"] == 3 and len(list(g._iteration_combos(plan))) == 3)
+
+    # Error: --limit-per names an axis that isn't being iterated.
+    try:
+        g._plan_iterations(make_args(
+            iterate=[["prompt", pr]], limit_per=["transformer_path", "4"]))
+        check("--limit-per names a non-active axis raises", False, "did not raise")
+    except ValueError as e:
+        check("--limit-per names a non-active axis raises",
+              "not an active --iterate axis" in str(e))
+
+    # Error: N below 1.
+    try:
+        g._plan_iterations(make_args(
+            iterate=[["transformer_path", tf]], limit_per=["transformer_path", "0"]))
+        check("--limit-per N below 1 raises", False, "did not raise")
+    except ValueError as e:
+        check("--limit-per N below 1 raises", "N must be >= 1" in str(e))
+
+    # Error: N not an integer.
+    try:
+        g._plan_iterations(make_args(
+            iterate=[["transformer_path", tf]], limit_per=["transformer_path", "lots"]))
+        check("--limit-per N not an integer raises", False, "did not raise")
+    except ValueError as e:
+        check("--limit-per N not an integer raises", "must be an integer" in str(e))
+
+    # Error: --limit-per with NO --iterate axis is a hard error, not a silent
+    # no-op (code review finding 2) — even at the default --batch 1 that would
+    # otherwise early-return None.
+    try:
+        g._plan_iterations(make_args(limit_per=["prompt", "5"]))
+        check("--limit-per with no --iterate raises", False, "did not raise")
+    except ValueError as e:
+        check("--limit-per with no --iterate raises",
+              "requires at least one --iterate axis" in str(e))
+
+    # Error: a repeated --iterate axis is rejected (code review finding 3 — it
+    # silently corrupted the plan/exec count invariant under --limit-per).
+    try:
+        g._plan_iterations(make_args(iterate=[["prompt", pr], ["prompt", pr]]))
+        check("duplicate --iterate axis raises", False, "did not raise")
+    except ValueError as e:
+        check("duplicate --iterate axis raises", "more than once" in str(e))
+
+    # N > inner: the COMBOS actually yield the full inner per group (not just the
+    # plan total) — reviewer-requested combos-level assertion.
+    plan = g._plan_iterations(make_args(
+        iterate=[["transformer_path", tf], ["prompt", pr]],
+        limit_per=["transformer_path", "99"]))
+    check("--limit-per N>inner: combos yield the full 3×10 = 30",
+          len(list(g._iteration_combos(plan))) == 30)
+
+    # The group axis can be declared SECOND on the CLI and still groups correctly.
+    plan = g._plan_iterations(make_args(
+        iterate=[["prompt", pr], ["transformer_path", tf]],
+        limit_per=["transformer_path", "2"]))
+    seq2 = [(c["transformer_path"], c["prompt"]) for c in g._iteration_combos(plan)]
+    check("--limit-per groups correctly when its axis is declared second",
+          len(seq2) == 6 and seq2[:2] == [("T0", "P0"), ("T0", "P1")]
+          and seq2[2] == ("T1", "P0"))
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n── _parse_args: --limit and --limit-per are mutually exclusive ─")
+
+_mx = subprocess.run(
+    [sys.executable, "-m", "comfyless.generate", "--model", "/nonexistent",
+     "--iterate", "prompt", "/x.json", "--limit", "5",
+     "--limit-per", "prompt", "3"],
+    input="", capture_output=True, text=True, cwd=str(Path(__file__).parent))
+check("--limit + --limit-per together: argparse rejects (exit 2)",
+      _mx.returncode == 2 and "not allowed with argument" in _mx.stderr)
+
+
+# ──────────────────────────────────────────────────────────────────────
 print("\n── _plan_iterations: --batch ────────────────────────────────")
 
 with tempfile.TemporaryDirectory() as tmp:
@@ -718,6 +862,24 @@ for flag, value in [("--batch", "5"), ("--limit", "5")]:
         ok_shape = False
     check(f"--json + {flag} {value}: contract-shaped IterationNotSupported error",
           ok_shape, f"stdout={proc.stdout[:300]!r}")
+
+# --limit-per takes two args (AXIS N), so it's checked separately — it must get
+# the SAME --json rejection as --limit (code review finding 1).
+_lp = subprocess.run(
+    [sys.executable, "-m", "comfyless.generate",
+     "--json", "--limit-per", "prompt", "5"],
+    input=stdin_req, capture_output=True, text=True,
+    cwd=str(Path(__file__).parent))
+check("--json + --limit-per: exit code 1", _lp.returncode == 1)
+try:
+    _lp_payload = json.loads(_lp.stdout)
+    _lp_ok = (_lp_payload.get("status") == "error"
+              and _lp_payload.get("error_type") == "IterationNotSupported"
+              and "limit-per" in _lp_payload.get("error", ""))
+except json.JSONDecodeError:
+    _lp_ok = False
+check("--json + --limit-per: contract-shaped IterationNotSupported error",
+      _lp_ok, f"stdout={_lp.stdout[:300]!r}")
 
 
 # ──────────────────────────────────────────────────────────────────────

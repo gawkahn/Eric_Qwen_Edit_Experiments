@@ -1742,12 +1742,24 @@ def _parse_args() -> argparse.Namespace:
                    metavar="N",
                    help="Hard cap on total generations per --iterate invocation "
                         "(default 500). Exceeds this and the run fails fast.")
-    p.add_argument("--limit", type=_positive_int, default=None,
+    # --limit (flat first-N of the Cartesian) and --limit-per (N per group axis)
+    # are two different truncation models — mutually exclusive.
+    _limit_group = p.add_mutually_exclusive_group()
+    _limit_group.add_argument("--limit", type=_positive_int, default=None,
                    metavar="N",
                    help="After --iterate Cartesian expansion, take only the first N "
                         "combinations. Ceiling, not requirement: if Cartesian total < N, "
                         "run them all (no error). Distinct from --max-iterations: --limit "
-                        "is silent truncation by design.")
+                        "is silent truncation by design. See also --limit-per.")
+    _limit_group.add_argument("--limit-per", nargs=2, default=None,
+                   metavar=("AXIS", "N"),
+                   help="Per-group cap: run N generations for EACH value of the "
+                        "--iterate axis AXIS, cycling the OTHER axes. E.g. "
+                        "'--iterate transformer_path t.json --iterate prompt p.json "
+                        "--limit-per transformer_path 25' runs 25 prompts against every "
+                        "transformer (leaving the prompt list intact). AXIS must be an "
+                        "active --iterate axis; mutually exclusive with --limit; "
+                        "--max-iterations still applies to the total.")
     p.add_argument("--batch", type=_positive_int, default=1,
                    metavar="N",
                    help="Repeat each planned generation N times. Alone (no --iterate), "
@@ -2270,6 +2282,16 @@ def _plan_iterations(args: argparse.Namespace) -> Optional[dict]:
     """
     batch = getattr(args, "batch", 1) or 1
     limit = getattr(args, "limit", None)
+    limit_per = getattr(args, "limit_per", None)
+
+    # --limit-per names an --iterate axis to group by; it is meaningless without
+    # one. Check BEFORE the early return so `--limit-per X N` alone doesn't silently
+    # no-op — the axis-membership promise must always fire (code review: drift).
+    if limit_per is not None and not args.iterate:
+        raise ValueError(
+            f"--limit-per requires at least one --iterate axis "
+            f"(got --limit-per {limit_per[0]!r} with no --iterate)"
+        )
 
     if not args.iterate and batch == 1:
         return None
@@ -2319,18 +2341,62 @@ def _plan_iterations(args: argparse.Namespace) -> Optional[dict]:
                     )
         axes.append((param, Path(filepath).stem, values))
 
+    # An axis given twice (argparse `append` permits it) has no coherent meaning —
+    # the per-run patch dict can hold only one value per param, and it silently
+    # corrupts the plan/exec count invariant under --limit-per. Reject it (code
+    # review: drift). This also removes the pre-existing flat-mode ambiguity.
+    axis_names = [a[0] for a in axes]
+    dupes = sorted({n for n in axis_names if axis_names.count(n) > 1})
+    if dupes:
+        raise ValueError(
+            f"--iterate axis(es) {dupes} given more than once; "
+            f"each axis may be iterated at most once"
+        )
+
     cartesian = 1
     for _, _, values in axes:
         cartesian *= len(values)
 
-    # --limit truncates the Cartesian; ceiling, not requirement (limit > cartesian → clamp).
-    effective = cartesian if limit is None else min(cartesian, limit)
+    # Two truncation models (argparse enforces they're mutually exclusive):
+    #   --limit N       → first N of the flattened Cartesian (silent ceiling).
+    #   --limit-per A N → N per value of axis A, cycling the OTHER axes. The named
+    #                     axis is the OUTER group; N caps the inner (other-axes)
+    #                     Cartesian per group value (ceiling — clamped when smaller).
+    limit_per_axis: Optional[str] = None
+    limit_per_n: Optional[int] = None
+    if limit_per is not None:
+        axis_name, n_str = limit_per
+        axis_names = [a[0] for a in axes]
+        if axis_name not in axis_names:
+            raise ValueError(
+                f"--limit-per axis {axis_name!r} is not an active --iterate axis. "
+                f"Active axes: {axis_names or '(none)'}"
+            )
+        try:
+            limit_per_n = int(n_str)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"--limit-per {axis_name}: N must be an integer, got {n_str!r}"
+            )
+        if limit_per_n < 1:
+            raise ValueError(f"--limit-per {axis_name}: N must be >= 1, got {limit_per_n}")
+        limit_per_axis = axis_name
+        inner = 1
+        group_len = 0
+        for name, _, values in axes:
+            if name == axis_name:
+                group_len = len(values)
+            else:
+                inner *= len(values)
+        effective = group_len * min(limit_per_n, inner)
+    else:
+        effective = cartesian if limit is None else min(cartesian, limit)
     total = effective * batch
 
     if total > args.max_iterations:
         raise ValueError(
             f"{total} iterations exceeds --max-iterations={args.max_iterations}. "
-            f"Raise --max-iterations, lower --batch, lower --limit, "
+            f"Raise --max-iterations, lower --batch, lower --limit / --limit-per, "
             f"or narrow the iteration files."
         )
 
@@ -2345,6 +2411,8 @@ def _plan_iterations(args: argparse.Namespace) -> Optional[dict]:
         "batch": batch,
         "total": total,
         "input_tokens": input_tokens,
+        "limit_per_axis": limit_per_axis,
+        "limit_per_n": limit_per_n,
     }
 
 
@@ -2378,6 +2446,30 @@ def _iteration_combos(plan: dict) -> Any:
         # Pure-batch mode: yield the empty patch `batch` times.
         for _ in range(batch):
             yield {}
+        return
+
+    # --limit-per: the named axis is the OUTER group; for each of its values, run
+    # the first N combinations of the OTHER axes' Cartesian (itertools.product of
+    # an empty axis list yields one empty tuple, so a lone group axis runs once per
+    # value). This is what makes "N prompts per transformer" land — the group axis
+    # varies slowest, the cycled axes fastest.
+    limit_per_axis = plan.get("limit_per_axis")
+    if limit_per_axis is not None:
+        per_n = plan["limit_per_n"]
+        group_name, _, group_values = next(a for a in axes if a[0] == limit_per_axis)
+        others = [a for a in axes if a[0] != limit_per_axis]
+        other_names = [a[0] for a in others]
+        other_lists = [a[2] for a in others]
+        for gval in group_values:
+            count = 0
+            for inner in itertools.product(*other_lists):
+                if count >= per_n:
+                    break
+                patch = {group_name: gval}
+                patch.update(dict(zip(other_names, inner)))
+                for _ in range(batch):
+                    yield dict(patch)
+                count += 1
         return
 
     names = [a[0] for a in axes]
@@ -2842,12 +2934,13 @@ def main() -> int:
         # with --json mode"). Reject rather than silently ignore — adding
         # iteration to the JSON schema is separate design work gated by the
         # LLM-agent-bridge slice.
-        if args.iterate or args.batch != 1 or args.limit is not None:
+        if (args.iterate or args.batch != 1 or args.limit is not None
+                or args.limit_per is not None):
             json.dump({
                 "status": "error",
-                "error": "--iterate / --batch / --limit are not supported in "
-                         "--json mode; iteration semantics will be added to the "
-                         "JSON bridge contract in a future release",
+                "error": "--iterate / --batch / --limit / --limit-per are not "
+                         "supported in --json mode; iteration semantics will be "
+                         "added to the JSON bridge contract in a future release",
                 "error_type": "IterationNotSupported",
                 "contract_version": CONTRACT_VERSION,
             }, sys.stdout, indent=2)
