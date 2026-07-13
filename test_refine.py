@@ -425,6 +425,295 @@ _FORBIDDEN_ALL = _LOAD_PLANE_COLS | {
 check("safe field allowlists disjoint from path/audit columns",
       not (_SAFE_KEYS & _FORBIDDEN_ALL), detail=str(_SAFE_KEYS & _FORBIDDEN_ALL))
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  Slice 3 — loop controller (greedy hill-climb) pure surface
+# ══════════════════════════════════════════════════════════════════════════════
+from comfyless.refine import (  # noqa: E402
+    WorkingConfig, LoraSlot, Candidate, Verdict, LoraOp, ResolvedLoraOp,
+    composite_score, verdict_passes, apply_overrides, build_judge_user_text,
+    verdict_record, _assert_no_paths, DEFAULT_W_PA, DEFAULT_W_AES,
+)
+
+print("\n== slice 3: composite scoring + pass gate ==")
+check("composite weights prompt-adherence above aesthetics",
+      composite_score(10, 5, 0.6, 0.4) == 8.0,
+      detail=str(composite_score(10, 5, 0.6, 0.4)))
+check("composite uses module defaults",
+      composite_score(10, 0) == DEFAULT_W_PA * 10 + DEFAULT_W_AES * 0)
+# The pass gate is NUMERIC (both axes >= threshold); the advisory verdict string
+# is deliberately ignored so a lying judge cannot self-promote (F8).
+check("pass when both axes >= threshold",
+      verdict_passes(Verdict(8, 8, "revise", {}, None, []), 8) is True)
+check("advisory 'revise' does not block a numeric pass",
+      verdict_passes(Verdict(9, 8, "revise", {}, None, []), 8) is True)
+check("fail when one axis below threshold",
+      verdict_passes(Verdict(10, 7, "pass", {}, None, []), 8) is False)
+check("advisory 'pass' cannot self-promote past the numeric gate",
+      verdict_passes(Verdict(3, 3, "pass", {}, None, []), 8) is False)
+
+print("\n== slice 3: apply_overrides — prompt ==")
+_base_cfg = WorkingConfig(prompt="orig", loras=[], base={"seed": 42})
+_v_prompt = Verdict(5, 5, "revise", {}, "rewritten", [])
+_c1 = apply_overrides(_base_cfg, _v_prompt, [], [])
+check("override prompt replaces prompt", _c1.prompt == "rewritten")
+_c2 = apply_overrides(_base_cfg, Verdict(5, 5, "revise", {}, None, []), [], [])
+check("absent override prompt keeps prior prompt", _c2.prompt == "orig")
+check("apply_overrides is pure — source cfg prompt unchanged",
+      _base_cfg.prompt == "orig")
+
+print("\n== slice 3: apply_overrides — LoRA add/remove/set_weight ==")
+_cfg_x = WorkingConfig(prompt="p",
+                       loras=[LoraSlot("x", "/root/x.safetensors", 1.0)],
+                       base={"seed": 1})
+
+
+def _rop(name, action, weight, path):
+    return ResolvedLoraOp(op=LoraOp(name, action, weight),
+                          resolved_name=name, abs_path=path)
+
+
+# add a new one (default weight when None), remove an active one
+_notices = []
+_c = apply_overrides(
+    _cfg_x, Verdict(5, 5, "revise", {}, None, []),
+    [_rop("y", "add", None, "/root/y.safetensors"),
+     _rop("x", "remove", None, "/root/x.safetensors")], _notices)
+check("add appends the new LoRA, remove drops the active one",
+      _c.lora_names() == ["y"], detail=str(_c.lora_names()))
+check("add with no weight defaults to 1.0", _c.loras[0].weight == 1.0)
+check("apply_overrides pure — source LoRA set unchanged",
+      _cfg_x.lora_names() == ["x"])
+
+# add an already-active LoRA → noticed no-op
+_n2 = []
+_c = apply_overrides(_cfg_x, Verdict(5, 5, "revise", {}, None, []),
+                     [_rop("x", "add", 0.5, "/root/x.safetensors")], _n2)
+check("add of an already-active LoRA is a no-op", _c.lora_names() == ["x"])
+check("add of active keeps prior weight (no-op, not reweight)",
+      _c.loras[0].weight == 1.0)
+check("add-active emits a notice", any("already active" in n for n in _n2))
+
+# remove a LoRA that isn't active → noticed no-op
+_n3 = []
+_c = apply_overrides(_cfg_x, Verdict(5, 5, "revise", {}, None, []),
+                     [_rop("z", "remove", None, "/root/z.safetensors")], _n3)
+check("remove of an inactive LoRA is a no-op", _c.lora_names() == ["x"])
+check("remove-inactive emits a notice", any("not active" in n for n in _n3))
+
+# set_weight on active → updates; on inactive → adds at that weight (+notice)
+_n4 = []
+_c = apply_overrides(_cfg_x, Verdict(5, 5, "revise", {}, None, []),
+                     [_rop("x", "set_weight", 2.5, "/root/x.safetensors")], _n4)
+check("set_weight updates an active LoRA's weight", _c.loras[0].weight == 2.5)
+_n5 = []
+_c = apply_overrides(_cfg_x, Verdict(5, 5, "revise", {}, None, []),
+                     [_rop("w", "set_weight", 1.5, "/root/w.safetensors")], _n5)
+check("set_weight on inactive LoRA adds it at that weight",
+      _c.lora_names() == ["x", "w"] and _c.loras[1].weight == 1.5)
+check("set_weight-inactive emits a notice", any("inactive" in n for n in _n5))
+
+# insertion order preserved across a multi-op merge
+_cfg_ab = WorkingConfig(prompt="p", loras=[
+    LoraSlot("a", "/root/a.safetensors", 1.0),
+    LoraSlot("b", "/root/b.safetensors", 1.0)], base={})
+_c = apply_overrides(_cfg_ab, Verdict(5, 5, "revise", {}, None, []),
+                     [_rop("c", "add", 1.0, "/root/c.safetensors")], [])
+check("insertion order preserved on add", _c.lora_names() == ["a", "b", "c"])
+
+print("\n== slice 3: WorkingConfig.to_generate_params ==")
+_p = _cfg_x.to_generate_params()
+check("to_generate_params sets prompt", _p["prompt"] == "p")
+check("to_generate_params carries the LOAD path in loras",
+      _p["loras"] == [{"path": "/root/x.safetensors", "weight": 1.0}])
+check("to_generate_params copies base (mutation isolation)",
+      (_p.__setitem__("seed", 999), _cfg_x.base["seed"] == 1)[1])
+
+print("\n== slice 3: F3 — no load-plane path ever reaches the LLM or verdict.json ==")
+# active LoRAs hold an abs_path internally; the judge text must render name+weight
+# only. A regression that leaks the path fails HERE, loudly.
+_jt = build_judge_user_text("target scene", _cfg_x,
+                            [{"name": "x", "description": "a detail LoRA"}])
+check("judge text omits abs_path of active LoRAs", "/root/" not in _jt)
+check("judge text omits .safetensors basename", ".safetensors" not in _jt)
+check("judge text carries the target prompt", "target scene" in _jt)
+check("judge text carries safe catalog metadata", "a detail LoRA" in _jt)
+
+# _assert_no_paths is the last structural gate — it must fire on any path key at
+# any nesting depth, and pass a clean payload.
+raises("_assert_no_paths fires on top-level abs_path",
+       lambda: _assert_no_paths({"abs_path": "/x"}))
+raises("_assert_no_paths fires on nested path key",
+       lambda: _assert_no_paths({"a": [{"b": {"root": "/x"}}]}))
+raises("_assert_no_paths fires on 'relative_path'",
+       lambda: _assert_no_paths({"relative_path": "y"}))
+try:
+    _assert_no_paths({"name": "x", "weight": 1.0, "meta": [{"description": "d"}]})
+    check("_assert_no_paths passes a clean payload", True)
+except RefineError:
+    check("_assert_no_paths passes a clean payload", False)
+
+# a leaking search_offer (upstream projection regressed) is caught before the
+# text is assembled — proves the gate protects independently of the projection.
+raises("build_judge_user_text refuses a path-bearing search offer",
+       lambda: build_judge_user_text(
+           "t", _cfg_x, [], search_offers=[{"name": "n", "abs_path": "/leak"}]))
+
+print("\n== slice 3: verdict_record is a path-free audit artifact ==")
+_vr = Verdict(6, 7, "revise",
+              {"prompt_adherence": "close", "aesthetics": "ok"},
+              "try adding rim light",
+              [LoraOp("detail-lora", "add", 0.8),
+               LoraOp("x", "remove", None)])
+_cand = Candidate(index=2, image_path="/root/candidate_02.png",
+                  metadata={"seed": 42, "loras": [{"path": "/root/x.safetensors"}]},
+                  verdict=_vr, composite=6.4)
+_rec = verdict_record(_cand, DEFAULT_W_PA, DEFAULT_W_AES)
+_recs = json.dumps(_rec)
+check("verdict_record contains no filesystem path", "/root/" not in _recs)
+check("verdict_record contains no .safetensors", ".safetensors" not in _recs)
+check("verdict_record records the raw proposed LoRA NAMES (not paths)",
+      [o["name"] for o in _rec["proposed_overrides"]["loras"]]
+      == ["detail-lora", "x"])
+check("verdict_record carries the numeric scores",
+      _rec["scores"] == {"prompt_adherence": 6, "aesthetics": 7})
+check("verdict_record records the composite + weights",
+      _rec["composite"] == 6.4 and _rec["weights"]["prompt_adherence"] == DEFAULT_W_PA)
+check("verdict_record keeps the advisory verdict string",
+      _rec["verdict"] == "revise")
+# defense in depth: if abs_path ever crept into the record it would raise here —
+# verdict_record calls _assert_no_paths internally, so a clean call is the proof.
+
+print("\n== slice 3: _daemon_namespace carries the wire-builder's attributes ==")
+_ns = refine._daemon_namespace("cuda:1", "bf16", "/out/cand")
+check("_daemon_namespace pins device/precision/savepath",
+      _ns.device == "cuda:1" and _ns.precision == "bf16"
+      and _ns.savepath == "/out/cand")
+check("_daemon_namespace defaults rebalance off (no accidental Krea path)",
+      _ns.rebalance is False and _ns.rebalance_weights is None)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Slice 3 — refine_loop controller (monkeypatched generation + judge)
+#
+#  run_generation (daemon/cold) and judge_candidate pull torch / a live endpoint,
+#  so the LOOP is exercised by replacing those two module-level callables with
+#  fakes: a fake generator that writes a real tiny PNG to the canonical path and
+#  reports a seed, and a fake judge that replays a scripted sequence of verdicts
+#  (or raises). This pins the pass/cap/patience stop logic, F7 iteration
+#  consumption, seed pinning, and winner finalization — the surface the code
+#  review flagged as untested. (run_generation's own daemon-move glue stays
+#  integration-tested by the hot GPU run, like _post_judge.)
+# ══════════════════════════════════════════════════════════════════════════════
+import tempfile as _tf  # noqa: E402
+from PIL import Image as _PILImage  # noqa: E402
+
+
+def _mkverdict(pa, aes, vstr="revise"):
+    return Verdict(pa, aes, vstr, {}, None, [])
+
+
+class _FakeGen:
+    """Stands in for refine.run_generation: writes a 4px PNG at the canonical path
+    and records the seed each call actually saw (to prove seed pinning)."""
+    def __init__(self, seed=123):
+        self.seed = seed
+        self.seeds_seen = []
+
+    def __call__(self, cfg, *, device, output_dir, stem, precision="bf16", log=print):
+        self.seeds_seen.append(cfg.base.get("seed"))
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, f"{stem}.png")
+        _PILImage.new("RGB", (4, 4), (7, 8, 9)).save(path)
+        return refine.GenOutcome(image_path=path, metadata={"seed": self.seed})
+
+
+class _FakeJudge:
+    """Replays a scripted list of Verdict (or Exception to raise) — the last entry
+    repeats if the loop runs longer than the script."""
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = 0
+
+    def __call__(self, image, target_prompt, cfg, backend_cfg, planner_loras, **kw):
+        item = self.script[min(self.calls, len(self.script) - 1)]
+        self.calls += 1
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def _run_loop(script, *, max_iter=10, patience=2, threshold=8, seed=123):
+    d = _tf.mkdtemp(prefix="refine_loop_test_")
+    fg, fj = _FakeGen(seed=seed), _FakeJudge(script)
+    _rg, _jc = refine.run_generation, refine.judge_candidate
+    refine.run_generation, refine.judge_candidate = fg, fj
+    try:
+        cfg = WorkingConfig(prompt="p", loras=[], base={"seed": -1})
+        out = refine.refine_loop(
+            cfg, target_prompt="a detailed test scene", catalog={}, roots=(),
+            conn=None, backend_cfg={"url": "http://x", "model": "m"},
+            output_dir=d, device="cuda", pass_threshold=threshold,
+            max_iterations=max_iter, patience=patience, log=lambda *_a: None)
+    finally:
+        refine.run_generation, refine.judge_candidate = _rg, _jc
+    return d, out, fg, fj
+
+
+print("\n== slice 3: refine_loop — pass stops + finalizes the passing candidate ==")
+_d, _o, _fg, _fj = _run_loop([_mkverdict(9, 9)], threshold=8)
+check("pass on iter 0 stops immediately", _o.iterations == 1)
+check("pass sets passed=True", _o.passed is True)
+check("winner file exists", _o.winner_path and os.path.isfile(_o.winner_path))
+check("winners/ holds exactly one image",
+      os.listdir(os.path.join(_d, "winners")) == ["candidate_00.png"])
+check("candidate image + sidecar + verdict.json all written",
+      all(os.path.isfile(os.path.join(_d, "candidates", f))
+          for f in ("candidate_00.png", "candidate_00.json",
+                    "candidate_00.verdict.json")))
+
+print("\n== slice 3: refine_loop — cap stop with best-composite winner ==")
+_d, _o, _fg, _fj = _run_loop([_mkverdict(5, 5)], max_iter=3, patience=99)
+check("runs to the iteration cap", _o.iterations == 3)
+check("cap stop is not a pass", _o.passed is False)
+check("winner is finalized even without a pass",
+      _o.winner_path and os.path.isfile(_o.winner_path))
+check("best composite recorded", _o.best_composite == 5.0)
+
+print("\n== slice 3: refine_loop — patience stops the run early ==")
+_d, _o, _fg, _fj = _run_loop(
+    [_mkverdict(7, 7), _mkverdict(5, 5), _mkverdict(5, 5), _mkverdict(5, 5)],
+    max_iter=10, patience=2)
+check("patience halts after 2 non-improving iters", _o.iterations == 3)
+check("best-so-far (iter 0) wins on a patience stop", _o.best_composite == 7.0)
+check("winner basename is the best candidate (iter 0)",
+      os.path.basename(_o.winner_path) == "candidate_00.png")
+
+print("\n== slice 3: refine_loop — F7 malformed verdict consumes an iteration ==")
+_d, _o, _fg, _fj = _run_loop([RefineError("bad json"), RefineError("bad json")],
+                             max_iter=10, patience=2)
+check("two unusable verdicts hit patience and stop", _fj.calls == 2)
+check("no candidate ever passed → winners/ empty, winner_path None",
+      _o.winner_path is None and _o.passed is False)
+check("the parse failure is recorded in the candidate's verdict.json",
+      json.load(open(os.path.join(_d, "candidates", "candidate_00.verdict.json")))
+      .get("error", "").startswith("bad json"))
+check("winners/ directory is empty after an all-failure run",
+      os.listdir(os.path.join(_d, "winners")) == [])
+
+print("\n== slice 3: refine_loop — seed pinned after iteration 0 ==")
+_d, _o, _fg, _fj = _run_loop([_mkverdict(5, 5)], max_iter=3, patience=99, seed=777)
+# iter 0 runs with the CLI seed (-1); every later iter must reuse the pinned seed
+# from iter 0's metadata (777) so the hill-climb varies only prompt/LoRA.
+check("iteration 0 uses the initial seed", _fg.seeds_seen[0] == -1)
+check("iterations 1+ reuse the pinned seed",
+      _fg.seeds_seen[1:] == [777, 777], detail=str(_fg.seeds_seen))
+
+print("\n== slice 3: refine_loop — no-pass run finalizes top composite ==")
+_d, _o, _fg, _fj = _run_loop(
+    [_mkverdict(6, 6), _mkverdict(4, 4), _mkverdict(4, 4)], max_iter=10, patience=2)
+check("winner is the highest-composite candidate", _o.best_composite == 6.0)
+check("winner file is iter 0's candidate",
+      os.path.basename(_o.winner_path) == "candidate_00.png")
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

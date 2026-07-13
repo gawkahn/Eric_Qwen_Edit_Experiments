@@ -309,5 +309,48 @@ Security section. The binding invariants the review established:
   plane never exposes); (c) slice 4 seed-image LoRA refs can be path-shaped, so
   honor the `path_was_discarded` INFO notice there.
 
+- 2026-07-13 (slice 3 landed) — greedy hill-climb loop controller
+  (`refine_loop`), daemon-aware generation (`run_generation`), the combined
+  judge+plan glue (`judge_candidate`), path-free `verdict_record`, and the CLI
+  (fresh `--prompt` entry). `test_refine.py` 94 → 155 tests.
+  **security-auditor (Fable): APPROVE** — F1/F2/F3/F5/F6 + forward-constraints
+  (a)/(b) all verified to hold; the pass gate is numeric and lie-proof (F8).
+  Review: `docs/security/review-refinement-loop-slice3-2026-07-13.md`.
+  **code-reviewer (Fable): needs-changes** on correctness; all findings folded
+  before commit:
+    - **HIGH — daemon savepath re-rooting.** The daemon re-roots the savepath
+      template under its OWN `--output-dir` ("the client never dictates paths"),
+      so on the loop's primary (daemon) path the candidates landed outside the
+      run's `candidates/` tree and the ADR §Output-layout audit trail was empty.
+      Fixed: `run_generation` now MOVES the daemon's returned image to the
+      canonical `output_dir/candidate_NN.png`, giving uniform daemon/cold naming.
+    - **MEDIUM — judge model autodetect escaped F7.** `GET /models` raised
+      `EnhanceError` (not `RefineError`), aborting the run mid-loop and skipping
+      winner finalization. Fixed: the model id is resolved + cached ONCE at
+      startup; `judge_candidate`'s fallback re-raises as `RefineError`.
+    - **MEDIUM — FTS search-offers was dead code.** The planner saw only active
+      LoRAs and could never ADD one (half the v1 authority). Fixed:
+      `search_loras(target_prompt)` now feeds path-free add-candidates into the
+      judge context each iteration.
+    - **MEDIUM — `refine_loop` had no tests.** Added 20 loop tests via
+      monkeypatched `run_generation`/`judge_candidate`: pass/cap/patience stops,
+      F7 iteration consumption, seed pinning after iter 0, winner finalization.
+    - **LOW** — `_post_judge` JSON decode moved outside the transport `try`
+      (non-JSON/oversized body → `RefineError`, stays within F7);
+      `run_generation` logs the unreachable-daemon fallback and raises on
+      `status=ok`-with-no-path; the cold path forwards transformer/vae/te/refiner
+      override fields (slice-4 landmine closed); the `key_env` registry
+      convention is honored for the judge Authorization header; `main()` exits
+      cleanly (not a traceback) on `RefineError` / bad `--lora` weight.
+  **Constraint (a) clarification (auditor INFO-2):** "planner-visible artifact"
+  in the slice-2 forward-constraint means the path-free `verdict.json` + the
+  judge context ONLY. The load-plane `<stem>.json` sidecar legitimately carries
+  `loras[].path` — it is the human's `--params` replay artifact and is never read
+  back into judge context. **Binding on slice 4:** seed sidecars are ingested
+  ONLY via the F4 trusted-human channel (loud echo of load-bearing fields,
+  `path_was_discarded` honored); sidecar content never enters judge context.
+  Slices remaining: (4) seed-image entry (F4/F5).
+
 **AI-Disclosure:** Claude (Fable 5) authored the design record from a design
-conversation with Grant; Grant reviewed.
+conversation with Grant; Grant reviewed. Slice 3 implementation + review
+folding authored by Claude (Fable 5); Grant reviewed.

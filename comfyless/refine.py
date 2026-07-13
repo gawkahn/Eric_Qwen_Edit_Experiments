@@ -1,8 +1,11 @@
 """comfyless iterative refinement loop (LLM-as-judge) — ADR-027.
 
-Slice 1 (this file, so far): the security-critical verdict boundary + the judge
-request-building pieces, in isolation. Later slices add catalog-name resolution
-(F2/F3), the greedy hill-climb loop controller, and seed-image entry (F4/F5).
+Slices landed here:
+  1. the security-critical verdict boundary + judge request-building (in isolation).
+  2. catalog-name resolution (F2) + path-stripped planner context (F3).
+  3. the greedy hill-climb loop controller (generate → judge+plan → apply →
+     candidates/winners), daemon-aware generation, and the CLI.
+Slice 4 (seed-image entry, F4/F5) is still deferred.
 
 The keystone invariant (ADR-027, security review F1): the LLM judge's output is
 gated by a CLOSED two-key allowlist — only `overrides.prompt` and
@@ -19,17 +22,19 @@ docs/security/review-refinement-loop-2026-07-13.md.
 
 from __future__ import annotations
 
+import argparse
 import base64
 import io
 import json
 import math
 import os
+import shutil
 import sqlite3
 import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional, Tuple
 
 # ── Bounds (security review F5/F6) ───────────────────────────────────────────
 #: Longest-side pixel cap for the image sent to the judge. Candidates can be
@@ -55,6 +60,22 @@ JUDGE_HTTP_TIMEOUT = 120
 JUDGE_RESPONSE_MAX_BYTES = 8 * 1024 ** 2
 
 _ALLOWED_LORA_ACTIONS = ("add", "remove", "set_weight")
+
+# ── Loop controller defaults (ADR-027 §Scoring) ──────────────────────────────
+#: Winner-ranking composite weights. Prompt-adherence is weighted above the
+#: noisier aesthetics axis.
+DEFAULT_W_PA, DEFAULT_W_AES = 0.6, 0.4
+#: Pass = BOTH axes >= this integer.
+DEFAULT_PASS_THRESHOLD = 8
+#: Hard cap on generations (bounds spend — the loop's authoritative stop).
+DEFAULT_MAX_ITERATIONS = 10
+#: Stop after this many iterations with no composite improvement.
+DEFAULT_PATIENCE = 2
+#: Judge runs at temperature 0 for low-variance / reproducible scoring.
+DEFAULT_JUDGE_TEMPERATURE = 0.0
+
+#: Load-plane path keys that must NEVER appear in a planner-visible payload (F3).
+_FORBIDDEN_CONTEXT_KEYS = ("abs_path", "path", "root", "relative_path")
 
 
 class RefineError(Exception):
@@ -377,12 +398,21 @@ def _post_judge(endpoint: str, payload: dict, key: str = "",
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             # Cap the read so a misbehaving endpoint can't stream unbounded bytes.
-            data = json.loads(resp.read(JUDGE_RESPONSE_MAX_BYTES).decode("utf-8"))
+            raw = resp.read(JUDGE_RESPONSE_MAX_BYTES)
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:300]
         raise RefineError(f"judge endpoint HTTP {e.code} from {endpoint}: {detail}") from e
     except (urllib.error.URLError, OSError) as e:
         raise RefineError(f"judge endpoint cannot reach {endpoint}: {e}") from e
+    # Decode OUTSIDE the transport try so a non-JSON / truncated (byte-capped)
+    # body raises RefineError — the F7 "consume an iteration" contract — rather
+    # than a bare JSONDecodeError that escapes refine_loop's `except RefineError`
+    # and crashes the run (security review slice-3, LOW).
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise RefineError(
+            f"judge endpoint returned a non-JSON/oversized body: {e}") from e
     try:
         return data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as e:
@@ -527,3 +557,664 @@ def assemble_planner_loras(conn, names) -> List[dict]:
         md = lora_metadata(conn, n) if conn is not None else None
         out.append(md if md is not None else {"name": n})
     return out
+
+
+# ── Working config + hill-climb state (slice 3) ──────────────────────────────
+@dataclass
+class LoraSlot:
+    """One active LoRA in the working config. `abs_path` is the LOAD target (a
+    server-side path produced by the ADR-015 resolver); it feeds generate()/the
+    daemon (the load plane) and is NEVER serialized into a planner-visible artifact
+    — the verdict.json and the judge context carry the catalog `name` + weight only
+    (ADR-027 F3 + slice-2 forward-constraint (a))."""
+    name: str
+    abs_path: str
+    weight: float = 1.0
+
+
+@dataclass
+class WorkingConfig:
+    """The mutable generation config the loop hill-climbs. `prompt` and `loras`
+    are the ONLY planner-mutable fields (ADR-027 v1 authority: prompt + LoRA, no
+    model/transformer swap); `base` carries the fixed generation params (model,
+    seed, steps, cfg, dims, quant, ...) opaquely."""
+    prompt: str
+    loras: List[LoraSlot]
+    base: dict  # model + fixed gen params; keys mirror the comfyless sidecar
+
+    def lora_names(self) -> List[str]:
+        return [s.name for s in self.loras]
+
+    def to_generate_params(self) -> dict:
+        """Params dict for the generation adapter. `loras` carry the LOAD path here
+        (this feeds generate()/the daemon — the load plane, never the planner)."""
+        p = dict(self.base)
+        p["prompt"] = self.prompt
+        p["loras"] = [{"path": s.abs_path, "weight": s.weight} for s in self.loras]
+        return p
+
+
+@dataclass
+class Candidate:
+    """One judged generation."""
+    index: int
+    image_path: str
+    metadata: dict
+    verdict: Verdict
+    composite: float
+
+
+@dataclass
+class LoopOutcome:
+    winner_path: Optional[str]
+    passed: bool
+    iterations: int
+    best_composite: Optional[float]
+
+
+def composite_score(prompt_adherence: int, aesthetics: int,
+                    w_pa: float = DEFAULT_W_PA, w_aes: float = DEFAULT_W_AES) -> float:
+    """Weighted composite for winner ranking (ADR-027 §Scoring)."""
+    return w_pa * prompt_adherence + w_aes * aesthetics
+
+
+def verdict_passes(v: Verdict, threshold: int) -> bool:
+    """Authoritative pass gate: BOTH axes >= threshold. The judge's advisory
+    `v.verdict` string is deliberately NOT consulted (a judge that lies "pass"
+    cannot self-promote past the numeric gate — ADR-027 F8)."""
+    return v.prompt_adherence >= threshold and v.aesthetics >= threshold
+
+
+def apply_overrides(cfg: WorkingConfig, verdict: Verdict,
+                    resolved_ops: List[ResolvedLoraOp],
+                    notices: Optional[List[str]] = None) -> WorkingConfig:
+    """Produce the NEXT working config from a validated verdict (pure).
+
+    Prompt: replaced iff the verdict carried a validated override prompt.
+    LoRAs: each already-RESOLVED op is applied by catalog name —
+      add        → append if absent (else noticed no-op)
+      remove     → drop if present (else noticed no-op)
+      set_weight → update if present, else add at that weight
+    `resolved_ops` have already passed the ADR-015 resolver (F2); this function
+    only merges by name/weight and never touches a raw LLM-supplied path."""
+    if notices is None:
+        notices = []
+    new_prompt = verdict.override_prompt if verdict.override_prompt else cfg.prompt
+    # Preserve insertion order while allowing O(1) membership by name.
+    slots: dict = {s.name: LoraSlot(s.name, s.abs_path, s.weight) for s in cfg.loras}
+    order: List[str] = [s.name for s in cfg.loras]
+    for r in resolved_ops:
+        name, act = r.resolved_name, r.op.action
+        if act == "remove":
+            if name in slots:
+                del slots[name]
+                order.remove(name)
+            else:
+                notices.append(f"lora {name!r}: remove — not active, ignored")
+        elif act == "add":
+            if name in slots:
+                notices.append(f"lora {name!r}: add — already active, ignored")
+            else:
+                w = r.op.weight if r.op.weight is not None else 1.0
+                slots[name] = LoraSlot(name, r.abs_path, w)
+                order.append(name)
+        elif act == "set_weight":
+            # parse_verdict guarantees a non-None weight for set_weight.
+            w = float(r.op.weight)  # type: ignore[arg-type]
+            if name in slots:
+                slots[name].weight = w
+            else:
+                slots[name] = LoraSlot(name, r.abs_path, w)
+                order.append(name)
+                notices.append(f"lora {name!r}: set_weight on inactive — added at {w}")
+    return WorkingConfig(prompt=new_prompt,
+                         loras=[slots[n] for n in order],
+                         base=dict(cfg.base))
+
+
+# ── Judge context assembly (F3 — path-stripped) ──────────────────────────────
+JUDGE_SYSTEM_PROMPT = (
+    "You are a meticulous image-quality judge for a text-to-image system. You are "
+    "shown ONE generated image plus a JSON context: the user's target prompt, the "
+    "prompt actually used, the active LoRAs (by catalog NAME and weight), and "
+    "catalog metadata for LoRAs you may consider.\n\n"
+    "Score the image on two axes, each an integer 1-10:\n"
+    "  - prompt_adherence: how completely the image realizes the TARGET prompt — "
+    "every named object, count, text string, spatial relation, and style. Missing "
+    "or wrong elements lower this hard.\n"
+    "  - aesthetics: composition, lighting, coherence, detail, and absence of "
+    "artifacts (extra limbs, warped text, seams), independent of the prompt.\n\n"
+    "Then decide fixes. You may ONLY change the prompt and the LoRA set. To change "
+    "LoRAs, reference them by a catalog NAME that appears in the provided context — "
+    "NEVER invent names and NEVER emit file paths. Actions: add, remove, set_weight "
+    "(weight is a float, typically 0-2).\n\n"
+    "Respond with STRICT JSON and nothing else, exactly this shape:\n"
+    '{"scores": {"prompt_adherence": <1-10>, "aesthetics": <1-10>}, '
+    '"critique": {"prompt_adherence": "<short>", "aesthetics": "<short>"}, '
+    '"verdict": "pass" | "revise", '
+    '"overrides": {"prompt": "<optional rewritten prompt>", '
+    '"loras": [{"name": "<catalog name>", "action": "add|remove|set_weight", '
+    '"weight": <optional float>}]}}'
+)
+
+
+def _assert_no_paths(obj: Any) -> None:
+    """Defense-in-depth (F3): raise if any load-plane path key appears anywhere in
+    a payload bound for the LLM or the path-free verdict.json. The allowlist
+    projections upstream (`_safe_lora_view`, `lora_metadata`) already strip these;
+    this is the last structural gate before the text leaves refine."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in _FORBIDDEN_CONTEXT_KEYS:
+                raise RefineError(
+                    f"F3 violation: path key {k!r} in a planner-visible payload")
+            _assert_no_paths(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            _assert_no_paths(v)
+
+
+def build_judge_user_text(target_prompt: str, cfg: WorkingConfig,
+                          planner_loras: List[dict],
+                          search_offers: Optional[List[dict]] = None) -> str:
+    """Assemble the judge/planner user message (F3: NO abs_path ever). The active
+    LoRAs are rendered as name+weight (paths dropped); `planner_loras`/`search_offers`
+    are already path-stripped upstream. `_assert_no_paths` is the final gate."""
+    payload: dict = {
+        "target_prompt": target_prompt,
+        "current_prompt": cfg.prompt,
+        "active_loras": [{"name": s.name, "weight": s.weight} for s in cfg.loras],
+        "lora_catalog": planner_loras,
+    }
+    if search_offers:
+        payload["catalog_search_offers"] = search_offers
+    _assert_no_paths(payload)
+    return ("Evaluate the attached image against the target prompt and suggest "
+            "fixes.\nContext (JSON):\n" + json.dumps(payload, indent=2,
+                                                     ensure_ascii=False))
+
+
+def _backend_key(cfg: dict) -> str:
+    """Resolve the endpoint API key per the ADR-026 registry convention: `key_env`
+    names an environment variable holding the key (a literal `key` is a fallback).
+    Mirrors enhance.enhance_openai_endpoint so a keyed judge endpoint configured in
+    the shared registry actually gets an Authorization header (code review slice-3)."""
+    env = cfg.get("key_env")
+    if env:
+        return os.environ.get(env, "")
+    return cfg.get("key", "") or ""
+
+
+def judge_candidate(image, target_prompt: str, cfg: WorkingConfig, backend_cfg: dict,
+                    planner_loras: List[dict], *,
+                    search_offers: Optional[List[dict]] = None,
+                    temperature: float = DEFAULT_JUDGE_TEMPERATURE,
+                    timeout: int = JUDGE_HTTP_TIMEOUT) -> Verdict:
+    """One combined judge+planner call: downscale image (F5) → data URI → payload →
+    POST → parse_verdict. A RefineError here means THIS iteration's verdict is
+    unusable; the loop catches it, records the failure, and continues (F7)."""
+    url = backend_cfg.get("url")
+    if not url:
+        raise RefineError("judge backend config missing 'url'")
+    key = _backend_key(backend_cfg)
+    # The model id is normally pre-resolved + cached in main() (one GET /models at
+    # startup). This fallback keeps direct callers/tests working; a failure here
+    # becomes a RefineError so it stays within the F7 iteration contract rather than
+    # escaping refine_loop's `except RefineError` (code review slice-3, MEDIUM-2).
+    model = backend_cfg.get("model")
+    if not model:
+        from comfyless import enhance
+        try:
+            model = enhance._resolve_endpoint_model(url, key, "")
+        except enhance.EnhanceError as e:
+            raise RefineError(f"judge model autodetect failed: {e}") from e
+    endpoint = url.rstrip("/") + "/chat/completions"
+    data_uri = image_to_data_uri(downscale_for_judge(image))
+    user_text = build_judge_user_text(target_prompt, cfg, planner_loras,
+                                      search_offers=search_offers)
+    payload = build_judge_payload(model, JUDGE_SYSTEM_PROMPT, user_text, data_uri,
+                                  temperature=temperature)
+    raw = _post_judge(endpoint, payload, key=key, timeout=timeout)
+    return parse_verdict(raw)
+
+
+# ── Generation adapter (daemon-first; ADR-027 warm-reuse assumption) ──────────
+@dataclass
+class GenOutcome:
+    image_path: str
+    metadata: dict
+
+
+def _daemon_namespace(device: str, precision: str, savepath: str) -> argparse.Namespace:
+    """A minimal argparse Namespace carrying just the attributes
+    generate._build_server_request reads, so we reuse the ONE canonical daemon
+    wire-request builder (it abspaths the model/LoRA/component path fields the
+    daemon validates against --model-base) instead of duplicating the wire contract.
+    NOTE: `savepath` is a TEMPLATE, not one of those validated path fields — the
+    daemon re-roots it under its own --output-dir, so run_generation normalizes the
+    returned path back into our candidates/ tree."""
+    return argparse.Namespace(
+        precision=precision, device=device, offload_vae=False,
+        attention_slicing=False, sequential_offload=False, vae_tiling="auto",
+        rebalance=False, rebalance_mult=0.0, rebalance_weights=None,
+        savepath=savepath,
+    )
+
+
+def run_generation(cfg: WorkingConfig, *, device: str, output_dir: str,
+                   stem: str, precision: str = "bf16",
+                   log: Callable[[str], None] = print) -> GenOutcome:
+    """Generate one candidate, returning it at the canonical path
+    `output_dir/stem.png`. DAEMON-FIRST: when a server is running for `device`,
+    reuse its warm pipeline (the ADR-027 performance assumption — a prompt-only
+    change reuses the pipeline, a LoRA change evicts+reloads server-side). Falls
+    back to a COLD in-process generate() when no daemon is reachable.
+
+    The daemon owns path resolution: it re-roots the savepath template under its
+    own --output-dir ("the client never dictates paths"), so its returned image
+    lands OUTSIDE our candidates/ tree. We MOVE it to the canonical path so the ADR
+    §Output layout holds and daemon/cold naming is uniform (code review slice-3)."""
+    from comfyless import generate as gen
+    from comfyless.server import socket_path
+
+    params = cfg.to_generate_params()
+    loras = params.get("loras", [])
+    canonical = os.path.join(output_dir, f"{stem}.png")
+
+    if socket_path(device).exists():
+        savepath = os.path.join(output_dir, stem)
+        args_ns = _daemon_namespace(device, precision, savepath)
+        req = gen._build_server_request(args_ns, params, loras,
+                                        savepath_override=savepath)
+        resp = gen._send_server_command(req, device)
+        if resp is not None:
+            if resp.get("status") != "ok":
+                raise RefineError(
+                    f"daemon generation failed: {resp.get('error', 'unknown error')}")
+            out_path = resp.get("output_path", "")
+            if not out_path:
+                # status=ok with no path shouldn't happen; fail loud rather than
+                # silently re-generate in-process (code review slice-3, LOW-5b).
+                raise RefineError("daemon returned status=ok but no output_path")
+            if os.path.abspath(out_path) != os.path.abspath(canonical):
+                shutil.move(out_path, canonical)
+            return GenOutcome(image_path=canonical, metadata=resp.get("metadata", {}))
+        # resp is None: socket present but the connection failed. Say so — running
+        # in-process now risks a VRAM collision with the resident daemon (code
+        # review slice-3, LOW-5a).
+        log(f"[refine] daemon socket present on {device} but unreachable — running "
+            f"in-process (possible VRAM contention with the resident daemon)")
+
+    # Cold in-process path. Forward the FULL weight-override set (transformer/VAE/
+    # text-encoder/refiner) to match the daemon path, so a future seed-params slice
+    # cannot silently generate with the wrong weights here (code review slice-3, LOW-7).
+    metadata = gen.generate(
+        model_path=params["model"],
+        prompt=params["prompt"],
+        output_path=canonical,
+        negative_prompt=params.get("negative_prompt", ""),
+        seed=params.get("seed", -1),
+        steps=params.get("steps", 28),
+        cfg_scale=params.get("cfg_scale", 3.5),
+        true_cfg_scale=params.get("true_cfg_scale"),
+        width=params.get("width", 1024),
+        height=params.get("height", 1024),
+        sampler=params.get("sampler", "default"),
+        schedule=params.get("schedule", "linear"),
+        max_sequence_length=params.get("max_sequence_length", 512),
+        loras=loras,
+        precision=precision,
+        device=device,
+        transformer_path=params.get("transformer_path", ""),
+        vae_path=params.get("vae_path", ""),
+        text_encoder_path=params.get("text_encoder_path", ""),
+        text_encoder_2_path=params.get("text_encoder_2_path", ""),
+        vae_from_transformer=params.get("vae_from_transformer", False),
+        refiner_path=params.get("refiner_path", ""),
+        refiner_steps=params.get("refiner_steps", 4),
+        refiner_cfg=params.get("refiner_cfg", 3.5),
+        quant=params.get("quant") or "none",
+        quant_skip=tuple(params.get("quant_skip") or ()),
+        quant_only=tuple(params.get("quant_only") or ()),
+        nag_scale=params.get("nag_scale", 0.0),
+        nag_tau=params.get("nag_tau", 2.5),
+        nag_alpha=params.get("nag_alpha", 0.25),
+        nag_end=params.get("nag_end", 1.0),
+    )
+    return GenOutcome(image_path=canonical, metadata=metadata)
+
+
+# ── Audit-trail writers ──────────────────────────────────────────────────────
+def _write_json(path: str, obj: dict) -> None:
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2, default=str)
+
+
+def verdict_record(cand: Candidate, w_pa: float, w_aes: float) -> dict:
+    """The path-free per-candidate audit record (`*.verdict.json`). Carries scores,
+    critique, the composite, and the overrides the planner PROPOSED (by name — the
+    raw LoraOp.name, no resolved path). `_assert_no_paths` gates it."""
+    v = cand.verdict
+    rec = {
+        "iteration": cand.index,
+        "scores": {"prompt_adherence": v.prompt_adherence,
+                   "aesthetics": v.aesthetics},
+        "composite": cand.composite,
+        "weights": {"prompt_adherence": w_pa, "aesthetics": w_aes},
+        "verdict": v.verdict,  # advisory self-report, not the pass gate
+        "critique": v.critique,
+        "proposed_overrides": {
+            "prompt": v.override_prompt,
+            "loras": [{"name": op.name, "action": op.action, "weight": op.weight}
+                      for op in v.lora_ops],
+        },
+        "notices": v.notices,
+    }
+    _assert_no_paths(rec)
+    return rec
+
+
+# ── Loop controller (greedy hill-climb) ──────────────────────────────────────
+def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
+                conn, backend_cfg: dict, output_dir: str, device: str,
+                precision: str = "bf16",
+                pass_threshold: int = DEFAULT_PASS_THRESHOLD,
+                max_iterations: int = DEFAULT_MAX_ITERATIONS,
+                patience: int = DEFAULT_PATIENCE,
+                w_pa: float = DEFAULT_W_PA, w_aes: float = DEFAULT_W_AES,
+                judge_timeout: int = JUDGE_HTTP_TIMEOUT,
+                log: Callable[[str], None] = print) -> LoopOutcome:
+    """Greedy hill-climb (ADR-027 §Loop). Each iteration: generate → judge+plan →
+    record → stop-check (pass / cap / patience) → apply overrides. A generation
+    failure is FATAL (every iteration would fail identically); a malformed judge
+    verdict only consumes an iteration (F7). Winner = the passing candidate, or the
+    top-composite candidate if none passed."""
+    from PIL import Image
+    candidates_dir = os.path.join(output_dir, "candidates")
+    winners_dir = os.path.join(output_dir, "winners")
+    os.makedirs(candidates_dir, exist_ok=True)
+    os.makedirs(winners_dir, exist_ok=True)
+
+    best: Optional[Candidate] = None
+    passed = False
+    no_improve = 0
+    iters_run = 0
+
+    for i in range(max_iterations):
+        iters_run = i + 1
+        outcome = run_generation(cfg, device=device, output_dir=candidates_dir,
+                                 stem=f"candidate_{i:02d}", precision=precision,
+                                 log=log)
+        stem = os.path.splitext(outcome.image_path)[0]
+        # Load-plane sidecar (carries paths — the human's --params replay artifact,
+        # NOT planner-facing; distinct from the path-free *.verdict.json below).
+        _write_json(stem + ".json", outcome.metadata)
+        # Pin the seed after the first generation so later iterations vary ONLY
+        # prompt/LoRA — a controlled hill-climb, not a random walk.
+        if i == 0 and outcome.metadata.get("seed") is not None:
+            cfg.base["seed"] = outcome.metadata["seed"]
+
+        planner_loras = assemble_planner_loras(conn, cfg.lora_names())
+        # FTS search on the target prompt offers ADD candidates by real catalog
+        # name (ADR §Planner context) — without this the planner sees only active
+        # LoRAs and can never add one, gutting half the v1 authority (code review
+        # slice-3, MEDIUM-3). Path-free (search_loras projects through the
+        # allowlist); a bad-FTS-syntax prompt degrades to no offers, never fatal.
+        search_offers = None
+        if conn is not None:
+            try:
+                search_offers = search_loras(conn, target_prompt)
+            except Exception as e:  # noqa: BLE001 — FTS on arbitrary text can raise
+                log(f"[refine] iter {i}: catalog search skipped ({e})")
+        img = Image.open(outcome.image_path).convert("RGB")
+        try:
+            verdict = judge_candidate(img, target_prompt, cfg, backend_cfg,
+                                      planner_loras, search_offers=search_offers,
+                                      timeout=judge_timeout)
+        except RefineError as e:
+            log(f"[refine] iter {i}: judge verdict unusable ({e}); "
+                f"consuming iteration, config unchanged")
+            _write_json(stem + ".verdict.json", {"iteration": i, "error": str(e)})
+            no_improve += 1
+            if no_improve >= patience:
+                log(f"[refine] no usable improvement for {patience} iters — stopping")
+                break
+            continue
+
+        comp = composite_score(verdict.prompt_adherence, verdict.aesthetics,
+                               w_pa, w_aes)
+        cand = Candidate(index=i, image_path=outcome.image_path,
+                         metadata=outcome.metadata, verdict=verdict, composite=comp)
+        for n in verdict.notices:
+            log(f"[refine] iter {i}: verdict notice: {n}")
+        _write_json(stem + ".verdict.json", verdict_record(cand, w_pa, w_aes))
+        log(f"[refine] iter {i}: prompt_adherence={verdict.prompt_adherence} "
+            f"aesthetics={verdict.aesthetics} composite={comp:.2f}")
+
+        if verdict_passes(verdict, pass_threshold):
+            log(f"[refine] iter {i}: PASS — both axes >= {pass_threshold}, stopping")
+            best = cand
+            passed = True
+            break
+
+        if best is None or comp > best.composite:
+            best = cand
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        if i == max_iterations - 1:
+            log(f"[refine] iteration cap {max_iterations} reached — stopping")
+            break
+        if no_improve >= patience:
+            log(f"[refine] no composite improvement for {patience} iters — stopping")
+            break
+
+        # Apply the planner's validated overrides → next config. Resolver notices
+        # stay operator/stderr-only (slice-2 forward-constraint (b): filesystem-drift
+        # state must never re-enter LLM context).
+        resolved_ops, res_notices = resolve_lora_ops(catalog, roots, verdict.lora_ops)
+        for n in res_notices:
+            log(f"[refine] iter {i}: {n}")
+        apply_notices: List[str] = []
+        cfg = apply_overrides(cfg, verdict, resolved_ops, apply_notices)
+        for n in apply_notices:
+            log(f"[refine] iter {i}: {n}")
+
+    if best is None:
+        log("[refine] no usable candidate produced — winners/ is empty")
+        return LoopOutcome(winner_path=None, passed=False,
+                           iterations=iters_run, best_composite=None)
+    win_dst = os.path.join(winners_dir, os.path.basename(best.image_path))
+    shutil.copy2(best.image_path, win_dst)
+    log(f"[refine] winner: {win_dst} (composite={best.composite:.2f}, passed={passed})")
+    return LoopOutcome(winner_path=win_dst, passed=passed,
+                       iterations=iters_run, best_composite=best.composite)
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+def _resolve_startup_loras(catalog, roots, specs: List[str]) -> List[LoraSlot]:
+    """Resolve optional `--lora NAME[:WEIGHT]` seed LoRAs through the SAME ADR-015
+    resolver the planner output uses (F2). User CLI input is trusted, but routing it
+    through the resolver keeps one name→path plane and gives clean not-found errors."""
+    slots: List[LoraSlot] = []
+    for spec in specs:
+        name, _, w = spec.partition(":")
+        try:
+            weight = float(w) if w else 1.0
+        except ValueError:
+            raise RefineError(f"--lora {spec!r}: weight {w!r} is not a number")
+        op = LoraOp(name=name.strip(), action="add", weight=weight)
+        resolved, _ = resolve_lora_ops(catalog, roots, [op])
+        if not resolved:
+            raise RefineError(f"--lora {spec!r}: not resolvable as a catalog LoRA")
+        slots.append(LoraSlot(resolved[0].resolved_name, resolved[0].abs_path, weight))
+    return slots
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="comfyless.refine",
+        description="Iterative LLM-as-judge refinement loop (ADR-027). Fresh "
+                    "--prompt entry; greedy generate→judge→plan hill-climb.")
+    p.add_argument("--prompt", required=True, help="Target generation prompt")
+    p.add_argument("--model", required=True,
+                   help="Diffusers model directory (validated against --model-base "
+                        "when a daemon is running; trusted CLI input otherwise)")
+    p.add_argument("--output-dir", required=True,
+                   help="Run directory; candidates/ and winners/ are created inside")
+    # Resolver plane (mirrors the MCP server startup roots).
+    p.add_argument("--model-base", required=True,
+                   help="Root that all model/LoRA paths must be within (catalog scan)")
+    p.add_argument("--lora-path", action="append", default=[], metavar="DIR",
+                   help="Extra LoRA scan root (repeatable; ADR-018)")
+    p.add_argument("--transformer-path", action="append", default=[], metavar="DIR",
+                   help="Extra transformer scan root (repeatable; ADR-018)")
+    p.add_argument("--catalog", default=None, metavar="FILE",
+                   help="Optional operator catalog manifest (ADR-022)")
+    p.add_argument("--catalog-db", default=None, metavar="FILE",
+                   help="Optional metadata DB for LoRA descriptions (ADR-022 S5)")
+    p.add_argument("--lora", action="append", default=[], metavar="NAME[:WEIGHT]",
+                   help="Seed LoRA by catalog name (repeatable). The planner may "
+                        "add/remove/reweight from here.")
+    # Judge backend (reuses the enhancer registry, ADR-026).
+    p.add_argument("--judge-backend", required=True, metavar="NAME",
+                   help="openai-endpoint backend name from the enhancer registry")
+    p.add_argument("--judge-config", default=None, metavar="PATH",
+                   help="Enhancer registry TOML (default: registry search)")
+    p.add_argument("--judge-timeout", type=int, default=JUDGE_HTTP_TIMEOUT,
+                   metavar="SEC", help="Per-call judge HTTP timeout")
+    # Loop controls.
+    p.add_argument("--pass-threshold", type=int, default=DEFAULT_PASS_THRESHOLD,
+                   help="Pass when BOTH axes >= this (default 8)")
+    p.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS,
+                   help="Hard cap on generations (default 10)")
+    p.add_argument("--patience", type=int, default=DEFAULT_PATIENCE,
+                   help="Stop after N iters with no composite gain (default 2)")
+    p.add_argument("--w-prompt-adherence", type=float, default=DEFAULT_W_PA,
+                   help="Composite weight for prompt-adherence (default 0.6)")
+    p.add_argument("--w-aesthetics", type=float, default=DEFAULT_W_AES,
+                   help="Composite weight for aesthetics (default 0.4)")
+    # Generation params (fixed across the run; base of the working config).
+    p.add_argument("--negative-prompt", default="")
+    p.add_argument("--seed", type=int, default=-1)
+    p.add_argument("--steps", type=int, default=28)
+    p.add_argument("--cfg", type=float, default=3.5)
+    p.add_argument("--true-cfg", type=float, default=None)
+    p.add_argument("--width", type=int, default=1024)
+    p.add_argument("--height", type=int, default=1024)
+    p.add_argument("--sampler", default="default")
+    p.add_argument("--max-seq-len", type=int, default=512)
+    p.add_argument("--quant", default="none")
+    p.add_argument("--device", default="cuda")
+    p.add_argument("--precision", default="bf16", choices=["bf16", "fp16", "fp32"])
+    return p
+
+
+def build_config_from_args(args, catalog, roots) -> WorkingConfig:
+    """Assemble the initial WorkingConfig from CLI args (pure w.r.t. generation).
+    Seed LoRAs are resolved through the ADR-015 resolver; all other fields are
+    trusted CLI input carried in `base`."""
+    seed_loras = _resolve_startup_loras(catalog, roots, args.lora)
+    base = {
+        "model": os.path.abspath(args.model),
+        "negative_prompt": args.negative_prompt,
+        "seed": args.seed,
+        "steps": args.steps,
+        "cfg_scale": args.cfg,
+        "true_cfg_scale": args.true_cfg,
+        "width": args.width,
+        "height": args.height,
+        "sampler": args.sampler,
+        "max_sequence_length": args.max_seq_len,
+        "quant": args.quant,
+    }
+    return WorkingConfig(prompt=args.prompt, loras=seed_loras, base=base)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = _build_arg_parser().parse_args(argv)
+    log = print
+
+    # Resolver plane: build the catalog + all_roots union exactly as the MCP
+    # server does (same operator roots), so planner names resolve consistently and
+    # daemon path-validation (against --model-base) agrees.
+    from comfyless.catalog import build_catalog, CatalogBuildError
+    model_base_real = os.path.realpath(args.model_base)
+    lora_roots = tuple(os.path.realpath(r) for r in args.lora_path)
+    tf_roots = tuple(os.path.realpath(r) for r in args.transformer_path)
+    try:
+        catalog = build_catalog(model_base_real, args.catalog,
+                                lora_paths=lora_roots, transformer_paths=tf_roots)
+    except CatalogBuildError as e:
+        print(f"[refine] catalog build failed: {e}", file=sys.stderr)
+        return 2
+    roots: Tuple[str, ...] = (model_base_real, *lora_roots, *tf_roots)
+
+    # Judge backend from the enhancer registry (must be openai-endpoint — the
+    # vision path). Fail closed on an unknown / wrong-type backend.
+    from comfyless import enhance
+    try:
+        backends = enhance.load_backends(args.judge_config)
+    except enhance.EnhanceError as e:
+        print(f"[refine] judge registry error: {e}", file=sys.stderr)
+        return 2
+    backend_cfg = backends.get(args.judge_backend)
+    if backend_cfg is None:
+        print(f"[refine] no such judge backend {args.judge_backend!r} "
+              f"(have: {', '.join(sorted(backends))})", file=sys.stderr)
+        return 2
+    if backend_cfg.get("type") != "openai-endpoint":
+        print(f"[refine] judge backend {args.judge_backend!r} must be type "
+              f"'openai-endpoint' (the vision path), got "
+              f"{backend_cfg.get('type')!r}", file=sys.stderr)
+        return 2
+
+    # Resolve + cache the judge model id ONCE at startup (one GET /models). Doing it
+    # per-iteration would let a transient /models failure abort the loop mid-run and
+    # skip winner finalization (code review slice-3, MEDIUM-2).
+    if not backend_cfg.get("model"):
+        try:
+            backend_cfg["model"] = enhance._resolve_endpoint_model(
+                backend_cfg["url"], _backend_key(backend_cfg), "")
+        except enhance.EnhanceError as e:
+            print(f"[refine] judge model autodetect failed: {e}", file=sys.stderr)
+            return 2
+
+    conn = open_catalog_db(args.catalog_db) if args.catalog_db else None
+    try:
+        cfg = build_config_from_args(args, catalog, roots)
+    except RefineError as e:
+        print(f"[refine] {e}", file=sys.stderr)
+        return 2
+
+    if not os.path.isdir(args.output_dir):
+        os.makedirs(args.output_dir, exist_ok=True)
+
+    try:
+        result = refine_loop(
+            cfg, target_prompt=args.prompt, catalog=catalog, roots=roots,
+            conn=conn, backend_cfg=backend_cfg, output_dir=args.output_dir,
+            device=args.device, precision=args.precision,
+            pass_threshold=args.pass_threshold, max_iterations=args.max_iterations,
+            patience=args.patience, w_pa=args.w_prompt_adherence,
+            w_aes=args.w_aesthetics, judge_timeout=args.judge_timeout, log=log)
+    except RefineError as e:
+        # A fatal generation error (e.g. daemon failure, model not found) surfaces
+        # here as a clean exit, not a traceback (code review slice-3, LOW-8).
+        print(f"[refine] run aborted: {e}", file=sys.stderr)
+        return 1
+    finally:
+        if conn is not None:
+            conn.close()
+
+    if result.winner_path is None:
+        return 1
+    print(f"\nDone. winner={result.winner_path} passed={result.passed} "
+          f"iterations={result.iterations} "
+          f"best_composite={result.best_composite:.2f}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
