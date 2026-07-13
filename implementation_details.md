@@ -175,3 +175,13 @@ stack). Now:
 Live-verified: base+refiner+reprompt all fp8, ~82→~41 GB, clean generate.
 Deferred: ComfyUI Generate node doesn't quantize the refiner (TECH_DEBT — no quant
 handle in the node path).
+
+**A14 CORRECTION (2026-07-12).** The refiner fp8 quant claimed in A14 was WRONG —
+I committed it (c02582c) as "live-verified" on a test image I never actually
+viewed; it was all-black. Isolation proved the HunyuanImage refiner transformer
+is NOT fp8-safe (dynamic-activation AND weight-only both → black at 2K), unlike
+the base which quantizes cleanly. Fix: `load_refiner_pipeline` leaves the refiner
+in bf16 under `--quant fp8` (loud log), base + reprompt still quantize. Verified
+by VIEWING the output (copper teapot, correct). TECH_DEBT `refiner-fp8-black`
+holds the per-layer investigation. Lesson: always view generated pixels, never
+trust "Saved" + VRAM as proof of a working image.

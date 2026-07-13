@@ -1237,3 +1237,20 @@ forward; the operator uses the comfyless CLI for VRAM-tight hunyuan runs.
 **Trigger:** node-path refiner VRAM becomes a real constraint — thread the quant
 mode through GEN_PIPELINE (or detect the base's torchao state) into the node's
 refiner load. Surfaced with the refiner-quant slice, 2026-07-12.
+Resolved: 2026-07-12 — MOOT. The refiner is now NOT fp8-quantized on ANY path
+(it produces black output under fp8 — see next entry), so the node correctly
+matches the CLI/daemon behavior. Re-opens only if refiner fp8 is ever fixed.
+
+**HunyuanImage refiner is not fp8-safe (black output)** *(2026-07-12)*
+Quantizing the refiner's transformer to fp8 — either torchao recipe,
+dynamic-activation OR weight-only — produces all-black (NaN) output at 2K, even
+though the BASE transformer quantizes cleanly (verified by isolation: base-only
+fp8 = content; base+refiner fp8 = mean 0.0 black). `load_refiner_pipeline` now
+leaves the refiner in bf16 under `--quant fp8` with a loud log; the base +
+reprompt still quantize. **Why not now:** root cause is per-layer (some refiner
+Linear(s) overflow fp8) and needs a component-level exclusion investigation
+(which modules to skip), not a recipe flip. **Trigger:** someone wants the
+refiner's ~34 GB back under quant — bisect the refiner's Linear modules under
+fp8 to find the NaN source and add a targeted skip-set, then re-enable the
+(already-threaded) quant path in `hunyuan_chain.load_refiner_pipeline`. The
+quant params stay wired through generate/server for that future fix.

@@ -119,24 +119,16 @@ def load_refiner_pipeline(
         local_files_only=True,
     )
 
-    # Quantize the refiner's own transformer (its dominant VRAM) to match the
-    # base — the shared text_encoder inherits the base's quant state. Quantize
-    # on CPU BEFORE .to(device) so the fp8 weights (not bf16) land on the GPU,
-    # which matters when the base+refiner+reprompt stack barely fits. Uses the
-    # refiner family's fp8 recipe (same quantize_module the base override path
-    # uses); quant_skip/quant_only name refiner component slots.
+    # NOTE: the HunyuanImage refiner transformer is NOT fp8-safe. Quantizing it
+    # (either torchao recipe — dynamic-activation OR weight-only) produces
+    # all-black output, verified 2026-07-12, even though the BASE quantizes
+    # cleanly. So `--quant fp8` leaves the refiner in bf16; the base + reprompt
+    # still quantize. The quant params stay in the signature (threaded from all
+    # call sites) so a future per-layer fix can re-enable it. See TECH_DEBT
+    # (refiner-fp8-black) for the investigation trigger.
     if quant and quant != "none":
-        from nodes.eric_diffusion_utils import quantize_module
-        skip = set(quant_skip or ())
-        only = set(quant_only or ())
-        for slot in ("transformer",):
-            if (only and slot not in only) or slot in skip:
-                continue
-            comp = getattr(refiner, slot, None)
-            if comp is not None and hasattr(comp, "parameters"):
-                if quantize_module(comp, quant, family=family,
-                                   log_prefix="[comfyless]"):
-                    _log(f"[comfyless] quant: refiner {slot!r} quantized ({quant})")
+        _log(f"[comfyless] quant: refiner left in {precision} — the HunyuanImage "
+             f"refiner is not fp8-safe (fp8 → black output); base is quantized")
 
     refiner = refiner.to(device)
 
