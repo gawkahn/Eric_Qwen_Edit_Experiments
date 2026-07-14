@@ -56,6 +56,7 @@ _PATH_FIELDS = frozenset({
     "model",
     "transformer_path",
     "vae_path",
+    "upscale_vae_path",
     "text_encoder_path",
     "text_encoder_2_path",
     "refiner_path",
@@ -243,8 +244,8 @@ def _check_paths(req: dict, roots: Union[str, Sequence[str]]) -> Optional[str]:
     # pickle-deserialization is allowed against) applies to the refiner (also
     # a model). The `_within` realpath+containment check enforces that
     # invariant for the refiner identically to every other model-path field.
-    for field in ("transformer_path", "vae_path", "text_encoder_path",
-                  "text_encoder_2_path", "refiner_path"):
+    for field in ("transformer_path", "vae_path", "upscale_vae_path",
+                  "text_encoder_path", "text_encoder_2_path", "refiner_path"):
         p = req.get(field, "") or ""
         if p:
             if not p.startswith("/"):
@@ -708,6 +709,31 @@ def _handle_generate(
             _log(f"[server] WARNING: {msg}")
             lora_warnings.append(msg)
 
+    # ── ADR-030: upscale VAE cache ────────────────────────────────────
+    # Cached INDEPENDENTLY of the pipeline (its own key, not in
+    # _request_cache_key) so switching the upscale VAE never evicts the
+    # 20B pipeline. Kept on CPU between requests; the decode helper moves
+    # it to GPU per-call and offloads it back. allow_download=False — the
+    # daemon never fetches from the network (local_files_only posture).
+    # Placed BEFORE the output reservation so a load failure returns cleanly
+    # without orphaning a reserved 0-byte PNG (code-review, ADR-020 parity).
+    up_path = req.get("upscale_vae_path", "") or ""
+    up_sub  = req.get("upscale_vae_subfolder", "") or ""
+    up_key  = (up_path, up_sub, req_precision)
+    if not up_path:
+        server_state.pop("upscale_vae", None)
+        server_state.pop("upscale_vae_key", None)
+    elif server_state.get("upscale_vae_key") != up_key:
+        from .generate import _load_upscale_vae
+        try:
+            server_state["upscale_vae"] = _load_upscale_vae(
+                up_path, up_sub, req_precision, allow_download=False)
+            server_state["upscale_vae_key"] = up_key
+            _log(f"[server] Upscale VAE cached ({up_path!r})")
+        except Exception as e:
+            return {"status": "error", "error_type": "LoadError",
+                    "error": f"upscale VAE load failed: {e}"}
+
     # ── Resolve output path (server owns this; client template is just a hint) ──
     # _reserved holds a 0-byte placeholder path when the auto-numbered branch
     # atomically claims a name (Finding 1); it is unlinked if generation fails so
@@ -781,6 +807,7 @@ def _handle_generate(
         "model_family":     server_state["model_family"],
         "guidance_embeds":  server_state["guidance_embeds"],
         "refiner_pipeline": server_state.get("refiner_pipeline"),
+        "upscale_vae":      server_state.get("upscale_vae"),
     }
     try:
         metadata = generate(
@@ -808,6 +835,8 @@ def _handle_generate(
             rebalance_weights=req.get("rebalance_weights"),
             transformer_path=req.get("transformer_path",    "") or "",
             vae_path=req.get("vae_path",            "") or "",
+            upscale_vae_path=req.get("upscale_vae_path", "") or "",
+            upscale_vae_subfolder=req.get("upscale_vae_subfolder", "") or "",
             text_encoder_path=req.get("text_encoder_path",   "") or "",
             text_encoder_2_path=req.get("text_encoder_2_path", "") or "",
             vae_from_transformer=bool(req.get("vae_from_transformer")),

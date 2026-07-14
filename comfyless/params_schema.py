@@ -67,6 +67,10 @@ _FIELD_DEFAULTS: Dict[str, object] = {
     "max_sequence_length":  512,
     "transformer_path":     "",
     "vae_path":             "",
+    # ADR-030: Wan 2× upscale VAE. Empty = off. Subfolder is the in-repo
+    # diffusers subdir (spacepxl default); empty loads from the path root.
+    "upscale_vae_path":      "",
+    "upscale_vae_subfolder": "",
     "text_encoder_path":    "",
     "text_encoder_2_path":  "",
     "vae_from_transformer": False,
@@ -130,6 +134,7 @@ _CLI_TO_CANONICAL: Dict[str, str] = {
     "max_seq_len": "max_sequence_length",
     "transformer": "transformer_path",
     "vae":         "vae_path",
+    "upscale_vae": "upscale_vae_path",
     "te1":         "text_encoder_path",
     "te2":         "text_encoder_2_path",
     "lora":        "loras",

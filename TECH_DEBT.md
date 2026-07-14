@@ -1254,3 +1254,17 @@ refiner's ~34 GB back under quant — bisect the refiner's Linear modules under
 fp8 to find the NaN source and add a targeted skip-set, then re-enable the
 (already-threaded) quant path in `hunyuan_chain.load_refiner_pipeline`. The
 quant params stay wired through generate/server for that future fix.
+
+**Upscale-VAE decode round-trips the 20B transformer CPU↔GPU every call (ADR-030)** *(2026-07-14)*
+`decode_latents_with_upscale_vae_safe` unconditionally offloads `pipe.transformer`
+to CPU and back for each 2× upscale decode (to free VRAM for the Wan decode). In
+the `--serve` daemon that means every `--upscale-vae` generation pays a ~40 GB
+(bf16 20B) PCIe transfer each way — real seconds — partially undercutting the
+speed win that motivates the feature. Restore is guaranteed in a `finally`, so
+the cache stays correct; only latency is affected. The `.to("cpu")`/`.to(cuda)`
+round-trip of a torchao-quantized (`--quant fp8`) transformer is also unverified.
+**Why not now:** slice 1 prioritized correctness + the daemon cache design; the
+offload is the proven-safe node behavior. **Trigger:** upscale becomes a hot
+daemon path — make the offload conditional on free VRAM (skip when the Wan decode
+fits alongside the resident transformer) or opt-in for the daemon, and add a
+hot test for `--quant fp8` + `--upscale-vae`. Surfaced by code-review of ADR-030.

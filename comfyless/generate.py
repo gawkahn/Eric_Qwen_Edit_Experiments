@@ -116,7 +116,10 @@ _SKIP_SIDECAR_KEYS = {"timestamp", "elapsed_seconds", "contract_version",
                       "lora_warnings", "nag_warnings", "model_family",
                       # rebalance is a runtime CLI flag, not a schema param;
                       # recorded for provenance but re-pass --rebalance to replay.
-                      "rebalance"}
+                      "rebalance",
+                      # ADR-030: derived provenance (output is 2× gen res), not
+                      # an input param — re-pass --upscale-vae to replay instead.
+                      "upscale_factor"}
 
 
 def _type_name(t) -> str:
@@ -1263,6 +1266,87 @@ def _apply_sigma_schedule(call_kwargs: dict, pipe, schedule: str,
     return warn
 
 
+# ── ADR-030: 2× upscale-VAE decode ────────────────────────────────────
+# spacepxl Wan2.1-VAE-upscale2x is a 12-channel decoder-only finetune;
+# pixel_shuffle(2) turns its output into a 2×-resolution image, giving
+# near-2048 output from a ~1024 (≈¼-cost) gen. Valid only on the families
+# that emit Qwen-layout packed latents in the shared Wan/Qwen latent space
+# (identical latents_mean/std); other families (flux/flux2) would decode
+# garbage. NB: the actual Wan video pipeline is intentionally NOT here — it
+# does not emit Qwen-style packed [B, seq, C*4] latents the decode helper
+# expects, and its family string doesn't resolve through _FAMILY_PATTERNS.
+_UPSCALE_COMPATIBLE_FAMILIES = frozenset(
+    {"krea", "krea-turbo", "qwen-image"})
+_UPSCALE_VAE_DEFAULT_SUBFOLDER = "diffusers/Wan2.1_VAE_upscale2x_imageonly_real_v1"
+
+
+def _load_upscale_vae(path: str, subfolder: str, precision: str,
+                      allow_download: bool):
+    """Load the AutoencoderKLWan 2× upscale VAE (kept on CPU until decode).
+
+    The caller-supplied ``path`` is resolved through ``resolve_hf_path``
+    (same trust boundary as ``--vae``) before any load. Returns the eval
+    VAE on CPU; ``decode_latents_with_upscale_vae_safe`` moves it to the
+    GPU per-decode and offloads it back.
+    """
+    import os
+    import torch
+    from diffusers import AutoencoderKLWan
+    from nodes.eric_diffusion_utils import resolve_hf_path
+
+    resolved = resolve_hf_path(path.strip(), allow_download=allow_download)
+    dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
+             "fp32": torch.float32}.get(precision, torch.bfloat16)
+    kwargs = {"torch_dtype": dtype}
+    # Subfolder resolution: explicit wins; else if the path is a repo root
+    # (no config.json at the top) fall back to spacepxl's standard diffusers
+    # subdir, so `--upscale-vae <repo>` works with no extra flag. If the path
+    # already points at the model dir (config.json present), use no subfolder.
+    sub = (subfolder or "").strip()
+    if not sub and not os.path.exists(os.path.join(resolved, "config.json")):
+        sub = _UPSCALE_VAE_DEFAULT_SUBFOLDER
+    if sub:
+        # Security (ADR-030 review, HIGH): `sub` is joined onto the already
+        # root-validated `resolved` and handed to from_pretrained, which reads
+        # config + weights (torch.load a .bin = pickle) from there. An absolute
+        # or `..`-traversing value escapes `resolved`, reopening the arbitrary-
+        # directory-load hole that _check_paths closes for the path itself.
+        # Confine to `resolved` via realpath (also catches symlink escapes).
+        root = os.path.realpath(resolved)
+        joined = os.path.realpath(os.path.join(resolved, sub))
+        if os.path.isabs(sub) or not (
+                joined == root or joined.startswith(root + os.sep)):
+            raise ValueError(
+                "upscale_vae_subfolder must be a relative subpath within the "
+                f"upscale VAE directory; refusing {subfolder!r}")
+        kwargs["subfolder"] = sub
+    vae = AutoencoderKLWan.from_pretrained(
+        resolved, local_files_only=not allow_download, **kwargs)
+    vae.eval()
+    return vae
+
+
+def _decode_upscale_2x(packed_latents, pipe, upscale_vae, height, width,
+                       device):
+    """Decode packed pipeline latents to a 2× PIL image via the upscale VAE.
+
+    Reuses the proven node helper (device pinning, transformer
+    offload/restore, auto-tiling). ``packed_latents`` is what the pipe
+    returns under ``output_type='latent'``.
+    """
+    import numpy as np
+    from PIL import Image
+    from nodes.eric_qwen_upscale_vae import decode_latents_with_upscale_vae_safe
+
+    vsf = int(getattr(pipe, "vae_scale_factor", 8) or 8)
+    img = decode_latents_with_upscale_vae_safe(
+        packed_latents, upscale_vae, pipe, int(height), int(width),
+        vae_scale_factor=vsf, device=device, log_prefix="[comfyless]",
+    )  # [B, 2H, 2W, 3] float32 in [0, 1] on CPU
+    arr = (img[0].clamp(0.0, 1.0).numpy() * 255.0).round().astype(np.uint8)
+    return Image.fromarray(arr)
+
+
 def generate(
     model_path: str,
     prompt: str,
@@ -1308,6 +1392,8 @@ def generate(
     nag_tau: float = 2.5,
     nag_alpha: float = 0.25,
     nag_end: float = 1.0,
+    upscale_vae_path: str = "",
+    upscale_vae_subfolder: str = "",
     _cached_pipeline: Optional[Dict[str, Any]] = None,
     mcp_caller: bool = False,
     extra_metadata: Optional[Dict[str, Any]] = None,
@@ -1364,6 +1450,35 @@ def generate(
             allow_hf_download=allow_hf_download,
             quant=quant, quant_skip=quant_skip, quant_only=quant_only,
         )
+
+    # ── ADR-030: 2× upscale-VAE gate + load ───────────────────────────
+    # When --upscale-vae is set, generation runs at the requested (gen)
+    # resolution and the FINAL decode goes through the Wan 2× upscale VAE,
+    # producing a 2× PNG. Gate to Qwen/Wan-latent families (shared latent
+    # space); other families would decode garbage. The daemon pre-loads
+    # and hands the VAE in via the cached dict; otherwise load inline.
+    upscale_active = bool(upscale_vae_path) or (
+        _cached_pipeline is not None
+        and _cached_pipeline.get("upscale_vae") is not None)
+    upscale_vae = None
+    if upscale_active:
+        if model_family not in _UPSCALE_COMPATIBLE_FAMILIES:
+            raise ValueError(
+                f"--upscale-vae is only supported for Qwen/Wan-latent "
+                f"families {sorted(_UPSCALE_COMPATIBLE_FAMILIES)}; --model "
+                f"resolved to family {model_family!r}. The upscale VAE shares "
+                f"the Qwen/Wan latent space and would decode garbage on other "
+                f"families."
+            )
+        if (_cached_pipeline is not None
+                and _cached_pipeline.get("upscale_vae") is not None):
+            upscale_vae = _cached_pipeline["upscale_vae"]
+            _log("[comfyless] Reusing cached upscale VAE")
+        else:
+            upscale_vae = _load_upscale_vae(
+                upscale_vae_path, upscale_vae_subfolder,
+                precision, allow_hf_download)
+            _log(f"[comfyless] Upscale VAE loaded ({upscale_vae_path!r})")
 
     # ── Hunyuan-Image refiner gate + load (ADR-016) ───────────────────
     # The chain activates when family is hunyuan-image AND refiner_path
@@ -1565,6 +1680,11 @@ def generate(
                 generator=generator,
             )
     else:
+        if upscale_active:
+            # ADR-030: generate at the requested (gen) resolution and emit
+            # packed latents; the Wan 2× upscale VAE decodes them to a 2×
+            # image below (output PNG is 2× width × 2× height).
+            call_kwargs["output_type"] = "latent"
         with swap_sampler(pipe, effective_sampler, log_prefix="[comfyless]"):
             if nag_active:
                 # Unbound Krea2NAGPipeline.__call__ on the (possibly cached)
@@ -1574,7 +1694,11 @@ def generate(
                 result = nag_pipe_call(pipe, **call_kwargs)
             else:
                 result = pipe(**call_kwargs)
-        final_pil = result.images[0]
+        if upscale_active:
+            final_pil = _decode_upscale_2x(
+                result.images, pipe, upscale_vae, height, width, device)
+        else:
+            final_pil = result.images[0]
     elapsed = time.monotonic() - t0
     _log(f"[comfyless] Generated in {elapsed:.1f}s")
 
@@ -1616,6 +1740,14 @@ def generate(
         "nag_tau": nag_tau,
         "nag_alpha": nag_alpha,
         "nag_end": nag_end,
+        # ADR-030: 2× upscale-VAE decode. width/height above are the GEN
+        # (pre-upscale) resolution; when active the saved PNG is 2× each.
+        # Canonical schema keys → sidecar-replayable: re-pass --upscale-vae /
+        # --upscale-vae-subfolder to reproduce. upscale_factor is derived
+        # provenance (not an input) → excluded from replay via _SKIP_SIDECAR_KEYS.
+        "upscale_vae_path": upscale_vae_path,
+        "upscale_vae_subfolder": upscale_vae_subfolder,
+        "upscale_factor": 2 if upscale_active else 1,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "elapsed_seconds": round(elapsed, 2),
         "contract_version": CONTRACT_VERSION,
@@ -1719,6 +1851,19 @@ def _parse_args() -> argparse.Namespace:
                    help="Custom transformer/UNet weights (dir, subdir, or .safetensors)")
     p.add_argument("--vae", type=str, default=None, metavar="PATH",
                    help="Custom VAE weights")
+    p.add_argument("--upscale-vae", type=str, default=None, metavar="PATH",
+                   help="Wan 2× upscale VAE (spacepxl/Wan2.1-VAE-upscale2x, "
+                        "ADR-030). When set, --width/--height are the GENERATION "
+                        "resolution and the saved PNG is 2× each dimension — a "
+                        "clean 1024 gen decoded to a 2048 image at ~¼ the 2048 "
+                        "gen cost. Qwen/Wan-latent families only "
+                        "(krea/qwen-image/wan); errors on others.")
+    p.add_argument("--upscale-vae-subfolder", type=str, default=None,
+                   metavar="SUBDIR",
+                   help="Subfolder within --upscale-vae holding the diffusers "
+                        "config+weights. Default: spacepxl's standard subdir when "
+                        "the path is a repo root; auto-skipped when the path is "
+                        "the model dir itself.")
     p.add_argument("--te1", type=str, default=None, metavar="PATH",
                    help="Custom text encoder slot 1 (CLIP-L for Flux; Qwen2.5-VL for Qwen)")
     p.add_argument("--te2", type=str, default=None, metavar="PATH",
@@ -1953,6 +2098,8 @@ def _run_json_mode() -> int:
             refiner_cfg=params.get("refiner_cfg", 3.5),
             transformer_path=params.get("transformer_path", ""),
             vae_path=params.get("vae_path", ""),
+            upscale_vae_path=params.get("upscale_vae_path", ""),
+            upscale_vae_subfolder=params.get("upscale_vae_subfolder", ""),
             text_encoder_path=params.get("text_encoder_path", ""),
             text_encoder_2_path=params.get("text_encoder_2_path", ""),
             vae_from_transformer=params.get("vae_from_transformer", False),
@@ -2123,6 +2270,10 @@ def _build_server_request(
         "rebalance_mult":      args.rebalance_mult,
         "transformer_path":    _abspath(p.get("transformer_path", "")),
         "vae_path":            _abspath(p.get("vae_path", "")),
+        # ADR-030: absolutize the upscale VAE path at the wire boundary
+        # (same as other model paths); subfolder is an in-repo name, not a path.
+        "upscale_vae_path":     _abspath(p.get("upscale_vae_path", "")),
+        "upscale_vae_subfolder": p.get("upscale_vae_subfolder", ""),
         "text_encoder_path":   _abspath(p.get("text_encoder_path", "")),
         "text_encoder_2_path": _abspath(p.get("text_encoder_2_path", "")),
         "vae_from_transformer": p.get("vae_from_transformer", False),
@@ -2778,6 +2929,7 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
         # or components between runs, so resolve each time rather than once
         # up front.
         for _key in ("model", "transformer_path", "vae_path",
+                     "upscale_vae_path",
                      "text_encoder_path", "text_encoder_2_path"):
             if p_cur.get(_key):
                 try:
@@ -2915,6 +3067,8 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                 rebalance_weights=_parse_rebalance_weights(args.rebalance_weights),
                 transformer_path=p_cur.get("transformer_path", ""),
                 vae_path=p_cur.get("vae_path", ""),
+                upscale_vae_path=p_cur.get("upscale_vae_path", ""),
+                upscale_vae_subfolder=p_cur.get("upscale_vae_subfolder", ""),
                 text_encoder_path=p_cur.get("text_encoder_path", ""),
                 text_encoder_2_path=p_cur.get("text_encoder_2_path", ""),
                 vae_from_transformer=p_cur.get("vae_from_transformer", False),

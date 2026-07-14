@@ -53,6 +53,11 @@ SCHEMA_KIND = types.MappingProxyType({
     "schedule":             _KIND_STR,
     "transformer_path":     _KIND_STR,
     "vae_path":             _KIND_STR,
+    # ADR-030: Wan 2× upscale VAE (path + optional subfolder). Sidecar-
+    # replayable; the path is validated as a path field (NUL-byte + root
+    # containment) at the daemon boundary like other model paths.
+    "upscale_vae_path":      _KIND_STR,
+    "upscale_vae_subfolder": _KIND_STR,
     "text_encoder_path":    _KIND_STR,
     "text_encoder_2_path":  _KIND_STR,
     "seed":                 _KIND_INT,

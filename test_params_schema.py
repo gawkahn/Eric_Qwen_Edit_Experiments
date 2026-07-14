@@ -180,10 +180,68 @@ for cli, canon in [
     ("te1", "text_encoder_path"),
     ("te2", "text_encoder_2_path"),
     ("lora", "loras"),
+    ("upscale_vae", "upscale_vae_path"),  # ADR-030
 ]:
     check(f"CLI map has {cli!r} → {canon!r}",
           cli_map.get(cli) == canon,
           f"got {cli_map.get(cli)!r}")
+
+# ADR-030: 2× upscale-VAE fields — schema defaults empty (off), and the
+# family-compat set gates decode to Qwen/Wan-latent families only.
+check("upscale_vae_path default is '' (off)",
+      schema["upscale_vae_path"][1] == "")
+check("upscale_vae_subfolder default is '' (off)",
+      schema["upscale_vae_subfolder"][1] == "")
+_fam = g._UPSCALE_COMPATIBLE_FAMILIES
+check("upscale family gate includes krea/krea-turbo/qwen-image",
+      {"krea", "krea-turbo", "qwen-image"} <= _fam)
+check("upscale family gate EXCLUDES flux/flux2 (would decode garbage)",
+      "flux" not in _fam and "flux2" not in _fam)
+# 'wan' is intentionally absent: the Wan video pipeline doesn't emit
+# Qwen-layout packed latents and its family string doesn't resolve.
+check("upscale family gate EXCLUDES raw wan (wrong latent layout)",
+      "wan" not in _fam)
+
+# ADR-030 negative: generate() raises ValueError for --upscale-vae on an
+# incompatible family BEFORE any generation. Reaches the runtime gate via a
+# stub cached pipeline (family=flux) — no GPU/model weights needed.
+import tempfile as _uv_tmp, os as _uv_os
+with _uv_tmp.TemporaryDirectory() as _uv_d:
+    _uv_mp = _uv_os.path.join(_uv_d, "model")
+    _uv_os.makedirs(_uv_mp)
+    _uv_op = _uv_os.path.join(_uv_d, "out.png")
+    _uv_raised = None
+    try:
+        g.generate(
+            model_path=_uv_mp, prompt="x", output_path=_uv_op, seed=1,
+            upscale_vae_path="/nonexistent-upscale-vae",
+            _cached_pipeline={"pipeline": object(), "model_family": "flux",
+                              "guidance_embeds": False},
+        )
+    except ValueError as _e:
+        _uv_raised = str(_e)
+    except Exception as _e:  # noqa: BLE001 — surface a wrong exception loudly
+        _uv_raised = f"WRONG-EXC:{type(_e).__name__}:{_e}"
+    check("ADR-030: --upscale-vae on flux family raises ValueError at the gate",
+          _uv_raised is not None and "upscale-vae" in _uv_raised,
+          f"got: {_uv_raised!r}")
+
+# ADR-030 security (review HIGH): _load_upscale_vae rejects a subfolder that
+# escapes the resolved path (absolute or `..` traversal) BEFORE from_pretrained —
+# the subfolder is joined onto the root-validated path and would otherwise load
+# weights from an arbitrary directory (pickle deserialization).
+with _uv_tmp.TemporaryDirectory() as _uvs_d:
+    for _bad in ("../../etc", "/etc/passwd", "a/../../../b"):
+        _sub_raised = None
+        try:
+            g._load_upscale_vae(_uvs_d, _bad, "bf16", allow_download=False)
+        except ValueError as _e:
+            _sub_raised = str(_e)
+        except Exception as _e:  # noqa: BLE001
+            _sub_raised = f"OTHER:{type(_e).__name__}"
+        check(f"ADR-030: traversal subfolder {_bad!r} rejected before load",
+              _sub_raised is not None and "relative subpath" in _sub_raised,
+              f"got: {_sub_raised!r}")
 
 
 # ──────────────────────────────────────────────────────────────────────

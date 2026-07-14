@@ -478,6 +478,16 @@ _err = srv._validate_request(dict(_base_req, quant="fp8", quant_only=["a/b"]))
 check("path-shaped quant_only entry rejected", _err is not None, f"err={_err!r}")
 _err = srv._validate_request(dict(_base_req, quant="fp8", quant_skip=["a\x00b"]))
 check("NUL quant_skip entry rejected", _err is not None, f"err={_err!r}")
+# ADR-030: upscale VAE fields — accepted as strings, NUL byte in the path
+# rejected (it's a _PATH_FIELDS member), non-str type rejected.
+_err = srv._validate_request(dict(_base_req, upscale_vae_path="/m/x",
+                                  upscale_vae_subfolder="diffusers/x"))
+check("upscale_vae_path + subfolder accepted (valid strings)",
+      _err is None, f"err={_err!r}")
+_err = srv._validate_request(dict(_base_req, upscale_vae_path="/m/a\x00b"))
+check("NUL byte in upscale_vae_path rejected", _err is not None, f"err={_err!r}")
+_err = srv._validate_request(dict(_base_req, upscale_vae_path=5))
+check("non-str upscale_vae_path type-rejected", _err is not None, f"err={_err!r}")
 _err = srv._validate_request(
     dict(_base_req, quant="fp8", quant_only=[f"c{i}" for i in range(33)]))
 check("oversized quant_only (>32) rejected", _err is not None, f"err={_err!r}")
@@ -711,6 +721,90 @@ check("wire request nag params pass server validation end-to-end",
       f"err={srv._validate_request(dict(_wire_n))!r}")
 
 
+print("\n── ADR-030: upscale-VAE independent cache lifecycle ───────────")
+
+# The headline daemon design: the upscale VAE is cached INDEPENDENTLY of the
+# 20B pipeline (own key, not in _request_cache_key), so switching it never
+# evicts the pipeline. Stub _load_pipeline + generate + _load_upscale_vae and
+# drive _handle_generate through load / warm-reuse / switch / drop.
+_uv_calls = {"n": 0}
+_orig_load_uv = _gen._load_upscale_vae
+
+
+def _fake_load_uv(path, subfolder, precision, allow_download=False):
+    _uv_calls["n"] += 1
+    return ("UPSCALE_VAE", path)  # sentinel object
+
+
+_gen._load_pipeline = _fake_load
+_gen.generate = _fake_generate
+_gen._load_upscale_vae = _fake_load_uv
+try:
+    _outdir_u = tempfile.mkdtemp()
+    _state_u: dict = {}
+    _req_u = {"type": "generate", "model": "/fake/Krea-2-Raw", "prompt": "p",
+              "upscale_vae_path": "/fake/UpscaleA", "upscale_vae_subfolder": ""}
+    _resp_u = srv._handle_generate(
+        _req_u, _outdir_u, _outdir_u, "cuda", "bf16", _state_u)
+    check("daemon: upscale request succeeds",
+          _resp_u.get("status") == "ok", f"resp={_resp_u!r}")
+    check("daemon: upscale VAE loaded once", _uv_calls["n"] == 1,
+          f"n={_uv_calls['n']}")
+    check("daemon: upscale VAE cached in server_state",
+          _state_u.get("upscale_vae") == ("UPSCALE_VAE", "/fake/UpscaleA"))
+    check("daemon: upscale VAE forwarded via cached dict to generate()",
+          _captured.get("_cached_pipeline", {}).get("upscale_vae")
+          == ("UPSCALE_VAE", "/fake/UpscaleA"))
+    check("daemon: upscale_vae_path forwarded to generate()",
+          _captured.get("upscale_vae_path") == "/fake/UpscaleA")
+    _pipe_obj = _state_u.get("pipeline")
+
+    # Same upscale VAE → warm (no VAE reload).
+    srv._handle_generate(dict(_req_u, prompt="p2"),
+                         _outdir_u, _outdir_u, "cuda", "bf16", _state_u)
+    check("daemon: same upscale VAE reused (no reload)", _uv_calls["n"] == 1,
+          f"n={_uv_calls['n']}")
+
+    # Different upscale VAE → reload the VAE, but the 20B pipeline stays put.
+    srv._handle_generate(
+        dict(_req_u, prompt="p3", upscale_vae_path="/fake/UpscaleB"),
+        _outdir_u, _outdir_u, "cuda", "bf16", _state_u)
+    check("daemon: switching upscale VAE reloads only the VAE",
+          _uv_calls["n"] == 2, f"n={_uv_calls['n']}")
+    check("daemon: switching upscale VAE does NOT evict the pipeline",
+          _state_u.get("pipeline") is _pipe_obj)
+    check("daemon: new upscale VAE cached",
+          _state_u.get("upscale_vae") == ("UPSCALE_VAE", "/fake/UpscaleB"))
+
+    # Drop upscale VAE → popped; cached dict carries None; pipeline survives.
+    srv._handle_generate(
+        {"type": "generate", "model": "/fake/Krea-2-Raw", "prompt": "p4"},
+        _outdir_u, _outdir_u, "cuda", "bf16", _state_u)
+    check("daemon: dropping upscale VAE pops it from server_state",
+          "upscale_vae" not in _state_u and "upscale_vae_key" not in _state_u)
+    check("daemon: cached dict upscale_vae None when unused",
+          _captured.get("_cached_pipeline", {}).get("upscale_vae") is None)
+    check("daemon: pipeline still cached after dropping upscale VAE",
+          _state_u.get("pipeline") is _pipe_obj)
+finally:
+    _gen._load_pipeline = _orig_load
+    _gen.generate = _orig_generate
+    _gen._load_upscale_vae = _orig_load_uv
+
+# Wire request carries the upscale fields and passes the boundary validator.
+_wire_u = _gen._build_server_request(
+    _args_q,
+    {"model": "/m", "prompt": "p", "upscale_vae_path": "/m/UpscaleA",
+     "upscale_vae_subfolder": "diffusers/x"},
+    [])
+check("wire request carries upscale_vae_path",
+      _wire_u.get("upscale_vae_path") == "/m/UpscaleA",
+      f"got {_wire_u.get('upscale_vae_path')!r}")
+check("wire request upscale fields pass server validation end-to-end",
+      srv._validate_request(dict(_wire_u)) is None,
+      f"err={srv._validate_request(dict(_wire_u))!r}")
+
+
 print("\n── H-1: _socket_dir symlink rejection ─────────────────────────")
 
 # _socket_dir honors XDG_RUNTIME_DIR first; force the /tmp branch and plant
@@ -881,6 +975,16 @@ with _tempfile.TemporaryDirectory() as _mb, \
     # relative paths still rejected regardless of union
     check("ADR-018: relative model path still rejected",
           srv._check_paths({"model": "rel/path"}, _roots) is not None)
+
+    # ADR-030: upscale_vae_path is a model path — same root-containment guard.
+    _uv = _mk18(_os.path.join(_tr, "Wan2.1-VAE-upscale2x", "config.json"))
+    check("ADR-030: upscale_vae_path under an allowed root accepted",
+          srv._check_paths(
+              {"model": _model, "upscale_vae_path": _uv}, _roots) is None)
+    _err = srv._check_paths(
+        {"model": _model, "upscale_vae_path": _esc}, _roots)
+    check("ADR-030: upscale_vae_path outside all roots rejected",
+          _err is not None and "outside the allowed roots" in _err)
 
     # run_server root validation fails closed BEFORE binding a socket
     with _tempfile.TemporaryDirectory() as _out18:

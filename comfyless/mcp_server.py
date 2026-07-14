@@ -57,6 +57,10 @@ _MCP_PATH_TYPED_FIELDS = (
     "model",
     "transformer_path",
     "vae_path",
+    # ADR-030: metadata["upscale_vae_path"] holds the caller's absolute
+    # upscale-VAE path; basename it in the PNG sink like every other path field
+    # so it cannot leak the host filesystem layout to an MCP agent.
+    "upscale_vae_path",
     "text_encoder_path",
     "text_encoder_2_path",
 )
