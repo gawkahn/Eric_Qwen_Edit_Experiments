@@ -327,6 +327,115 @@ with samplers_mod.swap_sampler(stub, "bogus_xyz"):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  RES exponential-multistep samplers: res_2m / res_3m (ADR-029)
+# ═══════════════════════════════════════════════════════════════════════
+print("\n── RES samplers (res_2m / res_3m) ─────────────────────────────")
+import math as _math  # noqa: E402
+
+
+def _phi_closed(j, z):
+    """Reference φ_j(z) = (e^z - Σ_{k<j} z^k/k!)/z^j (closed form)."""
+    rem = sum(z ** k / _math.factorial(k) for k in range(j))
+    return (_math.exp(z) - rem) / z ** j
+
+
+# 1) φ-function port matches the RES4LYF closed form (to float precision; our
+#    Taylor branch near z=0 is actually more accurate than the cancelling
+#    closed form, so a slightly loose tol is correct here).
+_phi_err = max(abs(samplers_mod._phi(j, z) - _phi_closed(j, z))
+               for z in (-2.0, -1.0, -0.5, -0.1, -0.02) for j in (1, 2))
+check("res:_phi matches RES4LYF closed form", _phi_err < 1e-8,
+      f"max err {_phi_err}")
+# Taylor branch (small z) stays finite and near the analytic limit 1/(j)!,
+# where the naive closed form would divide ~0/0.
+check("res:_phi stable at tiny z (no blowup)",
+      abs(samplers_mod._phi(1, -1e-6) - 1.0) < 1e-4
+      and abs(samplers_mod._phi(2, -1e-6) - 0.5) < 1e-4)
+
+# 2) res_2m / res_3m build from a real FlowMatchEuler config and their
+#    set_timesteps accepts sigmas (the drop-in / ADR-028 proxy invariant is
+#    also pinned by the registry-wide loop above).
+for _name in ("res_2m", "res_3m"):
+    _sc = samplers_mod._build_sampler_scheduler(
+        _name, diffusers.FlowMatchEulerDiscreteScheduler())
+    check(f"{_name}_builds", type(_sc).__name__.startswith("FlowRES"))
+    check(f"{_name}_in_registry", _name in samplers_mod.sampler_choices())
+
+# 3) res_2m step matches the CORRECT exponential update — form (A):
+#    e^{-h}·x + h·(b1·D_n + b2·D_{n-1}) with RAW denoised, as in ComfyUI core
+#    res_multistep and RES4LYF's main sampler loop. The reference is that
+#    independently-known-correct form, NOT the implementation's own expression.
+_base = diffusers.FlowMatchEulerDiscreteScheduler()
+_sigs = [1.0, 0.7, 0.45, 0.25, 0.1, 0.02]   # monotone descending, ends > 0
+_sc = samplers_mod._build_sampler_scheduler("res_2m", _base)
+_sc.set_timesteps(sigmas=_sigs, device="cpu")
+_x = torch.randn(1, 4, 8, 8)
+_v0 = torch.randn(1, 4, 8, 8)
+_x1 = _sc.step(_v0, _sc.timesteps[0], _x, return_dict=False)[0]  # Euler, buffers D_prev
+_v1 = torch.randn(1, 4, 8, 8)
+_si = _sc.step_index
+_sg = float(_sc.sigmas[_si]); _sgn = float(_sc.sigmas[_si + 1]); _sgp = float(_sc.sigmas[_si - 1])
+_D_cur = _x1 - _sg * _v1
+_D_prev = _x - float(_sc.sigmas[0]) * _v0
+_h = -_math.log(_sgn / _sg); _hp = -_math.log(_sg / _sgp); _c2 = -_hp / _h
+_b2 = _phi_closed(2, -_h) / _c2; _b1 = _phi_closed(1, -_h) - _b2
+_ref = _math.exp(-_h) * _x1 + _h * (_b1 * _D_cur + _b2 * _D_prev)   # raw denoised
+_got = _sc.step(_v1, _sc.timesteps[_si], _x1, return_dict=False)[0]
+check("res_2m step matches the exponential update (raw-denoised form A)",
+      (_got - _ref).abs().max().item() < 1e-5,
+      f"max diff {(_got - _ref).abs().max().item()}")
+
+# 3b) res_3m order-3 branch (γ / b3 path): after two bootstrap steps, step 2 must
+#     match a form-(A) res_3m reference — otherwise a wrong γ is invisible.
+_sc3 = samplers_mod._build_sampler_scheduler("res_3m", _base)
+_sc3.set_timesteps(sigmas=_sigs, device="cpu")
+_xa = torch.randn(1, 4, 8, 8)
+_va = torch.randn(1, 4, 8, 8); _Da = _xa - float(_sc3.sigmas[0]) * _va
+_xb = _sc3.step(_va, _sc3.timesteps[0], _xa, return_dict=False)[0]   # step0 Euler
+_vb = torch.randn(1, 4, 8, 8); _Db = _xb - float(_sc3.sigmas[1]) * _vb
+_xc = _sc3.step(_vb, _sc3.timesteps[1], _xb, return_dict=False)[0]   # step1 res_2m
+_vc = torch.randn(1, 4, 8, 8)
+_i2 = _sc3.step_index  # 2
+_s2 = float(_sc3.sigmas[_i2]); _s2n = float(_sc3.sigmas[_i2 + 1])
+_s2p = float(_sc3.sigmas[_i2 - 1]); _s2p2 = float(_sc3.sigmas[_i2 - 2])
+_Dc = _xc - _s2 * _vc
+_h2 = -_math.log(_s2n / _s2)
+_c2_ = -(-_math.log(_s2 / _s2p)) / _h2
+_c3_ = -(-_math.log(_s2 / _s2p2)) / _h2
+_g = (3 * _c3_ ** 3 - 2 * _c3_) / (_c2_ * (2 - 3 * _c2_))
+_B3 = _phi_closed(2, -_h2) / (_g * _c2_ + _c3_); _B2 = _g * _B3
+_B1 = _phi_closed(1, -_h2) - _B2 - _B3
+_ref3 = _math.exp(-_h2) * _xc + _h2 * (_B1 * _Dc + _B2 * _Db + _B3 * _Da)
+_got3 = _sc3.step(_vc, _sc3.timesteps[_i2], _xc, return_dict=False)[0]
+check("res_3m order-3 step matches the res_3m exponential update",
+      (_got3 - _ref3).abs().max().item() < 1e-5,
+      f"max diff {(_got3 - _ref3).abs().max().item()}")
+
+# 4) DEFINITIVE correctness check — exactness on a constant nonlinearity. A model
+#    whose denoised ≡ x0* (velocity v=(x-x0*)/σ) has the analytic solution
+#    x_i - x0* = (σ_i/σ_0)(x_init - x0*) at EVERY step; exponential (and Euler)
+#    methods are exact here. The previously-shipped double-counted form drifted
+#    toward x0*/2 and would FAIL this (the old σ→0-terminal convergence check
+#    masked it via the final Euler step).
+for _name in ("res_2m", "res_3m"):
+    _sc = samplers_mod._build_sampler_scheduler(_name, _base)
+    _sc.set_timesteps(sigmas=_sigs, device="cpu")
+    _x0star = torch.randn(1, 4, 8, 8)
+    _xinit = torch.randn(1, 4, 8, 8)
+    _x = _xinit.clone()
+    _s0 = float(_sc.sigmas[0])
+    _worst = 0.0
+    for _i, _ts in enumerate(_sc.timesteps):
+        _sg = float(_sc.sigmas[_i])
+        _v = (_x - _x0star) / _sg
+        _x = _sc.step(_v, _ts, _x, return_dict=False)[0]
+        _exact = _x0star + (float(_sc.sigmas[_i + 1]) / _s0) * (_xinit - _x0star)
+        _worst = max(_worst, (_x - _exact).abs().max().item())
+    check(f"{_name}_exact_on_constant_denoised", _worst < 1e-4,
+          f"worst per-step deviation {_worst}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  comfyless --schedule gate (ADR-028): _sigma_schedule_gate
 # ═══════════════════════════════════════════════════════════════════════
 print("\n── comfyless _sigma_schedule_gate (ADR-028) ──────────────────")

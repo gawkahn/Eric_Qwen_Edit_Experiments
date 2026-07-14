@@ -61,10 +61,26 @@ same update rule, so we use the simpler and more general naming.
 Author: Eric Hiss (GitHub: EricRollei)
 """
 
+import math
 from contextlib import contextmanager
 from typing import Optional
 
 import torch
+
+
+# ── Exponential-integrator φ-functions (RES samplers) ──────────────────────
+#
+# φ_j(z) = (e^z - Σ_{k<j} z^k/k!) / z^j.  Used by the RES (Refined Exponential
+# Solver) multistep samplers res_2m / res_3m.  Ported from RES4LYF
+# phi_functions.py (ClownsharkBatwing/RES4LYF); computed in float64 via the
+# always-stable entire-function Taylor series Σ z^m/(m+j)! near z=0 (where the
+# closed form suffers catastrophic cancellation) and the closed form elsewhere.
+def _phi(j: int, z: float) -> float:
+    z = float(z)
+    if abs(z) < 1e-2:
+        return sum((z ** m) / math.factorial(m + j) for m in range(16))
+    remainder = sum((z ** k) / math.factorial(k) for k in range(j))
+    return (math.exp(z) - remainder) / (z ** j)
 
 
 # ── Lazy import of diffusers base class ────────────────────────────────────
@@ -287,8 +303,149 @@ def _build_scheduler_classes() -> None:
                 return (prev_sample,)
             return FlowMatchEulerDiscreteSchedulerOutput(prev_sample=prev_sample)
 
+    class FlowRES2MScheduler(FlowMatchEulerDiscreteScheduler):
+        """RES 2nd-order exponential multistep (res_2m) for flow matching.
+
+        RES4LYF exponential-multistep step, log-sigma step size
+        ``h = -ln(σ_next/σ)`` with φ-function coefficients on the data (denoised)
+        predictions — ``denoised = x - σ·v`` for flow matching::
+
+            c2 = -h_prev/h ,  b2 = φ_2(-h)/c2 ,  b1 = φ_1(-h) - b2
+            x_{n+1} = e^{-h}·x + h·(b1·denoised_n + b2·denoised_{n-1})
+
+        Same update as ComfyUI-core ``res_multistep`` and RES4LYF's main sampler
+        loop (``x_0 + h·Σ b_i·eps_i`` with eps anchored to x — algebraically
+        identical since ``h·Σb = 1 - e^{-h}``). Buffers the previous denoised
+        prediction. Step 0 (no history) and the final step (σ_next→0, where h→∞)
+        fall back to flow Euler — which at σ_next=0 already yields the x0
+        prediction. One model eval per step (drop-in, like the multistep
+        schedulers).
+        """
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._res_prev_denoised: Optional[torch.Tensor] = None
+
+        def set_timesteps(self, num_inference_steps=None, device=None,
+                          sigmas=None, mu=None, timesteps=None):
+            super().set_timesteps(num_inference_steps=num_inference_steps,
+                                  device=device, sigmas=sigmas, mu=mu,
+                                  timesteps=timesteps)
+            self._res_prev_denoised = None
+
+        def step(self, model_output, timestep, sample, **kwargs):
+            if self.step_index is None:
+                self._init_step_index(timestep)
+            sample = sample.to(torch.float32)
+            sigma = float(self.sigmas[self.step_index])
+            sigma_next = float(self.sigmas[self.step_index + 1])
+            denoised = sample - sigma * model_output
+
+            if (self._res_prev_denoised is None or self.step_index == 0
+                    or sigma_next <= 0.0):
+                prev_sample = sample + (sigma_next - sigma) * model_output
+            else:
+                sigma_prev = float(self.sigmas[self.step_index - 1])
+                h = -math.log(sigma_next / sigma)
+                h_prev = -math.log(sigma / sigma_prev)
+                if h == 0.0 or h_prev == 0.0:
+                    # degenerate (duplicate sigma) — Euler, avoids /0 in c2/b2.
+                    prev_sample = sample + (sigma_next - sigma) * model_output
+                else:
+                    c2 = -h_prev / h
+                    b2 = _phi(2, -h) / c2
+                    b1 = _phi(1, -h) - b2
+                    prev_sample = math.exp(-h) * sample + h * (
+                        b1 * denoised + b2 * self._res_prev_denoised)
+
+            self._res_prev_denoised = denoised
+            self._step_index += 1
+            prev_sample = prev_sample.to(model_output.dtype)
+            if not kwargs.get("return_dict", True):
+                return (prev_sample,)
+            return FlowMatchEulerDiscreteSchedulerOutput(prev_sample=prev_sample)
+
+    class FlowRES3MScheduler(FlowMatchEulerDiscreteScheduler):
+        """RES 3rd-order exponential multistep (res_3m) for flow matching.
+
+        Ported from RES4LYF ``calculate_res_3m_step``. Buffers the two previous
+        denoised predictions. Bootstraps like a 3rd-order multistep: step 0 →
+        Euler, step 1 → res_2m, step ≥2 → res_3m; the final step (σ_next→0) falls
+        back to Euler. Coefficients (with c2=-h_prev/h, c3=-h_prev2/h)::
+
+            γ  = (3·c3³ - 2·c3) / (c2·(2 - 3·c2))
+            b3 = φ_2(-h) / (γ·c2 + c3) ,  b2 = γ·b3 ,  b1 = φ_1(-h) - b2 - b3
+            x_{n+1} = e^{-h}·x + h·(b1·denoised_n + b2·denoised_{n-1} + b3·denoised_{n-2})
+        """
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._res_prev1: Optional[torch.Tensor] = None   # denoised_{n-1}
+            self._res_prev2: Optional[torch.Tensor] = None   # denoised_{n-2}
+
+        def set_timesteps(self, num_inference_steps=None, device=None,
+                          sigmas=None, mu=None, timesteps=None):
+            super().set_timesteps(num_inference_steps=num_inference_steps,
+                                  device=device, sigmas=sigmas, mu=mu,
+                                  timesteps=timesteps)
+            self._res_prev1 = None
+            self._res_prev2 = None
+
+        def step(self, model_output, timestep, sample, **kwargs):
+            if self.step_index is None:
+                self._init_step_index(timestep)
+            sample = sample.to(torch.float32)
+            sigma = float(self.sigmas[self.step_index])
+            sigma_next = float(self.sigmas[self.step_index + 1])
+            denoised = sample - sigma * model_output
+
+            if self._res_prev1 is None or self.step_index == 0 or sigma_next <= 0.0:
+                # step 0 / final step: flow Euler.
+                prev_sample = sample + (sigma_next - sigma) * model_output
+            elif self._res_prev2 is None:
+                # step 1: res_2m (only one previous denoised available yet).
+                sigma_prev = float(self.sigmas[self.step_index - 1])
+                h = -math.log(sigma_next / sigma)
+                h_prev = -math.log(sigma / sigma_prev)
+                if h == 0.0 or h_prev == 0.0:
+                    prev_sample = sample + (sigma_next - sigma) * model_output
+                else:
+                    c2 = -h_prev / h
+                    b2 = _phi(2, -h) / c2
+                    b1 = _phi(1, -h) - b2
+                    prev_sample = math.exp(-h) * sample + h * (
+                        b1 * denoised + b2 * self._res_prev1)
+            else:
+                # step ≥2: res_3m.
+                sigma_prev = float(self.sigmas[self.step_index - 1])
+                sigma_prev2 = float(self.sigmas[self.step_index - 2])
+                h = -math.log(sigma_next / sigma)
+                h_prev = -math.log(sigma / sigma_prev)
+                h_prev2 = -math.log(sigma / sigma_prev2)
+                if h == 0.0 or h_prev == 0.0 or h_prev2 == 0.0:
+                    prev_sample = sample + (sigma_next - sigma) * model_output
+                else:
+                    c2 = -h_prev / h
+                    c3 = -h_prev2 / h
+                    gamma = (3.0 * c3 ** 3 - 2.0 * c3) / (c2 * (2.0 - 3.0 * c2))
+                    b3 = _phi(2, -h) / (gamma * c2 + c3)
+                    b2 = gamma * b3
+                    b1 = _phi(1, -h) - b2 - b3
+                    prev_sample = math.exp(-h) * sample + h * (
+                        b1 * denoised + b2 * self._res_prev1 + b3 * self._res_prev2)
+
+            self._res_prev2 = self._res_prev1
+            self._res_prev1 = denoised
+            self._step_index += 1
+            prev_sample = prev_sample.to(model_output.dtype)
+            if not kwargs.get("return_dict", True):
+                return (prev_sample,)
+            return FlowMatchEulerDiscreteSchedulerOutput(prev_sample=prev_sample)
+
     _SCHEDULER_CLASSES["multistep2"] = FlowMultistep2Scheduler
     _SCHEDULER_CLASSES["multistep3"] = FlowMultistep3Scheduler
+    _SCHEDULER_CLASSES["res_2m"] = FlowRES2MScheduler
+    _SCHEDULER_CLASSES["res_3m"] = FlowRES3MScheduler
 
 
 # ── Registry & dropdown ────────────────────────────────────────────────────
@@ -297,6 +454,8 @@ _SAMPLER_NAMES = [
     "default",       # no swap (pipeline's FlowMatchEuler)
     "multistep2",    # 2nd-order Adams-Bashforth
     "multistep3",    # 3rd-order Adams-Bashforth
+    "res_2m",        # 2nd-order RES exponential multistep (RES4LYF)
+    "res_3m",        # 3rd-order RES exponential multistep (RES4LYF)
 ]
 
 
