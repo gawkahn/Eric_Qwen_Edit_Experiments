@@ -38,19 +38,25 @@ For full-denoise txt2img (comfyless's only mode), compute
 
 1. `schedule != "linear"` — linear is the pipeline default; injecting it is a
    no-op, so skip and keep the native path.
-2. `effective_sampler == "default"` — a non-default `--sampler` swaps in a
-   multistep scheduler that generates and owns its *own* sigmas
-   (`eric_diffusion_samplers` passes `sigmas=` internally); two sigma sources
-   would collide. `--sampler` (non-default) + `--schedule` (non-linear) →
-   schedule ignored with a warning.
-3. `is_flow_match(pipe.scheduler)` is True **and** it is not a
-   `FlowMatchHeun*` scheduler. Classic schedulers (DDPM/Euler/DPM/DEIS/UniPC on
-   SDXL/SD1) either ignore flow sigmas or produce artifacts; `FlowMatchHeun`
-   explicitly rejects the `sigmas=` argument. Detected via
-   `nodes.eric_diffusion_scheduler.is_flow_match` (class-name based).
+2. `is_flow_match(pipe.scheduler)` is True — classic schedulers (DDPM/Euler/DPM/
+   DEIS/UniPC on SDXL/SD1) either ignore flow sigmas or produce artifacts.
+   Detected via `nodes.eric_diffusion_scheduler.is_flow_match` (class-name based).
+3. `"sigmas" in sched.set_timesteps`'s signature — the direct "accepts sigmas"
+   property (subsumes the `FlowMatchHeun` special case — its `set_timesteps` has
+   no `sigmas` param — and is future-proof against a new flow-match scheduler
+   that lacks the kwarg).
 4. `"sigmas" in inspect.signature(pipe.__call__).parameters` — defensive; every
    current family passes, but a future pipeline that doesn't must warn-and-skip,
    not crash.
+
+`--sampler` is **orthogonal** and imposes no gate: it sets the integration rule
+(Euler vs Adams-Bashforth multistep) while `--schedule` sets the sigma spacing.
+The multistep schedulers subclass `FlowMatchEulerDiscreteScheduler` and consume
+externally-supplied sigmas verbatim (their `set_timesteps` forwards them to the
+parent; `step()` overrides only the integrator), so a spacing composes with any
+integrator. The gate evaluates the pre-swap default scheduler, which is a valid
+proxy since every swapped-in sampler is a `FlowMatchEuler` subclass that also
+accepts sigmas.
 
 When any gate fails and `schedule != "linear"`, print a `WARNING: --schedule <x>
 ignored — <reason>; using the pipeline default` to stderr and generate normally.
@@ -68,16 +74,16 @@ records `schedule`, so `--params` replay is unchanged.
 - **Leave it reserved and just drop `karras`/`balanced` from the CLI `choices`.**
   Honest, but throws away a feature whose engine already ships; the user wants
   the schedule control the node path has.
-- **Also thread it through the multistep `--sampler` path.** Combining a custom
-  spacing with a multistep sampler's own sigma generation is a separate, larger
-  design; deferred. v1 makes them mutually exclusive with a warning.
 - **New sigma implementation in comfyless.** Rejected — `build_sigma_schedule` is
   the reviewed, tested source of truth; duplicating it invites drift.
 
+*(The original ADR also rejected combining `--schedule` with a multistep
+`--sampler`, on the mistaken premise that the multistep scheduler owns its own
+sigmas. That premise was false and the restriction was lifted — see the
+2026-07-13 amendment in the Changelog.)*
+
 ## Deferred / Out of Scope
 
-- `--schedule` combined with a non-default `--sampler` (multistep). Trigger: a
-  concrete need for Karras spacing under a multistep sampler.
 - Partial-denoise / img2img schedules (comfyless is full-denoise txt2img only).
 - The `power` parameter of `build_sigma_schedule` (reserved upstream too).
 
@@ -107,5 +113,16 @@ records `schedule`, so `--params` replay is unchanged.
     pipeline default," not "force uniform"), and `balanced`/`karras` REPLACE the
     tuned default rather than reshape a linspace. Recorded so it isn't
     re-litigated; behavior is user-opted and warn-don't-block-consistent.
+- 2026-07-13 (amendment — multistep restriction lifted) — the original gate
+  condition "`effective_sampler == "default"`" was **removed**. Its premise —
+  that a multistep `--sampler` generates and owns its own sigmas that would
+  collide with `--schedule` — was **wrong**: the multistep schedulers subclass
+  `FlowMatchEulerDiscreteScheduler`, override only `step()` (the integrator), and
+  their `set_timesteps` accepts external sigmas verbatim (verified: a karras list
+  round-trips into `self.sigmas`). Spacing (`--schedule`) and integration order
+  (`--sampler`) are orthogonal and now compose — e.g. `--sampler multistep2
+  --schedule karras` runs AB2 integration over karras spacing. `test_samplers.py`
+  gains a composition test; the gate keeps only the flow-match + sigmas-accepting
+  checks. Reviewed by code-reviewer (Fable).
 
 **AI-Disclosure:** Claude (Fable 5) authored from a design conversation with Grant; Grant reviewed.

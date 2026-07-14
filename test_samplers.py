@@ -135,7 +135,12 @@ print("\n=== set_timesteps signature introspection ===")
 
 import inspect as _inspect
 
-for name in ("multistep2", "multistep3"):
+# Iterate the FULL registry (minus "default"), not a hardcoded pair: the
+# ADR-028 schedule gate evaluates the PRE-swap default scheduler as a proxy for
+# the swapped sampler's sigma-acceptance, so EVERY registry sampler must accept
+# `sigmas` in set_timesteps or a future entry would pass the gate then crash in
+# retrieve_timesteps. This test forces that invariant on any new sampler.
+for name in [n for n in samplers_mod.sampler_choices() if n != "default"]:
     sched = samplers_mod._build_sampler_scheduler(name, reference)
     sig = _inspect.signature(sched.set_timesteps)
     param_names = set(sig.parameters.keys())
@@ -351,51 +356,59 @@ _classic = _GatePipe(diffusers.EulerDiscreteScheduler())
 
 # linear / unset are silent no-ops (the pipeline default needs no reshaping).
 check("schedule 'linear' is a silent no-op",
-      _cg._sigma_schedule_gate(_flow, "linear", "default", "flux", 20) == (None, None))
+      _cg._sigma_schedule_gate(_flow, "linear", "flux", 20) == (None, None))
 check("schedule '' (unset) is a silent no-op",
-      _cg._sigma_schedule_gate(_flow, "", "default", "flux", 20) == (None, None))
+      _cg._sigma_schedule_gate(_flow, "", "flux", 20) == (None, None))
 
-# Happy path: flow-match + default sampler → real sigmas, no warning.
-_sig, _w = _cg._sigma_schedule_gate(_flow, "karras", "default", "flux", 20)
-check("flow-match + default sampler: karras yields sigmas, no warning",
+# Happy path: flow-match scheduler → real sigmas, no warning.
+_sig, _w = _cg._sigma_schedule_gate(_flow, "karras", "flux", 20)
+check("flow-match: karras yields sigmas, no warning",
       _w is None and _sig is not None and len(_sig) == 20)
 check("karras sigmas descend from 1.0 toward sigma_min",
       _sig[0] == 1.0 and _sig[0] > _sig[-1])
-_sig_b, _ = _cg._sigma_schedule_gate(_flow, "balanced", "default", "flux", 20)
+_sig_b, _ = _cg._sigma_schedule_gate(_flow, "balanced", "flux", 20)
 check("balanced and karras produce different spacings", _sig_b != _sig)
 
+# --schedule is ORTHOGONAL to --sampler (ADR-028 amendment 2026-07-13): the gate
+# takes no sampler argument (no default-only restriction). The composition is
+# correct because a real multistep scheduler subclasses FlowMatchEuler and stores
+# externally-supplied sigmas verbatim — so karras spacing flows into the AB2
+# integrator. This round-trip is the load-bearing evidence.
+_ms_sched = samplers_mod._build_sampler_scheduler(
+    "multistep2", diffusers.FlowMatchEulerDiscreteScheduler())
+_ms_sched.set_timesteps(sigmas=[1.0, 0.6, 0.3, 0.1], device="cpu")
+check("multistep scheduler consumes external sigmas (spacing ⟂ integrator)",
+      [round(float(s), 3) for s in _ms_sched.sigmas.tolist()][:4]
+      == [1.0, 0.6, 0.3, 0.1])
+
 # Gate rejections all warn-and-ignore (sigmas None, reason string set).
-_s, _w = _cg._sigma_schedule_gate(_flow, "karras", "multistep2", "flux", 20)
-check("non-default --sampler → schedule ignored with a reason",
-      _s is None and _w is not None and "custom --sampler" in _w)
-_s, _w = _cg._sigma_schedule_gate(_classic, "karras", "default", "sdxl", 20)
+_s, _w = _cg._sigma_schedule_gate(_classic, "karras", "sdxl", 20)
 check("classic (non-flow-match) scheduler → schedule ignored with a reason",
       _s is None and _w is not None and "non-flow-match" in _w)
 _heun = _GatePipe(diffusers.FlowMatchHeunDiscreteScheduler())
-_s, _w = _cg._sigma_schedule_gate(_heun, "karras", "default", "flux", 20)
+_s, _w = _cg._sigma_schedule_gate(_heun, "karras", "flux", 20)
 check("FlowMatchHeun → schedule ignored (set_timesteps lacks sigmas)",
       _s is None and _w is not None and "set_timesteps" in _w)
 _s, _w = _cg._sigma_schedule_gate(
-    _NoSigmasPipe(diffusers.FlowMatchEulerDiscreteScheduler()),
-    "karras", "default", "flux", 20)
+    _NoSigmasPipe(diffusers.FlowMatchEulerDiscreteScheduler()), "karras", "flux", 20)
 check("pipeline without a sigmas= kwarg → schedule ignored",
       _s is None and _w is not None and "does not accept" in _w)
 check("scheduler=None → warn-and-ignore, no crash",
-      _cg._sigma_schedule_gate(_GatePipe(None), "karras", "default", "x", 20)[0] is None)
+      _cg._sigma_schedule_gate(_GatePipe(None), "karras", "x", 20)[0] is None)
 
 # The wiring seam _apply_sigma_schedule is what generate() actually calls — it
 # injects call_kwargs["sigmas"] on the happy path and returns the warning
 # otherwise (the wiring gap this slice closed).
 _ck = {"prompt": "x", "num_inference_steps": 20}
-_w = _cg._apply_sigma_schedule(_ck, _flow, "karras", "default", "flux", 20)
+_w = _cg._apply_sigma_schedule(_ck, _flow, "karras", "flux", 20)
 check("_apply_sigma_schedule injects sigmas into call_kwargs on the happy path",
       _w is None and "sigmas" in _ck and len(_ck["sigmas"]) == 20)
 _ck2 = {"prompt": "x"}
-_w2 = _cg._apply_sigma_schedule(_ck2, _classic, "karras", "default", "sdxl", 20)
+_w2 = _cg._apply_sigma_schedule(_ck2, _classic, "karras", "sdxl", 20)
 check("_apply_sigma_schedule returns a warning + injects nothing on reject",
       _w2 is not None and "sigmas" not in _ck2)
 _ck3 = {"prompt": "x"}
-_w3 = _cg._apply_sigma_schedule(_ck3, _flow, "linear", "default", "flux", 20)
+_w3 = _cg._apply_sigma_schedule(_ck3, _flow, "linear", "flux", 20)
 check("_apply_sigma_schedule is a silent no-op for linear",
       _w3 is None and "sigmas" not in _ck3)
 

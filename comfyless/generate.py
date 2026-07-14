@@ -1203,21 +1203,27 @@ def _iterate_combo_disposition(rc: int) -> str:
 #  Core generate function
 # ════════════════════════════════════════════════════════════════════════
 
-def _sigma_schedule_gate(pipe, schedule: str, effective_sampler: str,
-                         model_family: str, steps: int):
+def _sigma_schedule_gate(pipe, schedule: str, model_family: str, steps: int):
     """Decide whether a custom sigma `schedule` can be applied to this pipe call
     (ADR-028). Returns (sigmas_list_or_None, warning_or_None).
 
-    A non-linear schedule is honored ONLY when a default sampler is in play AND the
-    pipeline's scheduler is a non-Heun flow-match scheduler that accepts a `sigmas=`
-    kwarg. Any other case with a non-linear schedule returns (None, "<reason>") so
-    the caller warns-and-ignores (warn-don't-block). `linear` (the pipeline default)
-    and an unset schedule return (None, None) silently — no reshaping needed."""
+    A non-linear schedule is honored when the pipeline's scheduler is a flow-match
+    scheduler whose `set_timesteps` accepts a `sigmas=` kwarg. `--sampler` is
+    ORTHOGONAL: it sets the integration rule (Euler vs Adams-Bashforth multistep)
+    while `--schedule` sets the sigma spacing, and the multistep schedulers accept
+    external sigmas verbatim — so the two compose (ADR-028 amendment 2026-07-13).
+    Any other case with a non-linear schedule returns (None, "<reason>") so the
+    caller warns-and-ignores. `linear` / unset return (None, None) silently."""
     if not schedule or schedule == "linear":
         return None, None
-    if effective_sampler != "default":
-        return None, f"a custom --sampler ({effective_sampler}) owns the sigma schedule"
     from nodes.eric_diffusion_scheduler import is_flow_match
+    # This gate runs PRE-swap: `pipe.scheduler` is the model's default scheduler,
+    # not the multistep one swap_sampler installs around the call. That's a valid
+    # proxy — every registry sampler is a FlowMatchEuler subclass whose
+    # set_timesteps also accepts sigmas (pinned in test_samplers), so a default
+    # that passes here means the swapped scheduler will too. (Do NOT move this
+    # inside the swap context: is_flow_match is name-prefix based and the
+    # FlowMultistep* subclasses don't start with "FlowMatch", so it would flip.)
     sched = getattr(pipe, "scheduler", None)
     sched_name = type(sched).__name__ if sched is not None else "None"
     # is_flow_match gates on CORRECT interpretation (classic schedulers would
@@ -1244,16 +1250,14 @@ def _sigma_schedule_gate(pipe, schedule: str, effective_sampler: str,
 
 
 def _apply_sigma_schedule(call_kwargs: dict, pipe, schedule: str,
-                          effective_sampler: str, model_family: str,
-                          steps: int) -> Optional[str]:
+                          model_family: str, steps: int) -> Optional[str]:
     """Wire the schedule gate into the pipe call: inject `call_kwargs["sigmas"]`
     when the schedule is honored, else return the warning string (ADR-028). This is
     the testable seam over the one-line injection — the wiring gap this slice
     closed. A returned warning is BOTH printed to stderr (in-process visibility)
     AND carried in the sidecar `schedule_warnings` so a daemon/MCP client sees it
     across the wire (invariant N1; stderr alone doesn't cross that boundary)."""
-    sigmas, warn = _sigma_schedule_gate(pipe, schedule, effective_sampler,
-                                        model_family, steps)
+    sigmas, warn = _sigma_schedule_gate(pipe, schedule, model_family, steps)
     if sigmas is not None:
         call_kwargs["sigmas"] = sigmas
     return warn
@@ -1315,8 +1319,9 @@ def generate(
             in order.  LoRA load failures are non-fatal (warned, skipped).
         sampler: One of SAMPLER_NAMES ("default", "multistep2", "multistep3").
         schedule: Sigma-spacing schedule ("linear"/"balanced"/"karras", ADR-028).
-            Applied on the default sampler when the pipeline's scheduler is a
-            non-Heun flow-match scheduler; warn-and-ignored otherwise.
+            Applied when the pipeline's scheduler is a flow-match scheduler whose
+            set_timesteps accepts sigmas; warn-and-ignored otherwise. Orthogonal to
+            (composes with) `sampler`.
 
     Returns a metadata dict suitable for the sidecar JSON / bridge output.
     Raises on fatal errors (model not found, inference failure).
@@ -1530,11 +1535,12 @@ def generate(
 
     # ── Sigma schedule (ADR-028): reshape flow-match sigma spacing ────
     # `schedule` was long recorded-but-ignored; apply it here via the node
-    # path's build_sigma_schedule, gated to non-Heun flow-match schedulers on
-    # the default sampler. Warn-and-ignore everywhere else — the warning is
-    # carried in metadata (schedule_warnings) so the daemon/MCP client sees it.
+    # path's build_sigma_schedule, gated to flow-match schedulers that accept
+    # sigmas. Orthogonal to --sampler (spacing vs integration order — they
+    # compose). Warn-and-ignore everywhere else — the warning is carried in
+    # metadata (schedule_warnings) so the daemon/MCP client sees it.
     _sched_warn = _apply_sigma_schedule(
-        call_kwargs, pipe, schedule, effective_sampler, model_family, steps)
+        call_kwargs, pipe, schedule, model_family, steps)
     schedule_warnings = [_sched_warn] if _sched_warn else []
     if "sigmas" in call_kwargs:
         _log(f"[comfyless] sigma schedule: {schedule} (flow-match, {steps} steps)")
@@ -1594,7 +1600,7 @@ def generate(
         "sampler": sampler,
         "schedule": schedule,
         # Loud-across-the-wire: a --schedule that was warn-and-ignored (wrong
-        # family/scheduler/sampler) records WHY here, so a daemon/MCP client sees
+        # family/scheduler) records WHY here, so a daemon/MCP client sees
         # it — the daemon's stderr never reaches the client (invariant N1; mirrors
         # nag_warnings / lora_warnings). Empty on a clean apply or plain linear.
         "schedule_warnings": schedule_warnings,
@@ -1701,10 +1707,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--schedule", choices=SCHEDULE_NAMES, default=None,
                    help="Sigma-spacing schedule (ADR-028): linear (uniform), "
                         "balanced (Karras ρ=3), karras (Karras ρ=7, steps toward "
-                        "fine detail). Applied on the default --sampler when the "
-                        "model uses a flow-match scheduler (Flux/Qwen/Chroma/Krea/"
-                        "Z-Image/Flux.2); warn-and-ignored for classic schedulers "
-                        "(SDXL/SD1) or a non-default --sampler.")
+                        "fine detail). Applied when the model uses a flow-match "
+                        "scheduler (Flux/Qwen/Chroma/Krea/Z-Image/Flux.2); "
+                        "warn-and-ignored for classic schedulers (SDXL/SD1). "
+                        "Composes with --sampler (spacing vs integration order).")
     p.add_argument("--max-seq-len", type=int, default=None,
                    help="Max sequence length for text encoder")
     p.add_argument("--transformer", type=str, default=None, metavar="PATH",
@@ -2200,9 +2206,9 @@ def _delegate_to_server(
         # wire metadata (invariant N1; mirrors lora_warnings below).
         for _w in metadata.get("nag_warnings") or []:
             print(f"[comfyless] WARNING: NAG — {_w}", file=sys.stderr)
-        # A --schedule that the daemon warn-and-ignored (wrong family/scheduler/
-        # sampler) is likewise surfaced client-side from the wire metadata — the
-        # daemon's stderr never reaches here (ADR-028; invariant N1).
+        # A --schedule that the daemon warn-and-ignored (wrong family/scheduler)
+        # is likewise surfaced client-side from the wire metadata — the daemon's
+        # stderr never reaches here (ADR-028; invariant N1).
         for _w in metadata.get("schedule_warnings") or []:
             print(f"[comfyless] WARNING: --schedule ignored — {_w}", file=sys.stderr)
         # Daemon already carries lora_warnings in the wire metadata — surface
