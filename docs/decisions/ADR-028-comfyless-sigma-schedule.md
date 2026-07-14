@@ -125,4 +125,27 @@ sigmas. That premise was false and the restriction was lifted — see the
   gains a composition test; the gate keeps only the flow-match + sigmas-accepting
   checks. Reviewed by code-reviewer (Fable).
 
+- 2026-07-13 (RES4LYF schedules added) — `beta57` and `bong_tangent` added to
+  `SCHEDULE_NAMES` and to the engine `build_sigma_schedule`
+  (nodes/eric_qwen_image_multistage.py), so the comfyless `--schedule` path exposes
+  them. (The UltraGen/multistage **node dropdowns** are still hardcoded
+  linear/balanced/karras — the engine gained the schedules but the ComfyUI node UI
+  did not; extending those dropdowns is a deferred follow-up.) Formulas
+  **reimplemented from** ClownsharkBatwing/RES4LYF sigmas.py (not copied):
+  `beta57` = ComfyUI `beta_scheduler(alpha=0.5, beta=0.7)` — inverse-beta-CDF warp
+  of the normalized position (needs scipy, already a pinned dep); this one is
+  formula-identical (a test recomputes `beta.ppf(1-t, 0.5, 0.7)` and asserts
+  equality). `bong_tangent` = the two-stage arctan S-curve of
+  `get_bong_tangent_sigmas` / `bong_tangent_scheduler` (pivot 0.6, slope 0.2),
+  **approximated** in the normalized flow-match range: RES4LYF's 60/40 stage split
+  and pivot placement are kept, but adapted to build_sigma_schedule's exact-`keep`
+  contract (steps_internal = keep+1 replaces RES4LYF's `+2`/`[:-1]` ComfyUI
+  bookkeeping; keep<=2 degenerates and falls back to linear so the shared-start
+  invariant holds universally). An unknown schedule still falls back to linear.
+  `test_multistage.py` +32 (independent beta.ppf recompute, two-stage-midpoint
+  check, and small-keep edge cases keep=1..8). Reviewed by code-reviewer (Fable);
+  folded the keep==1/2 start-sigma bug and the node-dropdown/faithfulness wording.
+  NOTE: `--schedule`/`--sampler` are not yet `--iterate` axes — deferred to a
+  follow-up once the res_2m/res_3m samplers land, then wired together.
+
 **AI-Disclosure:** Claude (Fable 5) authored from a design conversation with Grant; Grant reviewed.

@@ -183,6 +183,13 @@ def build_sigma_schedule(num_steps: int, denoise: float,
         Karras-style with ρ=7 (EDM-optimal).  Heavily concentrates steps at
         low sigma (fine detail/sharpening), with large jumps through high
         sigma.  **Recommended for S3.**
+    beta57
+        RES4LYF beta scheduler with α=0.5, β=0.7 — the normalized position is
+        warped through the inverse beta CDF.  Concentrates steps toward both
+        ends (high and low sigma) more than the middle.
+    bong_tangent
+        RES4LYF two-stage arctan S-curve (pivot 0.6, slope 0.2) — a smooth
+        sigmoid descent that lingers around the mid-sigma pivots.
 
     Step budget distribution (S2 example: 30 steps, denoise=0.85):
 
@@ -203,7 +210,9 @@ def build_sigma_schedule(num_steps: int, denoise: float,
     Args:
         num_steps: Total number of denoising steps.
         denoise:   Fraction of schedule to use (1.0 = full, <1 = partial).
-        schedule:  ``"linear"``, ``"balanced"``, or ``"karras"``.
+        schedule:  ``"linear"``, ``"balanced"``, ``"karras"``, ``"beta57"``, or
+                   ``"bong_tangent"`` (see the Schedules section above). An
+                   unrecognized value falls back to ``"linear"``.
         power:     Reserved for future use.
 
     Returns:
@@ -244,6 +253,45 @@ def build_sigma_schedule(num_steps: int, denoise: float,
             sigma_start ** (1.0 / rho)
             + t * (sigma_min ** (1.0 / rho) - sigma_start ** (1.0 / rho))
         ) ** rho
+    elif schedule == "beta57":
+        # RES4LYF "beta57" = ComfyUI beta_scheduler(alpha=0.5, beta=0.7): warp the
+        # normalized position through the inverse beta CDF, then map onto the
+        # flow-match sigma range. Reimplemented from the formula (not copied) —
+        # ClownsharkBatwing/RES4LYF sigmas.py + comfy.samplers.beta_scheduler.
+        from scipy.stats import beta as _beta_dist
+        warp = _beta_dist.ppf(1.0 - t, 0.5, 0.7)
+        sigmas = sigma_min + warp * (sigma_start - sigma_min)
+    elif schedule == "bong_tangent":
+        # RES4LYF "bong_tangent": a two-stage arctan S-curve
+        # (get_bong_tangent_sigmas + bong_tangent_scheduler, pivot 0.6, slope 0.2,
+        # ClownsharkBatwing/RES4LYF sigmas.py). Reimplemented in normalized
+        # flow-match space, keeping RES4LYF's geometry: a 60/40 stage split
+        # (midpoint = int(steps*0.6)), stage-1 pivot at the split, stage-2 pivot at
+        # 0. RES4LYF runs steps+2 internally and yields steps+1 sigmas, so
+        # steps_internal = keep+1 gives EXACTLY `keep` here. At keep<=2 the split
+        # degenerates (a stage would be empty after the join-dedup `[:-1]`), so fall
+        # back to linear — which also preserves the "all schedules share a start
+        # sigma" invariant that the two-stage form would otherwise break there.
+        if keep <= 2:
+            sigmas = np.linspace(sigma_start, sigma_min, keep)
+        else:
+            _steps = keep + 1
+            _slope = 0.2 / (_steps / 40.0)
+            _mid = (sigma_start + sigma_min) / 2.0
+            _midpoint = int(_steps * 0.6)
+
+            def _bong_stage(n, pivot, s_from, s_to):
+                raw = ((2.0 / np.pi) * np.arctan(-_slope * (np.arange(n) - pivot)) + 1.0) / 2.0
+                hi, lo = raw[0], raw[-1]
+                rng = hi - lo if abs(hi - lo) > 1e-9 else 1.0
+                return (raw - lo) / rng * (s_from - s_to) + s_to
+
+            # stage 1: sigma_start→mid, pivot at the split (= _midpoint); the join
+            # point (== mid) is dropped so stage 2 owns it (RES4LYF's `[:-1]`).
+            _s1 = _bong_stage(_midpoint, _midpoint, sigma_start, _mid)[:-1]
+            # stage 2: mid→sigma_min, pivot at 0 (= _midpoint - stage_1_len).
+            _s2 = _bong_stage(_steps - _midpoint, 0, _mid, sigma_min)
+            sigmas = np.concatenate([_s1, _s2])
     else:  # "linear" (default)
         sigmas = np.linspace(sigma_start, sigma_min, keep)
 

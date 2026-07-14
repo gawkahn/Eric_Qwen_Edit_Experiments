@@ -124,6 +124,71 @@ check("balanced_between",
       lin_below_mid <= bal_below_mid <= kar_below_mid,
       f"lin={lin_below_mid:.0%} bal={bal_below_mid:.0%} kar={kar_below_mid:.0%}")
 
+# --- RES4LYF schedules: beta57 + bong_tangent (ADR-028) ---
+print("\n=== RES4LYF schedules (beta57 / bong_tangent) ===")
+for sched in ("beta57", "bong_tangent"):
+    s = build_sigma_schedule(30, 1.0, schedule=sched)
+    check(f"{sched}_length_full", len(s) == 30, f"got {len(s)}")
+    check(f"{sched}_starts_at_1", abs(s[0] - 1.0) < 1e-6, f"first={s[0]}")
+    check(f"{sched}_ends_near_min", 0 < s[-1] < 0.1, f"last={s[-1]}")
+    # arctan/beta warps can tie two neighbours at float precision at the flat
+    # ends — require non-increasing (not strictly), which is the real invariant.
+    check(f"{sched}_non_increasing",
+          all(s[i] - s[i + 1] >= -1e-9 for i in range(len(s) - 1)),
+          "found an increasing step")
+    part = build_sigma_schedule(30, 0.6, schedule=sched)
+    check(f"{sched}_denoise_length", len(part) == max(1, round(30 * 0.6)),
+          f"got {len(part)}")
+    check(f"{sched}_denoise_starts_lower", part[0] < s[0])
+    # same start sigma as linear for a given denoise (consistency invariant)
+    lin_d = build_sigma_schedule(30, 0.7, schedule="linear")
+    sch_d = build_sigma_schedule(30, 0.7, schedule=sched)
+    check(f"{sched}_denoise_consistent_start", abs(sch_d[0] - lin_d[0]) < 1e-6,
+          f"{sch_d[0]} vs {lin_d[0]}")
+
+# beta57 must match the ComfyUI beta_scheduler(alpha=0.5, beta=0.7) warp exactly —
+# recompute the inverse-beta-CDF mapping independently (proves the FORMULA, not
+# just that the curve descends).
+from scipy.stats import beta as _beta_dist  # noqa: E402
+_t = np.linspace(0.0, 1.0, 30)
+_expect = (1.0 / 30) + _beta_dist.ppf(1.0 - _t, 0.5, 0.7) * (1.0 - 1.0 / 30)
+_got = build_sigma_schedule(30, 1.0, schedule="beta57")
+check("beta57_matches_beta_ppf_formula",
+      all(abs(a - b) < 1e-9 for a, b in zip(_got, _expect)),
+      "beta57 diverges from beta.ppf(0.5,0.7)")
+
+# bong_tangent is a genuine two-stage curve: it passes near the midpoint sigma.
+_bong = build_sigma_schedule(30, 1.0, schedule="bong_tangent")
+_mid = (1.0 + 1.0 / 30) / 2.0
+check("bong_tangent_passes_midpoint",
+      any(abs(x - _mid) < 0.05 for x in _bong), f"no value near mid {_mid:.3f}")
+
+# both distinct from karras and from each other (not silent aliases of linear)
+_kar30 = build_sigma_schedule(30, 1.0, schedule="karras")
+check("beta57_distinct_from_karras", _got != _kar30)
+check("bong_tangent_distinct_from_karras", _bong != _kar30)
+check("beta57_distinct_from_bong_tangent", _got != _bong)
+
+# an unknown schedule falls back to linear (safe default), unchanged by the new names
+check("unknown_schedule_falls_back_to_linear",
+      build_sigma_schedule(20, 1.0, schedule="nope")
+      == build_sigma_schedule(20, 1.0, schedule="linear"))
+
+# Small-`keep` edge cases for bong_tangent (its two-stage split + join-dedup is
+# delicate here): the consistent-start invariant (first sigma == sigma_start) and
+# exact length must hold at keep=1/2/3, and across even + odd keep.
+for _keep in (1, 2, 3, 4, 5, 7, 8):
+    _s = build_sigma_schedule(_keep, 1.0, schedule="bong_tangent")
+    _lin = build_sigma_schedule(_keep, 1.0, schedule="linear")
+    check(f"bong_tangent_keep{_keep}_exact_length", len(_s) == _keep,
+          f"got {len(_s)}")
+    check(f"bong_tangent_keep{_keep}_starts_at_sigma_start",
+          abs(_s[0] - _lin[0]) < 1e-9, f"first={_s[0]} vs {_lin[0]}")
+    check(f"bong_tangent_keep{_keep}_ends_at_sigma_min",
+          abs(_s[-1] - (1.0 / _keep)) < 1e-9, f"last={_s[-1]}")
+    check(f"bong_tangent_keep{_keep}_non_increasing",
+          all(_s[i] - _s[i + 1] >= -1e-9 for i in range(len(_s) - 1)))
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Seed propagation tests

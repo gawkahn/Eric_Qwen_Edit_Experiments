@@ -68,7 +68,7 @@ from comfyless.family_defaults import DISTILLED_FAMILIES, FAMILY_DEFAULTS
 
 CONTRACT_VERSION = 1
 SAMPLER_NAMES = sampler_choices()
-SCHEDULE_NAMES = ["linear", "balanced", "karras"]
+SCHEDULE_NAMES = ["linear", "balanced", "karras", "beta57", "bong_tangent"]
 _ALIGN = 32  # dimension alignment for all supported models
 
 
@@ -1318,10 +1318,10 @@ def generate(
         loras: List of {"path": str, "weight": float} dicts.  Applied
             in order.  LoRA load failures are non-fatal (warned, skipped).
         sampler: One of SAMPLER_NAMES ("default", "multistep2", "multistep3").
-        schedule: Sigma-spacing schedule ("linear"/"balanced"/"karras", ADR-028).
-            Applied when the pipeline's scheduler is a flow-match scheduler whose
-            set_timesteps accepts sigmas; warn-and-ignored otherwise. Orthogonal to
-            (composes with) `sampler`.
+        schedule: Sigma-spacing schedule (one of SCHEDULE_NAMES: linear/balanced/
+            karras/beta57/bong_tangent, ADR-028). Applied when the pipeline's
+            scheduler is a flow-match scheduler whose set_timesteps accepts sigmas;
+            warn-and-ignored otherwise. Orthogonal to (composes with) `sampler`.
 
     Returns a metadata dict suitable for the sidecar JSON / bridge output.
     Raises on fatal errors (model not found, inference failure).
@@ -1707,10 +1707,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--schedule", choices=SCHEDULE_NAMES, default=None,
                    help="Sigma-spacing schedule (ADR-028): linear (uniform), "
                         "balanced (Karras ρ=3), karras (Karras ρ=7, steps toward "
-                        "fine detail). Applied when the model uses a flow-match "
-                        "scheduler (Flux/Qwen/Chroma/Krea/Z-Image/Flux.2); "
-                        "warn-and-ignored for classic schedulers (SDXL/SD1). "
-                        "Composes with --sampler (spacing vs integration order).")
+                        "fine detail), beta57 (RES4LYF beta α=0.5 β=0.7), "
+                        "bong_tangent (RES4LYF two-stage arctan). Applied when the "
+                        "model uses a flow-match scheduler (Flux/Qwen/Chroma/Krea/"
+                        "Z-Image/Flux.2); warn-and-ignored for classic schedulers "
+                        "(SDXL/SD1). Composes with --sampler (spacing vs "
+                        "integration order).")
     p.add_argument("--max-seq-len", type=int, default=None,
                    help="Max sequence length for text encoder")
     p.add_argument("--transformer", type=str, default=None, metavar="PATH",
