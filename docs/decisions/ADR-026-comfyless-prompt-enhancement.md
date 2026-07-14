@@ -161,4 +161,22 @@ vendored, on-disk reprompt tokenizer, and only under these constraints:
   `docs/security/review-enhancer-trust-remote-code-2026-07-11.md` (CLEAN after the
   auto_map/config-pin MEDIUM was folded). code-reviewer findings #3/#4/#6/#7 folded.
 
-**AI-Disclosure:** Claude (Opus 4.8) authored; Grant reviewed.
+- 2026-07-14 — **amendment: endpoint sampling-knob precedence.** The
+  `openai-endpoint` path previously read only `temperature`/`top_p` from the
+  recipe and ignored the backend cfg's sampling knobs entirely, never sending
+  `top_k`/`repetition_penalty` — so knobs set in `enhancers.toml` (e.g.
+  `[qwen-vl] temperature=0.99, top_k, repetition_penalty`) were silently dead.
+  New `_resolve_endpoint_sampling(recipe, cfg)` resolves every knob with
+  precedence **recipe > cfg > default**: `temperature` always resolves
+  (default 0.8, default moved out of `load_recipe` into the resolver so a
+  cfg-level temperature can apply when the recipe omits it); `top_p`/`top_k`/
+  `repetition_penalty` are emitted only when set (keeps a plain request
+  OpenAI-standard; the last two are vLLM extensions). `load_recipe` now
+  validates/coerces all four knobs if present. A bogus `batch` cfg key (the
+  toggle is `batch_variations`) emits a loud stderr warning but does not block
+  (warn-don't-block). Recipe knobs override backend defaults; recipes are the
+  per-recipe source of truth, cfg the per-backend fallback. test_enhance 59→80.
+  code-reviewer (Fable) run before commit.
+
+**AI-Disclosure:** Claude (Opus 4.8) authored; Grant reviewed. 2026-07-14
+sampling-precedence amendment: Claude (Fable) authored; Grant reviewed.

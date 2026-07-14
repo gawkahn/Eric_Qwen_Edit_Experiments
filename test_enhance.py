@@ -79,7 +79,13 @@ with tempfile.TemporaryDirectory() as tmp:
     check("missing family recipe falls back to generic", r2["system_prompt"] == "G")
     r3 = E.load_recipe("sdxl-generic", tmp)
     check("sdxl recipe distinct", r3["system_prompt"] == "TAGS")
-    check("recipe temperature default applied", E.load_recipe("sdxl-generic", tmp)["temperature"] == 0.8)
+    # ADR-026 (2026-07-14): load_recipe no longer force-defaults temperature —
+    # the default (0.8) + recipe>cfg precedence moved to the endpoint resolver so
+    # a backend cfg can supply any knob the recipe omits.
+    check("recipe WITHOUT temperature leaves it unset (resolver defaults)",
+          "temperature" not in E.load_recipe("sdxl-generic", tmp))
+    check("recipe WITH temperature keeps the file value",
+          E.load_recipe("generic", tmp)["temperature"] == 0.8)
     nosys = _write(tmp, "nosys.toml", 'target="nl"\n')
     try:
         E.load_recipe("nosys", tmp); check("recipe missing system_prompt rejected", False)
@@ -91,6 +97,105 @@ with tempfile.TemporaryDirectory() as tmp:
             E.load_recipe("ghost", tmp2); check("absent recipe (no fallback) rejected", False)
         except E.EnhanceError:
             check("absent recipe (no fallback) rejected", True)
+
+
+print("── ADR-026: endpoint sampling precedence (recipe > cfg > default) ──")
+
+# Resolver precedence
+_rc = {"temperature": 0.95, "top_p": 0.9}
+_cc = {"temperature": 0.99, "top_p": 0.5, "top_k": 20, "repetition_penalty": 1.05}
+_s = E._resolve_endpoint_sampling(_rc, _cc)
+check("recipe temperature overrides cfg", _s["temperature"] == 0.95)
+check("recipe top_p overrides cfg", _s["top_p"] == 0.9)
+check("cfg supplies top_k when recipe omits it", _s["top_k"] == 20)
+check("cfg supplies repetition_penalty when recipe omits it", _s["repetition_penalty"] == 1.05)
+check("cfg temperature used when recipe omits it",
+      E._resolve_endpoint_sampling({}, {"temperature": 0.99})["temperature"] == 0.99)
+_sn = E._resolve_endpoint_sampling({}, {})
+check("no knobs set -> only temperature default 0.8", _sn == {"temperature": 0.8})
+check("top_k/repetition_penalty NOT emitted unless set",
+      "top_k" not in _sn and "repetition_penalty" not in _sn)
+
+# Payload construction: mock the HTTP POST + model resolve, capture the wire payload
+_captured_payloads = []
+_orig_post, _orig_rm = E._post_chat, E._resolve_endpoint_model
+E._post_chat = lambda endpoint, payload, key: (_captured_payloads.append(payload) or ["ENHANCED"])
+E._resolve_endpoint_model = lambda url, key, m: (m or "test-model")
+try:
+    out = E.enhance_openai_endpoint(
+        "a cat",
+        {"type": "openai-endpoint", "url": "http://x/v1", "model": "M",
+         "top_k": 20, "repetition_penalty": 1.05},
+        {"system_prompt": "SP", "temperature": 0.95, "top_p": 0.9}, 1)
+    check("endpoint returns enhanced text", out == ["ENHANCED"])
+    _pay = _captured_payloads[-1]
+    check("payload temperature = recipe 0.95", _pay["temperature"] == 0.95)
+    check("payload top_p = recipe 0.9", _pay["top_p"] == 0.9)
+    check("payload top_k = cfg fallback 20", _pay["top_k"] == 20)
+    check("payload repetition_penalty = cfg fallback 1.05", _pay["repetition_penalty"] == 1.05)
+    check("payload carries recipe system prompt", _pay["messages"][0]["content"] == "SP")
+
+    _captured_payloads.clear()
+    E.enhance_openai_endpoint(
+        "a cat", {"type": "openai-endpoint", "url": "http://x/v1", "model": "M"},
+        {"system_prompt": "SP"}, 1)
+    _pay2 = _captured_payloads[-1]
+    check("clean run emits temperature default 0.8", _pay2["temperature"] == 0.8)
+    check("clean run sends NO top_k/repetition_penalty (OpenAI-standard)",
+          "top_k" not in _pay2 and "repetition_penalty" not in _pay2)
+finally:
+    E._post_chat, E._resolve_endpoint_model = _orig_post, _orig_rm
+
+# Recipe sampling-knob type validation
+with tempfile.TemporaryDirectory() as tmpc:
+    for _label, _toml in (
+        ("non-int-str top_k", 'system_prompt="S"\ntop_k="notint"\n'),
+        # bool → int(True)=1 would be a drastic silent change; reject it.
+        ("bool top_k", 'system_prompt="S"\ntop_k=true\n'),
+        ("bool temperature", 'system_prompt="S"\ntemperature=true\n'),
+        # non-integer float top_k must not silently truncate to 20.
+        ("non-integer-float top_k", 'system_prompt="S"\ntop_k=20.5\n'),
+    ):
+        _write(tmpc, "bad.toml", _toml)
+        try:
+            E.load_recipe("bad", tmpc); check(f"recipe {_label} rejected", False)
+        except E.EnhanceError:
+            check(f"recipe {_label} rejected", True)
+    _write(tmpc, "ok.toml",
+           'system_prompt="S"\ntop_k=40\nrepetition_penalty=1.1\ntop_p=0.8\n')
+    _ok = E.load_recipe("ok", tmpc)
+    check("recipe coerces top_k to int",
+          _ok["top_k"] == 40 and isinstance(_ok["top_k"], int))
+    check("recipe coerces repetition_penalty to float", _ok["repetition_penalty"] == 1.1)
+    # top_k as an integer-valued float (40.0) is accepted and narrowed to int.
+    _write(tmpc, "okf.toml", 'system_prompt="S"\ntop_k=40.0\n')
+    check("recipe integer-valued-float top_k accepted → int",
+          E.load_recipe("okf", tmpc)["top_k"] == 40)
+
+# cfg-sourced bad types raise EnhanceError (clean message), not a raw ValueError
+for _cfgbad in ({"temperature": "hot"}, {"top_k": True}, {"top_p": "x"}):
+    try:
+        E._resolve_endpoint_sampling({}, _cfgbad)
+        check(f"cfg bad type {_cfgbad} raises EnhanceError", False)
+    except E.EnhanceError:
+        check(f"cfg bad type {_cfgbad} raises EnhanceError", True)
+    except Exception as _e:  # noqa: BLE001 — a raw ValueError here is the bug
+        check(f"cfg bad type {_cfgbad} raises EnhanceError",
+              False, f"got {type(_e).__name__}")
+
+# Loud warning on the bogus 'batch' key (feedback: warn, don't block)
+import io as _io
+from contextlib import redirect_stderr as _rse
+with tempfile.TemporaryDirectory() as tmpb:
+    _reg = _write(tmpb, "enh.toml",
+                  '[qwen]\ntype="openai-endpoint"\nurl="http://x/v1"\nbatch=5\n')
+    _buf = _io.StringIO()
+    with _rse(_buf):
+        _b = E.load_backends(_reg)
+    check("bogus 'batch' key still loads the backend (warn, not block)",
+          "qwen" in _b)
+    check("bogus 'batch' key emits loud warning naming batch_variations",
+          "batch_variations" in _buf.getvalue(), _buf.getvalue())
 
 
 print("── _clean_output ──")

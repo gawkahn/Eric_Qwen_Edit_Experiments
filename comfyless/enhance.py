@@ -120,6 +120,15 @@ def load_backends(path: Optional[str] = None) -> Dict[str, dict]:
                 f"enhancer {name!r}: type must be one of {_VALID_TYPES}, got {t!r}"
             )
         backends[name] = dict(cfg)
+        # Loud-warn on the common 'batch' typo: the batching toggle is
+        # 'batch_variations = true' (request all --variations in one call);
+        # a bare 'batch' key is read by nothing and silently does nothing.
+        if "batch" in cfg:
+            print(
+                f"[enhance] WARNING: backend {name!r} sets 'batch' — no backend "
+                f"reads this key. Did you mean 'batch_variations = true'? "
+                f"(the variation COUNT comes from --variations N.) Ignoring 'batch'.",
+                file=sys.stderr)
     if not backends:
         raise EnhanceError(f"enhancer registry {p} defines no backends")
     return backends
@@ -135,6 +144,34 @@ def default_recipe_name(family: Optional[str]) -> str:
     if not family or family == "unknown":
         return "generic"
     return f"{family}-generic"
+
+
+def _coerce_sampling_value(key: str, val: Any, want_int: bool, layer: str):
+    """Validate + coerce a sampling knob, raising EnhanceError (never a raw
+    ValueError) so both the offline CLI and inline paths surface a clean error.
+
+    Rejects booleans explicitly: TOML has real bools, and `int(True)`/`float(True)`
+    would silently become 1/1.0 — a drastic, invisible sampling change. For
+    integer knobs (top_k) a non-integer float (20.5) is rejected rather than
+    silently truncated. `layer` names the source ("recipe X" / "backend cfg").
+    """
+    kind = "an integer" if want_int else "numeric"
+    if isinstance(val, bool):
+        raise EnhanceError(f"{layer} {key} must be {kind}, got boolean {val!r}")
+    try:
+        if want_int:
+            f = float(val)
+            if not f.is_integer():
+                raise EnhanceError(
+                    f"{layer} {key} must be {kind}, got {val!r}")
+            return int(f)
+        return float(val)
+    except (TypeError, ValueError):
+        raise EnhanceError(f"{layer} {key} must be {kind}, got {val!r}")
+
+
+_SAMPLING_KNOBS = (("temperature", False), ("top_p", False),
+                   ("repetition_penalty", False), ("top_k", True))
 
 
 def load_recipe(name: str, recipes_dir: Optional[str] = None) -> dict:
@@ -158,14 +195,13 @@ def load_recipe(name: str, recipes_dir: Optional[str] = None) -> dict:
         raise EnhanceError(f"malformed recipe {candidate}: {e}") from e
     if not r.get("system_prompt"):
         raise EnhanceError(f"recipe {candidate} missing 'system_prompt'")
-    r.setdefault("temperature", 0.8)
-    try:
-        r["temperature"] = float(r["temperature"])
-    except (TypeError, ValueError):
-        raise EnhanceError(
-            f"recipe {candidate}: temperature must be numeric, got "
-            f"{r['temperature']!r}"
-        )
+    # Sampling knobs are validated/coerced IF PRESENT. The default (temperature
+    # → 0.8) and recipe>cfg>default precedence live in the endpoint resolver
+    # (_resolve_endpoint_sampling), so a backend cfg can supply any knob the
+    # recipe omits. No force-default here — that would mask a cfg-level value.
+    for _k, _want_int in _SAMPLING_KNOBS:
+        if r.get(_k) is not None:
+            r[_k] = _coerce_sampling_value(_k, r[_k], _want_int, f"recipe {candidate}:")
     r.setdefault("target", "")
     return r
 
@@ -431,6 +467,39 @@ def _post_chat(endpoint: str, payload: dict, key: str) -> List[str]:
         ) from e
 
 
+def _resolve_endpoint_sampling(recipe: dict, cfg: dict) -> dict:
+    """Resolve openai-endpoint sampling knobs: recipe value > cfg value > default.
+
+    ``temperature`` always resolves (default 0.8). ``top_p`` / ``top_k`` /
+    ``repetition_penalty`` are included ONLY when a recipe or backend cfg sets
+    them — so a plain request stays OpenAI-standard (``top_k`` /
+    ``repetition_penalty`` are vLLM extensions that stricter servers reject if
+    sent unconditionally). This is the single source of truth for which sampling
+    fields reach the wire; the recipe layer owns per-recipe values, the cfg layer
+    supplies per-backend defaults.
+    """
+    def pick(key):
+        if recipe.get(key) is not None:
+            return recipe[key]
+        if cfg.get(key) is not None:
+            return cfg[key]
+        return None
+
+    # Recipe values were already coerced by load_recipe, so any coercion
+    # failure here is necessarily a cfg-sourced value → label it "backend cfg".
+    temp = pick("temperature")
+    out: Dict[str, Any] = {
+        "temperature": _coerce_sampling_value("temperature", temp, False,
+                                              "backend cfg:")
+        if temp is not None else 0.8}
+    for key, want_int in (("top_p", False), ("top_k", True),
+                          ("repetition_penalty", False)):
+        v = pick(key)
+        if v is not None:
+            out[key] = _coerce_sampling_value(key, v, want_int, "backend cfg:")
+    return out
+
+
 def enhance_openai_endpoint(text: str, cfg: dict, recipe: dict, n: int) -> List[str]:
     """Enhance via an OpenAI-compatible chat endpoint using the recipe system prompt.
 
@@ -451,25 +520,24 @@ def enhance_openai_endpoint(text: str, cfg: dict, recipe: dict, n: int) -> List[
     # Cache the resolved id back so a multi-prompt offline batch (which calls
     # this per source prompt with the same cfg dict) resolves /models once.
     cfg["model"] = model
-    temperature = float(recipe.get("temperature", 0.8))
-    top_p = recipe.get("top_p")
+    # recipe > cfg > default for every sampling knob (temperature/top_p/top_k/
+    # repetition_penalty). top_k + repetition_penalty are vLLM extensions,
+    # emitted only when set.
+    sampling = _resolve_endpoint_sampling(recipe, cfg)
     system_prompt = recipe["system_prompt"]
     endpoint = url.rstrip("/") + "/chat/completions"
     n = max(1, n)
 
     def _base_payload() -> dict:
-        p = {
+        return {
             "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": text},
             ],
-            "temperature": temperature,
             "stream": False,
+            **sampling,
         }
-        if top_p is not None:
-            p["top_p"] = float(top_p)
-        return p
 
     def _finalize(contents: List[str]) -> List[str]:
         cleaned = []
