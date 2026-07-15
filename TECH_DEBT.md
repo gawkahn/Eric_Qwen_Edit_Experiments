@@ -1283,3 +1283,21 @@ grows a coercion/validation step or a new knob with non-obvious semantics, add a
 gen_kwargs-capture test (mock `_load_reprompt`) proving each knob reaches
 `.generate()` and that bad types are rejected. Surfaced by code-review of the
 min_p wiring slice.
+
+**Refinement-loop cold path has no root containment for seed component paths (2026-07-15)**
+`comfyless/refine.py::run_generation` falls back to an in-process `gen.generate()`
+when no daemon socket is present. On that COLD path, seed-supplied
+`model`/`transformer_path`/`vae_path`/`text_encoder*_path`/`refiner_path`/
+`upscale_vae_path` load directly from any local directory the seed image's
+metadata names — the daemon's `_check_paths` root-union validation never runs.
+This is the same accepted trust model as `generate --params` replay (the LLM
+verifiably cannot reach `WorkingConfig.base`; only a user-chosen seed image can),
+so slice 4 shipped it as-is with the F4 loud echo strengthened to FLAG each path
+outside the roots ("loads on the cold path only"). **Why not now:** a fail-closed
+cold-path containment gate is a trust-model change (it would also constrain the
+existing fresh-`--prompt`/`--params` cold path), a decision that belongs to Grant,
+not a mechanical slice. **Trigger:** the refinement loop is ever run against
+seed images from a less-trusted source, OR the cold path becomes reachable by a
+non-interactive caller — then add a `_within`-union gate to `run_generation`'s
+cold branch (mirroring `server._check_paths`) and decide fail-closed vs warn.
+Surfaced by security-auditor review of ADR-027 slice 4 (MEDIUM-4).

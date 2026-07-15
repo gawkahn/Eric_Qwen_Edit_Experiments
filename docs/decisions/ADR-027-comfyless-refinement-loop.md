@@ -351,6 +351,53 @@ Security section. The binding invariants the review established:
   `path_was_discarded` honored); sidecar content never enters judge context.
   Slices remaining: (4) seed-image entry (F4/F5).
 
+- 2026-07-15 (slice 4 landed) — seed-image entry. `--seed-image` (a prior
+  comfyless PNG) + optional `--params` override sidecar seed the working config
+  via `build_config_from_seed`; `--prompt` XOR `--seed-image` (mutually exclusive
+  required group); `--model` optional (defaults to the seed's model). Seed params
+  keep FULL schema authority (user-initiated) — extraction routes through
+  `generate._load_params`/`_validate_params`. F5 gate (`load_seed_image_capped`)
+  runs FIRST; path-shaped `loras[].path` refs are `.safetensors`-stripped then
+  basename→catalog-resolved through the ADR-015 resolver (foreign dir dropped,
+  `path_was_discarded` surfaced, forward-constraint (c)); the load-bearing path
+  fields are loudly echoed before the first generation. `test_refine.py` 155→188.
+  **security-auditor (Fable): APPROVE with conditions** — no CRITICAL/HIGH; F1/F2/
+  F3/F5-at-entry/F6 + forward-constraints (b)/(c) all verified to hold. Four
+  MEDIUMs, all folded before commit:
+    - **F4 echo omitted `upscale_vae_path`** (a daemon-loaded weight field, ADR-030)
+      → added to `_SEED_ECHO_PATH_FIELDS` with a keep-in-sync note vs
+      `server._PATH_FIELDS`.
+    - **Seed prompt enters judge context unbounded.** **Ruling (this slice):** the
+      seed's embedded `prompt` becomes the judge TARGET and necessarily re-enters
+      judge context every iteration — this is the ONE deliberate exemption to the
+      slice-3 "sidecar content never enters judge context" constraint (the loop
+      cannot judge without a target). It is now length-capped at
+      `OVERRIDE_PROMPT_MAX_CHARS`, symmetric with the planner-override prompt, so a
+      crafted chunk cannot inject megabytes of judge-directed text (F8).
+    - **`--params` read escaped the F5 byte cap** → `_stat_within_bytes` gates it
+      against `SEED_IMAGE_MAX_BYTES` before read.
+    - **Cold path had no root containment for seed component paths** (same accepted
+      `generate --params` trust model; the LLM cannot reach `base`) → the F4 echo
+      now flags each path OUTSIDE the operator roots ("loads on the cold path
+      only") so the human sees it before an unattended loop; the daemon path still
+      hard-validates via `_check_paths`. A fail-closed cold-path gate is a
+      trust-model change deferred to Grant (TECH_DEBT).
+  **code-reviewer (Fable): needs-changes**, all folded:
+    - **MEDIUM — `float(r.op.weight or 1.0)` rewrote a deliberate weight 0.0 to
+      1.0** → `... if r.op.weight is not None else 1.0`; weight-0 test added.
+    - **MEDIUM — cold path dropped the ADR-030 `upscale_vae_path`/
+      `upscale_vae_subfolder`** (daemon replayed 2×, cold 1×) → both forwarded in
+      the cold `gen.generate` call.
+    - **LOWs** — `_extract` catch tuple gained `AttributeError`/`TypeError` +
+      a non-dict guard (a list/string `--params` no longer tracebacks); malformed
+      seed lora entries are dropped WITH a notice; seed mode logs that CLI gen
+      flags are ignored; abspath-on-slash HF-repo-id caveat documented; trivial
+      abspath test strengthened with a relative path.
+  Reviews saved: `docs/security/review-refinement-loop-slice4-2026-07-15.md`.
+  **ADR-027 is now feature-complete** (all four planned slices landed); deferred
+  items live in TECH_DEBT (cold-path containment; aesthetic-calibration follow-up).
+
 **AI-Disclosure:** Claude (Fable 5) authored the design record from a design
 conversation with Grant; Grant reviewed. Slice 3 implementation + review
-folding authored by Claude (Fable 5); Grant reviewed.
+folding authored by Claude (Fable 5); Grant reviewed. Slice 4 implementation +
+review folding authored by Claude (Fable 5); Grant reviewed.

@@ -714,6 +714,180 @@ check("winner is the highest-composite candidate", _o.best_composite == 6.0)
 check("winner file is iter 0's candidate",
       os.path.basename(_o.winner_path) == "candidate_00.png")
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  Slice 4 — seed-image entry (F4/F5)
+# ══════════════════════════════════════════════════════════════════════════════
+from comfyless.refine import build_config_from_seed  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+from PIL.PngImagePlugin import PngInfo  # noqa: E402
+
+print("\n== slice 4: seed-image entry — build fixture ==")
+_s4root = tempfile.mkdtemp()
+_s4mb = os.path.join(_s4root, "mb"); os.makedirs(_s4mb)
+_s4ld = os.path.join(_s4root, "loras"); os.makedirs(_s4ld)
+open(os.path.join(_s4ld, "detail-tweaker.safetensors"), "wb").close()
+_s4cat = build_catalog(_s4mb, lora_paths=(_s4ld,), transformer_paths=())
+_s4roots = (_s4mb, _s4ld)
+_s4model = os.path.join(_s4mb, "SomeModel"); os.makedirs(_s4model)
+
+# A comfyless sidecar carrying a PATH-shaped lora ref from a FOREIGN directory
+# (forward-constraint (c)) plus a skip-key that must be stripped.
+_seed_params = {
+    "prompt": "a knight in a snowy forest, cinematic",
+    "negative_prompt": "blurry", "model": _s4model, "transformer_path": "",
+    "loras": [{"path": "/foreign/dir/detail-tweaker.safetensors", "weight": 0.8}],
+    "seed": 12345, "steps": 30, "cfg_scale": 4.0, "width": 768, "height": 1024,
+    "sampler": "default", "timestamp": "2026-07-15T00:00:00+00:00",
+}
+def _png_with(params, name):
+    """A PNG carrying a comfyless tEXt chunk — the real --seed-image shape."""
+    p = os.path.join(_s4root, name)
+    _pi = PngInfo(); _pi.add_text("comfyless", json.dumps(params))
+    Image.new("RGB", (48, 48), "white").save(p, pnginfo=_pi)
+    return p
+
+_seed_png = _png_with(_seed_params, "seed.png")
+
+def _seed_args(**over):
+    d = dict(seed_image=_seed_png, params=None, model=None)
+    d.update(over)
+    return SimpleNamespace(**d)
+
+_quiet = lambda *_a, **_k: None  # noqa: E731
+
+print("== slice 4: seed from a PNG comfyless chunk ==")
+_cfg, _tp = build_config_from_seed(_seed_args(), _s4cat, _s4roots, log=_quiet)
+check("target prompt comes from the seed", _tp == "a knight in a snowy forest, cinematic")
+check("working prompt == target prompt", _cfg.prompt == _tp)
+check("seed gen params carried into base",
+      _cfg.base.get("steps") == 30 and _cfg.base.get("cfg_scale") == 4.0
+      and _cfg.base.get("width") == 768 and _cfg.base.get("height") == 1024)
+check("seed skip-key stripped (no timestamp in base)", "timestamp" not in _cfg.base)
+check("prompt/loras NOT duplicated into base",
+      "prompt" not in _cfg.base and "loras" not in _cfg.base)
+check("model pinned in base (abspath)", _cfg.base["model"] == os.path.abspath(_s4model))
+
+print("== slice 4: path-shaped seed lora → basename→catalog (F2/F4, forward-c) ==")
+check("foreign-path lora resolved by basename to the catalog lora",
+      len(_cfg.loras) == 1 and _cfg.loras[0].name == "detail-tweaker"
+      and os.path.exists(_cfg.loras[0].abs_path), detail=str(_cfg.loras))
+check("seed lora weight preserved", _cfg.loras[0].weight == 0.8)
+check("resolved lora abs_path under our root, NOT the foreign dir",
+      _cfg.loras[0].abs_path.startswith(_s4ld))
+
+print("== slice 4: resolve_lora_ops surfaces path_was_discarded (forward-c) ==")
+_pd_res, _pd_notes = refine.resolve_lora_ops(
+    _s4cat, _s4roots, [LoraOp("/x/y/detail-tweaker", "add", 1.0)])
+check("path-shaped ref still resolves", len(_pd_res) == 1)
+check("path discard is noticed", any("path discarded" in n for n in _pd_notes),
+      detail=str(_pd_notes))
+
+print("== slice 4: --model override wins over the seed's model ==")
+_ovr_model = os.path.join(_s4mb, "OtherModel"); os.makedirs(_ovr_model)
+_cfg2, _ = build_config_from_seed(_seed_args(model=_ovr_model), _s4cat, _s4roots, log=_quiet)
+check("--model overrides seed model", _cfg2.base["model"] == os.path.abspath(_ovr_model))
+
+print("== slice 4: seed lora weight 0.0 is HONORED, not rewritten to 1.0 ==")
+_w0_png = _png_with(
+    {"prompt": "x", "model": _s4model,
+     "loras": [{"path": "/d/detail-tweaker.safetensors", "weight": 0.0}]}, "w0.png")
+_cfg_w0, _ = build_config_from_seed(_seed_args(seed_image=_w0_png), _s4cat, _s4roots, log=_quiet)
+check("weight 0.0 preserved (not coerced to 1.0)",
+      len(_cfg_w0.loras) == 1 and _cfg_w0.loras[0].weight == 0.0,
+      detail=str(_cfg_w0.loras))
+
+print("== slice 4: bare-name seed lora (no path) resolves via name fallback ==")
+_bn_png = _png_with(
+    {"prompt": "x", "model": _s4model,
+     "loras": [{"name": "detail-tweaker", "weight": 0.5}]}, "barename.png")
+_cfg_bn, _ = build_config_from_seed(_seed_args(seed_image=_bn_png), _s4cat, _s4roots, log=_quiet)
+check("bare-name lora resolves",
+      len(_cfg_bn.loras) == 1 and _cfg_bn.loras[0].name == "detail-tweaker"
+      and _cfg_bn.loras[0].weight == 0.5)
+
+print("== slice 4: relative slash-path model is abspath'd (non-trivial) ==")
+_cfg_rel, _ = build_config_from_seed(_seed_args(model="rel/sub/model"), _s4cat, _s4roots, log=_quiet)
+check("relative slash model abspath'd (not passed through)",
+      _cfg_rel.base["model"] == os.path.abspath("rel/sub/model")
+      and _cfg_rel.base["model"] != "rel/sub/model")
+
+print("== slice 4: malformed seed lora entries dropped WITH a notice ==")
+_mal_png = _png_with(
+    {"prompt": "x", "model": _s4model,
+     "loras": ["notadict", {"weight": 1.0}, {"path": "detail-tweaker.safetensors"}]},
+    "malformed.png")
+_mal_echo = []
+_cfg_mal, _ = build_config_from_seed(
+    _seed_args(seed_image=_mal_png), _s4cat, _s4roots, log=lambda m: _mal_echo.append(m))
+check("only the one valid lora survives", len(_cfg_mal.loras) == 1)
+check("non-dict lora entry noticed", any("not an object" in m for m in _mal_echo))
+check("keyless lora entry noticed", any("no path/name" in m for m in _mal_echo))
+
+print("== slice 4: upscale_vae_path echoed + outside-roots flag (F4/MEDIUM-4) ==")
+_up_png = _png_with(
+    {"prompt": "x", "model": "/outside/roots/model",
+     "upscale_vae_path": "/outside/roots/wan-vae.safetensors"}, "upscale.png")
+_up_echo = []
+build_config_from_seed(_seed_args(seed_image=_up_png), _s4cat, _s4roots,
+                       log=lambda m: _up_echo.append(m))
+_up_joined = "\n".join(_up_echo)
+check("upscale_vae_path is echoed", "upscale_vae_path = /outside/roots/wan-vae.safetensors" in _up_joined)
+check("outside-roots path is flagged", "OUTSIDE the allowed roots" in _up_joined)
+
+print("== slice 4: --params overrides seed params key-by-key ==")
+_ovr_sidecar = os.path.join(_s4root, "override.json")
+with open(_ovr_sidecar, "w") as _f:
+    json.dump({"steps": 12, "cfg_scale": 2.0}, _f)
+_cfg3, _ = build_config_from_seed(_seed_args(params=_ovr_sidecar), _s4cat, _s4roots, log=_quiet)
+check("--params overrides steps/cfg", _cfg3.base["steps"] == 12 and _cfg3.base["cfg_scale"] == 2.0)
+check("--params leaves un-overridden seed fields intact", _cfg3.base["width"] == 768)
+
+print("== slice 4: F4 loud echo of load-bearing fields ==")
+_echoed = []
+build_config_from_seed(_seed_args(), _s4cat, _s4roots, log=lambda m: _echoed.append(m))
+_joined = "\n".join(_echoed)
+check("echo names the model path", os.path.abspath(_s4model) in _joined)
+check("echo names the seed lora path (pre-resolution)",
+      "/foreign/dir/detail-tweaker.safetensors" in _joined)
+check("echo reports the path was discarded", "path discarded" in _joined)
+
+print("== slice 4: F4/F5 negatives ==")
+_np_png = _png_with({"model": _s4model, "steps": 20}, "noprompt.png")
+raises("seed with no prompt rejected",
+       lambda: build_config_from_seed(_seed_args(seed_image=_np_png), _s4cat, _s4roots, log=_quiet))
+_nm_png = _png_with({"prompt": "x"}, "nomodel.png")
+raises("seed with no model and no --model rejected",
+       lambda: build_config_from_seed(_seed_args(seed_image=_nm_png), _s4cat, _s4roots, log=_quiet))
+_ws_png = _png_with({"prompt": "   \n\t ", "model": _s4model}, "wsprompt.png")
+raises("whitespace-only seed prompt rejected",
+       lambda: build_config_from_seed(_seed_args(seed_image=_ws_png), _s4cat, _s4roots, log=_quiet))
+_bw_png = _png_with(
+    {"prompt": "x", "model": _s4model,
+     "loras": [{"path": "detail-tweaker.safetensors", "weight": float("inf")}]},
+    "badweight.png")
+raises("non-finite seed lora weight rejected",
+       lambda: build_config_from_seed(_seed_args(seed_image=_bw_png), _s4cat, _s4roots, log=_quiet))
+_sw_png = _png_with(
+    {"prompt": "x", "model": _s4model,
+     "loras": [{"path": "detail-tweaker.safetensors", "weight": "heavy"}]}, "strweight.png")
+raises("non-numeric string seed lora weight rejected",
+       lambda: build_config_from_seed(_seed_args(seed_image=_sw_png), _s4cat, _s4roots, log=_quiet))
+_bigp_png = _png_with(
+    {"prompt": "x" * (refine.OVERRIDE_PROMPT_MAX_CHARS + 1), "model": _s4model},
+    "bigprompt.png")
+raises("seed prompt over the char cap rejected (MEDIUM-2)",
+       lambda: build_config_from_seed(_seed_args(seed_image=_bigp_png), _s4cat, _s4roots, log=_quiet))
+# F5: the --params sidecar read is byte-capped (this test file exceeds a 1-byte cap).
+raises("--params over the byte cap rejected (F5)",
+       lambda: refine._stat_within_bytes(__file__, 1))
+# F5: the entry path runs load_seed_image_capped FIRST — a non-image seed file is
+# rejected before any metadata is trusted (this .py file is not a decodable image),
+# proving the F5 gate is wired into the entry, not just the standalone helper.
+raises("non-image seed rejected at entry (F5 gate wired in)",
+       lambda: build_config_from_seed(
+           SimpleNamespace(seed_image=__file__, params=None, model=_s4model),
+           _s4cat, _s4roots, log=_quiet))
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

@@ -5,7 +5,13 @@ Slices landed here:
   2. catalog-name resolution (F2) + path-stripped planner context (F3).
   3. the greedy hill-climb loop controller (generate → judge+plan → apply →
      candidates/winners), daemon-aware generation, and the CLI.
-Slice 4 (seed-image entry, F4/F5) is still deferred.
+  4. seed-image entry (F4/F5): --seed-image (a prior comfyless PNG, + optional
+     --params override sidecar) seeds the working config. Seed params keep FULL
+     schema authority (user-initiated, unlike the planner's closed allowlist);
+     the read is byte/pixel-capped (F5); HF resolution stays fail-closed; the
+     load-bearing path fields are loudly echoed before the first generation
+     (F4); path-shaped seed LoRA refs resolve by basename via the ADR-015
+     resolver with a path_was_discarded notice (slice-2 forward-constraint (c)).
 
 The keystone invariant (ADR-027, security review F1): the LLM judge's output is
 gated by a CLOSED two-key allowlist — only `overrides.prompt` and
@@ -470,6 +476,16 @@ def resolve_lora_ops(catalog, roots, lora_ops: List[LoraOp],
                 f"lora {op.name!r}: not resolvable as a catalog LoRA "
                 f"(cause: {res.cause}) — dropped")
             continue
+        # A path-shaped ref (a seed sidecar carries loras[].path; slice-2
+        # forward-constraint (c)) is reduced to its basename by the resolver.
+        # Surface that discard so the operator sees a foreign directory was
+        # dropped and the LoRA re-bound to a catalog entry by name. On the
+        # planner path this never fires — planner names are never path-shaped
+        # (closed allowlist F1), so it also stands as a loud F2 tripwire there.
+        if res.path_was_discarded:
+            notices.append(
+                f"lora {op.name!r}: path discarded — resolved by basename to "
+                f"catalog LoRA {res.name!r}")
         resolved.append(ResolvedLoraOp(op=op, resolved_name=res.name,
                                        abs_path=res.abs_path))
     return resolved, notices
@@ -873,6 +889,11 @@ def run_generation(cfg: WorkingConfig, *, device: str, output_dir: str,
         refiner_path=params.get("refiner_path", ""),
         refiner_steps=params.get("refiner_steps", 4),
         refiner_cfg=params.get("refiner_cfg", 3.5),
+        # ADR-030 upscale-VAE pair — forwarded so a seed generated with
+        # --upscale-vae replays at 2× on the cold path too, not silently at 1×
+        # (daemon/cold parity, slice-3 LOW-7; code review slice-4).
+        upscale_vae_path=params.get("upscale_vae_path", ""),
+        upscale_vae_subfolder=params.get("upscale_vae_subfolder", ""),
         quant=params.get("quant") or "none",
         quant_skip=tuple(params.get("quant_skip") or ()),
         quant_only=tuple(params.get("quant_only") or ()),
@@ -1056,11 +1077,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="comfyless.refine",
         description="Iterative LLM-as-judge refinement loop (ADR-027). Fresh "
-                    "--prompt entry; greedy generate→judge→plan hill-climb.")
-    p.add_argument("--prompt", required=True, help="Target generation prompt")
-    p.add_argument("--model", required=True,
-                   help="Diffusers model directory (validated against --model-base "
-                        "when a daemon is running; trusted CLI input otherwise)")
+                    "--prompt entry OR --seed-image to refine a prior result; "
+                    "greedy generate→judge→plan hill-climb.")
+    entry = p.add_mutually_exclusive_group(required=True)
+    entry.add_argument("--prompt", help="Target generation prompt (fresh entry)")
+    entry.add_argument("--seed-image", metavar="PATH",
+                       help="Seed the config from a prior comfyless image "
+                            "(reads its embedded params / sidecar; F4/F5). The "
+                            "target prompt is taken from the seed's params.")
+    p.add_argument("--params", metavar="PATH", default=None,
+                   help="Optional sidecar/PNG overriding the --seed-image params "
+                        "key-by-key (only valid with --seed-image)")
+    p.add_argument("--model", default=None,
+                   help="Diffusers model directory (required with --prompt; with "
+                        "--seed-image it defaults to the seed's model and, if given, "
+                        "overrides it). Validated against --model-base under a daemon.")
     p.add_argument("--output-dir", required=True,
                    help="Run directory; candidates/ and winners/ are created inside")
     # Resolver plane (mirrors the MCP server startup roots).
@@ -1132,6 +1163,176 @@ def build_config_from_args(args, catalog, roots) -> WorkingConfig:
     return WorkingConfig(prompt=args.prompt, loras=seed_loras, base=base)
 
 
+#: Load-bearing path fields echoed loudly on seed entry (F4). A foreign image's
+#: metadata channel can carry any of these, and the COLD in-process path loads
+#: them with no root containment (only the daemon runs _check_paths), so the human
+#: must see each before an unattended loop starts, flagged if it is outside the
+#: roots. KEEP IN SYNC with comfyless/server.py::_PATH_FIELDS and the path-bearing
+#: keys of COMFYLESS_SCHEMA — add any new load-bearing path key here too.
+#: (loras[].path is echoed separately, pre-resolution.)
+_SEED_ECHO_PATH_FIELDS = ("model", "transformer_path", "vae_path",
+                          "text_encoder_path", "text_encoder_2_path",
+                          "refiner_path", "upscale_vae_path")
+#: The only weight-file extension the catalog indexes (build strips exactly this
+#: suffix to form a name); seed LoRA paths carry it and must have it stripped to
+#: match a catalog name.
+_WEIGHT_FILE_EXT = ".safetensors"
+
+
+def _stat_within_bytes(path: str, max_bytes: int) -> None:
+    """Reject a file larger than max_bytes (F5 local-DoS guard), raising
+    RefineError. The seed IMAGE is capped by load_seed_image_capped; the --params
+    sidecar (same provenance) gets this cheap stat check so a multi-GB JSON is not
+    slurped whole into memory."""
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        raise RefineError(f"cannot stat {path!r}: {e}") from e
+    if size > max_bytes:
+        raise RefineError(f"{path!r} is {size} bytes, exceeds cap {max_bytes}")
+
+
+def build_config_from_seed(args, catalog, roots,
+                           log: Callable[[str], None] = print) -> Tuple[WorkingConfig, str]:
+    """Seed the working config from --seed-image (a prior comfyless PNG) plus an
+    optional --params override sidecar, returning (WorkingConfig, target_prompt).
+    ADR-027 §Loop step 1 + security F4/F5.
+
+    The seed image's embedded comfyless chunk (and --params) is a SECOND untrusted
+    channel (F4). Unlike planner output (a closed two-key allowlist), seed params
+    are user-INITIATED and deliberately keep FULL schema authority — the user
+    chose this image, so its saved params (model, dims, quant, weights, ...) are
+    honored. The mitigations are: (1) F5 byte+pixel cap on the seed-image read and
+    a byte cap on the --params read; (2) HF resolution stays fail-closed (no
+    --allow-hf-download exists in refine); (3) a loud echo of every load-bearing
+    path field BEFORE the first generation, each flagged if it is outside the
+    operator roots (the cold path has no _check_paths gate); (4) path-shaped LoRA
+    refs resolve by basename through the ADR-015 resolver only (never honored as
+    paths), with a path_was_discarded notice; and (5) the seed prompt — which
+    necessarily enters judge context as the target — is length-capped like the
+    planner-override prompt (ADR-027 slice-4 ruling; the ONE exemption to the
+    slice-3 "sidecar content never enters judge context" constraint).
+
+    The seed image is read ONLY to extract its params; its pixels are not judged
+    (the loop generates candidate_00 from the seeded config). load_seed_image_capped
+    is the F5 gate — it runs FIRST, confirming the file is a real, in-bounds image
+    before any metadata it carries is trusted."""
+    from comfyless import generate as gen
+    from comfyless.server import _within
+    # F5 gate on the seed IMAGE, FIRST — a non-image / oversized / decompression-
+    # bomb seed is rejected before any metadata is parsed. Pixels are discarded.
+    load_seed_image_capped(args.seed_image)
+
+    def _extract(path: str) -> dict:
+        try:
+            data = gen._load_params(path)
+        except (OSError, ValueError, TypeError, AttributeError,
+                json.JSONDecodeError, KeyError) as e:
+            raise RefineError(f"cannot read seed params from {path!r}: {e}") from e
+        if not isinstance(data, dict):
+            raise RefineError(f"seed params in {path!r} are not a key/value object")
+        return data
+
+    extracted = _extract(args.seed_image)
+    if args.params:
+        # --params is a separate file of the same provenance as the seed image; it
+        # gets the same F5 byte cap (a JSON sidecar is otherwise an unbounded read)
+        # and overrides the embedded params key-by-key.
+        _stat_within_bytes(args.params, SEED_IMAGE_MAX_BYTES)
+        extracted = {**extracted, **_extract(args.params)}
+
+    prompt = extracted.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise RefineError(
+            "seed image/params carry no usable 'prompt' — the loop needs a target "
+            "to judge against; start a fresh run with --prompt instead")
+    # The seed prompt becomes the judge target and re-enters judge context every
+    # iteration — the ONE necessary exemption to the slice-3 constraint. Bound it
+    # like the planner-override prompt so a crafted chunk cannot inject megabytes
+    # of judge-directed text (security review MEDIUM-2, F8).
+    if len(prompt) > OVERRIDE_PROMPT_MAX_CHARS:
+        raise RefineError(
+            f"seed 'prompt' exceeds {OVERRIDE_PROMPT_MAX_CHARS} chars "
+            f"({len(prompt)}) — trim the seed metadata or use a fresh --prompt")
+
+    # --model (if given) overrides the seed's model; else the seed must carry one.
+    model = args.model or extracted.get("model")
+    if not isinstance(model, str) or not model.strip():
+        raise RefineError(
+            "no 'model' in the seed params and no --model given — cannot generate")
+
+    # Path-shaped seed LoRA refs → basename→catalog via the resolver (F2/F4,
+    # forward-constraint (c)). Weights are user-authority but must be finite.
+    # Malformed entries are dropped WITH a notice (warn-don't-block), not silently.
+    seed_ops: List[LoraOp] = []
+    skip_notices: List[str] = []
+    for entry in (extracted.get("loras") or []):
+        if not isinstance(entry, dict):
+            skip_notices.append(f"seed lora entry {entry!r} is not an object — skipped")
+            continue
+        ref = entry.get("path") or entry.get("name")
+        if not isinstance(ref, str) or not ref.strip():
+            skip_notices.append(f"seed lora entry {entry!r} has no path/name — skipped")
+            continue
+        try:
+            w = float(entry.get("weight", 1.0))
+        except (TypeError, ValueError):
+            raise RefineError(f"seed LoRA {ref!r}: weight "
+                              f"{entry.get('weight')!r} is not a number")
+        if not math.isfinite(w):
+            raise RefineError(f"seed LoRA {ref!r}: weight {w!r} is not finite")
+        # A sidecar stores the LOAD path (e.g. /d/detail-tweaker.safetensors);
+        # the catalog is keyed by extension-less name (build indexes only
+        # .safetensors, stripping that exact suffix). Strip the same suffix here
+        # but keep the ref PATH-shaped so the resolver still basename-strips it
+        # and flags path_was_discarded (forward-constraint (c)).
+        if ref.endswith(_WEIGHT_FILE_EXT):
+            ref = ref[: -len(_WEIGHT_FILE_EXT)]
+        seed_ops.append(LoraOp(name=ref, action="add", weight=w))
+    resolved, lora_notices = resolve_lora_ops(catalog, roots, seed_ops)
+    slots = [LoraSlot(r.resolved_name, r.abs_path,
+                      float(r.op.weight) if r.op.weight is not None else 1.0)
+             for r in resolved]
+
+    # base = every schema key EXCEPT prompt/loras (handled above); model pinned
+    # explicitly (may be the --model override). Missing gen params default inside
+    # run_generation, so no CLI-default backfill is needed here. abspath a
+    # path-shaped model; a bare name is left as-is. A slash-containing HF repo id
+    # is mangled by abspath — acceptable: refine is fail-closed on HF (no
+    # download), so a repo id could not resolve anyway.
+    base = {k: v for k, v in extracted.items() if k not in ("prompt", "loras")}
+    base["model"] = (os.path.abspath(model)
+                     if ("/" in model or os.sep in model) else model)
+
+    roots_t = (roots,) if isinstance(roots, str) else tuple(roots)
+
+    def _root_flag(val: str) -> str:
+        # The cold in-process path loads component weights with NO root containment
+        # (only the daemon runs _check_paths). Flag any echoed path outside the
+        # roots so the human sees it before an unattended loop starts (MEDIUM-4).
+        try:
+            inside = any(_within(val, r) for r in roots_t)
+        except Exception:  # noqa: BLE001 — a malformed path must not abort the echo
+            inside = False
+        return "" if inside else \
+            "  ** OUTSIDE the allowed roots — loads on the cold path only **"
+
+    # F4: loud echo of load-bearing fields BEFORE the first generation.
+    log("[refine] seed entry — load-bearing fields from an UNTRUSTED image "
+        "channel; verify before trusting:")
+    for fld in _SEED_ECHO_PATH_FIELDS:
+        val = base.get(fld)
+        if isinstance(val, str) and val.strip():
+            log(f"[refine]   {fld} = {val}{_root_flag(val)}")
+    for entry in (extracted.get("loras") or []):
+        if isinstance(entry, dict) and (entry.get("path") or entry.get("name")):
+            log(f"[refine]   lora path = {entry.get('path') or entry.get('name')}")
+    for n in (*skip_notices, *lora_notices):
+        log(f"[refine]   {n}")
+
+    return WorkingConfig(prompt=prompt, loras=slots, base=base), prompt
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = _build_arg_parser().parse_args(argv)
     log = print
@@ -1181,9 +1382,25 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[refine] judge model autodetect failed: {e}", file=sys.stderr)
             return 2
 
+    # --params is only meaningful when seeding from an image.
+    if args.params and not args.seed_image:
+        print("[refine] --params requires --seed-image (it overrides the seed's "
+              "embedded params); ignoring it on a fresh --prompt run has no "
+              "sensible meaning", file=sys.stderr)
+        return 2
+
     conn = open_catalog_db(args.catalog_db) if args.catalog_db else None
     try:
-        cfg = build_config_from_args(args, catalog, roots)
+        if args.seed_image:
+            log("[refine] seed mode: generation params come from the seed image "
+                "(and --params); the CLI gen flags (--steps/--cfg/--seed/--width/"
+                "--height/--sampler/--quant/...) are IGNORED — override via --params.")
+            cfg, target_prompt = build_config_from_seed(args, catalog, roots, log=log)
+        else:
+            if not args.model:
+                raise RefineError("--model is required with --prompt")
+            cfg = build_config_from_args(args, catalog, roots)
+            target_prompt = args.prompt
     except RefineError as e:
         print(f"[refine] {e}", file=sys.stderr)
         return 2
@@ -1193,7 +1410,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         result = refine_loop(
-            cfg, target_prompt=args.prompt, catalog=catalog, roots=roots,
+            cfg, target_prompt=target_prompt, catalog=catalog, roots=roots,
             conn=conn, backend_cfg=backend_cfg, output_dir=args.output_dir,
             device=args.device, precision=args.precision,
             pass_threshold=args.pass_threshold, max_iterations=args.max_iterations,
