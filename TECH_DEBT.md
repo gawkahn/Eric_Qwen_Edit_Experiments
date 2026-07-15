@@ -1268,3 +1268,18 @@ offload is the proven-safe node behavior. **Trigger:** upscale becomes a hot
 daemon path — make the offload conditional on free VRAM (skip when the Wan decode
 fits alongside the resident transformer) or opt-in for the daemon, and add a
 hot test for `--quant fp8` + `--upscale-vae`. Surfaced by code-review of ADR-030.
+
+**Hunyuan-reprompt sampling-knob cfg passthrough is untested (2026-07-15)**
+`enhance_hunyuan_reprompt` copies backend-cfg sampling knobs
+(`temperature`/`top_p`/`top_k`/`repetition_penalty`/`min_p`) into `gen_kwargs`
+raw — no `_coerce_sampling_value` and no test coverage for ANY knob on this path
+(the endpoint path is well-covered; the hunyuan loop is not). Adding `min_p` to
+the loop inherited this gap rather than creating it. **Why not now:** the min_p
+slice scoped to the endpoint resolver + recipe validation, which the tests do
+cover; the hunyuan path passes values straight to transformers `.generate()`,
+which validates them itself, so a bad cfg value surfaces as a generate-time
+error rather than silent corruption. **Trigger:** if the hunyuan cfg-knob path
+grows a coercion/validation step or a new knob with non-obvious semantics, add a
+gen_kwargs-capture test (mock `_load_reprompt`) proving each knob reaches
+`.generate()` and that bad types are rejected. Surfaced by code-review of the
+min_p wiring slice.

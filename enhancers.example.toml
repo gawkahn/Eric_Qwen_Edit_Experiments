@@ -23,13 +23,14 @@ precision = "bf16"     # optional (bf16|fp16|fp32; default bf16)
 # top_p       = 0.95   # default 0.8
 # top_k       = 20
 # repetition_penalty = 1.05
+# min_p       = 0.05   # truncate the low-prob tail; pairs well with high temperature
 
 # Endpoint sampling precedence is recipe > backend cfg > default (ADR-026):
 # whatever the selected recipe sets WINS over the values below, so tune per-run
 # diversity in the recipe, not here — the knobs below are the fallback for
 # recipes that omit them. temperature defaults to 0.8; top_p/top_k/
-# repetition_penalty are emitted only when set (top_k + repetition_penalty are
-# vLLM extensions stricter servers reject).
+# repetition_penalty/min_p are emitted only when set (top_k + repetition_penalty
+# + min_p are vLLM extensions stricter servers reject).
 [gemma-dense]
 type    = "openai-endpoint"
 url     = "http://localhost:8016/v1"
@@ -37,6 +38,7 @@ temperature = 0.9    # default 0.8 (shadowed by a recipe that sets temperature)
 top_p       = 0.95
 top_k       = 20
 repetition_penalty = 1.05
+# min_p     = 0.05          # optional vLLM extension; emitted only when set
 # batch_variations = true   # request all --variations in ONE call via the
                             #   OpenAI `n` param (throughput win on vLLM). It is
                             #   a toggle — the COUNT comes from --variations N.

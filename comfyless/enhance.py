@@ -171,7 +171,8 @@ def _coerce_sampling_value(key: str, val: Any, want_int: bool, layer: str):
 
 
 _SAMPLING_KNOBS = (("temperature", False), ("top_p", False),
-                   ("repetition_penalty", False), ("top_k", True))
+                   ("repetition_penalty", False), ("top_k", True),
+                   ("min_p", False))
 
 
 def load_recipe(name: str, recipes_dir: Optional[str] = None) -> dict:
@@ -348,7 +349,7 @@ def enhance_hunyuan_reprompt(text: str, cfg: dict, n: int,
     # `temperature`/`top_p` for more diverse --variations. Defaults are
     # Tencent's. do_sample stays on so variations actually differ.
     gen_kwargs = dict(_REPROMPT_GEN)
-    for _k in ("temperature", "top_p", "top_k", "repetition_penalty"):
+    for _k in ("temperature", "top_p", "top_k", "repetition_penalty", "min_p"):
         if _k in cfg:
             gen_kwargs[_k] = cfg[_k]
     try:
@@ -471,10 +472,10 @@ def _resolve_endpoint_sampling(recipe: dict, cfg: dict) -> dict:
     """Resolve openai-endpoint sampling knobs: recipe value > cfg value > default.
 
     ``temperature`` always resolves (default 0.8). ``top_p`` / ``top_k`` /
-    ``repetition_penalty`` are included ONLY when a recipe or backend cfg sets
-    them — so a plain request stays OpenAI-standard (``top_k`` /
-    ``repetition_penalty`` are vLLM extensions that stricter servers reject if
-    sent unconditionally). This is the single source of truth for which sampling
+    ``repetition_penalty`` / ``min_p`` are included ONLY when a recipe or backend
+    cfg sets them — so a plain request stays OpenAI-standard (``top_k`` /
+    ``repetition_penalty`` / ``min_p`` are vLLM extensions that stricter servers
+    reject if sent unconditionally). This is the single source of truth for which sampling
     fields reach the wire; the recipe layer owns per-recipe values, the cfg layer
     supplies per-backend defaults.
     """
@@ -493,7 +494,7 @@ def _resolve_endpoint_sampling(recipe: dict, cfg: dict) -> dict:
                                               "backend cfg:")
         if temp is not None else 0.8}
     for key, want_int in (("top_p", False), ("top_k", True),
-                          ("repetition_penalty", False)):
+                          ("repetition_penalty", False), ("min_p", False)):
         v = pick(key)
         if v is not None:
             out[key] = _coerce_sampling_value(key, v, want_int, "backend cfg:")
@@ -521,8 +522,8 @@ def enhance_openai_endpoint(text: str, cfg: dict, recipe: dict, n: int) -> List[
     # this per source prompt with the same cfg dict) resolves /models once.
     cfg["model"] = model
     # recipe > cfg > default for every sampling knob (temperature/top_p/top_k/
-    # repetition_penalty). top_k + repetition_penalty are vLLM extensions,
-    # emitted only when set.
+    # repetition_penalty/min_p). top_k + repetition_penalty + min_p are vLLM
+    # extensions, emitted only when set.
     sampling = _resolve_endpoint_sampling(recipe, cfg)
     system_prompt = recipe["system_prompt"]
     endpoint = url.rstrip("/") + "/chat/completions"

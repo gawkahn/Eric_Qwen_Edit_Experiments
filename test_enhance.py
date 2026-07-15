@@ -115,6 +115,12 @@ _sn = E._resolve_endpoint_sampling({}, {})
 check("no knobs set -> only temperature default 0.8", _sn == {"temperature": 0.8})
 check("top_k/repetition_penalty NOT emitted unless set",
       "top_k" not in _sn and "repetition_penalty" not in _sn)
+# min_p (vLLM extension) follows the same recipe>cfg>default emit-only-when-set rule
+check("min_p NOT emitted unless set", "min_p" not in _sn)
+check("recipe min_p overrides cfg",
+      E._resolve_endpoint_sampling({"min_p": 0.05}, {"min_p": 0.2})["min_p"] == 0.05)
+check("cfg supplies min_p when recipe omits it",
+      E._resolve_endpoint_sampling({}, {"min_p": 0.1})["min_p"] == 0.1)
 
 # Payload construction: mock the HTTP POST + model resolve, capture the wire payload
 _captured_payloads = []
@@ -126,11 +132,12 @@ try:
         "a cat",
         {"type": "openai-endpoint", "url": "http://x/v1", "model": "M",
          "top_k": 20, "repetition_penalty": 1.05},
-        {"system_prompt": "SP", "temperature": 0.95, "top_p": 0.9}, 1)
+        {"system_prompt": "SP", "temperature": 0.95, "top_p": 0.9, "min_p": 0.05}, 1)
     check("endpoint returns enhanced text", out == ["ENHANCED"])
     _pay = _captured_payloads[-1]
     check("payload temperature = recipe 0.95", _pay["temperature"] == 0.95)
     check("payload top_p = recipe 0.9", _pay["top_p"] == 0.9)
+    check("payload min_p = recipe 0.05", _pay["min_p"] == 0.05)
     check("payload top_k = cfg fallback 20", _pay["top_k"] == 20)
     check("payload repetition_penalty = cfg fallback 1.05", _pay["repetition_penalty"] == 1.05)
     check("payload carries recipe system prompt", _pay["messages"][0]["content"] == "SP")
@@ -141,8 +148,9 @@ try:
         {"system_prompt": "SP"}, 1)
     _pay2 = _captured_payloads[-1]
     check("clean run emits temperature default 0.8", _pay2["temperature"] == 0.8)
-    check("clean run sends NO top_k/repetition_penalty (OpenAI-standard)",
-          "top_k" not in _pay2 and "repetition_penalty" not in _pay2)
+    check("clean run sends NO top_k/repetition_penalty/min_p (OpenAI-standard)",
+          "top_k" not in _pay2 and "repetition_penalty" not in _pay2
+          and "min_p" not in _pay2)
 finally:
     E._post_chat, E._resolve_endpoint_model = _orig_post, _orig_rm
 
@@ -153,6 +161,8 @@ with tempfile.TemporaryDirectory() as tmpc:
         # bool → int(True)=1 would be a drastic silent change; reject it.
         ("bool top_k", 'system_prompt="S"\ntop_k=true\n'),
         ("bool temperature", 'system_prompt="S"\ntemperature=true\n'),
+        # min_p is a recognized knob → same bool rejection as the others.
+        ("bool min_p", 'system_prompt="S"\nmin_p=true\n'),
         # non-integer float top_k must not silently truncate to 20.
         ("non-integer-float top_k", 'system_prompt="S"\ntop_k=20.5\n'),
     ):
@@ -162,18 +172,21 @@ with tempfile.TemporaryDirectory() as tmpc:
         except E.EnhanceError:
             check(f"recipe {_label} rejected", True)
     _write(tmpc, "ok.toml",
-           'system_prompt="S"\ntop_k=40\nrepetition_penalty=1.1\ntop_p=0.8\n')
+           'system_prompt="S"\ntop_k=40\nrepetition_penalty=1.1\ntop_p=0.8\nmin_p=0.05\n')
     _ok = E.load_recipe("ok", tmpc)
     check("recipe coerces top_k to int",
           _ok["top_k"] == 40 and isinstance(_ok["top_k"], int))
     check("recipe coerces repetition_penalty to float", _ok["repetition_penalty"] == 1.1)
+    check("recipe coerces min_p to float",
+          _ok["min_p"] == 0.05 and isinstance(_ok["min_p"], float))
     # top_k as an integer-valued float (40.0) is accepted and narrowed to int.
     _write(tmpc, "okf.toml", 'system_prompt="S"\ntop_k=40.0\n')
     check("recipe integer-valued-float top_k accepted → int",
           E.load_recipe("okf", tmpc)["top_k"] == 40)
 
 # cfg-sourced bad types raise EnhanceError (clean message), not a raw ValueError
-for _cfgbad in ({"temperature": "hot"}, {"top_k": True}, {"top_p": "x"}):
+for _cfgbad in ({"temperature": "hot"}, {"top_k": True}, {"top_p": "x"},
+                {"min_p": True}):
     try:
         E._resolve_endpoint_sampling({}, _cfgbad)
         check(f"cfg bad type {_cfgbad} raises EnhanceError", False)
