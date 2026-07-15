@@ -37,6 +37,7 @@ import os
 import shutil
 import sqlite3
 import sys
+import tomllib
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -689,7 +690,32 @@ def apply_overrides(cfg: WorkingConfig, verdict: Verdict,
 
 
 # ── Judge context assembly (F3 — path-stripped) ──────────────────────────────
-JUDGE_SYSTEM_PROMPT = (
+#: The CODE-OWNED half of the judge system prompt: the exact JSON output shape
+#: `parse_verdict` depends on, plus the F1/F2 safety rule (change ONLY the prompt +
+#: LoRA set, by catalog NAME, never a path). This is appended to every judge
+#: prompt by `compose_judge_system_prompt` and is NEVER recipe-editable — so a
+#: recipe can retune the scoring guidance for a given judge model, but can never
+#: break the parse boundary or the name-only override authority.
+_JUDGE_OUTPUT_CONTRACT = (
+    "You may ONLY change the prompt and the LoRA set. To change LoRAs, reference "
+    "them by a catalog NAME that appears in the provided context — NEVER invent "
+    "names and NEVER emit file paths. Actions: add, remove, set_weight (weight is "
+    "a float, typically 0-2).\n\n"
+    "Respond with STRICT JSON and nothing else, exactly this shape:\n"
+    '{"scores": {"prompt_adherence": <1-10>, "aesthetics": <1-10>}, '
+    '"critique": {"prompt_adherence": "<short>", "aesthetics": "<short>"}, '
+    '"verdict": "pass" | "revise", '
+    '"overrides": {"prompt": "<optional rewritten prompt>", '
+    '"loras": [{"name": "<catalog name>", "action": "add|remove|set_weight", '
+    '"weight": <optional float>}]}}'
+)
+
+#: The RECIPE-editable half (the scoring RUBRIC). Shipped verbatim as
+#: judge_recipes/generic.toml, which is the runtime source of truth users edit.
+#: This constant is DELIBERATELY NOT pinned to that file — it is only the
+#: import-safe fallback used when no recipe file exists at all, and may lag the
+#: shipped generic.toml over time.
+_DEFAULT_JUDGE_RUBRIC = (
     "You are a meticulous image-quality judge for a text-to-image system. You are "
     "shown ONE generated image plus a JSON context: the user's target prompt, the "
     "prompt actually used, the active LoRAs (by catalog NAME and weight), and "
@@ -700,18 +726,62 @@ JUDGE_SYSTEM_PROMPT = (
     "or wrong elements lower this hard.\n"
     "  - aesthetics: composition, lighting, coherence, detail, and absence of "
     "artifacts (extra limbs, warped text, seams), independent of the prompt.\n\n"
-    "Then decide fixes. You may ONLY change the prompt and the LoRA set. To change "
-    "LoRAs, reference them by a catalog NAME that appears in the provided context — "
-    "NEVER invent names and NEVER emit file paths. Actions: add, remove, set_weight "
-    "(weight is a float, typically 0-2).\n\n"
-    "Respond with STRICT JSON and nothing else, exactly this shape:\n"
-    '{"scores": {"prompt_adherence": <1-10>, "aesthetics": <1-10>}, '
-    '"critique": {"prompt_adherence": "<short>", "aesthetics": "<short>"}, '
-    '"verdict": "pass" | "revise", '
-    '"overrides": {"prompt": "<optional rewritten prompt>", '
-    '"loras": [{"name": "<catalog name>", "action": "add|remove|set_weight", '
-    '"weight": <optional float>}]}}'
+    "Then decide fixes."
 )
+
+_JUDGE_RECIPES_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "judge_recipes")
+
+
+def compose_judge_system_prompt(rubric: str) -> str:
+    """Compose the full judge system prompt = recipe RUBRIC + the code-owned output
+    contract. The contract is always appended and never lives in the recipe, so a
+    bad/edited recipe can change scoring guidance but can never break the strict
+    JSON shape parse_verdict requires or the name-only override authority (F1/F2)."""
+    return rubric.rstrip() + "\n\n" + _JUDGE_OUTPUT_CONTRACT
+
+
+def load_judge_recipe(name: str, recipes_dir: Optional[str] = None) -> str:
+    """Load a judge recipe's RUBRIC (`system_prompt`) by name — the scoring guidance
+    only; the output contract is NOT in the file. Different judge models (gemma vs
+    qwen-vl, ...) get their own recipe file; select with --judge-recipe.
+
+    An EXPLICITLY named recipe that is missing FAILS CLOSED (RefineError) — never a
+    silent fall back to generic, which would quietly invalidate an A/B between
+    judge models. Only the default `generic` degrades: if generic.toml itself is
+    absent, warn and use the built-in `_DEFAULT_JUDGE_RUBRIC` so the loop still runs
+    with no recipes dir. `name` must be a bare name (defense-in-depth: keeps the
+    flag from reading an arbitrary .toml into the judge prompt if the loop is ever
+    exposed to an agent — ADR-027 defers that surface)."""
+    if "/" in name or "\\" in name or os.sep in name:
+        raise RefineError(
+            f"judge recipe name {name!r} must be a bare name, not a path")
+    d = recipes_dir or _JUDGE_RECIPES_DIR
+    candidate = os.path.join(d, f"{name}.toml")
+    if not os.path.isfile(candidate):
+        if name != "generic":
+            raise RefineError(
+                f"judge recipe {name!r} not found in {d} — create {name}.toml "
+                f"or use --judge-recipe generic")
+        print(f"[refine] WARNING: judge_recipes/generic.toml not found in {d}; "
+              f"using the built-in default rubric", file=sys.stderr)
+        return _DEFAULT_JUDGE_RUBRIC
+    try:
+        with open(candidate, "rb") as f:
+            r = tomllib.load(f)
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError) as e:
+        raise RefineError(f"malformed judge recipe {candidate}: {e}") from e
+    sp = r.get("system_prompt")
+    if not isinstance(sp, str) or not sp.strip():
+        raise RefineError(
+            f"judge recipe {candidate} missing a non-empty 'system_prompt'")
+    return sp
+
+
+#: Back-compat default composed prompt (generic rubric + contract). judge_candidate
+#: and refine_loop default to this; main() overrides it with the --judge-recipe
+#: selection.
+JUDGE_SYSTEM_PROMPT = compose_judge_system_prompt(_DEFAULT_JUDGE_RUBRIC)
 
 
 def _assert_no_paths(obj: Any) -> None:
@@ -764,6 +834,7 @@ def _backend_key(cfg: dict) -> str:
 def judge_candidate(image, target_prompt: str, cfg: WorkingConfig, backend_cfg: dict,
                     planner_loras: List[dict], *,
                     search_offers: Optional[List[dict]] = None,
+                    system_prompt: str = JUDGE_SYSTEM_PROMPT,
                     temperature: float = DEFAULT_JUDGE_TEMPERATURE,
                     timeout: int = JUDGE_HTTP_TIMEOUT) -> Verdict:
     """One combined judge+planner call: downscale image (F5) → data URI → payload →
@@ -788,7 +859,7 @@ def judge_candidate(image, target_prompt: str, cfg: WorkingConfig, backend_cfg: 
     data_uri = image_to_data_uri(downscale_for_judge(image))
     user_text = build_judge_user_text(target_prompt, cfg, planner_loras,
                                       search_offers=search_offers)
-    payload = build_judge_payload(model, JUDGE_SYSTEM_PROMPT, user_text, data_uri,
+    payload = build_judge_payload(model, system_prompt, user_text, data_uri,
                                   temperature=temperature)
     raw = _post_judge(endpoint, payload, key=key, timeout=timeout)
     return parse_verdict(raw)
@@ -944,6 +1015,7 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 patience: int = DEFAULT_PATIENCE,
                 w_pa: float = DEFAULT_W_PA, w_aes: float = DEFAULT_W_AES,
                 judge_timeout: int = JUDGE_HTTP_TIMEOUT,
+                judge_system_prompt: str = JUDGE_SYSTEM_PROMPT,
                 log: Callable[[str], None] = print) -> LoopOutcome:
     """Greedy hill-climb (ADR-027 §Loop). Each iteration: generate → judge+plan →
     record → stop-check (pass / cap / patience) → apply overrides. A generation
@@ -991,6 +1063,7 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
         try:
             verdict = judge_candidate(img, target_prompt, cfg, backend_cfg,
                                       planner_loras, search_offers=search_offers,
+                                      system_prompt=judge_system_prompt,
                                       timeout=judge_timeout)
         except RefineError as e:
             log(f"[refine] iter {i}: judge verdict unusable ({e}); "
@@ -1113,6 +1186,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="openai-endpoint backend name from the enhancer registry")
     p.add_argument("--judge-config", default=None, metavar="PATH",
                    help="Enhancer registry TOML (default: registry search)")
+    p.add_argument("--judge-recipe", default="generic", metavar="NAME",
+                   help="Judge rubric recipe from comfyless/judge_recipes/ "
+                        "(default: generic). Different judge models may need "
+                        "different rubrics; the JSON output contract is fixed.")
     p.add_argument("--judge-timeout", type=int, default=JUDGE_HTTP_TIMEOUT,
                    metavar="SEC", help="Per-call judge HTTP timeout")
     # Loop controls.
@@ -1382,6 +1459,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[refine] judge model autodetect failed: {e}", file=sys.stderr)
             return 2
 
+    # Judge rubric recipe → full system prompt (rubric + code-owned contract).
+    try:
+        judge_system_prompt = compose_judge_system_prompt(
+            load_judge_recipe(args.judge_recipe))
+    except RefineError as e:
+        print(f"[refine] judge recipe error: {e}", file=sys.stderr)
+        return 2
+
     # --params is only meaningful when seeding from an image.
     if args.params and not args.seed_image:
         print("[refine] --params requires --seed-image (it overrides the seed's "
@@ -1415,7 +1500,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             device=args.device, precision=args.precision,
             pass_threshold=args.pass_threshold, max_iterations=args.max_iterations,
             patience=args.patience, w_pa=args.w_prompt_adherence,
-            w_aes=args.w_aesthetics, judge_timeout=args.judge_timeout, log=log)
+            w_aes=args.w_aesthetics, judge_timeout=args.judge_timeout,
+            judge_system_prompt=judge_system_prompt, log=log)
     except RefineError as e:
         # A fatal generation error (e.g. daemon failure, model not found) surfaces
         # here as a clean exit, not a traceback (code review slice-3, LOW-8).

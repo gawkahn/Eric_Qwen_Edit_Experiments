@@ -397,7 +397,33 @@ Security section. The binding invariants the review established:
   **ADR-027 is now feature-complete** (all four planned slices landed); deferred
   items live in TECH_DEBT (cold-path containment; aesthetic-calibration follow-up).
 
+- 2026-07-15 (amendment — judge rubric → recipe) — the judge system prompt is no
+  longer a single hardcoded constant. It is SPLIT into a code-owned output
+  contract (`_JUDGE_OUTPUT_CONTRACT` — the strict JSON shape `parse_verdict`
+  requires + the F1/F2 "only prompt+LoRA, by catalog NAME, never a path" rule) and
+  an operator-editable RUBRIC (`comfyless/judge_recipes/*.toml`, selected with
+  `--judge-recipe NAME`, default `generic`). `compose_judge_system_prompt` ALWAYS
+  appends the contract, so a recipe can retune scoring for a given judge model
+  (gemma vs qwen-vl need different rubrics) but can NEVER break the parse boundary
+  or the name-only authority. **Decision:** the recipe sits at the same trust level
+  as the enhancer recipes (`comfyless/recipes/*.toml`) — operator-controlled local
+  config; `parse_verdict` + the ADR-015 resolver remain the actual enforcement and
+  are unchanged. **security-auditor (Fable): the security property holds** — the
+  contract is unconditionally appended on every path; a hostile rubric can at worst
+  waste iterations (existing F8 channel), never mint path/param authority. Folded:
+  fail-CLOSED on an explicitly-named missing recipe (a typo'd `--judge-recipe`
+  must not silently judge with generic and invalidate an A/B); bare-name guard on
+  the recipe name (defense-in-depth vs the deferred agent-exposure surface — no
+  arbitrary-`.toml`-into-prompt read). **code-reviewer (Fable):** folded a false
+  "pin test" comment (the constant is deliberately NOT pinned to the file — the
+  file is the runtime source of truth, the constant an import-safe fallback), a
+  missing recipe→loop→judge threading test (the headline feature's one untested
+  link, now asserted via a sentinel), and `UnicodeDecodeError` in the loader's
+  fail-closed except. `test_refine.py` 188→206. Review saved:
+  `docs/security/review-judge-recipe-2026-07-15.md`.
+
 **AI-Disclosure:** Claude (Fable 5) authored the design record from a design
 conversation with Grant; Grant reviewed. Slice 3 implementation + review
 folding authored by Claude (Fable 5); Grant reviewed. Slice 4 implementation +
-review folding authored by Claude (Fable 5); Grant reviewed.
+review folding authored by Claude (Fable 5); Grant reviewed. Judge-recipe
+amendment + review folding authored by Claude (Fable 5); Grant reviewed.

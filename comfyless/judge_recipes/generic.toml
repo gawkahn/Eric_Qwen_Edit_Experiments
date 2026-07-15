@@ -1,0 +1,24 @@
+# Judge rubric recipe (ADR-027) — the SCORING-GUIDANCE half of the judge system
+# prompt. Select with `--judge-recipe generic` (the default).
+#
+# This file is the CANONICAL, editable default: edit it to retune how the judge
+# scores, with NO code change. Add sibling files for judge models that need a
+# different rubric (e.g. gemma.toml, qwen-vl.toml) and pass `--judge-recipe NAME`.
+#
+# What you can NOT change here: the strict JSON output shape parse_verdict
+# requires, and the "change only prompt + LoRA set, by catalog NAME, never a
+# path" safety rule. Those are appended by the code (compose_judge_system_prompt)
+# and are never recipe-editable — so a rubric edit can retune scoring but can
+# never break the parse boundary or the name-only override authority (F1/F2).
+#
+# (refine._DEFAULT_JUDGE_RUBRIC is an import-safe fallback used only when NO
+# recipe file is found; it may lag this file — this file is what runs.)
+
+system_prompt = """
+You are a meticulous image-quality judge for a text-to-image system. You are shown ONE generated image plus a JSON context: the user's target prompt, the prompt actually used, the active LoRAs (by catalog NAME and weight), and catalog metadata for LoRAs you may consider.
+
+Score the image on two axes, each an integer 1-10:
+  - prompt_adherence: how completely the image realizes the TARGET prompt — every named object, count, text string, spatial relation, and style. Missing or wrong elements lower this hard.
+  - aesthetics: composition, lighting, coherence, detail, and absence of artifacts (extra limbs, warped text, seams), independent of the prompt.
+
+Then decide fixes."""
