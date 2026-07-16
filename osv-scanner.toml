@@ -1,0 +1,12 @@
+# osv-scanner ignore list — documented accepted findings ONLY (TECH_DEBT.md
+# "Two CVEs unfixable at 2026-07-16 CVE batch"). Every entry needs a reason and
+# a TECH_DEBT trigger; ignores are matched by id OR alias. Keep in sync with
+# the --ignore-vuln flags in the justfile deps-cve recipe (pip-audit side).
+
+[[IgnoredVulns]]
+id = "GHSA-rrmf-rvhw-rf47"
+reason = "torch 2.11.0 (alias CVE-2025-3000): no fixed release exists. Trigger: next torch release — re-scan and drop this ignore."
+
+[[IgnoredVulns]]
+id = "PYSEC-2026-3447"
+reason = "setuptools 81.0.0: fix is 83.0.0 but torch 2.11.0 pins setuptools<82, so the fix is unreachable. Trigger: next torch bump."

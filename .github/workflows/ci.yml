@@ -69,6 +69,46 @@ jobs:
           "${{ github.event.pull_request.base.sha }}"
           "${{ github.event.pull_request.head.sha }}"
 
+  supply-chain:
+    name: supply chain (sources + license + cve)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.11.7" # match dev box; exact pin per §11
+          enable-cache: false
+      # --locked verifies uv.lock integrity hashes; the scans run against it.
+      # NOTE: this resolves the full CUDA-wheel tree (~7 GB) — acceptable for
+      # now; if runner disk/time becomes a problem, switch the license/cve
+      # scans to `uv export`-based inputs that don't install.
+      - run: uv sync --locked
+      # Tier-3 (§11): fail if any dep is from a non-registry (unhashed)
+      # source. Fast, no network — fail early before the live scans.
+      - name: tier-3 hash sources (§11)
+        run: uv run python scripts/check_lock_sources.py
+      # mise provides the pinned osv-scanner + just (mise.toml).
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          version: "2026.5.0" # match dev box; exact pin per §11
+          install: false
+          cache: false
+      - run: mise trust ./mise.toml
+      - run: mise install
+      # License gate — deterministic; only fails when a dep's license leaves
+      # the ADR-031 allowlist. Runs first (fast, no network).
+      - name: license policy (ADR-031)
+        run: mise exec -- just deps-licenses
+      # CVE gate — pip-audit + osv-scanner query live OSV; HARD gate per §11
+      # (a newly-published CVE turns even an unrelated push red — that friction
+      # IS the rule). Documented ignores: osv-scanner.toml + the recipe's
+      # --ignore-vuln flags (TECH_DEBT "Two CVEs unfixable at 2026-07-16").
+      - name: cve scan (§11 gate)
+        run: mise exec -- just deps-cve
+
   sast:
     name: sast (semgrep)
     runs-on: ubuntu-latest
