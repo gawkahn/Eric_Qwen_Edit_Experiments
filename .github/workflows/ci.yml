@@ -1,0 +1,93 @@
+# CI gate — quality-gate kit adoption, 2026-07-16 (reference: local_agents).
+#
+# ADOPTED GATES ONLY: this repo has adopted the `secrets` and `commit-policy`
+# gates. The kit's typecheck / tests / sast / supply-chain jobs are NOT here
+# yet — the tests gate needs a decision on the 19 standalone (non-pytest)
+# suites, and types/sast need a measured baseline first. Add them gate-by-gate
+# per the kit README (~/.claude/templates/quality-gate-kit-python-uv/).
+#
+# Fails the build on:
+#   - any git-policy smoke-test regression (scripts/git-policy/)
+#   - any repo-policy violation in a PR's commits (the authoritative mirror of
+#     the pre-commit layer — a local --no-verify / SKIP bypass is caught here)
+#   - any committed secret (gitleaks, 0-baseline — measured clean at adoption)
+#
+# Supply chain (global CLAUDE.md §11):
+#   - every `uses:` is pinned to a commit SHA, not a floating tag.
+#   - the mise BINARY is exact-pinned; mise.toml pins gitleaks/just.
+#
+# Least privilege: read-only token, no secrets. Uses `pull_request` (NOT
+# `pull_request_target`), so fork PRs run with no secret access.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  git-policy:
+    name: git-policy smoke tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # persist-credentials: false — don't leave GITHUB_TOKEN in .git/config
+      # next to repo-controlled scripts (read-only token today; belt-and-
+      # suspenders regardless).
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: git-policy smoke tests
+        run: bash scripts/git-policy/test-git-policy.sh
+
+  commit-policy:
+    name: commit policy (PR only)
+    # The authoritative CI mirror of the pre-commit repo-policy checks:
+    # validates the PR's commit range. PR-only — direct pushes to main are
+    # covered by the local pre-commit layer + the harness hook. Becomes a hard
+    # gate only once branch protection requires PRs (kit README step 9).
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0 # need base + head commits for the range check
+          persist-credentials: false
+      - name: repo-policy checks over PR commits
+        run: >
+          bash scripts/git-policy/check-range.sh
+          "${{ github.event.pull_request.base.sha }}"
+          "${{ github.event.pull_request.head.sha }}"
+
+  secrets:
+    name: secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0 # full history — gitleaks `git` mode scans all commits
+          persist-credentials: false
+      # mise provides the pinned gitleaks (mise.toml: aqua:gitleaks/gitleaks).
+      # install:false so we can `mise trust` FIRST — a repo-local mise.toml is
+      # untrusted by default; without trust the pins silently do not apply.
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          version: "2026.5.0" # match dev box; exact pin per §11
+          install: false
+          cache: false # don't opt into an implicit actions/cache surface
+      - run: mise trust ./mise.toml
+      - run: mise install
+      # --redact keeps any matched value out of the CI log.
+      - name: gitleaks (secret scan)
+        run: mise exec -- gitleaks git . --config .gitleaks.toml --no-banner --redact
