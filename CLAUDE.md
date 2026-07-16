@@ -89,7 +89,7 @@ See the general `Git Commit Discipline` rule in `~/.claude/CLAUDE.md` for the ca
 
 **Commit message style** — matches the existing history shown by `git log --oneline`:
 
-- Prefix: `feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `update:`, `tool:` for standalone CLI tools, `workflows:` for workflow JSON artifacts
+- Prefix: `feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `update:`, `deps:` for dependency bumps, `chore:`, `tool:` for standalone CLI tools, `workflows:` for workflow JSON artifacts (the enforced set — `scripts/git-policy/_lib.sh` `pc_conventional`)
 - Imperative mood, lowercase after the prefix
 - Short first line (≤72 chars), optional body explaining the _why_ not the _what_
 - **Every AI-produced commit must include both trailers** (global §0 rule 6 + §7):
@@ -135,16 +135,26 @@ The global `Git Commit Discipline` rule "Never push to remote without explicit u
 
 **§12 security review triggers — already present:**
 
-§12 is broader than §5 and this project already trips it on three surfaces:
+§12 is broader than §5 and this project already trips it on the surfaces below.
+The file-scoped ones are mechanically gated by
+`scripts/git-policy/_red-zone-paths.sh` (commit-policy layer, adopted
+2026-07-16) — keep that list and this table in sync:
 
 | Surface | File | Trigger |
 |---------|------|---------|
-| Unix socket IPC server | `comfyless/server.py` | IPC (Unix sockets) |
-| HF repo ID resolution + download | `nodes/eric_diffusion_utils.py` `resolve_hf_path` | Loading model weights from caller-supplied paths |
-| `--json` stdin/stdout bridge | `comfyless/generate.py` `_run_json_mode` | Machine-facing interface; future LLM agent tool surface |
+| Unix socket IPC server | `comfyless/server.py` | IPC (Unix sockets) — ADR-001, `review-comfyless-server-2026-04-23.md` |
+| MCP server | `comfyless/mcp_server.py` | LLM agent tool surface — ADR-011, `review-comfyless-mcp-server-2026-04-28.md`, `review-mcp-pipeline-cache-2026-06-27.md` |
+| Refinement-loop judge/seed | `comfyless/refine.py` | LLM output influencing generation params; seed-image ingestion — ADR-027, `review-refinement-loop-*.md` |
+| HF repo ID resolution + download | `nodes/eric_diffusion_utils.py` `resolve_hf_path` (function-scoped, not path-gated) | Loading model weights from caller-supplied paths |
+| `--json` stdin/stdout bridge | `comfyless/generate.py` `_run_json_mode` (function-scoped, not path-gated) | Machine-facing interface; future LLM agent tool surface |
 | Scaled-fp8 / int8-tensorwise file-content parser (ADR-019 slices C..I8) | `nodes/eric_diffusion_fp8_ops.py` + detection/remap in `eric_diffusion_utils.py` | Custom parsing of caller-supplied weight-file CONTENT (header key patterns, scale tensors, comfy_quant descriptors incl. int8 `ci-w`) fed into compute ops — review chain `docs/security/review-slice-{C,Cd,PQ,R1R2R3,I8}-*.md`, reqs 1-56 |
 
-**Debt:** No ADR or security review exists for `comfyless/server.py` (IPC) or `resolve_hf_path` (caller-supplied model loading). These should have had §12 reviews before the code landed. Backlogged — when either surface is next modified, write the missing review before touching the code.
+**Debt:** No §12 security review exists for `resolve_hf_path` (caller-supplied
+model loading) — it should have had one before the code landed. Backlogged —
+when that surface is next modified, write the missing review before touching
+the code. (`comfyless/server.py` was previously listed here too; that half was
+closed by ADR-001 + `review-comfyless-server-2026-04-23.md` /
+`review-comfyless-server-hardening-2026-04-23.md`.)
 
 **Surfaces that become Red Zone on scope change:**
 
@@ -155,18 +165,42 @@ The global `Git Commit Discipline` rule "Never push to remote without explicit u
 **Review rules:**
 
 - **Every non-trivial code slice runs `code-reviewer` (Fable) before commit.** "Trivial" = single-line fix, pure doc edit, mechanical rename with no behavior change.
-- **Any change to `comfyless/server.py`, `resolve_hf_path`, or `_run_json_mode` also runs `security-auditor` (Fable).** Output saved to `docs/security/review-<slug>-<YYYY-MM-DD>.md` and referenced in the commit body.
+- **Any change to a `_red-zone-paths.sh` path (`comfyless/server.py`, `comfyless/mcp_server.py`, `comfyless/refine.py`, `nodes/eric_diffusion_fp8_ops.py`) or to the function-scoped `resolve_hf_path` / `_run_json_mode` also runs `security-auditor` (Fable).** Output saved to `docs/security/review-<slug>-<YYYY-MM-DD>.md` and referenced in the commit body.
 - **When the `--json` / LLM agent wiring lands:** write spec + ADR before code, run `security-auditor`, treat as Red Zone from the first commit.
 - Trivial skip ask: `"Trivial — skip review? Change: <one-line summary>. Reply 'review' to run it anyway."` Do not self-decide.
 - Pass `model: "fable"` explicitly at every Agent-tool invocation for reviewer agents (`code-reviewer`, `security-auditor`). The frontmatter pin is known-broken in Claude Code 2.1.117 — structural enforcement requires the invocation-time override.
 
-## Commit-time hooks
+## Commit-time hooks & quality gates
 
-`.claude/settings.json` installs a `PreToolUse` hook on `Bash` that rejects `git commit -m "..."` calls whose message lacks an `AI-disclosure:` trailer. Required per global §7 and §0 rule 6.
+Three enforcement layers (quality-gate kit adoption 2026-07-16 — `secrets` +
+`commit-policy` gates only; types/tests/sast/supply-chain NOT adopted yet, see
+the kit README in `~/.claude/templates/quality-gate-kit-python-uv/`):
 
-- Bypassable by editor commit (no `-m` flag).
-- For human-only commits: `AI-disclosure: none`.
-- Hook script: `.claude/hooks/check-ai-disclosure.sh` (committed; travels with repo).
+1. **Harness hook (AI-facing, earliest):** `.claude/settings.json` installs a
+   `PreToolUse` hook on `Bash` that rejects `git commit -m "..."` calls whose
+   message lacks an `AI-disclosure:` trailer (global §7 / §0 rule 6). Script:
+   `.claude/hooks/check-ai-disclosure.sh`. Bypassable by editor commit (no
+   `-m`); human-only commits use `AI-disclosure: none`.
+2. **pre-commit layer (real git state, every committer):**
+   `.pre-commit-config.yaml` + `scripts/git-policy/`. Enable once per clone:
+   `uv run pre-commit install --hook-type pre-commit --hook-type commit-msg`
+   (pre-commit is in the uv `dev` dependency group). Checks: conventional
+   subject, AI-disclosure trailer, no pyproject dep floors, TECH_DEBT.md
+   append-only, Red Zone spec(=ADR)/review references, gitleaks secret scan,
+   config-file hygiene. Red Zone paths live in
+   `scripts/git-policy/_red-zone-paths.sh` (keep in sync with the Review bar
+   above; `_run_json_mode` / `resolve_hf_path` are function-scoped and NOT
+   path-gated — see TECH_DEBT.md). Escapes: `Policy-override:` line in the
+   message skips the Red Zone reference checks; smoke tests:
+   `just policy-test`.
+3. **CI mirror (authoritative once branch protection exists):**
+   `.github/workflows/ci.yml` — git-policy smoke tests + gitleaks on every
+   push/PR; the commit-range policy check on PRs.
+
+Toolchain pins: `mise.toml` (gitleaks, just — `mise trust ./mise.toml && mise
+install`). Recipes: `just secrets`, `just policy-test`. The gitleaks baseline
+is 0 (history measured clean at adoption; `.gitleaks.toml` has no allowlist —
+this repo's tests embed no credential-shaped fixtures).
 
 ## Architecture
 

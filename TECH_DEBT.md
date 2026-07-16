@@ -1318,3 +1318,18 @@ containment against an allowlisted root and treat the commit as Red Zone from da
 one (mirrors the `--json` bridge / future-MCP treatment in the project Review bar).
 The 2026-07-16 overwrite-confirmation guard (warn + interactive y/N) is orthogonal
 and does not address containment.
+
+**git-policy: function-scoped Red Zone surfaces not path-gateable (2026-07-16)**
+The quality-gate kit's commit-policy layer (`scripts/git-policy/`, adopted
+2026-07-16) gates Red Zone commits by *file path* (`_red-zone-paths.sh`). Two of
+this repo's §12 surfaces are *function*-scoped: `comfyless/generate.py::
+_run_json_mode` and `nodes/eric_diffusion_utils.py::resolve_hf_path`. Their host
+files change in most feature slices for non-Red-Zone reasons, so listing them
+would fire the ADR/review-reference gate constantly and train a `Policy-override:`
+habit — they are deliberately NOT listed; enforcement for them remains T5
+(CLAUDE.md Review bar + reviewer discipline). **Why not now:** path-based hooks
+cannot see which function a diff touches; a diff-hunk-range parser is real work
+disproportionate to a solo repo. **Trigger:** either function moves into its own
+module (then add the path), or a commit slips through that changed one of them
+without review — then either build hunk-range detection into
+`pre-commit-checks.sh` or accept whole-file gating despite the friction.

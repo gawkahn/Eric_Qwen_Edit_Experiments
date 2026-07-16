@@ -70,6 +70,15 @@ dependencies = [
     "ftfy==6.3.1",
 ]
 
+[dependency-groups]
+# Dev-only tooling for the comfyless uv path (ADR-013). NOT part of
+# [project.dependencies], so the pyproject ↔ requirements.txt direct-dep
+# agreement rule (CLAUDE.md) is unaffected — ComfyUI Manager installs never
+# see this group.
+dev = [
+    "pre-commit==4.6.0",   # local enforcement layer (quality-gate kit, 2026-07-16)
+]
+
 [project.urls]
 Repository = "https://github.com/EricRollei/Eric_Qwen_Edit_Experiments"
 Issues = "https://github.com/EricRollei/Eric_Qwen_Edit_Experiments/issues"

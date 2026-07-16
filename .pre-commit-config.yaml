@@ -1,0 +1,50 @@
+# Local-dev enforcement layer for the repo-policy checks (quality-gate kit
+# adoption 2026-07-16; reference: local_agents ADR-012).
+#
+# Enable once per clone:  uv run pre-commit install --hook-type pre-commit --hook-type commit-msg
+# The CI mirror (scripts/git-policy/check-range.sh, the `commit-policy` job) is the
+# authoritative gate — a local `--no-verify` / `SKIP=` bypass is still caught there.
+#
+# These enforce the repo policy against real git state so they apply to every
+# committer, not only the in-session AI. The harness hook
+# (.claude/hooks/check-ai-disclosure.sh) stays as an earlier, AI-facing layer —
+# defense in depth, same split as the reference repo.
+minimum_pre_commit_version: "3.5.0"
+# A bare `pre-commit install` would otherwise install only the pre-commit stage
+# and silently drop the commit-msg checks (code-reviewer 2026-07-16).
+default_install_hook_types: [pre-commit, commit-msg]
+repos:
+  - repo: local
+    hooks:
+      - id: repo-policy-staged
+        name: repo policy — no dep floors, TECH_DEBT append-only
+        entry: scripts/git-policy/pre-commit-checks.sh
+        language: script
+        stages: [pre-commit]
+        pass_filenames: false
+        always_run: true
+      - id: repo-policy-commit-msg
+        name: repo policy — conventional subject, AI-disclosure, Red Zone refs
+        entry: scripts/git-policy/commit-msg-checks.sh
+        language: script
+        stages: [commit-msg]
+
+  # Secret scanning at commit time (defense in depth with the CI `secrets` job).
+  # Uses the repo's .gitleaks.toml. Pinned to the same gitleaks version as
+  # mise.toml; rev pinned to the commit SHA (not the movable tag) — §11
+  # supply-chain consistency.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: 2ca41cc1372d1e939a6a879f18cdc19fc1cac1ce # v8.30.0
+    hooks:
+      - id: gitleaks
+
+  # Non-mutating hygiene: validate config files + catch stray conflict markers /
+  # oversized files. (No auto-formatters here — they would churn existing files
+  # on first adoption; add trailing-whitespace/end-of-file-fixer per project.)
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: cef0300fd0fc4d2a87a85fa2093c6b283ea36f4b # v5.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
