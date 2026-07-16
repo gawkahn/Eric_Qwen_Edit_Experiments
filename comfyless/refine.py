@@ -403,7 +403,9 @@ def _post_judge(endpoint: str, payload: dict, key: str = "",
     if key:
         req.add_header("Authorization", f"Bearer {key}")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        # Judge endpoint URL is operator-configured (CLI/recipe), never from
+        # model output; read is capped below.
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
             # Cap the read so a misbehaving endpoint can't stream unbounded bytes.
             raw = resp.read(JUDGE_RESPONSE_MAX_BYTES)
     except urllib.error.HTTPError as e:

@@ -11,3 +11,11 @@ secrets:
 # Commit-policy smoke tests — the git-policy check functions + evil-merge e2e.
 policy-test:
     bash scripts/git-policy/test-git-policy.sh
+
+# 0-baseline hard gate (7 findings triaged + suppressed inline 2026-07-16);
+# scope is this repo's code roots (no src/). FPs: inline # nosemgrep + comment.
+# Security static analysis (SAST) — semgrep, exact-pinned via uv
+sast:
+    uv run --with semgrep==1.169.0 semgrep scan \
+      --config p/python --config p/security-audit --config p/secrets \
+      --error --quiet --metrics=off comfyless/ nodes/ pipelines/

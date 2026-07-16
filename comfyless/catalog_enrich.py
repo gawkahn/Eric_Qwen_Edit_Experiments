@@ -45,7 +45,9 @@ def _http_get_json(url: str, timeout: float = 15.0) -> Any:
     tests). Response size is bounded by a 4 MiB read cap — a hostile or
     misbehaving endpoint cannot balloon memory."""
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+    # URL is built from the hardcoded civitai API base + a quoted file hash —
+    # never caller/model-controlled; response read is capped at 4 MiB.
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
         raw = resp.read(4 * 1024 * 1024)
     return json.loads(raw.decode("utf-8", "replace"))
 

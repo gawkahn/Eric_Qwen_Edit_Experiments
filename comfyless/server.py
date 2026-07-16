@@ -86,7 +86,9 @@ def _socket_dir() -> Path:
     if st.st_uid != os.getuid():
         raise RuntimeError(f"socket dir {d} not owned by current uid")
     if stat.S_IMODE(st.st_mode) != 0o700:
-        os.chmod(d, 0o700)
+        # 0o700 TIGHTENS the socket dir to owner-only (the rule's 0o644
+        # suggestion is for files and would be a loosening here) — ADR-001.
+        os.chmod(d, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
     return d
 
 

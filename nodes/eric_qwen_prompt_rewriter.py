@@ -228,7 +228,9 @@ def _resolve_model_name(api_url: str, requested_model: str) -> str:
 
     try:
         req = urllib.request.Request(models_url, method="GET")
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        # Endpoint URL comes from api_keys.ini / node config (operator-set),
+        # never from model output.
+        with urllib.request.urlopen(req, timeout=10) as resp:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
             data = json.loads(resp.read().decode("utf-8"))
             model_ids = [m["id"] for m in data.get("data", [])]
 

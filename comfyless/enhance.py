@@ -425,7 +425,9 @@ def _resolve_endpoint_model(url: str, key: str, requested: str) -> str:
     if key:
         req.add_header("Authorization", f"Bearer {key}")
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        # Endpoint URL comes from the operator's recipe/CLI config (localhost
+        # LLM servers), never from model output.
+        with urllib.request.urlopen(req, timeout=10) as resp:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
             data = json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         raise EnhanceError(
@@ -450,7 +452,9 @@ def _post_chat(endpoint: str, payload: dict, key: str) -> List[str]:
     if key:
         req.add_header("Authorization", f"Bearer {key}")
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        # Endpoint URL comes from the operator's recipe/CLI config (localhost
+        # LLM servers), never from model output.
+        with urllib.request.urlopen(req, timeout=120) as resp:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:300]

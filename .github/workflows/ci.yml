@@ -69,6 +69,29 @@ jobs:
           "${{ github.event.pull_request.base.sha }}"
           "${{ github.event.pull_request.head.sha }}"
 
+  sast:
+    name: sast (semgrep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.11.7" # match dev box; exact pin per §11
+          enable-cache: false
+      # Security static analysis — semgrep exact-pinned; 0-baseline hard gate on
+      # the repo's code roots (packs p/python + p/security-audit + p/secrets;
+      # tokenless). `--error` fails the job on any finding. Rules are
+      # registry-fetched (drift accepted, same posture as a CVE gate); FPs are
+      # suppressed inline with # nosemgrep + a justification comment.
+      - name: semgrep (SAST — 0-baseline)
+        run: >
+          uv run --with semgrep==1.169.0 semgrep scan
+          --config p/python --config p/security-audit --config p/secrets
+          --error --quiet --metrics=off comfyless/ nodes/ pipelines/
+
   secrets:
     name: secret scan (gitleaks)
     runs-on: ubuntu-latest
