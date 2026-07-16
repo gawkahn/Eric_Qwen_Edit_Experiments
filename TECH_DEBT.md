@@ -1333,3 +1333,15 @@ disproportionate to a solo repo. **Trigger:** either function moves into its own
 module (then add the path), or a commit slips through that changed one of them
 without review — then either build hunk-range detection into
 `pre-commit-checks.sh` or accept whole-file gating despite the friction.
+
+**Two CVEs unfixable at 2026-07-16 CVE batch — accepted pending upstream (2026-07-16)**
+The `deps:` CVE batch (pillow/mcp/click direct; urllib3/pyjwt/python-multipart/
+pydantic-settings/idna/cryptography transitive) cleared every advisory with a
+released fix. Two remain open: (1) **torch 2.11.0 CVE-2025-3000 /
+GHSA-rrmf-rvhw-rf47** — no fixed release exists; (2) **setuptools 81.0.0
+PYSEC-2026-3447** — fix is 83.0.0 but torch 2.11.0 declares `setuptools<82`,
+so the fix is unreachable without a torch bump. **Why not now:** nothing to
+bump to. **Trigger:** any torch release note (watch the ADR-013 torch-pin
+lockstep: torchvision minor must move with it) — on the next torch bump, drop
+both ignores from the deps-cve recipe/osv config and re-scan. Both are pinned
+as documented ignores in the supply-chain gate so the CVE gate can be 0-red.

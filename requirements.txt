@@ -28,10 +28,10 @@ accelerate==1.13.0
 peft==0.18.1
 # safetensors 0.8.0: required by diffusers>=0.39.0; lockstep with the diffusers pin
 safetensors==0.8.0
-pillow==12.2.0
+pillow==12.3.0
 numpy==2.4.4
-mcp==1.27.0
-click==8.3.2
+mcp==1.28.1
+click==8.3.3
 scipy==1.17.1
 # Tokenizer backends (transformers soft deps) — required by the diffusers
 # text-encoder paths comfyless drives. sentencepiece+protobuf convert bare
