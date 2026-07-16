@@ -1,0 +1,11 @@
+# gitleaks config — secret scanning (quality-gate kit adoption, 2026-07-16).
+# `just secrets` / the CI `secrets` job scan all git-tracked history.
+#
+# No allowlist: measured clean at adoption (406 commits, 0 findings with the
+# default ruleset). Unlike the kit's reference repo, this repo's test suites do
+# not embed credential-shaped fixtures — real keys live in the gitignored
+# api_keys.ini and are never committed. If a test ever needs a fake-credential
+# fixture, add a narrowly-scoped path allowlist here with a comment, don't
+# weaken the default rules.
+[extend]
+useDefault = true

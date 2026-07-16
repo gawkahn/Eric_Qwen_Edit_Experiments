@@ -1,0 +1,12 @@
+# Repo-local toolchain pins (global CLAUDE.md §11 — exact pins only).
+# `mise trust ./mise.toml && mise install` provisions them; CI does the same.
+# Repo-local mise.toml is authoritative over ~/.config/mise (a global bump
+# can't silently change the pinned toolchain).
+#
+# Quality-gate kit adoption (2026-07-16): only the tools for the adopted gates
+# (secrets, commit-policy) are pinned here. The types/sast/supply-chain gates
+# are NOT adopted yet — add their pins (pyright, osv-scanner, node) when they
+# land.
+[tools]
+just = "1.56.0"                        # task runner for the justfile recipes
+"aqua:gitleaks/gitleaks" = "8.30.0"    # secret scanner (`just secrets` + pre-commit)
