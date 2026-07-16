@@ -1301,3 +1301,20 @@ seed images from a less-trusted source, OR the cold path becomes reachable by a
 non-interactive caller — then add a `_within`-union gate to `run_generation`'s
 cold branch (mirroring `server._check_paths`) and decide fail-closed vs warn.
 Surfaced by security-auditor review of ADR-027 slice 4 (MEDIUM-4).
+
+**Batch enhance CLI (`comfyless.enhance`) has no output-path containment (2026-07-16)**
+`comfyless/enhance.py::_cli` writes its `--output` JSON list + `.provenance.json`
+sidecar to whatever path is given — absolute, `../`, anywhere — with no
+`_check_paths`-style containment. This is SAFE today: the batch file-in/file-out
+CLI is operator-only trusted input (same as `comfygen --savepath`), the enhancer
+has ZERO MCP surface, and the MCP-natural path is INLINE enhancement
+(`enhance_prompt_list`, used by `generate --enhance-prompt`) which returns strings
+and writes NOTHING. **Why not now:** no untrusted caller can reach the file-write
+path; adding containment would be speculative. **Trigger:** if the batch
+file-in/file-out enhance is ever wired as an MCP/agent tool (the wrong shape — the
+inline path is what a chat agent wants), that commit turns `--output` into a
+§12 untrusted-path-write surface: add `server._within`/`_check_paths`-style output
+containment against an allowlisted root and treat the commit as Red Zone from day
+one (mirrors the `--json` bridge / future-MCP treatment in the project Review bar).
+The 2026-07-16 overwrite-confirmation guard (warn + interactive y/N) is orthogonal
+and does not address containment.

@@ -465,5 +465,89 @@ check("enhance_hunyuan_reprompt reads cfg quant", 'cfg.get("quant"' in _esrc)
 check("reprompt quant passed to loader", "_load_reprompt(model_dir, device, precision, quant)" in _esrc)
 
 
+# ── _cli overwrite guard ─────────────────────────────────────────────────────
+print("== _cli: warn/confirm on existing output ==")
+import os as _os  # noqa: E402
+import builtins as _builtins  # noqa: E402
+
+_orig_input, _orig_stdin = _builtins.input, sys.stdin
+_orig_lb, _orig_epl = E.load_backends, E.enhance_prompt_list
+_epl_calls = []
+def _fake_epl(prompts, backend, **kw):
+    _epl_calls.append(list(prompts))
+    # Real enhance_prompt_list returns (enhanced list, provenance LIST[dict]).
+    return (["ENHANCED-" + p for p in prompts],
+            [{"backend": backend, "src": p} for p in prompts])
+def _tty(val):
+    return types.SimpleNamespace(isatty=lambda: val)
+def _boom(*_a):
+    raise AssertionError("input() should not be called here")
+try:
+    E.load_backends = lambda *a, **k: {"x": {"type": "openai-endpoint", "url": "http://x/v1"}}
+    E.enhance_prompt_list = _fake_epl
+    with tempfile.TemporaryDirectory() as _td:
+        _inp = _os.path.join(_td, "in.json")
+        with open(_inp, "w") as _f:
+            json.dump(["a cat", "a dog"], _f)
+        _out = _os.path.join(_td, "out.json")
+
+        # (1) existing output + interactive "n" → abort (exit 1), file untouched,
+        # and the expensive enhancement is NOT run (guard is before the LLM call).
+        with open(_out, "w") as _f:
+            _f.write("SENTINEL")
+        _epl_calls.clear()
+        sys.stdin = _tty(True); _builtins.input = lambda *a: "n"
+        _rc = E._cli([_inp, "--backend", "x", "-o", _out])
+        check("interactive 'n' aborts with exit 1", _rc == 1)
+        check("declined overwrite leaves the file untouched", open(_out).read() == "SENTINEL")
+        check("declined overwrite skips the enhance run", _epl_calls == [])
+
+        # (2) existing output + interactive "y" → overwrite
+        _builtins.input = lambda *a: "y"
+        _rc = E._cli([_inp, "--backend", "x", "-o", _out, "--no-provenance"])
+        check("interactive 'y' proceeds (exit 0)", _rc == 0)
+        check("confirmed overwrite replaces the file",
+              json.load(open(_out)) == ["ENHANCED-a cat", "ENHANCED-a dog"])
+
+        # (3) existing output + NON-interactive stdin → warn + proceed, no prompt
+        with open(_out, "w") as _f:
+            _f.write("SENTINEL2")
+        sys.stdin = _tty(False); _builtins.input = _boom
+        _rc = E._cli([_inp, "--backend", "x", "-o", _out, "--no-provenance"])
+        check("non-interactive proceeds without prompting (exit 0)", _rc == 0)
+        check("non-interactive overwrote the file", json.load(open(_out))[0] == "ENHANCED-a cat")
+
+        # (3b) proceeding path WITH provenance → both files written, sidecar
+        # content matches the enhance return (exercises the prov_path branch).
+        _out3 = _os.path.join(_td, "out3.json")
+        sys.stdin = _tty(True); _builtins.input = _boom  # fresh path, no prompt
+        _rc = E._cli([_inp, "--backend", "x", "-o", _out3])
+        _prov3 = _os.path.join(_td, "out3.provenance.json")
+        check("provenance sidecar is written on the proceeding path",
+              _rc == 0 and _os.path.exists(_out3) and _os.path.exists(_prov3))
+        check("sidecar content matches the enhance provenance list",
+              json.load(open(_prov3)) == [{"backend": "x", "src": "a cat"},
+                                          {"backend": "x", "src": "a dog"}])
+
+        # (4) fresh output (nothing to clobber) → no prompt at all
+        _fresh = _os.path.join(_td, "fresh.json")
+        sys.stdin = _tty(True); _builtins.input = _boom
+        _rc = E._cli([_inp, "--backend", "x", "-o", _fresh, "--no-provenance"])
+        check("no prompt when output does not exist (exit 0)", _rc == 0)
+        check("fresh output was written", _os.path.exists(_fresh))
+
+        # (5) an existing PROVENANCE sidecar alone also triggers the guard
+        _out2 = _os.path.join(_td, "out2.json")
+        with open(_os.path.join(_td, "out2.provenance.json"), "w") as _f:
+            _f.write("OLDPROV")
+        _seen = []
+        sys.stdin = _tty(True); _builtins.input = lambda *a: (_seen.append(1) or "n")
+        _rc = E._cli([_inp, "--backend", "x", "-o", _out2])
+        check("existing provenance sidecar alone triggers the prompt",
+              _seen == [1] and _rc == 1)
+finally:
+    _builtins.input, sys.stdin = _orig_input, _orig_stdin
+    E.load_backends, E.enhance_prompt_list = _orig_lb, _orig_epl
+
 print(f"\n{'='*50}\n  {_passed} passed, {_failed} failed\n{'='*50}")
 sys.exit(1 if _failed else 0)

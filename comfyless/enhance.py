@@ -716,6 +716,31 @@ def _cli(argv: Optional[List[str]] = None) -> int:
         print("error: --concurrency must be >= 1", file=sys.stderr)
         return 2
 
+    # Resolve the output targets up front and confirm any overwrite BEFORE the
+    # (LLM-hitting) enhancement — a declined prompt must not waste a batch. Both
+    # the output list and the provenance sidecar are checked. Interactive stdin
+    # gets a y/N gate (default No); a non-interactive stdin warns and proceeds
+    # (backward-compatible + no hang on input()).
+    out_path = args.output or (str(Path(args.input).with_suffix("")) + ".enhanced.json")
+    prov_path = (None if args.no_provenance
+                 else str(Path(out_path).with_suffix("")) + ".provenance.json")
+    _existing = [p for p in (out_path, prov_path) if p and os.path.exists(p)]
+    if _existing:
+        print(f"warning: this will overwrite: {', '.join(_existing)}", file=sys.stderr)
+        if sys.stdin and sys.stdin.isatty():
+            # Prompt on stderr (where the warning is), so it stays visible when
+            # stdout is redirected to capture the enhanced JSON.
+            print("overwrite? (y/N): ", end="", file=sys.stderr, flush=True)
+            try:
+                _reply = input().strip().lower()
+            except EOFError:
+                _reply = ""
+            if _reply not in ("y", "yes"):
+                print("aborted; nothing written", file=sys.stderr)
+                return 1
+        else:
+            print("(non-interactive stdin — proceeding with overwrite)", file=sys.stderr)
+
     try:
         backends = load_backends(args.config)
         enhanced, provenance = enhance_prompt_list(
@@ -728,12 +753,11 @@ def _cli(argv: Optional[List[str]] = None) -> int:
         print(f"error [{args.backend}]: {e}", file=sys.stderr)
         return 1
 
-    out_path = args.output or (str(Path(args.input).with_suffix("")) + ".enhanced.json")
+    # out_path / prov_path were resolved (and overwrite-confirmed) above.
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(enhanced, f, ensure_ascii=False, indent=2)
     msg = f"wrote {len(enhanced)} prompts ({len(prompts)}×{args.variations}) → {out_path}"
-    if not args.no_provenance:
-        prov_path = str(Path(out_path).with_suffix("")) + ".provenance.json"
+    if prov_path is not None:
         with open(prov_path, "w", encoding="utf-8") as f:
             json.dump(provenance, f, ensure_ascii=False, indent=2)
         msg += f"  (+ {prov_path})"
