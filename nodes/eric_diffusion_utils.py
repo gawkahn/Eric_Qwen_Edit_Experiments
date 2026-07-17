@@ -1612,11 +1612,37 @@ def resolve_quant_components(
 #: See ADR-019 Changelog 2026-07-10 and TECH_DEBT.
 _FP8_WEIGHT_ONLY_FAMILIES = frozenset({"zimage"})
 
+#: The weight-only set is PER-MODE, not shared: fp8 dynamic-activation is
+#: clean on qwen-image (T1 smoke 2026-07-17, indistinguishable from bf16),
+#: but nvfp4 dynamic-activation on the same transformer produced pervasive
+#: granular noise + composition drift — same failure signature as the
+#: Z-Image-base fp8 incident, same rescue. 4-bit activation quant is simply
+#: coarser than 8-bit; a family can be fine under one and destroyed by the
+#: other. zimage transfers from fp8 (outlier rationale, ADR-019 2026-07-10);
+#: qwen-image added for nvfp4 only (ADR-019 2026-07-17).
+_NVFP4_WEIGHT_ONLY_FAMILIES = _FP8_WEIGHT_ONLY_FAMILIES | frozenset(
+    {"qwen-image"})
+
+
+def _quant_recipe_for_family(quant_mode, family):
+    """Recipe id for (`quant_mode`, `family`): 'weight_only' or
+    'dynamic_activation'. Unknown modes raise — a silent default to the fp8
+    set would hand a future mode the wrong weight-only families (the same
+    fallthrough-in-disguise shape the mode dispatcher kills)."""
+    weight_only_sets = {"fp8": _FP8_WEIGHT_ONLY_FAMILIES,
+                        "nvfp4": _NVFP4_WEIGHT_ONLY_FAMILIES}
+    if quant_mode not in weight_only_sets:
+        raise ValueError(
+            f"no weight-only family set for quant mode {quant_mode!r}; "
+            f"valid: {', '.join(weight_only_sets)}"
+        )
+    return ("weight_only" if family in weight_only_sets[quant_mode]
+            else "dynamic_activation")
+
 
 def _fp8_recipe_for_family(family):
-    """Recipe id for `family`: 'weight_only' or 'dynamic_activation'."""
-    return ("weight_only" if family in _FP8_WEIGHT_ONLY_FAMILIES
-            else "dynamic_activation")
+    """Recipe id for `family` under fp8 (kept: pre-split callers/tests)."""
+    return _quant_recipe_for_family("fp8", family)
 
 
 def _torchao_fp8_config(family=None):
@@ -1668,7 +1694,7 @@ def _torchao_nvfp4_config(family=None):
         NVFP4DynamicActivationNVFP4WeightConfig,
         NVFP4WeightOnlyConfig,
     )
-    if _fp8_recipe_for_family(family) == "weight_only":
+    if _quant_recipe_for_family("nvfp4", family) == "weight_only":
         return NVFP4WeightOnlyConfig()
     return NVFP4DynamicActivationNVFP4WeightConfig(use_triton_kernel=True)
 
@@ -1828,8 +1854,18 @@ def build_quant_config(
             _, _, _fam = detect_pipeline_class(model_path)
         except Exception:  # noqa: BLE001
             _fam = None
+            if quant_mode == "nvfp4":
+                # Post-split this fallback is no longer harmless: family
+                # None → dynamic-activation, the exact recipe the
+                # weight-only families exist to avoid. Warn loudly
+                # (invariant 6 still says proceed).
+                msg = ("quant: family detection failed — per-family "
+                       "weight-only routing not honored; nvfp4 will use "
+                       "the dynamic-activation recipe")
+                print(f"{log_prefix} WARNING: {msg}")
+                notices.append(msg)
         ao_config = _torchao_quant_config(quant_mode, _fam)
-        _recipe = _fp8_recipe_for_family(_fam)
+        _recipe = _quant_recipe_for_family(quant_mode, _fam)
         _rmsg = f"quant: {quant_mode} recipe={_recipe} (family {_fam!r})"
         print(f"{log_prefix} {_rmsg}")
         notices.append(_rmsg)
@@ -1947,7 +1983,8 @@ def quantize_module(module, quant_mode: str, family: str = None,
         else:
             quantize_(module, ao_config)
         print(f"{log_prefix} quant: {quant_mode} recipe="
-              f"{_fp8_recipe_for_family(family)} (family {family!r})")
+              f"{_quant_recipe_for_family(quant_mode, family)} "
+              f"(family {family!r})")
         return True
     except Exception as e:  # noqa: BLE001
         print(f"{log_prefix} WARNING: quant: in-place quantization of "

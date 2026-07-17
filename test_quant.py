@@ -589,6 +589,48 @@ check("nvfp4 config: default (None) -> DynamicActivation",
 check("nvfp4 dynamic config routes through the mslk triton kernel",
       getattr(_nv_default, "use_triton_kernel", False) is True)
 
+# ── Per-mode weight-only split (2026-07-17): dynamic-activation nvfp4
+# destroyed QwenImage output in the T1 live smoke (pervasive granular
+# noise) while fp8 dyn-act on the same transformer is bf16-indistinguishable
+# — so qwen-image is weight-only under nvfp4 ONLY. The negative pins that
+# the split is per-mode, not shared.
+check("nvfp4 config: qwen-image -> NVFP4WeightOnlyConfig (T1 noise fix)",
+      isinstance(edu._torchao_nvfp4_config("qwen-image"), _NVWOnly))
+check("fp8 config: qwen-image stays DynamicActivation (NEGATIVE — split "
+      "is per-mode)",
+      isinstance(edu._torchao_fp8_config("qwen-image"), _DynAct))
+check("recipe selector: ('nvfp4', 'qwen-image') -> weight_only",
+      edu._quant_recipe_for_family("nvfp4", "qwen-image") == "weight_only")
+check("recipe selector: ('fp8', 'qwen-image') -> dynamic_activation "
+      "(NEGATIVE)",
+      edu._quant_recipe_for_family("fp8", "qwen-image")
+      == "dynamic_activation")
+check("recipe selector: zimage weight_only under BOTH modes",
+      edu._quant_recipe_for_family("fp8", "zimage") == "weight_only"
+      and edu._quant_recipe_for_family("nvfp4", "zimage") == "weight_only")
+check("recipe selector: qwen-edit unaffected (dyn-act both modes — no "
+      "evidence yet)",
+      edu._quant_recipe_for_family("nvfp4", "qwen-edit")
+      == "dynamic_activation")
+try:
+    edu._quant_recipe_for_family("gguf", "qwen-image")
+    check("recipe selector: unknown mode raises, never a silent fp8-set "
+          "default (NEGATIVE)", False, "no raise")
+except ValueError as _e:
+    check("recipe selector: unknown mode raises, never a silent fp8-set "
+          "default (NEGATIVE)", "gguf" in str(_e))
+
+# Real CPU quantize under the new mapping: qwen-image nvfp4 is weight-only
+# (act_quant_kwargs None), same CI-safe shape as the zimage arm above.
+_mqw = _nn.Linear(64, 128, bias=False, dtype=torch.bfloat16)
+check("quantize_module nvfp4/qwen-image: quantizes (returns True)",
+      edu.quantize_module(_mqw, "nvfp4", family="qwen-image") is True)
+check("quantize_module nvfp4/qwen-image: weight-only "
+      "(act_quant_kwargs None)",
+      type(_mqw.weight.data).__name__ == "NVFP4Tensor"
+      and getattr(_mqw.weight.data, "act_quant_kwargs", "MISSING") is None,
+      f"got {type(_mqw.weight.data).__name__}")
+
 # Dispatcher: fp8 requests still get EXACTLY the fp8 classes (invariant 1).
 check("dispatcher: ('fp8', zimage) -> Float8WeightOnlyConfig (unchanged)",
       isinstance(edu._torchao_quant_config("fp8", "zimage"), _WOnly))
@@ -859,6 +901,40 @@ try:
               cfgp is not None
               and any("could not read 1 of the" in n for n in notesp),
               f"notes: {notesp}")
+
+    # Family-detection failure under nvfp4: post-split this silently lands
+    # on dynamic-activation — the known-bad recipe for qwen-image — so it
+    # must WARN (review finding 2). Detection succeeds on the fake dirs
+    # (it reads model_index.json), so force the failure.
+    _real_detect = edu.detect_pipeline_class
+
+    def _detect_boom(path):
+        raise RuntimeError("forced detection failure")
+
+    setattr(edu, "detect_pipeline_class", _detect_boom)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            mp = _mk_model_dir(tmp, _QWEN_INDEX)
+            root = Path(tmp)
+            (root / "transformer").mkdir()
+            _st_save({"blocks.0.ff.weight": torch.zeros(
+                          32, 16, dtype=torch.bfloat16)},
+                     str(root / "transformer" / "model.safetensors"))
+            cfgf, _, notesf = edu.build_quant_config(
+                mp, "nvfp4", only=("transformer",))
+            check("nvfp4 build: family-detection failure → loud routing "
+                  "WARN (NEGATIVE)",
+                  cfgf is not None
+                  and any("weight-only routing not honored" in n
+                          for n in notesf), f"notes: {notesf}")
+            cfgf8, _, notesf8 = edu.build_quant_config(
+                mp, "fp8", only=("transformer",))
+            check("fp8 build: no routing WARN on detection failure "
+                  "(NEGATIVE — fp8 recipe never depended on it here)",
+                  not any("routing not honored" in n for n in notesf8),
+                  f"notes: {notesf8}")
+    finally:
+        setattr(edu, "detect_pipeline_class", _real_detect)
 
     # Unscannable component under nvfp4: loud warning, load proceeds
     # (warn-don't-block — invariant 6).

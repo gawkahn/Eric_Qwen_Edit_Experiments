@@ -25,6 +25,21 @@
 
 May change: `docs/vision/slice-NV-nvfp4-quant-load.md` (this doc), `docs/decisions/ADR-019-*.md` (Changelog append), `pyproject.toml` + `requirements.txt` + `uv.lock` (dep slice), `nodes/eric_diffusion_utils.py`, `comfyless/params_validation.py`, `nodes/eric_diffusion_fp8_ops.py` (**Red Zone — security-auditor gate**), `comfyless/mcp_server.py` (**Red Zone** — found during implementation: the tool schema hardcoded the quant enum at line ~776; now derived from `QUANT_MODES`), `test_quant.py`, `test_fp8_single_file.py` (if the merge-refusal negative fits there better), `TECH_DEBT.md` (Resolved append, entry at line ~348), `docs/security/review-slice-NV-*.md` (new). Anything else → STOP and split. `resolve_hf_path`, `comfyless/server.py`, `comfyless/generate.py` must NOT need edits (they consume QUANT_MODES).
 
+**Amendment 2 (2026-07-17, second live-gate finding — per-mode weight-only
+split; SUPERSEDES invariant 4's shared-set wording):** the T1 smoke answered
+the deferred quality question: fp8 dyn-act on Qwen-Image-2512 is
+bf16-indistinguishable, but dynamic-activation nvfp4 on the transformer
+alone produced pervasive granular noise + composition drift — the
+Z-Image-base failure signature at 4-bit. Invariant 4's "families in
+`_FP8_WEIGHT_ONLY_FAMILIES` get `NVFP4WeightOnlyConfig()`" is now realized
+as a PER-MODE selector: `_quant_recipe_for_family(quant_mode, family)` with
+`_NVFP4_WEIGHT_ONLY_FAMILIES = _FP8_WEIGHT_ONLY_FAMILIES | {"qwen-image"}`;
+fp8 selection byte-identical (invariant 1 holds); unknown modes raise
+(no silent fp8-set default); family-detection failure under nvfp4 warns
+loudly that weight-only routing wasn't honored. qwen-edit deliberately not
+added pending its own smoke. code-reviewer (Fable) APPROVED; its 3 MED
+advisories all folded. See ADR-019 Changelog 2026-07-17 (amendment 2).
+
 **Amendment (2026-07-17, first live-gate finding — nvfp4 shape screen):**
 The deferred live smoke's first Qwen-Image-2512 load crashed inside
 `from_pretrained`: torchao's `_nvfp4_inference_linear_transform` HARD-RAISES
