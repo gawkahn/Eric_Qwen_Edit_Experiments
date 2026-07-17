@@ -1468,7 +1468,7 @@ def load_component(component_class, path: str, dtype, base_path: str = None,
 #
 # See docs/decisions/ADR-019-native-quantization-support.md.
 
-QUANT_MODES = ("none", "fp8")
+QUANT_MODES = ("none", "fp8", "nvfp4")
 
 #: Text encoders below this on-disk weight size are excluded from the default
 #: quant set (CLIP-G is ~1.4 GB, ByT5-small ~1.2 GB; T5-XXL / Qwen2.5-VL /
@@ -1642,16 +1642,74 @@ def _torchao_fp8_config(family=None):
     return Float8DynamicActivationFloat8WeightConfig()
 
 
+def _torchao_nvfp4_config(family=None):
+    """The nvfp4 recipe (ADR-019 slice NV; Blackwell-only, see the gate).
+
+    Mirrors the fp8 recipe split: `_FP8_WEIGHT_ONLY_FAMILIES` (zimage) get
+    weight-only nvfp4 — the activation-outlier rationale transfers until the
+    deferred live smoke says otherwise. `use_triton_kernel=True` routes the
+    quantize through the fast mslk kernel, which ASSERTS mslk at quantize
+    time (i.e. mid-from_pretrained) — probe it here instead so a missing
+    wheel surfaces as ImportError to the callers' existing warn-and-fall-back
+    handling, never a crashed load (slice NV invariant 3).
+
+    Unlike fp8, the LoRA direct-merge path does NOT support nvfp4 bases —
+    `_requant_config_matching_base` refuses them loudly (the act_quant_kwargs
+    recipe sniff would misclassify an NVFP4Tensor as fp8); PEFT adapters are
+    the supported LoRA route under nvfp4.
+    """
+    import importlib.util as _ilu
+    if _ilu.find_spec("mslk") is None:
+        raise ImportError(
+            "mslk is not installed — nvfp4 quantization needs the "
+            "mslk-cuda pin (see requirements.txt / ADR-019 slice NV)"
+        )
+    from torchao.prototype.mx_formats import (
+        NVFP4DynamicActivationNVFP4WeightConfig,
+        NVFP4WeightOnlyConfig,
+    )
+    if _fp8_recipe_for_family(family) == "weight_only":
+        return NVFP4WeightOnlyConfig()
+    return NVFP4DynamicActivationNVFP4WeightConfig(use_triton_kernel=True)
+
+
+def _torchao_quant_config(quant_mode: str, family=None):
+    """Mode dispatcher: the torchao config for `quant_mode` (fp8 | nvfp4).
+
+    Explicit branches, loud raise on anything else — a silent default to fp8
+    would quantize a future mode's weights with the wrong recipe (the same
+    fallthrough-in-disguise shape slice NV req 61 kills on the merge path).
+    """
+    if quant_mode == "fp8":
+        return _torchao_fp8_config(family)
+    if quant_mode == "nvfp4":
+        return _torchao_nvfp4_config(family)
+    raise ValueError(
+        f"no torchao config for quant mode {quant_mode!r}; "
+        f"valid: {', '.join(m for m in QUANT_MODES if m != 'none')}"
+    )
+
+
+#: Minimum CUDA compute capability per quant mode. fp8 dynamic-activation
+#: GEMM (_scaled_mm) needs >= 8.9 (Ada/Hopper/Blackwell); nvfp4 tensor cores
+#: exist only on Blackwell (>= 10.0). Callers validate against QUANT_MODES
+#: before the hardware probe; if an unvalidated mode slips through anyway it
+#: gets the STRICTEST floor (fail-closed — never let a future mode that
+#: needs newer hardware pass on the fp8 floor).
+_QUANT_MIN_CAPABILITY = {"fp8": (8, 9), "nvfp4": (10, 0)}
+
+
 def quant_hardware_ok(quant_mode: str, device: str) -> tuple[bool, str]:
     """Check the target device can run the requested quant mode.
 
     Returns (ok, reason).  fp8 dynamic-activation GEMM (_scaled_mm) needs
-    CUDA compute capability >= 8.9 (Ada/Hopper/Blackwell).
+    CUDA compute capability >= 8.9 (Ada/Hopper/Blackwell); nvfp4 needs
+    Blackwell (>= 10.0).
     """
     if quant_mode == "none":
         return True, ""
     if device == "cpu" or not torch.cuda.is_available():
-        return False, "fp8 quantization requires a CUDA device"
+        return False, f"{quant_mode} quantization requires a CUDA device"
     try:
         idx = 0
         if ":" in str(device):
@@ -1659,10 +1717,12 @@ def quant_hardware_ok(quant_mode: str, device: str) -> tuple[bool, str]:
         cap = torch.cuda.get_device_capability(idx)
     except Exception as e:  # noqa: BLE001 — any probe failure → fall back
         return False, f"could not probe CUDA capability ({e})"
-    if cap < (8, 9):
+    need = _QUANT_MIN_CAPABILITY.get(
+        quant_mode, max(_QUANT_MIN_CAPABILITY.values()))
+    if cap < need:
         return False, (
-            f"fp8 GEMM needs compute capability >= 8.9, device has "
-            f"{cap[0]}.{cap[1]}"
+            f"{quant_mode} GEMM needs compute capability >= "
+            f"{need[0]}.{need[1]}, device has {cap[0]}.{cap[1]}"
         )
     return True, ""
 
@@ -1711,9 +1771,9 @@ def build_quant_config(
             _, _, _fam = detect_pipeline_class(model_path)
         except Exception:  # noqa: BLE001
             _fam = None
-        ao_config = _torchao_fp8_config(_fam)
+        ao_config = _torchao_quant_config(quant_mode, _fam)
         _recipe = _fp8_recipe_for_family(_fam)
-        _rmsg = f"quant: fp8 recipe={_recipe} (family {_fam!r})"
+        _rmsg = f"quant: {quant_mode} recipe={_recipe} (family {_fam!r})"
         print(f"{log_prefix} {_rmsg}")
         notices.append(_rmsg)
     except ImportError as e:
@@ -1763,8 +1823,8 @@ def quantize_module(module, quant_mode: str, family: str = None,
         return False
     try:
         from torchao.quantization import quantize_
-        quantize_(module, _torchao_fp8_config(family))
-        print(f"{log_prefix} quant: fp8 recipe="
+        quantize_(module, _torchao_quant_config(quant_mode, family))
+        print(f"{log_prefix} quant: {quant_mode} recipe="
               f"{_fp8_recipe_for_family(family)} (family {family!r})")
         return True
     except Exception as e:  # noqa: BLE001

@@ -1562,43 +1562,190 @@ check("arch: load_component blocks the mismatch at the door (fix 2)",
       "Architecture mismatch" in _seam, _seam[:160])
 
 
-# ── family-aware requant recipe match on the LoRA-merge path (2026-07-10) ──
+# ── family-aware requant recipe match on the LoRA-merge path (2026-07-10;
+# slice NV 2026-07-16 hardened it with a class ALLOWLIST, reqs 61-63) ──
 # _requant_config_matching_base reads the base tensor's act_quant_kwargs to
 # requantize a merged layer with the SAME recipe (weight-only vs dynamic-
 # activation). None ⇒ weight-only; set ⇒ dynamic; ABSENT ⇒ loud raise (a
 # torchao API change must never silently requantize a Z-Image weight-only base
-# as dynamic-activation and reintroduce the speckle bug).
+# as dynamic-activation and reintroduce the speckle bug). Slice NV: the sniff
+# is now gated on isinstance(data, Float8Tensor), so the three arms use REAL
+# CPU-quantized Float8Tensors (weight-only quantize needs no fp8 GEMM
+# hardware); the old duck-typed fakes now exercise the ALLOWLIST refusal.
 from torchao.quantization import (                       # noqa: E402
     Float8DynamicActivationFloat8WeightConfig as _DynActCfg,
+    Float8Tensor as _F8T,
     Float8WeightOnlyConfig as _WOnlyCfg,
+    quantize_ as _tao_quantize,
 )
 
 
-class _FakeAkwNone:
-    act_quant_kwargs = None
+def _real_f8_weight_only():
+    m = nn.Linear(32, 32, bias=False, dtype=torch.bfloat16)
+    _tao_quantize(m, _WOnlyCfg())
+    return m.weight.data
 
 
-class _FakeAkwSet:
-    act_quant_kwargs = object()  # any non-None ⇒ dynamic-activation base
-
-
-class _FakeNoAkw:
-    pass  # attribute absent ⇒ API drift ⇒ must raise
-
-
+_f8_none = _real_f8_weight_only()           # genuine weight-only: akw None
+check("requant-match arms are real Float8Tensors (test-fixture sanity)",
+      isinstance(_f8_none, _F8T) and _f8_none.act_quant_kwargs is None)
 check("requant-match: base act_quant_kwargs=None -> weight-only config",
       isinstance(fp8ops._requant_config_matching_base(
-          _FakeAkwNone(), "layer.weight", "[t]"), _WOnlyCfg))
+          _f8_none, "layer.weight", "[t]"), _WOnlyCfg))
+_f8_set = _real_f8_weight_only()
+_f8_set.act_quant_kwargs = object()         # non-None ⇒ dynamic-activation
 check("requant-match: base act_quant_kwargs set -> dynamic-activation config",
       isinstance(fp8ops._requant_config_matching_base(
-          _FakeAkwSet(), "layer.weight", "[t]"), _DynActCfg))
+          _f8_set, "layer.weight", "[t]"), _DynActCfg))
+_f8_gone = _real_f8_weight_only()
+object.__delattr__(_f8_gone, "act_quant_kwargs")   # simulate API drift
 _raised = False
 try:
-    fp8ops._requant_config_matching_base(_FakeNoAkw(), "layer.weight", "[t]")
+    fp8ops._requant_config_matching_base(_f8_gone, "layer.weight", "[t]")
 except RuntimeError as _e:
     _raised = "act_quant_kwargs" in str(_e)
 check("requant-match: absent act_quant_kwargs RAISES (no silent mismatch)",
       _raised)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── slice NV: nvfp4 merge refusal (security reqs 61-65) ────────")
+# review-slice-NV-nvfp4-merge-guard-2026-07-16.md. NVFP4Tensor ALSO carries
+# act_quant_kwargs (None when weight-only), so without the req-61 class
+# allowlist a LoRA direct merge would silently requantize an nvfp4 base as
+# fp8 — a mixed-representation model with no error.
+from torchao.prototype.mx_formats import (               # noqa: E402
+    NVFP4WeightOnlyConfig as _NV4WOnlyCfg,
+)
+
+
+def _real_nvfp4_linear():
+    m = nn.Linear(32, 32, bias=False, dtype=torch.bfloat16)
+    _tao_quantize(m, _NV4WOnlyCfg())
+    return m
+
+
+_nv4 = _real_nvfp4_linear().weight.data
+check("tripwire (req 63b): NVFP4Tensor is NOT a Float8Tensor subclass — a "
+      "torchao bump that changes this defeats the allowlist and must fail CI",
+      not isinstance(_nv4, _F8T))
+check("the misclassification is real: NVFP4Tensor carries act_quant_kwargs",
+      hasattr(_nv4, "act_quant_kwargs"))
+
+# req 61: allowlist refusal names the class and the escape routes.
+_msg = ""
+try:
+    fp8ops._requant_config_matching_base(_nv4, "blk.attn.weight", "[t]")
+except RuntimeError as _e:
+    _msg = str(_e)
+check("req 61: NVFP4 base REFUSED by the recipe matcher (NEGATIVE)",
+      "NVFP4Tensor" in _msg and "PEFT" in _msg, _msg[:160])
+
+# req 63c: generic allowlist — ANY non-Float8Tensor refuses, not just NVFP4
+# (a third torchao rep must hit the same wall; duck-typed akw is not enough).
+class _FakeAkwNone:
+    act_quant_kwargs = None
+
+
+_raised = False
+try:
+    fp8ops._requant_config_matching_base(_FakeAkwNone(), "layer.weight", "[t]")
+except RuntimeError:
+    _raised = True
+check("req 63c: duck-typed akw-carrier (non-Float8Tensor) refused (NEGATIVE)",
+      _raised)
+
+# reqs 61+62 through the dispatcher: a real nvfp4 Parameter refuses, weights
+# bit-identical, backup dict UNTOUCHED (the gate fires before the backup
+# record — no stale entry on the refusal path).
+class _NVHost(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.blk = _real_nvfp4_linear()
+
+
+_nvh = _NVHost()
+_nv_before = _nvh.blk.weight.data.dequantize().clone()
+_nv_bk = {}
+_raised = False
+try:
+    fp8ops.apply_merge_delta(_nvh, "blk.weight",
+                             torch.randn(32, 32) * 0.01, _nv_bk)
+except RuntimeError as _e:
+    _raised = "NVFP4Tensor" in str(_e)
+check("req 61/62: apply_merge_delta refuses nvfp4 Parameter (NEGATIVE)",
+      _raised)
+check("req 62: refused merge left weights bit-identical",
+      torch.equal(_nvh.blk.weight.data.dequantize(), _nv_before))
+check("req 62: refused merge recorded NO backup entry (no stale state)",
+      _nv_bk == {})
+
+# Positive control (req 63d): the genuine-Float8 torchao merge path still
+# works end-to-end after the gate hoist (weight-only requants on CPU).
+class _F8Host(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.blk = nn.Linear(32, 32, bias=False, dtype=torch.bfloat16)
+        _tao_quantize(self.blk, _WOnlyCfg())
+
+
+_f8h = _F8Host()
+_f8_bk = {}
+check("req 63d: Float8 weight-only base still merges (kind 'torchao')",
+      fp8ops.apply_merge_delta(_f8h, "blk.weight",
+                               torch.randn(32, 32, dtype=torch.bfloat16)
+                               * 0.01, _f8_bk) == "torchao")
+check("req 63d: Float8 merge recorded its kind-tagged backup",
+      _f8_bk.get("blk.weight", {}).get("kind") == "torchao_param")
+
+# req 64: a torchao rep held as a BUFFER (not nn.Parameter) skips branch (b),
+# reports its LOGICAL dtype (so branch (c)'s fp8-dtype sniff misses it), and
+# must hit the (c2) guard — never branch (d)'s in-place add_.
+class _NVBufHost(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.blk = nn.Module()
+        self.blk.register_buffer("weight", _real_nvfp4_linear().weight.data)
+
+
+_nvb = _NVBufHost()
+_raised = False
+try:
+    fp8ops.apply_merge_delta(_nvb, "blk.weight",
+                             torch.randn(32, 32) * 0.01, {})
+except RuntimeError as _e:
+    _raised = "req 64" in str(_e) or "outside an nn.Parameter" in str(_e)
+check("req 64: torchao tensor as buffer refused, no plain-path fallthrough "
+      "(NEGATIVE)", _raised)
+
+# req 65: the all-or-nothing entry gate — refuses BEFORE the first merge so
+# a direct-merge adapter can never leave a partially-merged nvfp4 model.
+_raised = False
+try:
+    fp8ops.refuse_unmergeable_base(_NVHost(), log_prefix="[t]")
+except RuntimeError as _e:
+    _raised = "BEFORE any target" in str(_e) and "NVFP4Tensor" in str(_e)
+check("req 65: entry gate refuses an nvfp4-bearing base (NEGATIVE)", _raised)
+_raised = False
+try:
+    fp8ops.refuse_unmergeable_base(_NVBufHost(), log_prefix="[t]")
+except RuntimeError:
+    _raised = True
+check("req 65: entry gate sees nvfp4 held as a .weight buffer too", _raised)
+
+
+class _OKHost(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.plain = nn.Linear(8, 8, bias=False)
+        self.f8 = nn.Linear(32, 32, bias=False, dtype=torch.bfloat16)
+        _tao_quantize(self.f8, _WOnlyCfg())
+        self.sf8 = fp8ops.ScaledFp8Linear(
+            _fp8((8, 8)), _scalar(0.02), None, None)
+
+
+check("req 65: entry gate PASSES plain + Float8 + ScaledFp8Linear bases",
+      fp8ops.refuse_unmergeable_base(_OKHost(), log_prefix="[t]") is None)
 
 
 shutil.rmtree(_TMP, ignore_errors=True)

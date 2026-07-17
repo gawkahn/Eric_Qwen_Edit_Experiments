@@ -129,7 +129,7 @@ _RUNTIME_KIND = types.MappingProxyType({
 # torch, and the daemon's request-validation path must stay light and
 # non-raising (slice-DQ security review F1 — a heavy import there is an
 # accept-loop-kill hazard). test_quant.py asserts the two stay in sync.
-QUANT_MODES = ("none", "fp8")
+QUANT_MODES = ("none", "fp8", "nvfp4")
 
 
 # MCP-surface transport-control fields (ADR-017). Neither sidecar-shaped

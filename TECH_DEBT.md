@@ -374,6 +374,34 @@ met: a slice pins the triad, `uv lock`, updates `requirements.txt` + `pyproject.
 together, adds `--quant nvfp4`, and smoke-tests QwenImage quality vs fp8.
 See `docs/decisions/ADR-019-native-quantization-support.md` §Deferred,
 `project_native_quant_support.md` memory.
+Resolved: 2026-07-16 — trigger met on EASIER terms than recorded (no torch
+2.12 bump needed): MSLK 1.1.x is the stable release line FOR torch 2.11.x,
+so the current pins carry nvfp4. Side-session smoke on Blackwell sm_120
+verified `NVFP4DynamicActivationNVFP4WeightConfig(use_triton_kernel=True)`
+end-to-end on the repo's exact torch/torchao pins, incl. the negative
+control (mslk absent → the known AssertionError). Slice NV: `mslk-cuda==
+1.1.0` pinned, `--quant nvfp4` wired (Blackwell ≥10.0 gate, mslk
+warn-fallback, weight-only family split, nvfp4-base direct-merge refusal —
+security reqs 61-66). Live QUALITY smoke still owed — see the 2026-07-16
+entry below.
+
+**nvfp4 live quality smoke owed before recommending the mode** *(2026-07-16)*
+Slice NV wired `--quant nvfp4` with unit coverage only — both GPUs were
+busy on a long iterate run when it landed. Until a real-generation gate
+passes, nvfp4 is wired-but-unvalidated: prefer `--quant fp8`. Expect
+weights-only-style fiddling per family on first live runs (the fp8
+rollout's pattern), plus these specific unknowns: does the quantize-on-load
+inside `from_pretrained` run the mslk triton kernel on CUDA-resident
+tensors (CPU-staged loads may need the non-triton path)? does the zimage
+weight-only transfer hold for nvfp4? is dynamic-activation nvfp4 quality
+acceptable on QwenImage (more quant-sensitive than Flux, LPIPS 0.41 vs
+0.44)? The 1.39-1.49× throughput win also expects `torch.compile` — without
+it nvfp4 is mainly a VRAM play (upstream: 62→52 GB).
+Why not now: no free GPU.
+Trigger: a GPU frees up. Gate per the handoff/vision: same prompt+seed
+nvfp4 vs fp8 vs bf16 on QwenImage (detailed idiosyncratic prompts with
+checkable anchors), plus a LoRA-via-PEFT run under nvfp4 (direct merge is
+deliberately refused — reqs 61/65).
 
 **Daemon socket silently drops `quant` from hand-crafted clients** *(2026-07-02)*
 Slice A registered `quant`/`quant_skip`/`quant_only` in `_RUNTIME_KIND`, so the
@@ -450,6 +478,19 @@ after the loop) — real restructuring for an adversarial-only path.
 Trigger: extending the DMR surface (new quantized reps), OR a real user
 report of a partially-merged adapter.
 See `docs/security/review-slice-DMR-quantized-merge-2026-07-03.md`.
+*Amended 2026-07-16 (slice NV, security review req 65): the "new quantized
+reps" trigger FIRED with nvfp4 — and worse than the entry assumed: under
+`--quant nvfp4` the per-target refusal becomes the NORMAL flow for
+direct-merge-only adapters, not adversarial-only, so partial merge would have
+been routine. Closed for the unmergeable-rep class by
+`refuse_unmergeable_base` (fp8_ops): all four merge call sites scan the
+resolution map BEFORE the first mutation and refuse the whole adapter if any
+target is a torchao rep the dispatcher would refuse — weights untouched
+per-ADAPTER, daemon-cached pipelines clean by construction. The OTHER
+mid-loop raise paths this entry lists (non-finite delta, orphan fp8,
+requant-scale validation) remain per-target and adversarial-only — the
+transactional-merge restructuring is still deferred; this entry stays open
+for those, trigger unchanged.*
 
 **Daemon LoRA lifecycle: merged adapters never unload; weight-only changes ignored** *(2026-07-02)*
 Two defects in `comfyless/server.py`'s LoRA diff (`_handle_generate` ~392-444),

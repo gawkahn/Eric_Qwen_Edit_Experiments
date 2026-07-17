@@ -385,6 +385,7 @@ def _load_lokr_adapter_direct(pipe, state_dict: dict, adapter_name: str,
     import math, re
     from .eric_diffusion_fp8_ops import (
         apply_merge_delta, merge_resolution_map, record_direct_merge,
+        refuse_unmergeable_base,
     )
 
     transformer = getattr(pipe, "transformer", None) or getattr(pipe, "unet", None)
@@ -393,6 +394,9 @@ def _load_lokr_adapter_direct(pipe, state_dict: dict, adapter_name: str,
     # reps. merge_resolution_map includes .weight-named buffers (BINDING —
     # security review DMR-3/8) so ScaledFp8Linear targets resolve.
     model_sd = merge_resolution_map(transformer)
+    # Slice NV req 65: all-or-nothing — refuse BEFORE the first merge so a
+    # mid-loop unmergeable target can't leave a partially-merged model.
+    refuse_unmergeable_base(transformer, model_sd, log_prefix)
 
     # Group state dict keys by module path
     modules: dict[str, dict] = {}  # module_path -> {"lokr_w1": ..., ...}
@@ -569,11 +573,14 @@ def _load_loha_adapter_direct(pipe, state_dict: dict, adapter_name: str,
     """
     from .eric_diffusion_fp8_ops import (
         apply_merge_delta, merge_resolution_map, record_direct_merge,
+        refuse_unmergeable_base,
     )
 
     transformer = getattr(pipe, "transformer", None) or getattr(pipe, "unet", None)
     # Slice DMR — see _load_lokr_adapter_direct for the dispatcher rationale.
     model_sd = merge_resolution_map(transformer)
+    # Slice NV req 65: all-or-nothing entry gate (see _load_lokr_adapter_direct).
+    refuse_unmergeable_base(transformer, model_sd, log_prefix)
 
     # Group state dict keys by module path
     modules: dict[str, dict] = {}
@@ -1004,11 +1011,14 @@ def _load_lora_adapter_direct(pipe, state_dict: dict, adapter_name: str,
     """
     from .eric_diffusion_fp8_ops import (
         apply_merge_delta, merge_resolution_map, record_direct_merge,
+        refuse_unmergeable_base,
     )
 
     transformer = getattr(pipe, "transformer", None) or getattr(pipe, "unet", None)
     # Slice DMR — see _load_lokr_adapter_direct for the dispatcher rationale.
     model_sd = merge_resolution_map(transformer)
+    # Slice NV req 65: all-or-nothing entry gate (see _load_lokr_adapter_direct).
+    refuse_unmergeable_base(transformer, model_sd, log_prefix)
 
     modules: dict[str, dict] = {}
     for k, v in state_dict.items():

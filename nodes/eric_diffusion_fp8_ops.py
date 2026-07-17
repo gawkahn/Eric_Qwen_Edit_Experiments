@@ -1199,6 +1199,54 @@ def merge_resolution_map(root) -> dict:
     return m
 
 
+def refuse_unmergeable_base(root, model_sd: "dict | None" = None,
+                            log_prefix: str = "[LoRA]") -> None:
+    """All-or-nothing entry gate for direct-merge adapters (slice NV req 65).
+
+    apply_merge_delta refuses unmergeable reps PER TARGET, so a mid-adapter
+    refusal would leave every earlier target of the same adapter merged and
+    PERSISTED — the DMR partial-merge debt, whose "extending the DMR surface
+    (new quantized reps)" trigger fired with nvfp4. Callers invoke this once,
+    right after computing merge_resolution_map and BEFORE the first
+    apply_merge_delta, so a refusal leaves the model bit-identical
+    per-ADAPTER, not just per-target (and a daemon-cached pipeline stays
+    clean by construction).
+
+    Deliberately conservative: refuses when the BASE holds any torchao rep
+    the dispatcher would refuse (any torchao class that is not Float8Tensor),
+    even though the adapter might have touched only plain targets —
+    predicting the exact target set would duplicate each call site's
+    resolution logic. Fail-open ONLY when torchao itself is absent (then no
+    torchao rep can exist in the process — provably safe); torchao present
+    but Float8Tensor unimportable means a dep bump moved the class, and the
+    gate fails CLOSED here, before any mutation — otherwise the same
+    ImportError would fire MID-LOOP in _requant_config_matching_base and
+    reopen the per-adapter partial-merge hole this gate closes (code review
+    2026-07-16, finding 2).
+    """
+    try:
+        from torchao.quantization import Float8Tensor
+    except ImportError:
+        import importlib.util as _ilu
+        if _ilu.find_spec("torchao") is None:
+            return
+        raise
+    if model_sd is None:
+        model_sd = merge_resolution_map(root)
+    for key, t in model_sd.items():
+        data = t.data if isinstance(t, nn.Parameter) else t
+        if (type(data).__module__.startswith("torchao")
+                and not isinstance(data, Float8Tensor)):
+            raise RuntimeError(
+                f"{log_prefix} base model holds {type(data).__name__} "
+                f"weights (e.g. {_safe_name(key)}) — LoRA direct merge "
+                f"under this quantized representation is unsupported; "
+                f"refusing BEFORE any target is merged (ADR-019 §4 / slice "
+                f"NV req 65). Use the PEFT adapter path, or generate "
+                f"without --quant nvfp4"
+            )
+
+
 def apply_merge_delta(root, target_key: str, delta: torch.Tensor,
                       backup: dict, log_prefix: str = "[LoRA]") -> str:
     """Merge a weight delta into ANY supported base representation.
@@ -1258,6 +1306,23 @@ def apply_merge_delta(root, target_key: str, delta: torch.Tensor,
             f"{log_prefix} {_safe_name(target_key)} is an fp8 tensor not "
             f"owned by a ScaledFp8Linear — unsupported quantized "
             f"representation; refusing to merge (ADR-019 §4 / DMR-4)"
+        )
+
+    # (c2) torchao-module tensor that did NOT dispatch above — i.e. one held
+    # as a BUFFER rather than an nn.Parameter (slice NV req 64). torchao
+    # subclasses report their LOGICAL dtype (bf16), so branch (c)'s fp8-dtype
+    # sniff misses them and branch (d)'s in-place add_ would mutate a
+    # quantized rep — the exact operation DMR-4 forbids. Not reachable from
+    # current load paths (quantize_ produces Parameters); closed because
+    # slice NV widens the torchao-rep diversity in loaded models. Do NOT
+    # route buffers into _merge_into_torchao — its backup/swap contract
+    # assumes a Parameter.
+    if type(data).__module__.startswith("torchao"):
+        raise RuntimeError(
+            f"{log_prefix} {_safe_name(target_key)} is a "
+            f"{type(data).__name__} held outside an nn.Parameter — "
+            f"unsupported quantized representation; refusing to merge "
+            f"(ADR-019 §4 / slice NV req 64)"
         )
 
     # (d) plain high-precision tensor — byte-identical legacy behavior
@@ -1337,11 +1402,27 @@ def _requant_config_matching_base(data, target_key: str, log_prefix: str):
     as dynamic-activation and reintroduce the exact speckle/NaN bug the recipe
     split fixes, so refuse loudly instead (test_quant pins the attribute, so a
     torchao change trips the suite first).
+
+    Slice NV req 61: the akw sniff is preceded by a class ALLOWLIST — only
+    torchao `Float8Tensor` proceeds. `NVFP4Tensor` ALSO carries
+    `act_quant_kwargs` (None when weight-only), so without the gate an nvfp4
+    base would be silently requantized as fp8 here — a mixed-representation
+    model with no error. Allowlist, not an NVFP4 blocklist: any third torchao
+    rep (int8 AQT, MX, future classes) must hit the same refusal.
     """
     from torchao.quantization import (
         Float8DynamicActivationFloat8WeightConfig,
+        Float8Tensor,
         Float8WeightOnlyConfig,
     )
+    if not isinstance(data, Float8Tensor):
+        raise RuntimeError(
+            f"{log_prefix} base quantized tensor for "
+            f"{_safe_name(target_key)} is {type(data).__name__} — LoRA "
+            f"direct merge under this quantized representation is "
+            f"unsupported (ADR-019 §4 / slice NV req 61); use the PEFT "
+            f"adapter path, or generate without --quant nvfp4"
+        )
     _akw = getattr(data, "act_quant_kwargs", _MISSING)
     if _akw is _MISSING:
         raise RuntimeError(
@@ -1357,11 +1438,17 @@ def _requant_config_matching_base(data, target_key: str, log_prefix: str):
 def _merge_into_torchao(root, owner, leaf: str, p: nn.Parameter,
                         target_key: str, delta: torch.Tensor, backup: dict,
                         log_prefix: str) -> str:
+    data = p.data
+    # req 62 (slice NV): the recipe match — which is also the class-allowlist
+    # refusal for non-Float8 reps (req 61) — fires BEFORE the backup record
+    # and BEFORE dequantize, so a refused merge touches no state at all: no
+    # stale backup entry, no compute on a representation we're about to
+    # declare unsupported ("nothing has been persisted yet" — req 30 posture).
+    _cfg = _requant_config_matching_base(data, target_key, log_prefix)
     if target_key not in backup:
         # The ORIGINAL Parameter object, retained verbatim — exact restore
         # by swap (Vision invariant 2). fp8-sized, cheaper than bf16 clones.
         backup[target_key] = {"kind": "torchao_param", "param": p}
-    data = p.data
     W = data.dequantize() if hasattr(data, "dequantize") \
         else data.to(torch.float32)
     merged = W.to(torch.float32) + delta.to(device=W.device,
@@ -1380,7 +1467,6 @@ def _merge_into_torchao(root, owner, leaf: str, p: nn.Parameter,
             f"ALL ZERO — refusing to requantize a degenerate layer (req 22)"
         )
     from torchao.quantization import quantize_
-    _cfg = _requant_config_matching_base(data, target_key, log_prefix)
     out_f, in_f = merged.shape
     tmp = nn.Linear(in_f, out_f, bias=False, device=merged.device,
                     dtype=torch.bfloat16)

@@ -454,8 +454,8 @@ from comfyless.mcp_server import (  # noqa: E402
     _GENERATE_INPUT_SCHEMA, _pipeline_cache_key)
 
 _props = _GENERATE_INPUT_SCHEMA["properties"]
-check("MCP schema declares quant enum",
-      _props.get("quant", {}).get("enum") == ["none", "fp8"])
+check("MCP schema declares quant enum (derived from QUANT_MODES)",
+      _props.get("quant", {}).get("enum") == list(_PV_QUANT_MODES))
 check("MCP schema declares quant_skip as string array",
       _props.get("quant_skip", {}).get("items", {}).get("type") == "string")
 check("MCP schema declares quant_only as string array",
@@ -537,6 +537,189 @@ if (torch.cuda.is_available()
 else:
     check("merge-discriminator: dyn-activation base has act_quant_kwargs set "
           "(SKIPPED: no fp8-capable GPU)", True)
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("── slice NV: nvfp4 quantize-on-load (ADR-019, vision slice-NV) ─")
+
+# Invariant 5: the mode exists at both boundaries (the sync test above
+# already pins params_validation == utils; this pins the VALUE).
+check("nvfp4 in QUANT_MODES", "nvfp4" in edu.QUANT_MODES,
+      f"{edu.QUANT_MODES!r}")
+
+# ── Invariant 2: hardware gate — nvfp4 needs Blackwell (>= 10.0), fp8
+# keeps its >= 8.9 floor. Fake the CUDA probe so this runs anywhere.
+_real_avail = torch.cuda.is_available
+_real_cap = torch.cuda.get_device_capability
+try:
+    torch.cuda.is_available = lambda: True
+    torch.cuda.get_device_capability = lambda idx=0: (8, 9)
+    ok_fp8, _ = edu.quant_hardware_ok("fp8", "cuda")
+    ok_nv, why_nv = edu.quant_hardware_ok("nvfp4", "cuda")
+    check("cap 8.9: fp8 accepted (gate unchanged, invariant 1)", ok_fp8)
+    check("cap 8.9: nvfp4 REJECTED (NEGATIVE, invariant 2)", not ok_nv,
+          f"ok={ok_nv}")
+    check("cap 8.9 nvfp4 rejection names the mode and the 10.0 floor",
+          "nvfp4" in why_nv and "10.0" in why_nv, f"why: {why_nv}")
+    torch.cuda.get_device_capability = lambda idx=0: (12, 0)
+    ok_nv, _ = edu.quant_hardware_ok("nvfp4", "cuda")
+    ok_fp8, _ = edu.quant_hardware_ok("fp8", "cuda:1")
+    check("cap 12.0 (Blackwell sm_120): nvfp4 accepted", ok_nv)
+    check("cap 12.0: fp8 accepted on indexed device", ok_fp8)
+finally:
+    torch.cuda.is_available = _real_avail
+    torch.cuda.get_device_capability = _real_cap
+
+ok_cpu, why_cpu = edu.quant_hardware_ok("nvfp4", "cpu")
+check("nvfp4 on cpu rejected, message names the mode (NEGATIVE)",
+      not ok_cpu and "nvfp4" in why_cpu, f"why: {why_cpu}")
+
+# ── Invariant 4: recipe/config selection mirrors the fp8 family split.
+from torchao.prototype.mx_formats import (               # noqa: E402
+    NVFP4DynamicActivationNVFP4WeightConfig as _NVDynAct,
+    NVFP4WeightOnlyConfig as _NVWOnly,
+)
+check("nvfp4 config: zimage -> NVFP4WeightOnlyConfig (family gate)",
+      isinstance(edu._torchao_nvfp4_config("zimage"), _NVWOnly))
+check("nvfp4 config: zimage-turbo -> DynamicActivation (fast path kept)",
+      isinstance(edu._torchao_nvfp4_config("zimage-turbo"), _NVDynAct))
+_nv_default = edu._torchao_nvfp4_config()
+check("nvfp4 config: default (None) -> DynamicActivation",
+      isinstance(_nv_default, _NVDynAct))
+check("nvfp4 dynamic config routes through the mslk triton kernel",
+      getattr(_nv_default, "use_triton_kernel", False) is True)
+
+# Dispatcher: fp8 requests still get EXACTLY the fp8 classes (invariant 1).
+check("dispatcher: ('fp8', zimage) -> Float8WeightOnlyConfig (unchanged)",
+      isinstance(edu._torchao_quant_config("fp8", "zimage"), _WOnly))
+check("dispatcher: ('fp8', None) -> Float8 DynamicActivation (unchanged)",
+      isinstance(edu._torchao_quant_config("fp8", None), _DynAct))
+check("dispatcher: ('nvfp4', None) -> NVFP4 DynamicActivation",
+      isinstance(edu._torchao_quant_config("nvfp4", None), _NVDynAct))
+try:
+    edu._torchao_quant_config("gguf")
+    check("dispatcher: unknown mode raises, never a silent fp8 default "
+          "(NEGATIVE)", False, "no raise")
+except ValueError as _e:
+    check("dispatcher: unknown mode raises, never a silent fp8 default "
+          "(NEGATIVE)", "gguf" in str(_e))
+
+# Invariant 1: the fp8-facing strings render byte-identically to the
+# pre-slice-NV hardcoded forms (mode-aware f-strings, pinned exactly).
+_ok_cpu, _why = edu.quant_hardware_ok("fp8", "cpu")
+check("fp8 cpu message byte-identical to pre-NV",
+      _why == "fp8 quantization requires a CUDA device", f"got {_why!r}")
+_real_avail = torch.cuda.is_available
+_real_cap = torch.cuda.get_device_capability
+try:
+    torch.cuda.is_available = lambda: True
+    torch.cuda.get_device_capability = lambda idx=0: (8, 0)
+    _ok, _why = edu.quant_hardware_ok("fp8", "cuda")
+    check("fp8 capability message byte-identical to pre-NV",
+          _why == "fp8 GEMM needs compute capability >= 8.9, device has 8.0",
+          f"got {_why!r}")
+finally:
+    torch.cuda.is_available = _real_avail
+    torch.cuda.get_device_capability = _real_cap
+
+import contextlib as _ctx                                # noqa: E402
+import io as _io                                         # noqa: E402
+_buf = _io.StringIO()
+_mfp8 = _nn.Linear(64, 128, bias=False, dtype=torch.bfloat16)
+with _ctx.redirect_stdout(_buf):
+    edu.quantize_module(_mfp8, "fp8", family="zimage")
+check("fp8 recipe notice byte-identical to pre-NV",
+      "quant: fp8 recipe=weight_only (family 'zimage')" in _buf.getvalue(),
+      f"got {_buf.getvalue()!r}")
+
+# ── Invariant 3 NEGATIVE: missing mslk surfaces as ImportError from the
+# config builder (probed BEFORE torchao's quantize-time AssertionError can
+# kill a from_pretrained mid-load) and as warn-and-fall-back from
+# build_quant_config.
+import importlib.util as _ilu_mod                        # noqa: E402
+_real_find_spec = _ilu_mod.find_spec
+
+
+def _hide_mslk(name, *a, **k):
+    if name == "mslk":
+        return None
+    return _real_find_spec(name, *a, **k)
+
+
+try:
+    _ilu_mod.find_spec = _hide_mslk
+    try:
+        edu._torchao_nvfp4_config()
+        check("mslk hidden: _torchao_nvfp4_config raises ImportError "
+              "(NEGATIVE)", False, "no raise")
+    except ImportError as e:
+        check("mslk hidden: _torchao_nvfp4_config raises ImportError "
+              "(NEGATIVE)", "mslk" in str(e), f"msg: {e}")
+    # Through build_quant_config: environment problem → None config +
+    # loud notice, never an exception (invariant 6 of slice A extends).
+    _real_hw = edu.quant_hardware_ok
+    edu.quant_hardware_ok = lambda m, d: (True, "")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            mp = _mk_model_dir(tmp, _QWEN_INDEX)
+            cfg, comps, notes = edu.build_quant_config(mp, "nvfp4")
+            check("mslk hidden: build_quant_config falls back to "
+                  "unquantized (NEGATIVE)", cfg is None and comps == {},
+                  f"cfg {cfg} comps {comps}")
+            check("mslk hidden: fallback is announced",
+                  any("FALLING BACK" in n for n in notes), f"notes: {notes}")
+    finally:
+        edu.quant_hardware_ok = _real_hw
+finally:
+    _ilu_mod.find_spec = _real_find_spec
+
+# ── quantize_module routes by mode (override path) — real CPU quantize;
+# both nvfp4 recipes quantize weights on CPU (kernel choice matters only
+# at forward time), verified 2026-07-16.
+_m = _nn.Linear(64, 128, bias=False, dtype=torch.bfloat16)
+check("quantize_module nvfp4/zimage: quantizes (returns True)",
+      edu.quantize_module(_m, "nvfp4", family="zimage") is True)
+check("quantize_module nvfp4/zimage: weight is NVFP4Tensor",
+      type(_m.weight.data).__name__ == "NVFP4Tensor",
+      f"got {type(_m.weight.data).__name__}")
+check("quantize_module nvfp4/zimage: weight-only (act_quant_kwargs None)",
+      getattr(_m.weight.data, "act_quant_kwargs", "MISSING") is None)
+check("nvfp4-quantized module detected by is_quantized_module "
+      "(LoRA PEFT-path gate)", edu.is_quantized_module(_m) is True)
+
+# The dynamic-activation arm quantized fine on the CUDA-visible dev box
+# (2026-07-16) but may hardware-probe on a GPU-less CI runner, where
+# quantize_module's warn-and-skip contract returns False — self-skip there,
+# same pattern as the fp8 dyn-act arm above.
+_m2 = _nn.Linear(64, 128, bias=False, dtype=torch.bfloat16)
+_ok2 = edu.quantize_module(_m2, "nvfp4", family=None)
+if not _ok2 and not torch.cuda.is_available():
+    check("quantize_module nvfp4 default family: quantizes "
+          "(SKIPPED: no CUDA — torchao declined the dyn-act recipe)", True)
+    check("quantize_module nvfp4 default: dynamic-activation "
+          "(SKIPPED: no CUDA)", True)
+else:
+    check("quantize_module nvfp4 default family: quantizes (returns True)",
+          _ok2 is True)
+    check("quantize_module nvfp4 default: dynamic-activation "
+          "(act_quant_kwargs set)",
+          getattr(_m2.weight.data, "act_quant_kwargs", None) is not None)
+
+# The merge-guard rationale, pinned (slice NV invariant 6): NVFP4Tensor
+# ALSO carries act_quant_kwargs (None when weight-only), so the fp8_ops
+# recipe sniff CANNOT discriminate fp8 from nvfp4 — the class gate in
+# _requant_config_matching_base is load-bearing. If torchao ever drops
+# the attribute this check flags the API drift before the merge path
+# sees it (mirrors the fp8 attribute pin above).
+check("NVFP4Tensor carries act_quant_kwargs (why the merge guard is a "
+      "CLASS check, not an akw sniff)",
+      hasattr(_m.weight.data, "act_quant_kwargs"))
+
+# ── Invariant 7: cache-key fragments discriminate nvfp4 from fp8.
+frag_nv = edu.quant_cache_fragment("nvfp4")
+check("fragment('nvfp4') is non-empty", frag_nv != "")
+check("fragment('nvfp4') != fragment('fp8') (no cross-mode cache hit)",
+      frag_nv != edu.quant_cache_fragment("fp8"))
 
 
 # ──────────────────────────────────────────────────────────────────────

@@ -43,6 +43,10 @@ from mcp.types import Tool, TextContent
 # co-package consumer of the same security primitive. Future refactor may
 # promote _within to a shared helper module; out of slice-1 scope.
 from comfyless.server import _within
+# Single source of truth for the quant-mode enum advertised in the tool
+# schema (ADR-019 slice NV). params_validation is deliberately light (no
+# torch) — same rationale as the daemon's use of it (slice-DQ review F1).
+from comfyless.params_validation import QUANT_MODES
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -773,14 +777,16 @@ _GENERATE_INPUT_SCHEMA: dict[str, Any] = {
         },
         "quant": {
             "type": "string",
-            "enum": ["none", "fp8"],
+            "enum": list(QUANT_MODES),
             "description": (
                 "Quantize-on-load (ADR-019). fp8 halves VRAM on the "
                 "transformer + large text encoders using native fp8 tensor "
-                "cores; VAE and CLIP encoders are never quantized. Falls "
-                "back to unquantized with a warning on unsupported "
-                "hardware. Non-cascade models only (ignored for cascade). "
-                "Default none."
+                "cores; VAE and CLIP encoders are never quantized. nvfp4 "
+                "(slice NV) quantizes further on Blackwell GPUs — wired "
+                "but not yet quality-validated; prefer fp8 until the live "
+                "smoke lands. Falls back to unquantized with a warning on "
+                "unsupported hardware. Non-cascade models only (ignored "
+                "for cascade). Default none."
             ),
         },
         "quant_skip": {

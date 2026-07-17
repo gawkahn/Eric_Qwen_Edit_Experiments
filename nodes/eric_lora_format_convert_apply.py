@@ -698,6 +698,7 @@ def _apply_converted_lora_as_delta(
     """
     from .eric_diffusion_fp8_ops import (
         apply_merge_delta, merge_resolution_map, record_direct_merge,
+        refuse_unmergeable_base,
     )
     # Slice DMR: quantized bases merge via dequant->merge->requant;
     # apply_merge_delta owns the raise for unmergeable reps. The resolution
@@ -705,6 +706,9 @@ def _apply_converted_lora_as_delta(
     # an adversarial `foo.weight_scale.diff` key must never resolve onto a
     # ScaledFp8Linear scale buffer).
     model_sd = merge_resolution_map(transformer)
+    # Slice NV req 65: all-or-nothing — refuse BEFORE the first merge so a
+    # mid-loop unmergeable target can't leave a partially-merged model.
+    refuse_unmergeable_base(transformer, model_sd, log_prefix)
     modules: Dict[str, Dict[str, "torch.Tensor"]] = {}
     for k, v in state_dict.items():
         base, sfx = split_state_key(k)
