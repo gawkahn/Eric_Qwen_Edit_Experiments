@@ -97,6 +97,12 @@ def license_allowed(expr: str) -> bool:
     """True iff *expr* is acceptable under ADR-031. Empty/unknown → False."""
     if not expr or not expr.strip():
         return False
+    # GPL-denial scans the FULL field first (code-reviewer 2026-07-16): a field
+    # like "MIT\nAND GPL-3.0" must not pass via the first-line reduction below.
+    # Full MIT/Apache/BSD license TEXTS contain no "GPL" substring, so packages
+    # that embed the whole permissive text still pass.
+    if re.search(r"\b[AL]?GPL", expr.upper()):
+        return False
     # Some packages (e.g. tiktoken) embed the FULL license text in the License
     # field; the declared license is its first line ("MIT License\n\nCopyright
     # ..."). Only the first non-empty line is the SPDX-ish expression — parsing
@@ -126,9 +132,12 @@ def main() -> int:
             continue
         if _NVIDIA_NAME_RE.match(name):
             continue  # ADR-031 §Decision-3: CUDA runtime wheels, name-scoped
-        if name in _PACKAGE_EXCEPTIONS:
-            continue  # ADR-031 §Decision-4: verified-permissive metadata gaps
         lic = pkg.get("License", "") or ""
+        # ADR-031 §Decision-4 exceptions apply ONLY while the metadata gap
+        # persists — the moment a future version ships a real license string,
+        # the gate re-engages (code-reviewer 2026-07-16).
+        if name in _PACKAGE_EXCEPTIONS and lic.strip().upper() in {"", "UNKNOWN"}:
+            continue
         if not license_allowed(lic):
             violations.append((pkg.get("Name", ""), pkg.get("Version", ""), lic))
     if violations:

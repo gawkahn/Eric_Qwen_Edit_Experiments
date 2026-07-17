@@ -1,16 +1,18 @@
 # CI gate — quality-gate kit adoption, 2026-07-16 (reference: local_agents).
 #
-# ADOPTED GATES ONLY: this repo has adopted the `secrets` and `commit-policy`
-# gates. The kit's typecheck / tests / sast / supply-chain jobs are NOT here
-# yet — the tests gate needs a decision on the 19 standalone (non-pytest)
-# suites, and types/sast need a measured baseline first. Add them gate-by-gate
-# per the kit README (~/.claude/templates/quality-gate-kit-python-uv/).
+# ADOPTED GATES: secrets, commit-policy, sast, supply-chain (2026-07-16). The
+# kit's tests job is NOT here yet — it needs a decision on the 19 standalone
+# (non-pytest) suites. Add remaining gates per the kit README
+# (~/.claude/templates/quality-gate-kit-python-uv/).
 #
 # Fails the build on:
 #   - any git-policy smoke-test regression (scripts/git-policy/)
 #   - any repo-policy violation in a PR's commits (the authoritative mirror of
 #     the pre-commit layer — a local --no-verify / SKIP bypass is caught here)
 #   - any committed secret (gitleaks, 0-baseline — measured clean at adoption)
+#   - any semgrep SAST finding (0-baseline, 7 triaged suppressions inline)
+#   - any non-registry lock source, non-ADR-031 license, or known CVE in the
+#     locked deps (two documented no-fix ignores in osv-scanner.toml)
 #
 # Supply chain (global CLAUDE.md §11):
 #   - every `uses:` is pinned to a commit SHA, not a floating tag.
@@ -82,10 +84,14 @@ jobs:
           version: "0.11.7" # match dev box; exact pin per §11
           enable-cache: false
       # --locked verifies uv.lock integrity hashes; the scans run against it.
-      # NOTE: this resolves the full CUDA-wheel tree (~7 GB) — acceptable for
-      # now; if runner disk/time becomes a problem, switch the license/cve
-      # scans to `uv export`-based inputs that don't install.
+      # NOTE: this resolves the full CUDA-wheel tree. UV_NO_CACHE keeps the
+      # runner from holding wheels twice (cache + venv would blow ubuntu-latest's
+      # ~14 GB free disk — code-reviewer 2026-07-16); if disk/time still becomes
+      # a problem, switch the license/cve scans to `uv export`-based inputs
+      # that don't install.
       - run: uv sync --locked
+        env:
+          UV_NO_CACHE: "1"
       # Tier-3 (§11): fail if any dep is from a non-registry (unhashed)
       # source. Fast, no network — fail early before the live scans.
       - name: tier-3 hash sources (§11)
@@ -130,7 +136,7 @@ jobs:
         run: >
           uv run --with semgrep==1.169.0 semgrep scan
           --config p/python --config p/security-audit --config p/secrets
-          --error --quiet --metrics=off comfyless/ nodes/ pipelines/
+          --error --quiet --metrics=off comfyless/ nodes/ pipelines/ scripts/
 
   secrets:
     name: secret scan (gitleaks)

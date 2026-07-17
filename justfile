@@ -1,6 +1,6 @@
-# Quality-gate recipes (kit adoption 2026-07-16 — secrets + commit-policy only;
-# types/tests/sast/supply-chain gates not adopted yet, see the kit README in
-# ~/.claude/templates/quality-gate-kit-python-uv/ for the remaining gates).
+# Quality-gate recipes (kit adoption 2026-07-16 — secrets, commit-policy,
+# sast, and supply-chain adopted; types/tests still pending, see the kit
+# README in ~/.claude/templates/quality-gate-kit-python-uv/).
 # Requires: mise (pins in mise.toml), uv.
 
 # --redact keeps secret values out of the output; 0-baseline hard gate.
@@ -75,4 +75,4 @@ policy-test:
 sast:
     uv run --with semgrep==1.169.0 semgrep scan \
       --config p/python --config p/security-audit --config p/secrets \
-      --error --quiet --metrics=off comfyless/ nodes/ pipelines/
+      --error --quiet --metrics=off comfyless/ nodes/ pipelines/ scripts/
