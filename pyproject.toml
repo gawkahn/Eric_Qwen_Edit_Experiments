@@ -70,6 +70,18 @@ dependencies = [
     "ftfy==6.3.1",
 ]
 
+# Type checker config (ADR-032). pyright is a Node tool pinned in mise.toml,
+# NOT a pyproject/uv.lock dep. Scope: this repo's code roots; test suites stay
+# out per global §15 (they deliberately violate the contracts they test).
+# Baseline 1026 (ratchet — .claude/typecheck-baseline may only go down).
+[tool.pyright]
+include = ["comfyless", "nodes", "pipelines"]
+exclude = ["**/__pycache__"]
+pythonVersion = "3.12"
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "basic"
+
 [dependency-groups]
 # Dev-only tooling for the comfyless uv path (ADR-013). NOT part of
 # [project.dependencies], so the pyproject ↔ requirements.txt direct-dep

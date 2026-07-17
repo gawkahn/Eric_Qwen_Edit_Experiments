@@ -69,6 +69,12 @@ deps-verify-sources:
 policy-test:
     bash scripts/git-policy/test-git-policy.sh
 
+# Static type check (ADR-032). pyright pinned in mise.toml; scope + venv come
+# from pyproject [tool.pyright]. Ratchet gate: error count must not exceed
+# .claude/typecheck-baseline (currently large; may only go down).
+typecheck:
+    mise exec -- pyright
+
 # 0-baseline hard gate (7 findings triaged + suppressed inline 2026-07-16);
 # scope is this repo's code roots (no src/). FPs: inline # nosemgrep + comment.
 # Security static analysis (SAST) — semgrep, exact-pinned via uv

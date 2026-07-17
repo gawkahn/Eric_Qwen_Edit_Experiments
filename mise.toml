@@ -3,11 +3,12 @@
 # Repo-local mise.toml is authoritative over ~/.config/mise (a global bump
 # can't silently change the pinned toolchain).
 #
-# Quality-gate kit adoption (2026-07-16): only the tools for the adopted gates
-# are pinned here (secrets, commit-policy, sast, supply-chain; semgrep and the
+# Quality-gate kit adoption (2026-07-16): tools for the adopted gates
+# (secrets, commit-policy, sast, supply-chain, types; semgrep and the
 # supply-chain Python tools are uv-pinned in the justfile recipes instead).
-# The types gate is NOT adopted yet — add its pins (node, pyright) when it lands.
 [tools]
 just = "1.56.0"                        # task runner for the justfile recipes
 "aqua:gitleaks/gitleaks" = "8.30.0"    # secret scanner (`just secrets` + pre-commit)
 "aqua:google/osv-scanner" = "2.4.0"    # CVE scanner (part of `just deps-cve`)
+node = "22.22.2"                       # runtime for pyright
+"npm:pyright" = "1.1.411"              # type checker (ADR-032); `just typecheck`
