@@ -402,6 +402,20 @@ Trigger: a GPU frees up. Gate per the handoff/vision: same prompt+seed
 nvfp4 vs fp8 vs bf16 on QwenImage (detailed idiosyncratic prompts with
 checkable anchors), plus a LoRA-via-PEFT run under nvfp4 (direct merge is
 deliberately refused — reqs 61/65).
+Resolved: 2026-07-17 — T1 gate ran (Grant live, nvfp4-smoke/RUNBOOK.md);
+verdict: **functional, not recommended — fp8 stays the default**. Findings:
+(1) first load crashed on the Qwen2.5-VL vision tower's non-/16 shapes →
+shape screen (de837de); with it, CPU-staged quantize-on-load through the
+mslk path works. (2) dyn-act nvfp4 on QwenImage is NOT acceptable —
+pervasive granular noise — answering that unknown; per-mode weight-only
+split added qwen-image (3dfc24d). (3) Weight-only nvfp4 on QwenImage is
+usable but visibly lossy (blotchiness, smeared fine detail) and ~4.7×
+SLOWER than bf16/fp8 (83.7s vs 17.8s @ 50 steps: no fused dequant kernel).
+(4) Krea (dyn-act) is nvfp4's first real operating point: usable output
+with drift, 15 vs 23 GB and 37 vs 58 s vs fp8. Still unrun from the
+runbook: zimage weight-only transfer (T3), LoRA-under-nvfp4 PEFT arm (T4)
+— revisit if nvfp4 ever graduates past niche-VRAM use; torch.compile and
+calibrated offline nvfp4 remain the ADR-019 deferred paths to real parity.
 
 **Daemon socket silently drops `quant` from hand-crafted clients** *(2026-07-02)*
 Slice A registered `quant`/`quant_skip`/`quant_only` in `_RUNTIME_KIND`, so the
