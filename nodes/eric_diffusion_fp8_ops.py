@@ -24,13 +24,19 @@ change here is security-auditor-gated. The load path implements the binding
 requirements of docs/security/review-slice-C-fp8-single-file-2026-07-02.md
 plus the C-d delta review (review-slice-Cd-comfy-quant-2026-07-02.md):
 header-only classification via safe_open (names + dtypes + shapes, never
-__metadata__) — with EXACTLY ONE bounded exception (delta req 11): the raw
-bytes of `.comfy_quant` descriptor tensors may be read, gated by
-header-declared dtype U8, 1-D shape, and numel <= 4096 BEFORE any tensor
-materialization; the decoded JSON drives EXACTLY ONE decision — the format
-allowlist pass/fail (delta req 15; `full_precision_matrix_mult` and every
-other field is attacker-controlled and deliberately NOT read; reading any
-new descriptor field requires a fresh security review). Also: control-char
+__metadata__) — with EXACTLY TWO bounded exceptions (NF4 req 83 amended
+the original one-exception claim): (1) the raw bytes of `.comfy_quant`
+descriptor tensors may be read, gated by header-declared dtype U8, 1-D
+shape, and numel <= 4096 BEFORE any tensor materialization; the decoded
+JSON drives EXACTLY ONE decision — the format allowlist pass/fail (delta
+req 15; `full_precision_matrix_mult` and every other field is
+attacker-controlled and deliberately NOT read; reading any new descriptor
+field requires a fresh security review); (2) the bnb-4bit quant-state
+blobs (slice NF4, LOAD stage only — classify validates their bounds from
+the header without reading), same U8/1-D/<=4096 gates (reqs 69/70), whose
+JSON drives EXACTLY TWO consumed values — shape and blocksize (req 71
+scope lock; quant_type is cross-checked-then-discarded, dtype is
+allowlist-validated-then-discarded, never getattr-resolved). Also: control-char
 key rejection; scalar-F32 scale shape/dtype asserts; finite-positive-normal
 scale validation at load (before EITHER compute path); per-tensor
 scale-coverage check; and scale↔weight binding by SOURCE pairing + value
@@ -120,6 +126,42 @@ _CQ_KNOWN_FIELDS = {"format", "full_precision_matrix_mult"}
 
 _E4M3_MAX = 448.0
 
+#: bitsandbytes 4-bit single-file support (ADR-019 slice NF4, security
+#: review reqs 67-90). Marker suffixes are the ONLY classify trigger (req
+#: 67); `.absmax`/`.quant_map` alone never fire the sniff (not bnb-unique).
+#: Measured key form: `<name>.weight.quant_state.bitsandbytes__nf4`.
+_BNB4_MARKER_SUFFIXES = ("bitsandbytes__nf4", "bitsandbytes__fp4")
+_BNB4_QS_SEGMENT = ".quant_state."
+_BNB4_ABSMAX_SUFFIX = ".absmax"
+_BNB4_QMAP_SUFFIX = ".quant_map"
+_BNB4_MAX_QS_NUMEL = 4096     # same bound class as _CQ_MAX_NUMEL (req 69/70)
+#: Roots that never belong to the transformer in an AIO bundle (req 78 —
+#: same set as eric_krea2_convert._NON_TRANSFORMER_ROOTS; duplicated here so
+#: the Red Zone module has no import-order coupling into the converter).
+_BNB4_NON_TRANSFORMER_ROOTS = (
+    "text_encoders.", "text_encoder.", "vae.", "first_stage_model.",
+    "conditioner.", "cond_stage_model.",
+)
+#: Known Flux-lineage transformer roots — survivors OUTSIDE this set after
+#: the subtree filter get a loud notice (req 85, warn-don't-block).
+_BNB4_KNOWN_TRANSFORMER_ROOTS = (
+    "double_blocks.", "single_blocks.", "img_in.", "txt_in.", "time_in.",
+    "vector_in.", "guidance_in.", "final_layer.",
+)
+
+
+def _bnb4_foreign_marker(k: str) -> bool:
+    """True when `k` is a NON-bnb quant marker key (req 68 scan half).
+
+    Shared by the classify-time scoped scan and the loader's surviving-dict
+    purity gate (req 81 delta: the loader re-runs the FULL flavor scan —
+    dtypes AND marker keys — so a direct loader call cannot forward stray
+    scale/descriptor floats to the model builder)."""
+    return (k.endswith((_CQ_SUFFIX,)
+                       + tuple(_CA_SUFFIXES.values())
+                       + tuple(_CB_SUFFIXES.values()))
+            or k == "scaled_fp8" or k.endswith(".weight_scale_2"))
+
 
 def _safe_name(k: str) -> str:
     """Sanitize an attacker-controlled tensor name for logs/errors (F7)."""
@@ -168,7 +210,11 @@ def classify_fp8_single_file(path: str):
         or k == "scaled_fp8"
         for k in keys
     )
-    if not fp8_keys and not _any_marker:
+    # bnb-4bit marker sniff (slice NF4, req 67): fires ONLY on the
+    # bitsandbytes marker suffix — .absmax/.quant_map alone never trigger.
+    bnb4_marker_keys = [k for k in keys
+                        if k.endswith(_BNB4_MARKER_SUFFIXES)]
+    if not fp8_keys and not _any_marker and not bnb4_marker_keys:
         # Not an fp8 file: return untouched so the standard path stays
         # byte-identical (invariant 2) — no further inspection of any kind.
         return None, {}
@@ -181,6 +227,13 @@ def classify_fp8_single_file(path: str):
                 f"weight file contains a tensor name with control "
                 f"characters ({_safe_name(k)}) — refusing to parse"
             )
+
+    if bnb4_marker_keys:
+        # Dispatch BEFORE the nvfp4/cq branches so hybrid files reject with
+        # a message naming both sides (req 68) — either order fails closed
+        # (review verdict c); this one names the defect more precisely.
+        return _classify_bnb4(keys, dtypes, shapes, fp8_keys,
+                              bnb4_marker_keys)
 
     # (comfy_quant descriptors are handled below, after the sharper nvfp4
     # signature check — slice C-d replaced the former blanket reject.)
@@ -236,6 +289,150 @@ def classify_fp8_single_file(path: str):
     if cb_hits:
         return "cb", info
     return "cc", info
+
+
+def _bnb4_base_of(marker_key: str) -> str | None:
+    """The quantized base key ("<name>.weight") for a bnb4 marker key.
+
+    Measured form: `<name>.weight.quant_state.bitsandbytes__nf4`. Returns
+    None when the key doesn't follow it (caller rejects — a marker that
+    can't name its base is malformed by definition).
+    """
+    for flavor in _BNB4_MARKER_SUFFIXES:
+        sfx = _BNB4_QS_SEGMENT + flavor
+        if marker_key.endswith(sfx):
+            base = marker_key[: -len(sfx)]
+            if base.endswith(".weight"):
+                return base
+    return None
+
+
+def _bnb4_flavor_of(marker_key: str) -> str:
+    """'nf4' or 'fp4' from the marker suffix."""
+    return "fp4" if marker_key.endswith("bitsandbytes__fp4") else "nf4"
+
+
+def _classify_bnb4(keys, dtypes, shapes, fp8_keys, marker_keys):
+    """Header-time bnb-4bit family validation (slice NF4, reqs 67-69).
+
+    Fires only from the bitsandbytes marker suffix (req 67). Validates
+    EVERY marker family header-wide — including families under roots the
+    loader will later drop (req 69: a crafted broken TE-side family fails
+    loud here, never silently). Reads names/dtypes/shapes only; the
+    quant-state BYTES are read at load, gated by req 70.
+    """
+    # req 68 (delta-amended) — flavor mutual exclusion SCOPED to the
+    # transformer namespace: keys under the exempt roots (the SAME
+    # constant the req-78 subtree filter drops — the real AIO file
+    # bundles an fp8 T5 beside the NF4 transformer) are exempt from this
+    # scan ONLY because req 78 guarantees they never reach the build set;
+    # the loader's req-81 purity scan on the surviving dict is the
+    # authoritative copy. Precedence: any bnb4 marker present means
+    # bnb4-or-reject — the file must never fall through to cc/ca/cb/cq
+    # (the fp8 TE keys would otherwise classify the real AIO as "cc").
+    def _scanned(k):
+        return not k.startswith(_BNB4_NON_TRANSFORMER_ROOTS)
+
+    _other_side = None
+    _scanned_fp8 = [k for k in fp8_keys if _scanned(k)]
+    if _scanned_fp8:
+        _other_side = f"fp8 tensor {_safe_name(_scanned_fp8[0])}"
+    else:
+        for k in keys:
+            if not _scanned(k):
+                continue
+            if dtypes.get(k) == "I8":
+                _other_side = f"int8 tensor {_safe_name(k)}"
+                break
+            if _bnb4_foreign_marker(k):
+                _other_side = f"non-bnb quant marker {_safe_name(k)}"
+                break
+    if _other_side is not None:
+        raise ScaledFp8FormatError(
+            f"file mixes bitsandbytes 4-bit markers (e.g. "
+            f"{_safe_name(marker_keys[0])}) with {_other_side} in the "
+            f"transformer namespace — hybrid quant flavors are refused "
+            f"(NF4 req 68)"
+        )
+
+    key_set = set(keys)
+    bases = {}
+    for mk in marker_keys:
+        base = _bnb4_base_of(mk)
+        if base is None:
+            raise ScaledFp8FormatError(
+                f"bnb4 marker {_safe_name(mk)} does not follow the "
+                f"<name>.weight.quant_state.bitsandbytes__nf4 form — "
+                f"refusing (NF4 req 69)"
+            )
+        if base in bases:
+            raise ScaledFp8FormatError(
+                f"base {_safe_name(base)} carries both __nf4 and __fp4 "
+                f"markers — ambiguous flavor, refusing (NF4 req 69)"
+            )
+        bases[base] = mk
+        # Marker blob bounds BEFORE any tensor read (req 69): U8, 1-D,
+        # 1 <= numel <= 4096 (the _CQ_MAX_NUMEL gate class).
+        mshape = shapes[mk]
+        mnumel = 1
+        for d in mshape:
+            mnumel *= d
+        if (dtypes[mk] != "U8" or len(mshape) != 1
+                or not (1 <= mnumel <= _BNB4_MAX_QS_NUMEL)):
+            raise ScaledFp8FormatError(
+                f"bnb4 quant-state {_safe_name(mk)} is {dtypes[mk]} shape "
+                f"{mshape} — must be 1-D U8 with 1..{_BNB4_MAX_QS_NUMEL} "
+                f"bytes (NF4 req 69)"
+            )
+        # Family completeness (req 69): packed base + absmax + quant_map,
+        # each with the pinned dtype/shape class.
+        if base not in key_set or dtypes[base] != "U8":
+            raise ScaledFp8FormatError(
+                f"bnb4 family {_safe_name(base)}: packed U8 weight missing "
+                f"or wrong dtype ({dtypes.get(base, 'ABSENT')}) — "
+                f"refusing (NF4 req 69)"
+            )
+        # req 89: pin the measured packed layout [N, 1].
+        pshape = shapes[base]
+        if len(pshape) != 2 or pshape[1] != 1 or pshape[0] < 1:
+            raise ScaledFp8FormatError(
+                f"bnb4 packed weight {_safe_name(base)} has shape "
+                f"{pshape} — only the measured [N, 1] layout is supported "
+                f"(NF4 req 89)"
+            )
+        am = base + _BNB4_ABSMAX_SUFFIX
+        if am not in key_set or dtypes[am] != "F32" or len(shapes[am]) != 1:
+            raise ScaledFp8FormatError(
+                f"bnb4 family {_safe_name(base)}: absmax missing or not "
+                f"1-D F32 ({dtypes.get(am, 'ABSENT')} "
+                f"{shapes.get(am, ())}) — refusing (NF4 req 69)"
+            )
+        qm = base + _BNB4_QMAP_SUFFIX
+        if qm not in key_set or dtypes[qm] != "F32" or shapes[qm] != (16,):
+            raise ScaledFp8FormatError(
+                f"bnb4 family {_safe_name(base)}: quant_map missing or not "
+                f"F32 shape (16,) ({dtypes.get(qm, 'ABSENT')} "
+                f"{shapes.get(qm, ())}) — refusing (NF4 req 69)"
+            )
+
+    # Dangling members (req 69): absmax/quant_map suffixes in a .weight
+    # family namespace with no marker. A marker-less packed U8 tensor is
+    # NOT catchable here (nothing distinguishes it by name at the header) —
+    # the loader's req-79 residual scan rejects it instead (two-point).
+    for k in keys:
+        if k.endswith((_BNB4_ABSMAX_SUFFIX, _BNB4_QMAP_SUFFIX)):
+            fam_base = k[: k.rfind(".")]
+            if fam_base.endswith(".weight") and fam_base not in bases:
+                raise ScaledFp8FormatError(
+                    f"bnb4 member {_safe_name(k)} has no "
+                    f"quant_state marker for its family — dangling member, "
+                    f"refusing (NF4 req 69)"
+                )
+
+    flavors = sorted({_bnb4_flavor_of(mk) for mk in bases.values()})
+    info = {"n_keys": len(keys), "n_bnb4": len(bases),
+            "flavors": flavors, "dtypes": dtypes, "shapes": shapes}
+    return "bnb4", info
 
 
 def _classify_cq(path: str, keys, dtypes, shapes, fp8_keys, cq_keys, cb_hits):
@@ -808,6 +1005,377 @@ def _fingerprint(t: torch.Tensor):
     return (tuple(t.shape), sample)
 
 
+def _materialize_from_bf16_sd(component_class, bf16_sd, config_path, dtype,
+                              strip_prefix, log_prefix):
+    """Shared tail: build the component from a dequantized float dict.
+
+    ComfyUI-native Krea-2 checkpoints (community civitai single-file) use
+    key names released diffusers 0.39.0 has no from_single_file converter
+    for — build_krea2_transformer converts + builds; everything else goes
+    through component_class.from_single_file. (Factored from the scaled-fp8
+    stage-2 tail for reuse by the bnb4 branch — slice NF4.)
+    """
+    from .eric_krea2_convert import (
+        is_krea2_comfy_checkpoint, build_krea2_transformer,
+    )
+    if is_krea2_comfy_checkpoint(bf16_sd.keys()):
+        print(f"{log_prefix} ComfyUI-native Krea-2 keys — converting to "
+              f"diffusers + from_config build")
+        return build_krea2_transformer(
+            component_class, bf16_sd, config_path, dtype, strip_prefix,
+            log_prefix)
+    # Classes whose only construction path is a bespoke converter (Krea2)
+    # have no from_single_file. Reaching here with one means the file's
+    # keys did not match its native-format converter — i.e. the checkpoint
+    # is a DIFFERENT architecture than the pipeline expects. Say that,
+    # rather than letting `AttributeError: no attribute 'from_single_file'`
+    # surface and read as a diffusers bug.
+    if not hasattr(component_class, "from_single_file"):
+        raise ScaledFp8FormatError(
+            f"{component_class.__name__} has no from_single_file, and this "
+            f"checkpoint's keys do not match its native-format converter — "
+            f"the file is very likely a different architecture than the "
+            f"pipeline expects. Check that the transformer override matches "
+            f"the base model's family."
+        )
+    return component_class.from_single_file(
+        bf16_sd, config=config_path, torch_dtype=dtype, local_files_only=True,
+    )
+
+
+def _bnb4_parse_quant_state(blob, marker_key):
+    """Bounded parse of the bnb quant-state JSON (NF4 reqs 70/71).
+
+    SCOPE LOCK (req 71, auditor-binding): the JSON drives EXACTLY TWO
+    consumed values — `shape` and `blocksize`. `quant_type` is
+    cross-checked against the marker suffix and `dtype` is validated
+    against a literal allowlist then DISCARDED (never getattr-resolved,
+    never selects the output dtype). Reading ANY further field for
+    behavior requires a fresh security review.
+    """
+    if (blob.dtype != torch.uint8 or blob.dim() != 1
+            or not (1 <= blob.numel() <= _BNB4_MAX_QS_NUMEL)):
+        raise ScaledFp8FormatError(
+            f"bnb4 quant-state {_safe_name(marker_key)} tensor is "
+            f"{blob.dtype} {tuple(blob.shape)} — must be 1-D uint8 with "
+            f"1..{_BNB4_MAX_QS_NUMEL} bytes (NF4 req 70)"
+        )
+    try:
+        qs = json.loads(bytes(blob.numpy().tobytes()).decode("utf-8",
+                                                             errors="strict"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        # RecursionError included deliberately: ~2 KB of nested "[[[["
+        # blows json.loads' recursion inside the 4096-byte bound (req 70).
+        raise ScaledFp8FormatError(
+            f"bnb4 quant-state {_safe_name(marker_key)} is not valid "
+            f"UTF-8 JSON — refusing (NF4 req 70)"
+        ) from None
+    if not isinstance(qs, dict):
+        raise ScaledFp8FormatError(
+            f"bnb4 quant-state {_safe_name(marker_key)} JSON root is "
+            f"{type(qs).__name__}, not an object — refusing (NF4 req 70)"
+        )
+    for field in qs:
+        if isinstance(field, str) and field.startswith("nested"):
+            raise ScaledFp8FormatError(
+                f"bnb4 quant-state {_safe_name(marker_key)} carries "
+                f"{field!r} — double-quantized (nested-absmax) NF4 is "
+                f"unsupported; refusing rather than half-decoding "
+                f"(NF4 req 71)"
+            )
+    shape = qs.get("shape")
+    if (not isinstance(shape, list) or not (1 <= len(shape) <= 8)
+            or not all(isinstance(d, int) and not isinstance(d, bool)
+                       and d >= 1 for d in shape)):
+        raise ScaledFp8FormatError(
+            f"bnb4 quant-state {_safe_name(marker_key)} shape field is "
+            f"invalid — need a list of 1..8 ints >= 1 (NF4 req 71)"
+        )
+    blocksize = qs.get("blocksize")
+    # req 86: power-of-two <= 4096 (measured: 64) — shrinks the untested
+    # input space; widen deliberately if a real file demands it.
+    if (not isinstance(blocksize, int) or isinstance(blocksize, bool)
+            or blocksize < 1 or blocksize > 4096
+            or (blocksize & (blocksize - 1)) != 0):
+        raise ScaledFp8FormatError(
+            f"bnb4 quant-state {_safe_name(marker_key)} blocksize "
+            f"{blocksize!r} — need a power-of-two int in 1..4096 "
+            f"(NF4 reqs 71/86)"
+        )
+    qt = qs.get("quant_type")
+    if qt is not None and qt != _bnb4_flavor_of(marker_key):
+        raise ScaledFp8FormatError(
+            f"bnb4 quant-state {_safe_name(marker_key)} declares "
+            f"quant_type {qt!r} but the marker suffix says "
+            f"{_bnb4_flavor_of(marker_key)!r} — mismatch, refusing "
+            f"(NF4 req 71)"
+        )
+    dt = qs.get("dtype")
+    if dt is not None and dt not in ("bfloat16", "float16", "float32"):
+        raise ScaledFp8FormatError(
+            f"bnb4 quant-state {_safe_name(marker_key)} dtype field "
+            f"{dt!r} is not a known storage dtype — refusing (NF4 req 71)"
+        )
+    return shape, blocksize
+
+
+def _bnb4_dequantize(packed, absmax, qmap, shape, blocksize, base):
+    """Pure-torch bnb-4bit decode (NF4 reqs 72-76).
+
+    Nibble order is bnb's HIGH-nibble-first — numerically proven against
+    bitsandbytes 0.49.2 `dequantize_4bit` on the real projectGaia file
+    (golden vectors in test_fp8_single_file.py). Bitwise ops on the uint8
+    tensor keep indices provably in [0, 15] (req 74) — no signed cast.
+    """
+    numel = 1
+    for d in shape:
+        numel *= d
+    # req 72 — coverage equations BEFORE any allocation sized by the
+    # declared shape: all decode allocations are then bounded by ~4x the
+    # packed bytes physically present in the file.
+    if packed.numel() != (numel + 1) // 2:
+        raise ScaledFp8FormatError(
+            f"bnb4 {_safe_name(base)}: packed has {packed.numel()} bytes "
+            f"but declared shape {shape} needs {(numel + 1) // 2} — "
+            f"refusing (NF4 req 72)"
+        )
+    n_blocks = (numel + blocksize - 1) // blocksize
+    if absmax.numel() != n_blocks:
+        raise ScaledFp8FormatError(
+            f"bnb4 {_safe_name(base)}: absmax has {absmax.numel()} "
+            f"entries but shape {shape} / blocksize {blocksize} needs "
+            f"{n_blocks} — refusing (NF4 req 72)"
+        )
+    # req 75 — codebook: exactly 16, finite, |v| <= 1.0 (bnb normalizes
+    # both nf4 and fp4 tables to max-abs 1.0; larger values are crafted
+    # and amplify with attacker absmax).
+    if qmap.numel() != 16:
+        raise ScaledFp8FormatError(
+            f"bnb4 {_safe_name(base)}: quant_map has {qmap.numel()} "
+            f"entries, need exactly 16 — refusing (NF4 req 75)"
+        )
+    qmap32 = qmap.to(torch.float32)
+    if not bool(torch.isfinite(qmap32).all()) or bool(
+            (qmap32.abs() > 1.0).any()):
+        raise ScaledFp8FormatError(
+            f"bnb4 {_safe_name(base)}: quant_map carries non-finite or "
+            f"|v| > 1.0 entries — refusing (NF4 req 75)"
+        )
+    # req 76 — absmax: finite and >= 0. ZERO IS LEGAL (an all-zero weight
+    # block legitimately has absmax 0) — this deliberately diverges from
+    # the F2 finite-positive-NORMAL rule used for fp8/int8 scales; do not
+    # "fix" this into rejecting legitimate files (and do not relax F2).
+    am32 = absmax.to(torch.float32)
+    bad = ~torch.isfinite(am32) | (am32 < 0)
+    if bool(bad.any()):
+        idx = int(bad.nonzero()[0])
+        raise ScaledFp8FormatError(
+            f"bnb4 {_safe_name(base)}: absmax[{idx}] is non-finite or "
+            f"negative — refusing (NF4 req 76)"
+        )
+    # req 74 — unpack: uint8 bitwise, high nibble first.
+    flat = packed.reshape(-1)
+    idxs = torch.stack(((flat >> 4) & 0xF, flat & 0xF), dim=1).reshape(-1)
+    # req 73 — take exactly the first numel values; the padding nibble of
+    # an odd-numel tensor is dropped here and can never influence output.
+    idxs = idxs[:numel].long()
+    vals = qmap32[idxs]
+    scale = am32.repeat_interleave(blocksize)[:numel]
+    return (vals * scale).reshape(shape)
+
+
+def _load_bnb4_component(component_class, weights_path: str, dtype,
+                         config_path: str,
+                         strip_prefix: str | None = None,
+                         log_prefix: str = "[EricDiffusion-fp8]"):
+    """Load a bitsandbytes-4bit single file by dequantizing to bf16
+    (ADR-019 slice NF4, security review reqs 67-90).
+
+    Unconditional dequant (req 80): there is no bnb4 residency op — the
+    model always comes back as plain float modules; with --quant active,
+    quantize_module re-quantizes downstream (fp8/nvfp4), same posture as
+    ci-w. Two-point enforcement (req 81): every classify-time gate is
+    re-asserted here against the actual tensors, so a direct call on a
+    non-conforming file rejects without the classifier's help.
+    """
+    from safetensors.torch import load_file as st_load
+
+    if not weights_path.lower().endswith(".safetensors"):
+        raise ScaledFp8FormatError(
+            f"bnb4 loading requires a .safetensors file, got "
+            f"{_safe_name(os.path.basename(weights_path))}"
+        )
+    raw = st_load(weights_path)
+    for k in raw:
+        if any(ord(c) < 0x20 for c in k):
+            raise ScaledFp8FormatError(
+                f"tensor name with control characters at strip time "
+                f"({_safe_name(k)}) — refusing (F7)"
+            )
+
+    # req 78 (delta-amended) — subtree filter on RAW keys BEFORE the
+    # prefix strip: `first_stage_model.` / `cond_stage_model.` are both
+    # exempt roots AND dominant-prefix candidates, so a post-strip filter
+    # could be defeated by a crafted dominant prefix stripping an exempt
+    # subtree INTO the transformer namespace. Raw-key drop closes that by
+    # construction. Same constant as the classify-time scan exemption
+    # (single source of truth — req 68 delta).
+    dropped_roots = set()
+    dropped_marker_families = 0
+    kept = {}
+    for k, v in raw.items():
+        root_hit = next((r for r in _BNB4_NON_TRANSFORMER_ROOTS
+                         if k.startswith(r)), None)
+        if root_hit is not None:
+            dropped_roots.add(root_hit)
+            if k.endswith(_BNB4_MARKER_SUFFIXES):
+                dropped_marker_families += 1
+        else:
+            kept[k] = v
+    del raw
+    if dropped_roots:
+        print(f"{log_prefix} bnb4: dropped non-transformer subtree(s) "
+              f"{sorted(dropped_roots)} — base-model components fill "
+              f"those slots (NF4 req 78)")
+    if dropped_marker_families:
+        # req 82 (delta-amended): dropped-root marker families get one
+        # aggregate line, never silence.
+        print(f"{log_prefix} bnb4: {dropped_marker_families} quantized "
+              f"famil{'y' if dropped_marker_families == 1 else 'ies'} "
+              f"under dropped roots were validated at classify but NOT "
+              f"materialized (NF4 req 82)")
+
+    # req 77 — prefix strip with COLLISION DETECTION, never last-wins: an
+    # AIO file carrying the real prefixed key and an evil unprefixed twin
+    # must reject, not silently shadow.
+    sd = {}
+    if strip_prefix:
+        for k, v in kept.items():
+            nk = k[len(strip_prefix):] if k.startswith(strip_prefix) else k
+            if nk in sd:
+                raise ScaledFp8FormatError(
+                    f"prefix strip collides: two source tensors map to "
+                    f"{_safe_name(nk)} — refusing (NF4 req 77)"
+                )
+            sd[nk] = v
+    else:
+        sd = kept
+    # req 85 — loud notice for survivors outside the known Flux
+    # transformer namespace (warn-don't-block).
+    unknown_roots = sorted({
+        k.split(".", 1)[0] for k in sd
+        if not k.startswith(_BNB4_KNOWN_TRANSFORMER_ROOTS)})
+    if unknown_roots:
+        print(f"{log_prefix} WARNING: bnb4: tensors under unrecognized "
+              f"root(s) {unknown_roots[:6]} survive the subtree filter — "
+              f"passing to the model builder as-is (NF4 req 85)")
+    # req 88 — a still-prefixed transformer namespace means dominant-prefix
+    # detection was defeated; name it rather than letting the converter's
+    # KeyError surface.
+    still_prefixed = [k for k in sd
+                      if k.startswith("model.diffusion_model.")]
+    if still_prefixed:
+        raise ScaledFp8FormatError(
+            f"bnb4: {len(still_prefixed)} tensor(s) still carry the "
+            f"'model.diffusion_model.' prefix after prefix handling (e.g. "
+            f"{_safe_name(still_prefixed[0])}) — prefix detection was "
+            f"defeated; refusing (NF4 req 88)"
+        )
+
+    # ── Family discovery + re-assertion (reqs 69/81, loader side) ──────
+    marker_keys = [k for k in sd if k.endswith(_BNB4_MARKER_SUFFIXES)]
+    if not marker_keys:
+        raise ScaledFp8FormatError(
+            "classified as bnb4 but no quant-state markers survive the "
+            "subtree filter — nothing to decode; refusing (NF4 req 69)"
+        )
+    # req 68 (as scoped) re-assertion — the AUTHORITATIVE copy (req 81
+    # delta): the SURVIVING namespace must be flavor-pure. BOTH halves of
+    # the classify scan re-run here: no fp8/int8 dtype AND no foreign
+    # quant-marker key may sit beside bnb4 markers.
+    for k, t in sd.items():
+        if t.dtype in _TORCH_FP8 or t.dtype == torch.int8:
+            raise ScaledFp8FormatError(
+                f"bnb4 transformer namespace carries {t.dtype} tensor "
+                f"{_safe_name(k)} — hybrid quant flavors are refused "
+                f"(NF4 req 68/81)"
+            )
+        if _bnb4_foreign_marker(k):
+            raise ScaledFp8FormatError(
+                f"bnb4 transformer namespace carries non-bnb quant marker "
+                f"{_safe_name(k)} — hybrid quant flavors are refused "
+                f"(NF4 req 68/81)"
+            )
+
+    flavors = set()
+    bf16_sd = {}
+    consumed = set()
+    for mk in sorted(marker_keys):
+        base = _bnb4_base_of(mk)
+        if base is None:
+            raise ScaledFp8FormatError(
+                f"bnb4 marker {_safe_name(mk)} does not follow the "
+                f"<name>.weight.quant_state form — refusing (NF4 req 69)"
+            )
+        am_key = base + _BNB4_ABSMAX_SUFFIX
+        qm_key = base + _BNB4_QMAP_SUFFIX
+        missing = [k for k in (base, am_key, qm_key) if k not in sd]
+        if missing:
+            raise ScaledFp8FormatError(
+                f"bnb4 family {_safe_name(base)}: member "
+                f"{_safe_name(missing[0])} missing — refusing (NF4 req 69)"
+            )
+        packed, am, qm = sd[base], sd[am_key], sd[qm_key]
+        if (packed.dtype != torch.uint8 or packed.dim() != 2
+                or packed.shape[1] != 1):
+            raise ScaledFp8FormatError(
+                f"bnb4 packed weight {_safe_name(base)} is {packed.dtype} "
+                f"{tuple(packed.shape)} — only the measured uint8 [N, 1] "
+                f"layout is supported (NF4 reqs 69/89)"
+            )
+        if am.dtype != torch.float32 or am.dim() != 1:
+            raise ScaledFp8FormatError(
+                f"bnb4 absmax {_safe_name(am_key)} is {am.dtype} "
+                f"{tuple(am.shape)} — need 1-D float32 (NF4 req 69)"
+            )
+        if qm.dtype != torch.float32 or tuple(qm.shape) != (16,):
+            raise ScaledFp8FormatError(
+                f"bnb4 quant_map {_safe_name(qm_key)} is {qm.dtype} "
+                f"{tuple(qm.shape)} — need float32 (16,) (NF4 req 69)"
+            )
+        shape, blocksize = _bnb4_parse_quant_state(sd[mk], mk)
+        flavors.add(_bnb4_flavor_of(mk))
+        bf16_sd[base] = _bnb4_dequantize(
+            packed, am, qm, shape, blocksize, base).to(dtype)
+        # req 90 — consume as we go so packed + decoded never both peak.
+        consumed.update((base, am_key, qm_key, mk))
+        del sd[base], sd[am_key], sd[qm_key], sd[mk]
+
+    # ── Residual pass-through (req 79): floats only, NOTHING integral ──
+    for k, t in sd.items():
+        if not t.is_floating_point():
+            raise ScaledFp8FormatError(
+                f"bnb4: residual non-float tensor {_safe_name(k)} "
+                f"({t.dtype}) after family consumption — a stray packed "
+                f"or integer tensor has no float interpretation; refusing "
+                f"(NF4 req 79)"
+            )
+        bf16_sd[k] = t.to(dtype)
+    del sd
+
+    # req 82 — one aggregate notice, no per-layer lines.
+    print(f"{log_prefix} bnb4: {len(consumed) // 4} "
+          f"{'/'.join(sorted(flavors))} 4-bit Linears dequantized to "
+          f"{dtype} (bitsandbytes single-file, slice NF4; --quant "
+          f"re-quantizes via torchao)")
+
+    model = _materialize_from_bf16_sd(
+        component_class, bf16_sd, config_path, dtype, None, log_prefix)
+    del bf16_sd
+    # req 80 — unconditional return: no residency swap exists for bnb4.
+    return model
+
+
 def load_scaled_fp8_component(component_class, weights_path: str, dtype,
                               config_path: str, variant: str,
                               strip_prefix: str | None = None,
@@ -1049,38 +1617,9 @@ def load_scaled_fp8_component(component_class, weights_path: str, dtype,
             bf16_sd[k] = t.to(dtype) if t.is_floating_point() else t
     del sd
 
-    # ComfyUI-native Krea-2 checkpoints (community civitai single-file) use key
-    # names released diffusers 0.39.0 has no from_single_file converter for.
-    # build_krea2_transformer converts + builds (shared with the general
-    # single-file path so plain-fp8/bf16/bundle native-Krea files load too).
-    # (ADR-019 Changelog 2026-07-07; nodes/eric_krea2_convert.py.)
-    from .eric_krea2_convert import (
-        is_krea2_comfy_checkpoint, build_krea2_transformer,
-    )
-    if is_krea2_comfy_checkpoint(bf16_sd.keys()):
-        print(f"{log_prefix} ComfyUI-native Krea-2 keys — converting to "
-              f"diffusers + from_config build")
-        model = build_krea2_transformer(
-            component_class, bf16_sd, config_path, dtype, strip_prefix, log_prefix)
-        del bf16_sd
-    else:
-        # Classes whose only construction path is a bespoke converter (Krea2)
-        # have no from_single_file. Reaching here with one means the file's
-        # keys did not match that converter's signature — i.e. the checkpoint
-        # is a DIFFERENT architecture than the pipeline expects. Say that,
-        # rather than letting `AttributeError: no attribute 'from_single_file'`
-        # surface and read as a diffusers bug.
-        if not hasattr(component_class, "from_single_file"):
-            raise ScaledFp8FormatError(
-                f"{component_class.__name__} has no from_single_file, and this "
-                f"checkpoint's keys do not match its native-format converter — "
-                f"the file is very likely a different architecture than the "
-                f"pipeline expects. Check that the transformer override matches "
-                f"the base model's family."
-            )
-        model = component_class.from_single_file(
-            bf16_sd, config=config_path, torch_dtype=dtype, local_files_only=True,
-        )
+    model = _materialize_from_bf16_sd(
+        component_class, bf16_sd, config_path, dtype, strip_prefix, log_prefix)
+    del bf16_sd
 
     # Slice R2 / req 40 (security review R1R2R3): dequant-to-bf16 mode —
     # return the clean bf16 model HERE, skipping only step 3 (the residency

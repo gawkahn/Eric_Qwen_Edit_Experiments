@@ -8,7 +8,9 @@ file, which loader path applies and whether it is expected to work —
 WITHOUT loading any weights (header-only, seconds for hundreds of files).
 
 Verdict classes (most→least problematic):
-  BNB-NF4    bitsandbytes NF4 — unsupported (ADR-019 dropped NF4)
+  BNB        bitsandbytes Int8/other — unsupported
+  BNB4       bitsandbytes 4-bit (nf4/fp4) — loads natively since ADR-019
+             slice NF4 (dequant-to-bf16)
   NVFP4      nvfp4 block layout (.weight_scale_2) — deferred (ADR-019)
   SVDQ       nunchaku SVDQuant (.qweight/.wscales/.smooth) — unsupported,
              needs nunchaku kernels
@@ -113,9 +115,16 @@ def audit_file(path: str) -> dict:
     if any(".quant_state." in k or ".absmax" in k or ".bitsandbytes" in k
            or k.endswith(".SCB") or k.endswith(".weight_format")
            for k in keys):
-        rec.update(verdict="BNB",
-                   detail="bitsandbytes NF4/Int8 — unsupported "
-                          "(ADR-019 dropped bnb)")
+        # 4-bit (quant_state.bitsandbytes__nf4/__fp4) loads natively since
+        # ADR-019 slice NF4 (dequant-to-bf16); Int8 (.SCB) stays unsupported.
+        if any(k.endswith(("bitsandbytes__nf4", "bitsandbytes__fp4"))
+               for k in keys):
+            rec.update(verdict="BNB4",
+                       detail="bitsandbytes 4-bit — loads natively "
+                              "(dequant-to-bf16, ADR-019 slice NF4)")
+        else:
+            rec.update(verdict="BNB",
+                       detail="bitsandbytes Int8/other — unsupported")
         return rec
 
     if any(k.endswith((".qweight", ".wscales")) for k in keys):
@@ -204,7 +213,7 @@ def main() -> int:
     by_verdict = collections.defaultdict(list)
     for r in records:
         by_verdict[r["verdict"]].append(r)
-    order = ["BNB", "SVDQ", "NVFP4", "AIO", "UNREADABLE"]
+    order = ["BNB", "SVDQ", "NVFP4", "BNB4", "AIO", "UNREADABLE"]
     order += sorted(v for v in by_verdict
                     if v.startswith("CQ-") and v != "CQ-FP8")
     order += ["CQ-FP8", "SCALED", "PLAINFP8", "HI-PREC"]

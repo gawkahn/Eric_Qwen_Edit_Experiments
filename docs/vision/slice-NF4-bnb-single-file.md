@@ -35,7 +35,11 @@ weights; norms/bias/scale keys are plain F32.
    re-validates everything it consumes (sizes, dtypes, quant-state JSON
    bounds, finiteness) and raises `ScaledFp8FormatError` with an
    actionable message on any violation. No tensor-content trust from the
-   header stage.
+   header stage. *(Req 83 amendment: this adds a SECOND bounded
+   byte-read exception to the fp8_ops module contract — the bnb
+   quant-state blob, load-stage only, U8/1-D/≤4096-gated, whose JSON
+   drives exactly two consumed values: shape and blocksize. The module
+   docstring enumerates both exceptions.)*
 3. **Decode correctness is proven numerically** — the nibble unpack order,
    codebook lookup, and per-block absmax multiply are verified against
    hand-computed expected tensors in tests (the old `dequantize_nf4.py` is
@@ -46,7 +50,11 @@ weights; norms/bias/scale keys are plain F32.
    parse (existing 4096-byte descriptor cap pattern); required fields
    allowlisted; unknown/absent → loud reject. Double-quantized states
    (`nested_absmax` present) reject loudly as unsupported, never
-   half-decode.
+   half-decode. *(Superseded in part by contract req 71: required fields
+   are strictly validated and `nested_*` rejects, but OTHER unknown
+   fields are deliberately ignored — only shape and blocksize are ever
+   consumed; the scope lock, not an unknown-field reject, is the
+   enforcement mechanism.)*
 5. **AIO subtree selection is exact** — from the AIO file, ONLY the
    transformer subtree is materialized; `text_encoders.*` / `vae.*` /
    other non-transformer roots are dropped before the dequant stage and

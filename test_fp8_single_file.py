@@ -1748,6 +1748,533 @@ check("req 65: entry gate PASSES plain + Float8 + ScaledFp8Linear bases",
       fp8ops.refuse_unmergeable_base(_OKHost(), log_prefix="[t]") is None)
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Slice NF4: bitsandbytes 4-bit single-file consumption (security review
+# reqs 67-90 + delta addendum). Golden vectors are REAL bitsandbytes
+# 0.49.2 output (dequantize_4bit on the projectGaia file / a quantize_4bit
+# round-trip), so the decode is proven against bnb, not against itself.
+print("── slice NF4: bnb 4-bit classify + dequant (reqs 67-90) ───────")
+
+#: Canonical NF4 codebook as stored in the real projectGaia file.
+_NF4_MAP = [-1.0, -0.696193, -0.525073, -0.394917, -0.284441, -0.184773,
+            -0.09105, 0.0, 0.07958, 0.16093, 0.246112, 0.337915, 0.44071,
+            0.562617, 0.722957, 1.0]
+
+
+def _qs_blob(obj=None, raw=None):
+    data = raw if raw is not None else json.dumps(obj).encode()
+    return torch.frombuffer(bytearray(data), dtype=torch.uint8).clone()
+
+
+def _packed(byte_list):
+    return torch.tensor([[b] for b in byte_list], dtype=torch.uint8)
+
+
+def _nf4_family(base, packed, absmax, shape, blocksize=64, flavor="nf4",
+                qmap=None, qs=None):
+    """Four-key bnb4 family fixture, measured projectGaia layout."""
+    state = qs if qs is not None else {
+        "quant_type": flavor, "blocksize": blocksize,
+        "dtype": "bfloat16", "shape": list(shape)}
+    return {
+        base: packed,
+        base + ".absmax": torch.tensor(absmax, dtype=torch.float32),
+        base + ".quant_map": (qmap if qmap is not None
+                              else torch.tensor(_NF4_MAP,
+                                                dtype=torch.float32)),
+        base + ".quant_state.bitsandbytes__" + flavor: _qs_blob(state),
+    }
+
+
+# Golden #1: first 8 packed bytes of the real projectGaia
+# double_blocks.0.img_attn.proj.weight, absmax[0]=0.03125; expected values
+# from bnb 0.49.2 dequantize_4bit on GPU. The byte pattern is
+# nibble-ASYMMETRIC (e.g. 0x6E → hi 6, lo 14), so a low-nibble-first
+# implementation decodes DIFFERENT values and fails (req 74 negative).
+_G1_BYTES = [110, 90, 88, 44, 228, 163, 9, 25]
+_G1_EXPECT = [-0.002838, 0.022583, -0.005768, 0.00769, -0.005768, 0.002487,
+              -0.016357, 0.013794, 0.022583, -0.008911, 0.00769, -0.012329,
+              -0.03125, 0.005035, -0.021729, 0.005035]
+# Golden #2: bnb quantize_4bit round-trip, shape (2,5) — partial final
+# block (numel 10 < blocksize 64), absmax from bnb itself.
+_G2_BYTES = [108, 209, 242, 94, 128]
+_G2_EXPECT = [-0.007697, 0.037257, 0.047563, -0.058856, 0.08454, -0.044389,
+              -0.015621, 0.061118, 0.006728, -0.08454]
+
+# Positive: UNET-style file classifies bnb4 (req 67) and decodes to the
+# bnb golden values; family keys consumed, plain key passes (req 80).
+_p_nf4 = _mk("nf4_unet.safetensors", {
+    **_nf4_family("double_blocks.0.mlp.weight", _packed(_G1_BYTES),
+                  [0.03125], (2, 8)),
+    "double_blocks.0.norm.weight": torch.ones(4, dtype=torch.bfloat16),
+})
+_v, _info = _classify(_p_nf4)
+check("NF4: UNET-style file classifies bnb4 (req 67)",
+      _v == "bnb4" and _info.get("n_bnb4") == 1
+      and _info.get("flavors") == ["nf4"], f"got {_v} {_info.get('n_bnb4')}")
+_buf = _io2.StringIO()
+with _cl2.redirect_stdout(_buf):
+    _m = fp8ops._load_bnb4_component(
+        _CaptureComp, _p_nf4, torch.bfloat16, "")
+_rsd = _m._received_sd
+check("NF4: decode matches bitsandbytes golden #1 (req 74 — hi-nibble "
+      "order proven against bnb 0.49.2)",
+      torch.allclose(_rsd["double_blocks.0.mlp.weight"].float().flatten(),
+                     torch.tensor(_G1_EXPECT), atol=2e-4),
+      f"got {_rsd['double_blocks.0.mlp.weight'].float().flatten()[:4]}")
+check("NF4: family keys consumed, plain key passes, all-float dict "
+      "(reqs 79/80)",
+      set(_rsd) == {"double_blocks.0.mlp.weight",
+                    "double_blocks.0.norm.weight"}
+      and all(t.is_floating_point() for t in _rsd.values()))
+check("NF4: one aggregate notice names flavor + count (req 82)",
+      "1 nf4 4-bit" in _buf.getvalue(), f"log: {_buf.getvalue()[:200]!r}")
+
+# Low-nibble-first negative (req 74): swapped unpack ≠ golden.
+_lo_first = torch.stack(
+    (torch.tensor(_G1_BYTES, dtype=torch.uint8) & 0xF,
+     (torch.tensor(_G1_BYTES, dtype=torch.uint8) >> 4) & 0xF),
+    dim=1).reshape(-1).long()
+_lo_vals = torch.tensor(_NF4_MAP)[_lo_first] * 0.03125
+check("NF4: low-nibble-first decode differs from golden (req 74 NEGATIVE "
+      "— the byte pattern is order-asymmetric)",
+      not torch.allclose(_lo_vals, torch.tensor(_G1_EXPECT), atol=2e-4))
+
+# Golden #2: partial final block (req 73).
+_p_partial = _mk("nf4_partial.safetensors", _nf4_family(
+    "double_blocks.0.a.weight", _packed(_G2_BYTES), [0.08454], (2, 5)))
+_m2 = fp8ops._load_bnb4_component(_CaptureComp, _p_partial,
+                                  torch.bfloat16, "")
+check("NF4: partial-block decode matches bnb golden #2 (reqs 72/73)",
+      torch.allclose(
+          _m2._received_sd["double_blocks.0.a.weight"].float().flatten(),
+          torch.tensor(_G2_EXPECT), atol=2e-4))
+
+# Pad nibble inert (req 73): odd numel — only the pad nibble differs.
+_pa = _mk("nf4_pad_a.safetensors", _nf4_family(
+    "double_blocks.0.b.weight", _packed([0x12, 0x30]), [1.0], (1, 3)))
+_pb = _mk("nf4_pad_b.safetensors", _nf4_family(
+    "double_blocks.0.b.weight", _packed([0x12, 0x3F]), [1.0], (1, 3)))
+check("NF4: pad nibble of odd-numel tensor is inert (req 73)",
+      torch.equal(
+          fp8ops._load_bnb4_component(_CaptureComp, _pa, torch.bfloat16,
+                                      "")._received_sd[
+              "double_blocks.0.b.weight"],
+          fp8ops._load_bnb4_component(_CaptureComp, _pb, torch.bfloat16,
+                                      "")._received_sd[
+              "double_blocks.0.b.weight"]))
+
+# 0xFF byte → indices (15, 15) → codebook max both nibbles (req 74).
+_pff = _mk("nf4_ff.safetensors", _nf4_family(
+    "double_blocks.0.c.weight", _packed([0xFF]), [2.0], (1, 2)))
+check("NF4: byte 0xFF decodes to (map[15], map[15]) * absmax (req 74)",
+      torch.allclose(
+          fp8ops._load_bnb4_component(_CaptureComp, _pff, torch.bfloat16,
+                                      "")._received_sd[
+              "double_blocks.0.c.weight"].float(),
+          torch.tensor([[2.0, 2.0]]), atol=1e-2))
+
+# Zero absmax is LEGAL (req 76): block decodes to zeros.
+_pz = _mk("nf4_zero.safetensors", _nf4_family(
+    "double_blocks.0.d.weight", _packed([0x59]), [0.0], (1, 2)))
+check("NF4: zero absmax accepted, block decodes to zeros (req 76)",
+      torch.equal(
+          fp8ops._load_bnb4_component(_CaptureComp, _pz, torch.bfloat16,
+                                      "")._received_sd[
+              "double_blocks.0.d.weight"],
+          torch.zeros(1, 2, dtype=torch.bfloat16)))
+
+# fp4 flavor loads (req 84 / verdict a) — same machinery, marker-driven.
+_p_fp4 = _mk("fp4_flavor.safetensors", _nf4_family(
+    "double_blocks.0.e.weight", _packed(_G2_BYTES), [0.08454], (2, 5),
+    flavor="fp4"))
+_vf, _infof = _classify(_p_fp4)
+check("NF4: __fp4 marker classifies bnb4 with flavor fp4 (req 84)",
+      _vf == "bnb4" and _infof.get("flavors") == ["fp4"])
+check("NF4: fp4 flavor loads through the same decode (verdict a)",
+      hasattr(fp8ops._load_bnb4_component(_CaptureComp, _p_fp4,
+                                          torch.bfloat16, ""),
+              "_received_sd"))
+
+# AIO shape (delta req 68): the motivating real-file layout — NF4
+# transformer under model.diffusion_model.* + fp8 T5 + .SCB int8 under
+# text_encoders.* — classifies bnb4 (NEVER cc: precedence pin) and loads
+# with the exempt subtrees absent from the handed-over dict (reqs 78/5).
+_p_aio = _mk("nf4_aio.safetensors", {
+    **_nf4_family("model.diffusion_model.double_blocks.0.mlp.weight",
+                  _packed(_G1_BYTES), [0.03125], (2, 8)),
+    "model.diffusion_model.double_blocks.0.norm.weight":
+        torch.ones(4, dtype=torch.bfloat16),
+    "text_encoders.t5xxl.block.0.k.weight": _fp8((8, 8), seed=3),
+    "text_encoders.t5xxl.block.0.k.weight.SCB":
+        torch.ones(8, dtype=torch.float32),
+    "text_encoders.clip.int8.weight":
+        torch.ones(4, 4, dtype=torch.int8),
+    "vae.decoder.conv.weight": torch.ones(2, 2, dtype=torch.float32),
+})
+_va, _infoa = _classify(_p_aio)
+check("NF4: AIO with fp8 TE classifies bnb4, never cc (delta req 68 "
+      "precedence pin)", _va == "bnb4", f"got {_va}")
+_ma = fp8ops._load_bnb4_component(
+    _CaptureComp, _p_aio, torch.bfloat16, "",
+    strip_prefix="model.diffusion_model.")
+check("NF4: AIO load drops TE/VAE subtrees — no exempt key, no fp8/int8 "
+      "dtype in the handed-over dict (reqs 78/79, invariant 5)",
+      set(_ma._received_sd) == {"double_blocks.0.mlp.weight",
+                               "double_blocks.0.norm.weight"}
+      and all(t.is_floating_point()
+              for t in _ma._received_sd.values()))
+
+# Delta alias closure: first_stage_model. is BOTH an exempt root AND a
+# dominant-prefix candidate — raw-key drop must remove it BEFORE the strip
+# could pull it into the transformer namespace (delta reqs 78/81).
+_p_alias = _mk("nf4_alias.safetensors", {
+    **_nf4_family("double_blocks.0.mlp.weight", _packed(_G1_BYTES),
+                  [0.03125], (2, 8)),
+    **{f"first_stage_model.evil{i}.weight": _fp8((4, 4), seed=i)
+       for i in range(6)},
+})
+_malias = fp8ops._load_bnb4_component(
+    _CaptureComp, _p_alias, torch.bfloat16, "",
+    strip_prefix="first_stage_model.")
+check("NF4: exempt-root-as-dominant-prefix dropped RAW, never stripped "
+      "into the namespace (delta reqs 78/81 alias closure)",
+      set(_malias._received_sd) == {"double_blocks.0.mlp.weight"})
+
+# Subtree filter is bnb4-ONLY (req 78 invariant-1 negative): an fp8 ca
+# fixture with a text_encoders. key loads exactly as today — key SURVIVES.
+_p_ca_te = _mk("ca_with_te.safetensors", {
+    "blocks.0.mlp.weight": _fp8((64, 32)),
+    "blocks.0.mlp.weight_scale": _scalar(0.01),
+    "blocks.0.mlp.input_scale": _scalar(0.02),
+    "text_encoders.keepme.weight": torch.ones(4, dtype=torch.float32),
+})
+_mca = fp8ops.load_scaled_fp8_component(
+    _CaptureComp, _p_ca_te, torch.bfloat16, "", "ca", dequant_fp8=True)
+check("NF4: subtree filter does NOT run for fp8 variants — "
+      "text_encoders. key survives a ca load (req 78 NEGATIVE)",
+      "text_encoders.keepme.weight" in _mca._received_sd)
+
+# Constant unity (delta): one shared tuple drives BOTH the req-68 scan
+# exemption and the req-78 drop — drift between them is the smuggle gap.
+check("NF4: single exempt-roots constant, all six roots present (delta)",
+      isinstance(fp8ops._BNB4_NON_TRANSFORMER_ROOTS, tuple)
+      and set(fp8ops._BNB4_NON_TRANSFORMER_ROOTS) == {
+          "text_encoders.", "text_encoder.", "vae.", "first_stage_model.",
+          "conditioner.", "cond_stage_model."})
+
+# ── NF4 negatives: classify-time (reqs 67-72) ──────────────────────────
+check("NF4: .absmax/.quant_map WITHOUT marker → (None, {}) — suffixes "
+      "alone never fire the sniff (req 67 NEGATIVE)",
+      _classify(_mk("no_marker.safetensors", {
+          "a.weight": torch.ones(2, 2, dtype=torch.float32),
+          "a.weight.absmax": torch.ones(1, dtype=torch.float32),
+          "a.weight.quant_map": torch.ones(16, dtype=torch.float32),
+      })) == (None, {}))
+check("NF4: .SCB int8 file with no 4-bit marker stays unrecognized "
+      "(req 68 NEGATIVE)",
+      _classify(_mk("scb_only.safetensors", {
+          "a.weight": torch.ones(2, 2, dtype=torch.int8),
+          "a.weight.SCB": torch.ones(2, dtype=torch.float32),
+      })) == (None, {}))
+_expect_reject("NF4: fp8 tensor in the TRANSFORMER namespace beside bnb4 "
+               "markers rejects (req 68 NEGATIVE)",
+               _mk("hybrid_fp8.safetensors", {
+                   **_nf4_family("double_blocks.0.mlp.weight",
+                                 _packed(_G1_BYTES), [0.03125], (2, 8)),
+                   "double_blocks.1.x.weight": _fp8((4, 4)),
+               }), "req 68")
+_expect_reject("NF4: comfy_quant marker beside bnb4 markers rejects "
+               "(req 68 NEGATIVE)",
+               _mk("hybrid_cq.safetensors", {
+                   **_nf4_family("double_blocks.0.mlp.weight",
+                                 _packed(_G1_BYTES), [0.03125], (2, 8)),
+                   "double_blocks.1.y.comfy_quant":
+                       _desc({"format": "float8_e4m3fn"}),
+               }), "req 68")
+_expect_reject("NF4: marker without packed base rejects (req 69 NEGATIVE)",
+               _mk("dangling_marker.safetensors", {
+                   "double_blocks.0.z.weight.quant_state.bitsandbytes__nf4":
+                       _qs_blob({"shape": [2, 2], "blocksize": 64}),
+               }), "req 69")
+_expect_reject("NF4: absmax member missing rejects (req 69 NEGATIVE)",
+               _mk("no_absmax.safetensors", {
+                   k: v for k, v in _nf4_family(
+                       "double_blocks.0.mlp.weight", _packed(_G1_BYTES),
+                       [0.03125], (2, 8)).items()
+                   if not k.endswith(".absmax")
+               }), "req 69")
+_expect_reject("NF4: malformed family under an EXEMPT root still rejects "
+               "at classify (req 69 / delta ruling 2 NEGATIVE)",
+               _mk("bad_te_family.safetensors", {
+                   **_nf4_family("double_blocks.0.mlp.weight",
+                                 _packed(_G1_BYTES), [0.03125], (2, 8)),
+                   **{k: v for k, v in _nf4_family(
+                       "text_encoders.t5.q.weight", _packed([0x11]),
+                       [1.0], (1, 2)).items()
+                      if not k.endswith(".absmax")},
+               }), "req 69")
+_expect_reject("NF4: quant_map wrong shape rejects (req 69 NEGATIVE)",
+               _mk("bad_qmap.safetensors", _nf4_family(
+                   "double_blocks.0.mlp.weight", _packed(_G1_BYTES),
+                   [0.03125], (2, 8),
+                   qmap=torch.ones(8, dtype=torch.float32))), "req 69")
+_expect_reject("NF4: both flavors on one base rejects as ambiguous "
+               "(req 69 NEGATIVE)",
+               _mk("both_flavors.safetensors", {
+                   **_nf4_family("double_blocks.0.mlp.weight",
+                                 _packed(_G1_BYTES), [0.03125], (2, 8)),
+                   "double_blocks.0.mlp.weight.quant_state."
+                   "bitsandbytes__fp4":
+                       _qs_blob({"shape": [2, 8], "blocksize": 64}),
+               }), "ambiguous")
+_expect_reject("NF4: quant-state blob over 4096 bytes rejects at header "
+               "(req 69 NEGATIVE)",
+               _mk("big_blob.safetensors", _nf4_family(
+                   "double_blocks.0.mlp.weight", _packed(_G1_BYTES),
+                   [0.03125], (2, 8),
+                   qs=None) | {
+                   "double_blocks.0.mlp.weight.quant_state."
+                   "bitsandbytes__nf4":
+                       torch.zeros(5000, dtype=torch.uint8)},
+               ), "req 69")
+_expect_reject("NF4: non-JSON quant-state rejects (req 70 NEGATIVE)",
+               lambda: fp8ops._load_bnb4_component(
+                   _CaptureComp, _mk("bad_json.safetensors", _nf4_family(
+                       "double_blocks.0.mlp.weight", _packed(_G1_BYTES),
+                       [0.03125], (2, 8)) | {
+                       "double_blocks.0.mlp.weight.quant_state."
+                       "bitsandbytes__nf4":
+                           _qs_blob(raw=b"\xff\xfe not json")},
+                   ), torch.bfloat16, ""), "req 70")
+_expect_reject("NF4: JSON list root rejects (req 70 NEGATIVE)",
+               lambda: fp8ops._load_bnb4_component(
+                   _CaptureComp, _mk("list_root.safetensors", {
+                       **_nf4_family("double_blocks.0.mlp.weight",
+                                     _packed(_G1_BYTES), [0.03125],
+                                     (2, 8)),
+                       "double_blocks.0.mlp.weight.quant_state."
+                       "bitsandbytes__nf4": _qs_blob(raw=b"[1, 2]"),
+                   }), torch.bfloat16, ""), "req 70")
+_expect_reject("NF4: nested_absmax field rejects — double-quantized "
+               "unsupported (req 71 NEGATIVE)",
+               lambda: fp8ops._load_bnb4_component(
+                   _CaptureComp, _mk("nested.safetensors", {
+                       **_nf4_family("double_blocks.0.mlp.weight",
+                                     _packed(_G1_BYTES), [0.03125], (2, 8),
+                                     qs={"shape": [2, 8], "blocksize": 64,
+                                         "nested_absmax": True}),
+                   }), torch.bfloat16, ""), "double-quantized")
+_expect_reject("NF4: non-power-of-two blocksize rejects (reqs 71/86 "
+               "NEGATIVE)",
+               lambda: fp8ops._load_bnb4_component(
+                   _CaptureComp, _mk("bs63.safetensors", {
+                       **_nf4_family("double_blocks.0.mlp.weight",
+                                     _packed(_G1_BYTES), [0.03125], (2, 8),
+                                     qs={"shape": [2, 8],
+                                         "blocksize": 63}),
+                   }), torch.bfloat16, ""), "req")
+_expect_reject("NF4: quant_type/marker mismatch rejects (req 71 NEGATIVE)",
+               lambda: fp8ops._load_bnb4_component(
+                   _CaptureComp, _mk("qt_mismatch.safetensors", {
+                       **_nf4_family("double_blocks.0.mlp.weight",
+                                     _packed(_G1_BYTES), [0.03125], (2, 8),
+                                     qs={"quant_type": "fp4",
+                                         "shape": [2, 8],
+                                         "blocksize": 64}),
+                   }), torch.bfloat16, ""), "mismatch")
+_expect_reject("NF4: huge declared shape over tiny packed rejects BEFORE "
+               "allocation (req 72 NEGATIVE)",
+               lambda: fp8ops._load_bnb4_component(
+                   _CaptureComp, _mk("shape_bomb.safetensors", {
+                       **_nf4_family("double_blocks.0.mlp.weight",
+                                     _packed(_G1_BYTES), [0.03125], (2, 8),
+                                     qs={"shape": [65536, 65536],
+                                         "blocksize": 64}),
+                   }), torch.bfloat16, ""), "req 72")
+_expect_reject("NF4: absmax off-by-one rejects (req 72 NEGATIVE)",
+               lambda: fp8ops._load_bnb4_component(
+                   _CaptureComp, _mk("absmax_short.safetensors", {
+                       **_nf4_family("double_blocks.0.mlp.weight",
+                                     _packed(list(range(64)) * 2),
+                                     [0.5, 0.5, 0.5], (4, 64)),
+                   }), torch.bfloat16, ""), "req 72")
+_expect_reject("NF4: NaN codebook rejects (req 75 NEGATIVE)",
+               lambda: fp8ops._load_bnb4_component(
+                   _CaptureComp, _mk("nan_map.safetensors", _nf4_family(
+                       "double_blocks.0.mlp.weight", _packed(_G1_BYTES),
+                       [0.03125], (2, 8),
+                       qmap=torch.tensor([float("nan")] + _NF4_MAP[1:],
+                                         dtype=torch.float32))),
+                   torch.bfloat16, ""), "req 75")
+_expect_reject("NF4: codebook |v| > 1 rejects (req 75 NEGATIVE)",
+               lambda: fp8ops._load_bnb4_component(
+                   _CaptureComp, _mk("amp_map.safetensors", _nf4_family(
+                       "double_blocks.0.mlp.weight", _packed(_G1_BYTES),
+                       [0.03125], (2, 8),
+                       qmap=torch.tensor([448.0] + _NF4_MAP[1:],
+                                         dtype=torch.float32))),
+                   torch.bfloat16, ""), "req 75")
+_expect_reject("NF4: negative absmax rejects, naming the index (req 76 "
+               "NEGATIVE)",
+               lambda: fp8ops._load_bnb4_component(
+                   _CaptureComp, _mk("neg_absmax.safetensors", _nf4_family(
+                       "double_blocks.0.mlp.weight", _packed(_G1_BYTES),
+                       [-0.5], (2, 8))), torch.bfloat16, ""), "req 76")
+_expect_reject("NF4: post-strip key collision rejects, never last-wins "
+               "(req 77 NEGATIVE)",
+               lambda: fp8ops._load_bnb4_component(
+                   _CaptureComp, _mk("collide.safetensors", {
+                       **_nf4_family(
+                           "model.diffusion_model.double_blocks.0.mlp"
+                           ".weight", _packed(_G1_BYTES), [0.03125],
+                           (2, 8)),
+                       "double_blocks.0.mlp.weight":
+                           torch.ones(2, 8, dtype=torch.bfloat16),
+                   }), torch.bfloat16, "",
+                   strip_prefix="model.diffusion_model."), "req 77")
+_expect_reject("NF4: stray marker-less U8 tensor rejects at the residual "
+               "scan (req 79 NEGATIVE)",
+               lambda: fp8ops._load_bnb4_component(
+                   _CaptureComp, _mk("stray_u8.safetensors", {
+                       **_nf4_family("double_blocks.0.mlp.weight",
+                                     _packed(_G1_BYTES), [0.03125],
+                                     (2, 8)),
+                       "double_blocks.9.evil": torch.ones(
+                           4, dtype=torch.uint8),
+                   }), torch.bfloat16, ""), "req 79")
+_expect_reject("NF4: still-prefixed namespace (defeated prefix detection) "
+               "rejects with the prefix named (req 88 NEGATIVE)",
+               lambda: fp8ops._load_bnb4_component(
+                   _CaptureComp, _mk("no_strip.safetensors", _nf4_family(
+                       "model.diffusion_model.double_blocks.0.mlp.weight",
+                       _packed(_G1_BYTES), [0.03125], (2, 8))),
+                   torch.bfloat16, "", strip_prefix=None), "req 88")
+_expect_reject("NF4: direct loader call re-asserts absmax dtype without "
+               "the classifier (req 81 two-point NEGATIVE)",
+               lambda: fp8ops._load_bnb4_component(
+                   _CaptureComp, _mk("f64_absmax.safetensors", {
+                       **_nf4_family("double_blocks.0.mlp.weight",
+                                     _packed(_G1_BYTES), [0.03125],
+                                     (2, 8)),
+                       "double_blocks.0.mlp.weight.absmax":
+                           torch.tensor([0.03125], dtype=torch.float64),
+                   }), torch.bfloat16, ""), "req 69")
+
+# Load-stage purity gate (delta req 81 — the AUTHORITATIVE flavor scan):
+# direct loader calls bypass the classifier, so the surviving-dict scan
+# must reject BOTH halves on its own — fp8/int8 dtypes AND foreign
+# marker keys.
+_expect_reject("NF4: direct loader call rejects fp8 tensor in the "
+               "surviving dict (delta req 81 purity NEGATIVE)",
+               lambda: fp8ops._load_bnb4_component(
+                   _CaptureComp, _mk("purity_fp8.safetensors", {
+                       **_nf4_family("double_blocks.0.mlp.weight",
+                                     _packed(_G1_BYTES), [0.03125],
+                                     (2, 8)),
+                       "double_blocks.1.x.weight": _fp8((4, 4)),
+                   }), torch.bfloat16, ""), "req 68/81")
+_expect_reject("NF4: direct loader call rejects foreign marker key in "
+               "the surviving dict (delta req 81 purity NEGATIVE)",
+               lambda: fp8ops._load_bnb4_component(
+                   _CaptureComp, _mk("purity_marker.safetensors", {
+                       **_nf4_family("double_blocks.0.mlp.weight",
+                                     _packed(_G1_BYTES), [0.03125],
+                                     (2, 8)),
+                       "double_blocks.1.x.weight_scale": _scalar(0.01),
+                   }), torch.bfloat16, ""), "req 68/81")
+
+# Dropped-family notice (delta req 82): a COMPLETE NF4 family under an
+# exempt root classifies, loads, is absent from the dict, and the
+# aggregate not-materialized line fires; surviving notice counts ONLY the
+# materialized family.
+_p_dropfam = _mk("nf4_dropfam.safetensors", {
+    **_nf4_family("model.diffusion_model.double_blocks.0.mlp.weight",
+                  _packed(_G1_BYTES), [0.03125], (2, 8)),
+    **_nf4_family("text_encoders.t5.q.weight", _packed(_G2_BYTES),
+                  [0.08454], (2, 5)),
+})
+check("NF4: complete family under exempt root still classifies bnb4 "
+      "(delta ruling 2)", _classify(_p_dropfam)[0] == "bnb4")
+_buf = _io2.StringIO()
+with _cl2.redirect_stdout(_buf):
+    _mdf = fp8ops._load_bnb4_component(
+        _CaptureComp, _p_dropfam, torch.bfloat16, "",
+        strip_prefix="model.diffusion_model.")
+check("NF4: dropped family absent from dict; not-materialized line + "
+      "surviving-only count (delta req 82)",
+      set(_mdf._received_sd) == {"double_blocks.0.mlp.weight"}
+      and "NOT materialized" in _buf.getvalue()
+      and "1 nf4 4-bit" in _buf.getvalue(),
+      f"log: {_buf.getvalue()[:300]!r}")
+
+# Cheap contract sub-negatives (review finding 4).
+_expect_reject("NF4: deep-nested JSON (RecursionError class) rejects as "
+               "format error (req 70 NEGATIVE)",
+               lambda: fp8ops._load_bnb4_component(
+                   _CaptureComp, _mk("recursion.safetensors", {
+                       **_nf4_family("double_blocks.0.mlp.weight",
+                                     _packed(_G1_BYTES), [0.03125],
+                                     (2, 8)),
+                       "double_blocks.0.mlp.weight.quant_state."
+                       "bitsandbytes__nf4": _qs_blob(raw=b"[" * 2000),
+                   }), torch.bfloat16, ""), "req 70")
+_expect_reject("NF4: scalar JSON root rejects (req 70 NEGATIVE)",
+               lambda: fp8ops._load_bnb4_component(
+                   _CaptureComp, _mk("scalar_root.safetensors", {
+                       **_nf4_family("double_blocks.0.mlp.weight",
+                                     _packed(_G1_BYTES), [0.03125],
+                                     (2, 8)),
+                       "double_blocks.0.mlp.weight.quant_state."
+                       "bitsandbytes__nf4": _qs_blob(raw=b"42"),
+                   }), torch.bfloat16, ""), "req 70")
+_expect_reject("NF4: boolean blocksize rejects — bool is not an int here "
+               "(req 71 NEGATIVE)",
+               lambda: fp8ops._load_bnb4_component(
+                   _CaptureComp, _mk("bool_bs.safetensors", {
+                       **_nf4_family("double_blocks.0.mlp.weight",
+                                     _packed(_G1_BYTES), [0.03125], (2, 8),
+                                     qs={"shape": [2, 8],
+                                         "blocksize": True}),
+                   }), torch.bfloat16, ""), "req")
+_expect_reject("NF4: packed larger than declared shape rejects (req 72 "
+               "NEGATIVE, other direction)",
+               lambda: fp8ops._load_bnb4_component(
+                   _CaptureComp, _mk("packed_big.safetensors", {
+                       **_nf4_family("double_blocks.0.mlp.weight",
+                                     _packed([1, 2, 3]), [1.0], (1, 2)),
+                   }), torch.bfloat16, ""), "req 72")
+_expect_reject("NF4: flat [N] packed layout rejects — [N, 1] pin "
+               "(req 89 NEGATIVE)",
+               _mk("flat_packed.safetensors", {
+                   **_nf4_family("double_blocks.0.mlp.weight",
+                                 torch.tensor(_G1_BYTES,
+                                              dtype=torch.uint8),
+                                 [0.03125], (2, 8)),
+               }), "req")
+_expect_reject("NF4: in-namespace int8 tensor rejects at classify "
+               "(req 68 / ruling 3 NEGATIVE)",
+               _mk("ns_int8.safetensors", {
+                   **_nf4_family("double_blocks.0.mlp.weight",
+                                 _packed(_G1_BYTES), [0.03125], (2, 8)),
+                   "double_blocks.2.q.weight":
+                       torch.ones(4, 4, dtype=torch.int8),
+               }), "req 68")
+_expect_reject("NF4: dangling absmax beside a VALID family rejects "
+               "(req 69 NEGATIVE)",
+               _mk("extra_dangling.safetensors", {
+                   **_nf4_family("double_blocks.0.mlp.weight",
+                                 _packed(_G1_BYTES), [0.03125], (2, 8)),
+                   "double_blocks.3.z.weight.absmax":
+                       torch.ones(1, dtype=torch.float32),
+               }), "req 69")
+
+# Regression pin (req 67b): existing variants classify identically with
+# the NF4 code present — spot-check the suite's own earlier fixtures.
+check("NF4: ca fixture still classifies ca (req 67b regression)",
+      _classify(p_ca)[0] == "ca")
+
+
 shutil.rmtree(_TMP, ignore_errors=True)
 print("\n" + "─" * 50)
 print(f"  {passed} passed, {failed} failed")

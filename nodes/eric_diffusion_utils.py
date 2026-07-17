@@ -469,13 +469,18 @@ def _diagnose_slot_mismatch(ckpt_keys: set, target_slot: str) -> str:
     )
     if is_bnb_quantized:
         quant_type = "bitsandbytes NF4" if any("nf4" in k.lower() for k in ckpt_keys) else "quantized (bitsandbytes)"
+        # bnb 4-bit files with proper quant_state markers load natively
+        # since slice NF4 — reaching THIS diagnostic means the file has
+        # bnb-ish keys but did NOT classify as bnb4 (e.g. .SCB int8-only,
+        # or a stripped/nonstandard 4-bit export missing its markers).
         return (
-            f"\n\nThis is a {quant_type} checkpoint — single-file loading "
-            f"does NOT support quantized models. You have two options:\n"
-            f"  1. Use the un-quantized version of this checkpoint, OR\n"
-            f"  2. Run dequantize_nf4.py (in this repo's root) once to convert "
-            f"the NF4 checkpoint to bf16, then use the bf16 output in the "
-            f"Component Loader as a normal single-file transformer override."
+            f"\n\nThis looks like a {quant_type} checkpoint, but it did not "
+            f"match the supported bitsandbytes 4-bit single-file layout "
+            f"(packed U8 .weight + .absmax + .quant_map + "
+            f".quant_state.bitsandbytes__nf4 per quantized param — those "
+            f"load natively since ADR-019 slice NF4). bnb INT8 (.SCB) and "
+            f"nonstandard 4-bit exports are not supported — use the "
+            f"un-quantized version of this checkpoint."
         )
 
     # ── Check 1b: ComfyUI FP8 quantization ──────────────────────────────
@@ -794,6 +799,18 @@ def _load_single_weights(component_class, weights_path: str, dtype,
         classify_fp8_single_file, load_scaled_fp8_component,
     )
     _fp8_variant, _fp8_info = classify_fp8_single_file(weights_path)
+    if _fp8_variant == "bnb4":
+        # bitsandbytes 4-bit (slice NF4): unconditional dequant-to-bf16 —
+        # no residency op exists; --quant re-quantizes via torchao.
+        from .eric_diffusion_fp8_ops import _load_bnb4_component
+        print(f"[EricDiffusion] Detected bitsandbytes 4-bit checkpoint "
+              f"({_fp8_info.get('n_bnb4', '?')} "
+              f"{'/'.join(_fp8_info.get('flavors', []) or ['?'])} "
+              f"families) — dequant-to-bf16 loader (slice NF4)")
+        return _load_bnb4_component(
+            component_class, weights_path, dtype, config_path,
+            strip_prefix=detected_prefix,
+        )
     if _fp8_variant in ("ca", "cb", "cq-a", "cq-w", "ci-w"):
         if _fp8_variant == "ci-w":
             print(f"[EricDiffusion] Detected ComfyUI int8-tensorwise "
