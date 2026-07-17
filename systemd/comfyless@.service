@@ -56,7 +56,7 @@ Environment=HF_HUB_CACHE=/mnt/nvme-8tb/hf
 ExecStart=/home/gawkahn/projects/ai-lab/code/Eric_Qwen_Edit_Experiments/.venv/bin/python3 -m comfyless.generate --serve \
     --device cuda:%i \
     --model-base /home/gawkahn/projects/ai-lab/ai-base/models \
-    --output-dir /home/gawkahn/gen-output \
+    --output-dir /home/gawkahn/projects/ai-lab/ai-stack-data/comfyless \
     --precision bf16
 # Clean shutdown via the existing device-scoped unload path; SIGTERM is the
 # systemd fallback if the daemon is wedged past TimeoutStopSec (stale socket
