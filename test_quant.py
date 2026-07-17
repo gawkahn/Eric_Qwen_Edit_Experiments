@@ -527,8 +527,16 @@ def _akw(cfg):
 
 check("merge-discriminator: weight-only base has act_quant_kwargs=None",
       _akw(edu._torchao_fp8_config("zimage")) is None)
-check("merge-discriminator: dyn-activation base has act_quant_kwargs set",
-      _akw(edu._torchao_fp8_config("flux")) is not None)
+# The dyn-activation recipe hits torchao's _check_hardware_support (CUDA cc
+# ≥8.9 / MI300+ / XPU) inside quantize_ — self-skip on incapable hardware
+# (e.g. CI runners), same pattern as the fp8 CUDA-positive block above.
+if (torch.cuda.is_available()
+        and torch.cuda.get_device_capability(0) >= (8, 9)):
+    check("merge-discriminator: dyn-activation base has act_quant_kwargs set",
+          _akw(edu._torchao_fp8_config("flux")) is not None)
+else:
+    check("merge-discriminator: dyn-activation base has act_quant_kwargs set "
+          "(SKIPPED: no fp8-capable GPU)", True)
 
 
 # ──────────────────────────────────────────────────────────────────────

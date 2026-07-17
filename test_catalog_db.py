@@ -104,9 +104,15 @@ try:
 finally:
     cdb.fs_is_fuse = _orig_fs_is_fuse
 
-# the real project tree IS on mergerfs — the real detector must say so
-check("real detector flags the mergerfs projects tree as FUSE",
-      cdb.fs_is_fuse("/home/gawkahn/projects/ai-lab") is True)
+# the real project tree IS on mergerfs — the real detector must say so.
+# Dev-box-only assertion: the path is this machine's mergerfs mount; on any
+# other host (e.g. a CI runner) it doesn't exist — self-skip loudly there.
+if os.path.isdir("/home/gawkahn/projects/ai-lab"):
+    check("real detector flags the mergerfs projects tree as FUSE",
+          cdb.fs_is_fuse("/home/gawkahn/projects/ai-lab") is True)
+else:
+    check("real detector flags the mergerfs projects tree as FUSE "
+          "(SKIPPED: dev-box mergerfs path absent on this host)", True)
 check("real detector passes an ext4 location",
       cdb.fs_is_fuse(os.path.expanduser("~/.local/share")) is False)
 
