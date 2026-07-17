@@ -25,6 +25,26 @@
 
 May change: `docs/vision/slice-NV-nvfp4-quant-load.md` (this doc), `docs/decisions/ADR-019-*.md` (Changelog append), `pyproject.toml` + `requirements.txt` + `uv.lock` (dep slice), `nodes/eric_diffusion_utils.py`, `comfyless/params_validation.py`, `nodes/eric_diffusion_fp8_ops.py` (**Red Zone — security-auditor gate**), `comfyless/mcp_server.py` (**Red Zone** — found during implementation: the tool schema hardcoded the quant enum at line ~776; now derived from `QUANT_MODES`), `test_quant.py`, `test_fp8_single_file.py` (if the merge-refusal negative fits there better), `TECH_DEBT.md` (Resolved append, entry at line ~348), `docs/security/review-slice-NV-*.md` (new). Anything else → STOP and split. `resolve_hf_path`, `comfyless/server.py`, `comfyless/generate.py` must NOT need edits (they consume QUANT_MODES).
 
+**Amendment (2026-07-17, first live-gate finding — nvfp4 shape screen):**
+The deferred live smoke's first Qwen-Image-2512 load crashed inside
+`from_pretrained`: torchao's `_nvfp4_inference_linear_transform` HARD-RAISES
+on any Linear weight whose last two dims aren't divisible by 16 (NVFP4 packs
+16-element blocks along both dims), and the Qwen2.5-VL text encoder's vision
+tower is hidden-size 3420 — all 96 `visual.blocks.*.mlp.{up,gate,down}_proj`
+weights violate the constraint. fp8 never hit this (rowwise scales, no shape
+requirement). Fix, within the existing edit scope (`eric_diffusion_utils.py`
++ `test_quant.py`): `_nvfp4_incompatible_weight_keys` scans each selected
+component's safetensors HEADERS (official API, metadata only, ms per file)
+and routes offenders through `modules_to_not_convert` — full weight keys
+including `.weight`, the one form both quantizer gates match on current pins
+(transformers `should_convert_module` endswith rule, surviving the
+checkpoint→runtime `model.` prefix remap; diffusers exact-equality rule).
+`quantize_module` (override path) applies the same screen as a `filter_fn`.
+Warn-don't-block both ways: offenders stay bf16 with a loud notice; an
+unscannable component (no readable safetensors header) warns that screening
+was impossible and proceeds. Invariant 1 unaffected — fp8 is deliberately
+unscreened (negative-tested).
+
 **Scope amendment (2026-07-16, security-auditor req 65):** `nodes/eric_qwen_edit_lora.py` and `nodes/eric_lora_format_convert_apply.py` added — one call-site line after each of the four `merge_resolution_map` computations. The auditor found the DMR partial-merge debt trigger ("extending the DMR surface — new quantized reps") FIRED: a per-target refusal mid-adapter would leave earlier targets merged while `_apply_loras`' broad except reports "LoRA load failed" and generation continues on a half-merged, possibly daemon-cached transformer. Resolution is the auditor's option (a): an all-or-nothing entry gate (`refuse_unmergeable_base` in fp8_ops) scanning the resolution map BEFORE the first mutation, making invariant 6's "weights untouched" true per-adapter. Deliberately conservative: refuses direct merge into any model holding an unmergeable torchao rep, even if the adapter might have touched only plain targets.
 
 ## 3. Design (condensed)

@@ -723,6 +723,192 @@ check("fragment('nvfp4') != fragment('fp8') (no cross-mode cache hit)",
 
 
 # ──────────────────────────────────────────────────────────────────────
+print("── nvfp4 shape screen (16-block constraint, 2026-07-17 fix) ───")
+# torchao hard-raises mid-from_pretrained on Linear weights whose last two
+# dims aren't divisible by 16 (first live hit: Qwen2.5-VL vision tower,
+# hidden 3420). The screen reads safetensors HEADERS ONLY and routes
+# offenders through modules_to_not_convert; fp8 is deliberately unscreened.
+
+from safetensors.torch import save_file as _st_save      # noqa: E402
+
+_BAD_UP = "visual.blocks.0.mlp.up_proj.weight"     # [20, 16] → 20 % 16 != 0
+_BAD_DOWN = "visual.blocks.0.mlp.down_proj.weight"  # [16, 20]
+_GOOD = "layers.0.self_attn.q_proj.weight"          # [32, 16] → clean
+
+
+def _mk_te_safetensors(comp_dir, extra=None):
+    comp_dir.mkdir(parents=True, exist_ok=True)
+    tensors = {
+        _GOOD: torch.zeros(32, 16, dtype=torch.bfloat16),
+        _BAD_UP: torch.zeros(20, 16, dtype=torch.bfloat16),
+        _BAD_DOWN: torch.zeros(16, 20, dtype=torch.bfloat16),
+        # Never flagged: non-2-D and non-".weight" entries are outside
+        # torchao's Linear-only conversion even when their dims violate /16.
+        "norm.weight": torch.zeros(20, dtype=torch.bfloat16),
+        "patch.conv.weight": torch.zeros(20, 16, 3, 3, dtype=torch.bfloat16),
+        "some.scale": torch.zeros(20, 20, dtype=torch.bfloat16),
+    }
+    tensors.update(extra or {})
+    _st_save(tensors, str(comp_dir / "model.safetensors"))
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    _mk_te_safetensors(root / "text_encoder")
+    bad, scanned, nfail = edu._nvfp4_incompatible_weight_keys(
+        str(root), "text_encoder")
+    check("scan flags exactly the 2-D .weight offenders (sorted)",
+          bad == sorted([_BAD_UP, _BAD_DOWN]), f"got {bad}")
+    check("scan counts the readable header, no failures",
+          scanned == 1 and nfail == 0, f"got {scanned}, {nfail}")
+
+    # Sharded component: keys union across files, both headers counted.
+    _st_save({"shard2.linear.weight": torch.zeros(16, 20, dtype=torch.bfloat16)},
+             str(root / "text_encoder" / "model-00002.safetensors"))
+    bad2, scanned2, _ = edu._nvfp4_incompatible_weight_keys(
+        str(root), "text_encoder")
+    check("sharded scan unions offenders across files",
+          bad2 == sorted([_BAD_UP, _BAD_DOWN, "shard2.linear.weight"]),
+          f"got {bad2}")
+    check("sharded scan counts both headers", scanned2 == 2, f"got {scanned2}")
+
+    # Partial failure: one good shard + one garbage shard → failures
+    # reported so callers warn about an INCOMPLETE screen (review finding 2).
+    with open(root / "text_encoder" / "model-00003.safetensors", "wb") as f:
+        f.seek(4096 - 1)
+        f.write(b"\0")
+    bad2b, scanned2b, nfail2b = edu._nvfp4_incompatible_weight_keys(
+        str(root), "text_encoder")
+    check("partial failure: good shards still scanned, failure counted "
+          "(NEGATIVE)", scanned2b == 2 and nfail2b == 1 and bad2b == bad2,
+          f"got {scanned2b}, {nfail2b}, {bad2b}")
+
+    # Unreadable file (sparse garbage, the _mk_model_dir shape): screen
+    # reports 0 scanned so callers WARN instead of assuming clean (NEGATIVE).
+    garb = root / "text_encoder_garbage"
+    garb.mkdir()
+    with open(garb / "model.safetensors", "wb") as f:
+        f.seek(4096 - 1)
+        f.write(b"\0")
+    bad3, scanned3, nfail3 = edu._nvfp4_incompatible_weight_keys(
+        str(root), "text_encoder_garbage")
+    check("unreadable header → no keys, 0 scanned, 1 failed (NEGATIVE)",
+          bad3 == [] and scanned3 == 0 and nfail3 == 1,
+          f"got {bad3}, {scanned3}, {nfail3}")
+
+    check("missing component dir → no keys, no reads (NEGATIVE)",
+          edu._nvfp4_incompatible_weight_keys(str(root), "nope")
+          == ([], 0, 0))
+
+# ── Wiring through build_quant_config (hardware mocked — CI-safe).
+_real_hw = edu.quant_hardware_ok
+setattr(edu, "quant_hardware_ok", lambda m, d: (True, ""))
+try:
+    with tempfile.TemporaryDirectory() as tmp:
+        mp = _mk_model_dir(tmp, _QWEN_INDEX)
+        root = Path(mp)
+        _mk_te_safetensors(root / "text_encoder")
+        (root / "transformer").mkdir()
+        _st_save({"blocks.0.ff.weight": torch.zeros(32, 16, dtype=torch.bfloat16)},
+                 str(root / "transformer" / "model.safetensors"))
+
+        cfg, comps, notes = edu.build_quant_config(
+            mp, "nvfp4", only=("text_encoder", "transformer"))
+        check("nvfp4 build: config built with both components",
+              cfg is not None and sorted(comps) == ["text_encoder",
+                                                    "transformer"],
+              f"comps {comps}")
+        assert cfg is not None
+        _te_cfg = cfg.quant_mapping["text_encoder"]
+        _tr_cfg = cfg.quant_mapping["transformer"]
+        check("nvfp4 build: offenders land in the TE's "
+              "modules_to_not_convert (full keys incl. .weight)",
+              _te_cfg.modules_to_not_convert == sorted([_BAD_UP, _BAD_DOWN]),
+              f"got {_te_cfg.modules_to_not_convert}")
+        check("nvfp4 build: clean component gets NO exclusions",
+              _tr_cfg.modules_to_not_convert is None,
+              f"got {_tr_cfg.modules_to_not_convert}")
+        check("nvfp4 build: exclusion is announced in notices",
+              any("not divisible by 16" in n and "text_encoder" in n
+                  for n in notes), f"notes: {notes}")
+
+        # fp8 on the SAME dir: unscreened — no exclusions, no notice
+        # (NEGATIVE: proves the screen is nvfp4-scoped).
+        cfg8, comps8, notes8 = edu.build_quant_config(
+            mp, "fp8", only=("text_encoder", "transformer"))
+        assert cfg8 is not None
+        check("fp8 build on same weights: no modules_to_not_convert "
+              "(NEGATIVE)",
+              cfg8.quant_mapping["text_encoder"].modules_to_not_convert
+              is None,
+              f"got {cfg8.quant_mapping['text_encoder'].modules_to_not_convert}")
+        check("fp8 build: no divisibility notice (NEGATIVE)",
+              not any("divisible by 16" in n for n in notes8),
+              f"notes: {notes8}")
+
+        # Partial shard failure through the build: incomplete screen must
+        # WARN even though other shards scanned fine (review finding 2).
+        with open(root / "text_encoder" / "model-00009.safetensors",
+                  "wb") as f:
+            f.seek(4096 - 1)
+            f.write(b"\0")
+        cfgp, _, notesp = edu.build_quant_config(
+            mp, "nvfp4", only=("text_encoder", "transformer"))
+        check("nvfp4 build: partial shard failure → incomplete-screen WARN, "
+              "config still built (NEGATIVE)",
+              cfgp is not None
+              and any("could not read 1 of the" in n for n in notesp),
+              f"notes: {notesp}")
+
+    # Unscannable component under nvfp4: loud warning, load proceeds
+    # (warn-don't-block — invariant 6).
+    with tempfile.TemporaryDirectory() as tmp:
+        mp = _mk_model_dir(tmp, _QWEN_INDEX,
+                           te_sizes={"text_encoder": 4096})  # sparse garbage
+        cfg, comps, notes = edu.build_quant_config(
+            mp, "nvfp4", only=("text_encoder",))
+        check("nvfp4 build: unreadable headers → WARN notice, config still "
+              "built (warn-don't-block)",
+              cfg is not None
+              and any("could not read any safetensors header" in n
+                      for n in notes),
+              f"cfg {cfg} notes: {notes}")
+finally:
+    setattr(edu, "quant_hardware_ok", _real_hw)
+
+# ── quantize_module (override path): same screen as a live filter_fn.
+# Weight-only recipe quantizes on CPU (established above) — CI-safe.
+_scr = _nn.Sequential(
+    _nn.Linear(16, 16, bias=False, dtype=torch.bfloat16),   # clean
+    _nn.Linear(10, 16, bias=False, dtype=torch.bfloat16),   # weight [16,10]
+)
+_buf = _io.StringIO()
+with _ctx.redirect_stdout(_buf):
+    _ok_scr = edu.quantize_module(_scr, "nvfp4", family="zimage")
+check("quantize_module nvfp4: quantizes despite a bad-shape Linear "
+      "(returns True)", _ok_scr is True)
+check("quantize_module nvfp4: clean Linear quantized",
+      type(_scr[0].weight.data).__name__ == "NVFP4Tensor",
+      f"got {type(_scr[0].weight.data).__name__}")
+check("quantize_module nvfp4: bad-shape Linear left in full precision",
+      type(_scr[1].weight.data).__name__ != "NVFP4Tensor"
+      and _scr[1].weight.dtype == torch.bfloat16,
+      f"got {type(_scr[1].weight.data).__name__}")
+check("quantize_module nvfp4: skip is announced with the module fqn",
+      "not divisible by 16" in _buf.getvalue()
+      and "(e.g. 1)" in _buf.getvalue(), f"got {_buf.getvalue()!r}")
+
+# fp8 on the same bad shape: NOT screened — fp8 rowwise has no /16
+# constraint and the validated path must stay byte-identical (NEGATIVE).
+_m_bad8 = _nn.Linear(10, 16, bias=False, dtype=torch.bfloat16)
+check("quantize_module fp8: bad-shape Linear still quantizes (NEGATIVE — "
+      "screen is nvfp4-scoped)",
+      edu.quantize_module(_m_bad8, "fp8", family="zimage") is True
+      and "Float8" in type(_m_bad8.weight.data).__name__,
+      f"got {type(_m_bad8.weight.data).__name__}")
+
+
+# ──────────────────────────────────────────────────────────────────────
 print("\n" + "─" * 50)
 print(f"  {passed} passed, {failed} failed")
 print("─" * 50)

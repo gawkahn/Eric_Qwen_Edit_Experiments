@@ -1727,6 +1727,63 @@ def quant_hardware_ok(quant_mode: str, device: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _nvfp4_incompatible_weight_keys(
+    model_path: str, component_name: str,
+) -> tuple[list, int, int]:
+    """Header-only scan for weights NVFP4 cannot represent (slice NV fix).
+
+    NVFP4 packs 16-element blocks along both dims, and torchao HARD-RAISES
+    mid-from_pretrained on any Linear weight whose last two dims aren't
+    divisible by 16 (first hit live: Qwen2.5-VL's vision tower, hidden 3420).
+    Reads only safetensors headers via the safetensors API — no tensor data —
+    so screening a 16 GB text encoder costs milliseconds.
+
+    Returns (bad_keys, files_scanned, files_failed). `bad_keys` are full
+    weight keys (".weight" suffix INCLUDED) — that exact form matches both
+    quantizer gates on the current pins: transformers' should_convert_module
+    matches via endswith (surviving checkpoint→runtime renames like
+    Qwen2.5-VL's added "model." prefix), diffusers' via exact key equality
+    (its torchao path does not rename). files_scanned == 0 means no readable
+    header was found; files_failed > 0 means the screen is INCOMPLETE (an
+    unreadable shard may hide offenders) — callers must warn in both cases,
+    never assume the component is clean.
+
+    Known blind spot (theoretical on current pins): a runtime Linear whose
+    weight is TIED to a tensor stored under a different checkpoint key
+    (lm_head ↔ embed_tokens style) is screened under the stored key only —
+    if the runtime name differs, neither matcher fires and a violating tied
+    Linear would still crash the load. No pinned checkpoint hits this.
+    """
+    comp_dir = os.path.join(model_path, component_name)
+    if not os.path.isdir(comp_dir):
+        return [], 0, 0
+    try:
+        entries = sorted(os.scandir(comp_dir), key=lambda e: e.name)
+    except OSError:
+        return [], 0, 0
+    from safetensors import safe_open
+    bad, files_scanned, files_failed = set(), 0, 0
+    for entry in entries:
+        if not (entry.is_file() and entry.name.endswith(".safetensors")):
+            continue
+        try:
+            with safe_open(entry.path, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    # Only 2-D ".weight" tensors: torchao's default filter
+                    # converts nn.Linear weights only, so conv (4-D) and
+                    # norm/bias (1-D) entries can never hit the constraint.
+                    if not key.endswith(".weight"):
+                        continue
+                    shape = f.get_slice(key).get_shape()
+                    if len(shape) == 2 and (shape[-1] % 16 or shape[-2] % 16):
+                        bad.add(key)
+            files_scanned += 1
+        except Exception:  # noqa: BLE001 — unreadable file → screen incomplete
+            files_failed += 1
+            continue
+    return sorted(bad), files_scanned, files_failed
+
+
 def build_quant_config(
     model_path: str,
     quant_mode: str,
@@ -1796,13 +1853,48 @@ def build_quant_config(
         notices.append(msg)
         return None, {}, notices
 
+    # nvfp4 shape screen: torchao hard-raises mid-load on Linear weights with
+    # dims not divisible by 16 (NVFP4 16-block packing).  Screen each selected
+    # component's safetensors headers up front and route offenders through
+    # modules_to_not_convert so they stay in full precision — warn-don't-block
+    # (invariant 6): a partial quant beats a crashed load.  fp8 has no shape
+    # constraint (rowwise scales) and is deliberately not screened.
+    not_convert: dict = {}
+    if quant_mode == "nvfp4":
+        for name in sorted(selected):
+            bad_keys, files_scanned, files_failed = (
+                _nvfp4_incompatible_weight_keys(model_path, name))
+            if not files_scanned or files_failed:
+                # Total OR partial read failure: an unreadable shard may
+                # hide offenders, so the screen is incomplete either way.
+                msg = (f"quant: nvfp4 shape screen could not read "
+                       f"{'any' if not files_scanned else f'{files_failed} of the'} "
+                       f"safetensors header(s) in {name!r} — load may still "
+                       f"fail if a weight dim is not divisible by 16")
+                print(f"{log_prefix} WARNING: {msg}")
+                notices.append(msg)
+            if bad_keys:
+                msg = (f"quant: nvfp4 — {len(bad_keys)} weight(s) in "
+                       f"{name!r} have dims not divisible by 16 (e.g. "
+                       f"{bad_keys[0]}); left in full precision (NVFP4 "
+                       f"16-block constraint)")
+                print(f"{log_prefix} {msg}")
+                notices.append(msg)
+                not_convert[name] = bad_keys
+
     quant_mapping = {}
     for name in selected:
         library = (model_index.get(name) or [None])[0]
+        # Fresh list per config: diffusers' quantizer extends the stored
+        # list IN PLACE (keep_in_fp32/offload keys), so sharing one across
+        # configs or retries would accumulate entries.
+        _mtnc = list(not_convert[name]) if name in not_convert else None
         if library == "transformers":
-            quant_mapping[name] = _TransformersTorchAoConfig(quant_type=ao_config)
+            quant_mapping[name] = _TransformersTorchAoConfig(
+                quant_type=ao_config, modules_to_not_convert=_mtnc)
         else:
-            quant_mapping[name] = _DiffusersTorchAoConfig(quant_type=ao_config)
+            quant_mapping[name] = _DiffusersTorchAoConfig(
+                quant_type=ao_config, modules_to_not_convert=_mtnc)
     print(f"{log_prefix} quant: {quant_mode} on {sorted(selected)} "
           f"(roles: {selected})")
     return PipelineQuantizationConfig(quant_mapping=quant_mapping), selected, notices
@@ -1823,7 +1915,37 @@ def quantize_module(module, quant_mode: str, family: str = None,
         return False
     try:
         from torchao.quantization import quantize_
-        quantize_(module, _torchao_quant_config(quant_mode, family))
+        ao_config = _torchao_quant_config(quant_mode, family)
+        if quant_mode == "nvfp4":
+            # Same 16-block screen as build_quant_config, but on the live
+            # module: torchao raises on Linear weights whose last two dims
+            # aren't divisible by 16, so filter those out of the conversion
+            # instead of losing the whole component to a crash.  COMPOSE
+            # with torchao's default filter rather than replace it — it
+            # carries load-bearing guards (skips already-quantized shared
+            # weights and MultiheadAttention's NonDynamicallyQuantizable
+            # out_proj).  Private import, acceptable under the exact
+            # torchao==0.17.0 pin.
+            from torchao.quantization.quant_api import _is_linear
+            skipped: list = []
+
+            def _nvfp4_shape_ok(m, fqn):
+                if not _is_linear(m, fqn):
+                    return False
+                w = getattr(m, "weight", None)
+                ok = (isinstance(w, torch.Tensor) and w.ndim == 2
+                      and w.shape[-1] % 16 == 0 and w.shape[-2] % 16 == 0)
+                if not ok:
+                    skipped.append(fqn)
+                return ok
+
+            quantize_(module, ao_config, filter_fn=_nvfp4_shape_ok)
+            if skipped:
+                print(f"{log_prefix} quant: nvfp4 — {len(skipped)} Linear(s) "
+                      f"with dims not divisible by 16 left in full precision "
+                      f"(e.g. {skipped[0]})")
+        else:
+            quantize_(module, ao_config)
         print(f"{log_prefix} quant: {quant_mode} recipe="
               f"{_fp8_recipe_for_family(family)} (family {family!r})")
         return True
