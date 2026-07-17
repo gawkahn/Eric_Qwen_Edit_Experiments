@@ -1,9 +1,8 @@
 # CI gate — quality-gate kit adoption, 2026-07-16 (reference: local_agents).
 #
-# ADOPTED GATES: secrets, commit-policy, sast, supply-chain, types
-# (2026-07-16). The kit's tests job is NOT here yet — it needs a decision on
-# the 19 standalone (non-pytest) suites. See the kit README
-# (~/.claude/templates/quality-gate-kit-python-uv/).
+# ALL SIX KIT GATES ADOPTED (2026-07-16): secrets, commit-policy, sast,
+# supply-chain, types, tests. Kit README:
+# ~/.claude/templates/quality-gate-kit-python-uv/.
 #
 # Fails the build on:
 #   - any git-policy smoke-test regression (scripts/git-policy/)
@@ -15,6 +14,8 @@
 #     locked deps (two documented no-fix ignores in osv-scanner.toml)
 #   - any pyright error count ABOVE .claude/typecheck-baseline (ADR-032
 #     ratchet — the authoritative fail-CLOSED mirror of the local hook)
+#   - any test-suite failure (`just tests` — the standalone test_*.py battery;
+#     verified CPU-safe by a CUDA_VISIBLE_DEVICES="" full run at adoption)
 #
 # Supply chain (global CLAUDE.md §11):
 #   - every `uses:` is pinned to a commit SHA, not a floating tag.
@@ -72,6 +73,37 @@ jobs:
           bash scripts/git-policy/check-range.sh
           "${{ github.event.pull_request.base.sha }}"
           "${{ github.event.pull_request.head.sha }}"
+
+  tests:
+    name: tests (standalone suite battery)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.11.7" # match dev box; exact pin per §11
+          enable-cache: false
+      # Full locked venv (CUDA wheel tree included — the lock is exact; the
+      # suites are proven CPU-safe, GPU never touched). UV_NO_CACHE: don't
+      # hold the wheels twice on runner disk.
+      - run: uv sync --locked
+        env:
+          UV_NO_CACHE: "1"
+      # mise provides the pinned `just` for the recipe (single source of truth
+      # for the battery loop). Install only `just` — this job needs nothing
+      # else from mise.toml.
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          version: "2026.5.0" # match dev box; exact pin per §11
+          install: false
+          cache: false
+      - run: mise trust ./mise.toml
+      - run: mise install just
+      - name: run test battery (just tests)
+        run: mise exec just -- just tests
 
   typecheck:
     name: typecheck (pyright ratchet)

@@ -75,6 +75,28 @@ policy-test:
 typecheck:
     mise exec -- pyright
 
+# Runs every test_*.py standalone suite against the uv .venv (ADR-013), glob-
+# based so new suites are picked up automatically. Excludes test_flux2.py
+# (live GPU smoke — run manually). Fails on any suite's nonzero exit.
+# Full unit-test battery — this repo's suites are standalone scripts, NOT pytest
+tests:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    fail=0; n=0
+    for t in test_*.py; do
+        [ "$t" = "test_flux2.py" ] && continue
+        n=$((n+1))
+        if out=$(./.venv/bin/python3 "$t" 2>&1); then
+            printf '%-42s PASS\n' "$t"
+        else
+            fail=1
+            printf '%-42s FAIL\n%s\n' "$t" "$out"
+        fi
+    done
+    echo "---"
+    [ "$fail" -eq 0 ] && echo "tests: all $n suites passed" || echo "tests: FAILURES above"
+    exit $fail
+
 # 0-baseline hard gate (7 findings triaged + suppressed inline 2026-07-16);
 # scope is this repo's code roots (no src/). FPs: inline # nosemgrep + comment.
 # Security static analysis (SAST) — semgrep, exact-pinned via uv
