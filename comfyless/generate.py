@@ -1685,15 +1685,23 @@ def generate(
             # packed latents; the Wan 2× upscale VAE decodes them to a 2×
             # image below (output PNG is 2× width × 2× height).
             call_kwargs["output_type"] = "latent"
+        # Slice PAUSE: first ^C pauses at the next step boundary, second
+        # aborts (docs/vision/slice-pause-sigint.md). No-op off the
+        # interactive CLI (non-TTY/daemon/thread) and on pipelines without
+        # callback_on_step_end. The stock pipe.__call__ signature stands
+        # proxy for the NAG wrappers (all four accept the callback).
+        from comfyless.pause import sigint_pause
         with swap_sampler(pipe, effective_sampler, log_prefix="[comfyless]"):
             if nag_active:
                 # Unbound Krea2NAGPipeline.__call__ on the (possibly cached)
                 # stock pipeline: NAG processors are installed per-call and
                 # restored in a finally, so the cached object's class and
                 # shape never change (cache keys stay NAG-free by design).
-                result = nag_pipe_call(pipe, **call_kwargs)
+                with sigint_pause(pipe.__call__, call_kwargs):
+                    result = nag_pipe_call(pipe, **call_kwargs)
             else:
-                result = pipe(**call_kwargs)
+                with sigint_pause(pipe.__call__, call_kwargs):
+                    result = pipe(**call_kwargs)
         if upscale_active:
             final_pil = _decode_upscale_2x(
                 result.images, pipe, upscale_vae, height, width, device)
