@@ -257,6 +257,36 @@ check("callback removed after abort exit too (NEGATIVE)",
 
 
 # ──────────────────────────────────────────────────────────────────────
+print("── invariant 5: daemon opt-out (enabled=False) ────────────────")
+# The daemon runs generation on its MAIN thread, usually with TTY stdin
+# (foreground terminal), so the implicit guards do NOT cover it — it opts
+# out explicitly. enabled=False must be a transparent no-op even when every
+# implicit guard would otherwise pass (2026-07-17 incident).
+
+kw5 = {"prompt": "x"}
+with sigint_pause(_pipe_with_callback, kw5, _isatty=_TTY, enabled=False):
+    check("enabled=False: no callback injected despite TTY + support (NEGATIVE)",
+          "callback_on_step_end" not in kw5, f"{kw5.keys()}")
+    check("enabled=False: SIGINT handler untouched (NEGATIVE)",
+          signal.getsignal(signal.SIGINT) is _orig_handler)
+check("enabled=False: kwargs unchanged after exit",
+      kw5 == {"prompt": "x"})
+
+# Wiring: the daemon call site and generate() must actually thread the flag.
+# Source-text checks (no torch import needed in this suite).
+_root = Path(__file__).parent
+_server_src = (_root / "comfyless" / "server.py").read_text()
+_gen_src = (_root / "comfyless" / "generate.py").read_text()
+check("server.py generate() call passes interactive_pause=False",
+      "interactive_pause=False" in _server_src)
+check("generate() signature exposes interactive_pause (default True)",
+      "interactive_pause: bool = True" in _gen_src)
+check("both sigint_pause call sites gate on interactive_pause",
+      _gen_src.count("enabled=interactive_pause") >= 2,
+      f"count={_gen_src.count('enabled=interactive_pause')}")
+
+
+# ──────────────────────────────────────────────────────────────────────
 print("\n" + "─" * 50)
 print(f"  {passed} passed, {failed} failed")
 print("─" * 50)

@@ -857,6 +857,12 @@ def _handle_generate(
             refiner_steps=req.get("refiner_steps", 4),
             refiner_cfg=req.get("refiner_cfg", 3.5),
             _cached_pipeline=cached,
+            # Explicit pause opt-out (slice PAUSE, 2026-07-17): the daemon
+            # runs generation on its MAIN thread, usually in a foreground
+            # terminal (TTY stdin), so sigint_pause's implicit guards don't
+            # fire — a stray ^C here would block the daemon on input()
+            # mid-generation and wedge every client.
+            interactive_pause=False,
         )
     except Exception as e:
         import traceback

@@ -1008,6 +1008,113 @@ with _tempfile.TemporaryDirectory() as _mb, \
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Client-side recv-failure contract (2026-07-17): a daemon that ACCEPTS a
+# request but never answers must surface a synthetic ClientRecvError dict —
+# never None. None means "no daemon; fall through to in-process generation",
+# and doing that against a live daemon starts a second model load on a GPU
+# whose VRAM the daemon still holds. (Before the fix, the recv deadline's
+# ValueError escaped _send_server_command entirely and crashed the client.)
+print("── client recv-failure contract (_send_server_command) ────────")
+
+import os
+import tempfile
+import comfyless.generate as gen
+
+_tmpdir = tempfile.mkdtemp(prefix="comfyless-recv-test-")
+_old_xdg = os.environ.get("XDG_RUNTIME_DIR")
+os.environ["XDG_RUNTIME_DIR"] = _tmpdir
+_old_client_timeout = srv._CLIENT_RECV_TIMEOUT_SEC
+srv._CLIENT_RECV_TIMEOUT_SEC = 0.3   # picked up at call time via the local import
+try:
+    _sockp = srv.socket_path("cpu")
+
+    # (a) wedged daemon: accepts + reads the request, never responds.
+    _lsock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    _lsock.bind(str(_sockp))
+    _lsock.listen(1)
+    _held = []
+
+    def _wedged_daemon():
+        c, _ = _lsock.accept()
+        c.recv(65536)        # consume the request…
+        _held.append(c)      # …and hold the socket open past the deadline
+
+    _t = threading.Thread(target=_wedged_daemon, daemon=True)
+    _t.start()
+    _resp = gen._send_server_command({"type": "generate"}, "cpu")
+    check("wedged daemon → synthetic error dict, not None",
+          isinstance(_resp, dict) and _resp.get("status") == "error",
+          f"got {_resp!r}")
+    check("wedged daemon → error_type ClientRecvError",
+          isinstance(_resp, dict)
+          and _resp.get("error_type") == "ClientRecvError")
+    check("wedged daemon → message names the deadline and no-fallback",
+          isinstance(_resp, dict)
+          and "no valid response" in _resp.get("error", "")
+          and "not falling back" in _resp.get("error", ""))
+    for _c in _held:
+        _c.close()
+    _lsock.close()
+    _sockp.unlink()
+
+    # (a2) broken daemon: valid JSON that is not an object. Callers do
+    # resp.get(...), so this must surface as ClientRecvError, not crash
+    # (security review SHOULD 1, review-pause-daemon-guard-2026-07-17).
+    _lsock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    _lsock.bind(str(_sockp))
+    _lsock.listen(1)
+
+    def _scalar_daemon():
+        c, _ = _lsock.accept()
+        c.recv(65536)
+        c.sendall(b'"hello"\n')
+        c.close()
+
+    _t = threading.Thread(target=_scalar_daemon, daemon=True)
+    _t.start()
+    _resp = gen._send_server_command({"type": "generate"}, "cpu")
+    check("non-dict JSON response → ClientRecvError dict, not crash/None",
+          isinstance(_resp, dict)
+          and _resp.get("error_type") == "ClientRecvError"
+          and "non-object response" in _resp.get("error", ""),
+          f"got {_resp!r}")
+    _lsock.close()
+    _sockp.unlink()
+
+    # (b) daemon dies before responding (clean EOF) → None: the process is
+    # gone, its VRAM is freed, in-process fall-through is legitimate.
+    _lsock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    _lsock.bind(str(_sockp))
+    _lsock.listen(1)
+
+    def _dying_daemon():
+        c, _ = _lsock.accept()
+        c.recv(65536)
+        c.close()            # EOF without a response
+
+    _t = threading.Thread(target=_dying_daemon, daemon=True)
+    _t.start()
+    _resp = gen._send_server_command({"type": "generate"}, "cpu")
+    check("daemon EOF before response → None (fall-through allowed, NEGATIVE)",
+          _resp is None, f"got {_resp!r}")
+    _lsock.close()
+    _sockp.unlink()
+
+    # (c) no socket at all → None (the original absent-daemon path).
+    _resp = gen._send_server_command({"type": "generate"}, "cpu")
+    check("absent socket → None (fall-through allowed, NEGATIVE)",
+          _resp is None, f"got {_resp!r}")
+finally:
+    srv._CLIENT_RECV_TIMEOUT_SEC = _old_client_timeout
+    if _old_xdg is None:
+        os.environ.pop("XDG_RUNTIME_DIR", None)
+    else:
+        os.environ["XDG_RUNTIME_DIR"] = _old_xdg
+    import shutil
+    shutil.rmtree(_tmpdir, ignore_errors=True)
+
+
+# ──────────────────────────────────────────────────────────────────────
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print("──────────────────────────────────────────────────")

@@ -15,11 +15,16 @@ module existed. So the feature only ever ADDS a stop between "running" and
 
 Scope guards (all make :func:`sigint_pause` a transparent no-op):
 
-- not the main thread (``signal.signal`` would raise) — covers the daemon's
-  worker threads;
-- stdin is not a TTY — covers the daemon/MCP surfaces, ``--json`` mode
-  driven by a parent process, and redirected/piped runs, where "block on
-  input()" would hang forever;
+- ``enabled=False`` — the explicit opt-out. The daemon (``server.py``)
+  passes this: it handles requests on its MAIN thread and is normally run
+  in a foreground terminal (TTY stdin), so neither implicit guard below
+  covers it — without the opt-out, a stray ^C in the daemon's terminal
+  would block the whole daemon on ``input()`` mid-generation, wedging
+  every client (2026-07-17);
+- not the main thread (``signal.signal`` would raise);
+- stdin is not a TTY — covers detached daemons, the MCP stdio surface,
+  ``--json`` mode driven by a parent process, and redirected/piped runs,
+  where "block on input()" would hang forever;
 - the target callable does not accept ``callback_on_step_end`` (unknown
   pipeline families) — introspected, never assumed;
 - the caller already installed a ``callback_on_step_end`` — we never
@@ -51,6 +56,7 @@ def _supports_step_callback(pipe_call) -> bool:
 @contextmanager
 def sigint_pause(pipe_call, call_kwargs: dict,
                  log_prefix: str = "[comfyless]",
+                 enabled: bool = True,
                  _input=input, _isatty=None):
     """Arm ^C pause/abort around one pipeline call.
 
@@ -61,8 +67,16 @@ def sigint_pause(pipe_call, call_kwargs: dict,
     is injected on entry and ALWAYS removed on exit, so a dict the caller
     reuses (or records) never leaks the hook.
 
+    ``enabled=False`` is the explicit opt-out for non-interactive callers
+    whose runtime shape the implicit guards can't see (the foreground-
+    terminal daemon: main thread + TTY stdin, but blocking on input()
+    would wedge every client).
+
     ``_input`` / ``_isatty`` exist for tests only.
     """
+    if not enabled:
+        yield
+        return
     # getattr-with-default so a detached stdin (sys.stdin is None — spawned
     # without a console, embedded interpreter) no-ops instead of raising on
     # the attribute access itself (code review 2026-07-16, SHOULD 1).

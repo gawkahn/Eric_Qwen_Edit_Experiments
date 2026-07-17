@@ -1397,3 +1397,16 @@ an environment mismatch rather than a real regression. **Trigger:** next time
 LoRA format conversion is touched — verify them against `./.venv/bin/python3`,
 then either add a `tests/test_*.py` arm to the justfile recipe or record why
 they stay manual. Surfaced by code-reviewer during the tests-gate slice.
+
+**Connect-refused on a LIVE daemon still falls through in-process (2026-07-17)**
+`_send_server_command` (comfyless/generate.py) treats connect/send `OSError`
+as "daemon absent" → returns None → `_delegate_to_server` falls through to
+in-process generation. A live daemon whose listen backlog is momentarily full
+would be misread as absent, starting an in-process model load on a GPU whose
+VRAM the daemon holds — the same hazard the 2026-07-17 recv-side fix closed
+(ClientRecvError), surviving on the connect side. **Why not now:** requires a
+concurrent client burst against a serial solo-desktop daemon; the recv-side
+fix covers the observed incident. **Trigger:** any parallel-client work
+against one daemon (batch drivers, MCP multi-session), or the next
+`_send_server_command` change. Surfaced by code-reviewer during the
+pause-daemon-guard slice.

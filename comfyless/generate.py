@@ -1396,6 +1396,7 @@ def generate(
     upscale_vae_subfolder: str = "",
     _cached_pipeline: Optional[Dict[str, Any]] = None,
     mcp_caller: bool = False,
+    interactive_pause: bool = True,
     extra_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Generate a single image and save it.
@@ -1408,6 +1409,11 @@ def generate(
             karras/beta57/bong_tangent, ADR-028). Applied when the pipeline's
             scheduler is a flow-match scheduler whose set_timesteps accepts sigmas;
             warn-and-ignored otherwise. Orthogonal to (composes with) `sampler`.
+        interactive_pause: arm the ^C pause/resume hook (slice PAUSE) around
+            the pipeline call. The daemon passes False — its foreground-
+            terminal shape (main thread + TTY stdin) defeats sigint_pause's
+            implicit guards, and blocking on input() there wedges every
+            client (2026-07-17).
 
     Returns a metadata dict suitable for the sidecar JSON / bridge output.
     Raises on fatal errors (model not found, inference failure).
@@ -1687,8 +1693,9 @@ def generate(
             call_kwargs["output_type"] = "latent"
         # Slice PAUSE: first ^C pauses at the next step boundary, second
         # aborts (docs/vision/slice-pause-sigint.md). No-op off the
-        # interactive CLI (non-TTY/daemon/thread) and on pipelines without
-        # callback_on_step_end. The stock pipe.__call__ signature stands
+        # interactive CLI (non-TTY/thread) and on pipelines without
+        # callback_on_step_end; the daemon opts out explicitly via
+        # interactive_pause=False. The stock pipe.__call__ signature stands
         # proxy for the NAG wrappers (all four accept the callback).
         from comfyless.pause import sigint_pause
         with swap_sampler(pipe, effective_sampler, log_prefix="[comfyless]"):
@@ -1697,10 +1704,12 @@ def generate(
                 # stock pipeline: NAG processors are installed per-call and
                 # restored in a finally, so the cached object's class and
                 # shape never change (cache keys stay NAG-free by design).
-                with sigint_pause(pipe.__call__, call_kwargs):
+                with sigint_pause(pipe.__call__, call_kwargs,
+                                  enabled=interactive_pause):
                     result = nag_pipe_call(pipe, **call_kwargs)
             else:
-                with sigint_pause(pipe.__call__, call_kwargs):
+                with sigint_pause(pipe.__call__, call_kwargs,
+                                  enabled=interactive_pause):
                     result = pipe(**call_kwargs)
         if upscale_active:
             final_pil = _decode_upscale_2x(
@@ -2184,7 +2193,20 @@ def _run_serve_mode(args: argparse.Namespace) -> int:
 def _send_server_command(req: dict, device: str = "cuda") -> Optional[dict]:
     """Connect to the running server for `device`, send one request, return the response.
 
-    Returns None if the socket doesn't exist or the connection is refused.
+    Return contract (drives _delegate_to_server's fall-through decision):
+      dict — the server's response, OR a synthetic {"status": "error",
+             "error_type": "ClientRecvError"} when the daemon ACCEPTED the
+             request but no parseable response arrived within
+             _CLIENT_RECV_TIMEOUT_SEC (busy/wedged daemon, reset mid-read).
+             A live daemon still holds its GPU's VRAM, so this must surface
+             as an error — never as "no daemon", which would trigger an
+             in-process generation against an occupied GPU (2026-07-17;
+             previously the timeout's ValueError escaped uncaught).
+      None — daemon absent or unreachable (no socket, connect/send failed,
+             or clean EOF: the daemon process died before responding).
+             Caller may fall through to in-process generation.
+    Local socket-object creation failure (FD exhaustion) raises.
+
     The socket is device-keyed (ADR-020): one daemon per GPU, so the caller's
     device selects which daemon to reach.
     Local import keeps server.py off the critical import path.
@@ -2196,13 +2218,40 @@ def _send_server_command(req: dict, device: str = "cuda") -> Optional[dict]:
         return None
     conn = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
     try:
-        conn.connect(str(sock_p))
-        _send(conn, req)
-        # Pass the client-side timeout: the server's 5s default is a DoS guard
-        # on its request-read path, not a ceiling on how long generation takes.
-        return _recv(conn, timeout=_CLIENT_RECV_TIMEOUT_SEC)
-    except (OSError, ConnectionRefusedError):
-        return None
+        try:
+            conn.connect(str(sock_p))
+            _send(conn, req)
+        except OSError:
+            return None
+        try:
+            # Pass the client-side timeout: the server's 5s default is a DoS
+            # guard on its request-read path, not a ceiling on how long
+            # generation takes. _recv returns None on clean EOF (daemon died).
+            resp = _recv(conn, timeout=_CLIENT_RECV_TIMEOUT_SEC)
+            if resp is not None and not isinstance(resp, dict):
+                # Valid JSON but not an object (security review SHOULD 1,
+                # review-pause-daemon-guard-2026-07-17): callers do
+                # resp.get(...) — a scalar/list would crash them. A literal
+                # `null` response remains indistinguishable from clean EOF
+                # at this layer (acceptable under the same-UID model).
+                raise ValueError(
+                    f"non-object response: {type(resp).__name__}")
+            return resp
+        except (ValueError, OSError) as e:
+            # _recv raises ValueError on deadline expiry / oversized frame /
+            # garbage JSON; OSError (e.g. ECONNRESET) means the connection
+            # broke mid-read. Either way the daemon took the request —
+            # report, don't fall through.
+            return {
+                "status": "error",
+                "error_type": "ClientRecvError",
+                "error": (
+                    f"daemon on {device!r} accepted the request but sent no "
+                    f"valid response within {_CLIENT_RECV_TIMEOUT_SEC:.0f}s "
+                    f"({e}); it may be busy or wedged — not falling back to "
+                    f"in-process generation"
+                ),
+            }
     finally:
         conn.close()
 

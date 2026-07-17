@@ -133,6 +133,10 @@ _generate_canonical = {
         # MCP-internal call-shape flag; signals _save_with_metadata to apply
         # invariant-12 PNG redaction. Not user-facing; not a sidecar param.
         "mcp_caller",
+        # ^C pause opt-out (slice PAUSE): execution-context flag — the daemon
+        # passes False (2026-07-17). Never sidecar-shaped: replaying a
+        # sidecar must not decide whether ^C pauses the replaying process.
+        "interactive_pause",
         # Caller-supplied provenance dict merged into the sidecar (e.g. inline
         # prompt-enhancement original prompt + backend/recipe, ADR-026 §7).
         # Not a sidecar-input schema key.
