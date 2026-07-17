@@ -1410,3 +1410,17 @@ fix covers the observed incident. **Trigger:** any parallel-client work
 against one daemon (batch drivers, MCP multi-session), or the next
 `_send_server_command` change. Surfaced by code-reviewer during the
 pause-daemon-guard slice.
+
+**run_server unlinks a live daemon's socket without a liveness probe (2026-07-17)**
+`run_server` (comfyless/server.py:933-934) unconditionally unlinks an existing
+socket at startup. Starting `comfyless@N` (systemd unit, 2026-07-17) while a
+manually-started daemon owns that device's socket steals the path: the manual
+daemon is orphaned (unreachable, still holding VRAM) and its shutdown
+`finally` later deletes the NEW daemon's socket. `systemctl stop`'s
+`ExecStop --unload` can likewise cleanly unload a foreign daemon over IPC.
+Availability-only, single-user. **Why not now:** the fix (connect-probe the
+existing socket; refuse to start if it answers) modifies a Red Zone path and
+takes the ADR-reference + security-auditor route — not a drive-by on the unit
+slice. **Trigger:** first real dual-launch collision, or the next
+`run_server` change. Surfaced by infra-auditor
+(docs/security/review-systemd-daemon-unit-2026-07-17.md, SHOULD 2).

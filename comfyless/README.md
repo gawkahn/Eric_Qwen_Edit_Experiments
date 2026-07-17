@@ -815,6 +815,26 @@ $PY -m comfyless.generate --serve --device cuda:1 --model-base /path/to/models -
 
 `--unload` is device-scoped: `--unload --device cuda:1` stops only the cuda:1 daemon.
 
+### Headless daemon (systemd user unit)
+
+Running `--serve` in a foreground terminal couples the daemon to that terminal: a stray `^C` or window close takes it down, and the log evaporates with the scrollback. The template unit `systemd/comfyless@.service` (repo root) runs it headless instead — instance name = GPU index:
+
+```bash
+mkdir -p ~/.config/systemd/user && cp systemd/comfyless@.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+systemctl --user start comfyless@0        # daemon for cuda:0
+systemctl --user start comfyless@1        # daemon for cuda:1 (parallel, own socket)
+journalctl --user -u comfyless@0 -f       # tail the log (this IS the log — journald)
+systemctl --user stop comfyless@0         # clean stop via --unload, then SIGTERM fallback
+```
+
+What the unit buys over a terminal/tmux launch:
+
+- **Log:** everything the server printed to stderr lands in journald; `journalctl --user -u comfyless@<gpu>` is the persistent, tailable log (`-f` to follow, `--since -1h` etc.). No log file to rotate.
+- **Crash recovery:** `Restart=on-failure` — a sticky CUDA error (e.g. `cudaErrorLaunchTimeout`, which poisons the process context and can only be cleared by a process restart) brings the daemon back automatically with a fresh context. A clean `--unload`/`stop` exits 0 and stays down.
+- **No TTY:** stdin is `/dev/null`, so nothing interactive (including the `^C` pause hook) can ever block the daemon.
+
+Boot-persistent: `systemctl --user enable comfyless@1`. To keep user units running after logout, `loginctl enable-linger` once. Paths (model base, output dir, repo location) are hardcoded in the unit — edit your installed copy in `~/.config/systemd/user/` if they differ, then `systemctl --user daemon-reload`.
+
 ### Using the server (auto-detect)
 
 After the server starts, run generation normally:

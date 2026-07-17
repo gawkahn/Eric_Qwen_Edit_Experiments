@@ -1,0 +1,72 @@
+# comfyless@.service — headless comfyless model server, one instance per GPU.
+#
+# Instance name = GPU index: `systemctl --user start comfyless@0` serves
+# --device cuda:0 (socket comfyless-cuda0.sock), comfyless@1 serves cuda:1.
+#
+# Install (once per machine):
+#   mkdir -p ~/.config/systemd/user && cp systemd/comfyless@.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+# Tail the log:
+#   journalctl --user -u comfyless@0 -f
+# Survive logout (optional, workstation stays logged in otherwise):
+#   loginctl enable-linger
+#
+# Under systemd stdin is /dev/null (not a TTY), so the ^C pause hook
+# (comfyless/pause.py) is doubly inert here — no terminal to catch a stray
+# ^C in, which is half the reason this unit exists (see
+# docs/security/review-pause-daemon-guard-2026-07-17.md).
+#
+# Restart=on-failure covers the sticky-CUDA death mode (2026-07-17 incident:
+# cudaErrorLaunchTimeout poisons the process context; the daemon can only be
+# fixed by a process restart — which this does automatically). A clean
+# `--unload` (or ExecStop below) exits 0 and does NOT restart.
+
+[Unit]
+Description=comfyless model server (GPU %i)
+Documentation=file:///home/gawkahn/projects/ai-lab/code/Eric_Qwen_Edit_Experiments/comfyless/README.md
+# Without these, RestartSec=5 vs the default burst window (5 in 10s) means the
+# limit can never trip and a persistent fault (e.g. wedged GPU + retrying MCP
+# client) load/crash-loops forever (infra audit 2026-07-17, SHOULD 1).
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=exec
+# Defense-in-depth inside the user's own privilege boundary (infra audit
+# 2026-07-17, SHOULD 3). RestrictAddressFamilies structurally enforces the
+# ADR-001 "AF_UNIX only, never a TCP listener" invariant and makes any
+# accidental network fetch fail loudly (models load local_files_only).
+# If a future dependency legitimately needs sockets, relax it deliberately.
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+ProtectSystem=full
+# ProtectHome=read-only deliberately NOT set: torch/triton JIT caches write
+# under ~/.cache and the daemon writes to ~/gen-output; enumerate-and-allow
+# is a follow-up if ever wanted.
+WorkingDirectory=/home/gawkahn/projects/ai-lab/code/Eric_Qwen_Edit_Experiments
+# .venv is not an editable install; -m comfyless.generate needs the repo on
+# the path (same as start-mcpo.sh).
+Environment=PYTHONPATH=/home/gawkahn/projects/ai-lab/code/Eric_Qwen_Edit_Experiments
+Environment=PYTHONUNBUFFERED=1
+# HF cache must live on raw ext4, not mergerfs (filelock hangs — see the
+# filesystem constraint in ~/.claude/CLAUDE.md).
+Environment=HF_HOME=/mnt/nvme-8tb/hf
+Environment=HF_HUB_CACHE=/mnt/nvme-8tb/hf
+# Uncomment to keep tqdm step bars out of the journal:
+# Environment=TQDM_DISABLE=1
+ExecStart=/home/gawkahn/projects/ai-lab/code/Eric_Qwen_Edit_Experiments/.venv/bin/python3 -m comfyless.generate --serve \
+    --device cuda:%i \
+    --model-base /home/gawkahn/projects/ai-lab/ai-base/models \
+    --output-dir /home/gawkahn/gen-output \
+    --precision bf16
+# Clean shutdown via the existing device-scoped unload path; SIGTERM is the
+# systemd fallback if the daemon is wedged past TimeoutStopSec (stale socket
+# is unlinked at next startup — server.py run_server handles it).
+ExecStop=/home/gawkahn/projects/ai-lab/code/Eric_Qwen_Edit_Experiments/.venv/bin/python3 -m comfyless.generate --unload --device cuda:%i
+Restart=on-failure
+RestartSec=5
+# A generation can be mid-flight at stop; give --unload time to be queued
+# behind it before SIGTERM.
+TimeoutStopSec=120
+
+[Install]
+WantedBy=default.target
