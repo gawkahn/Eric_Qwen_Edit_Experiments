@@ -140,7 +140,9 @@ jobs:
           set -uo pipefail
           out=$(mise exec -- pyright 2>&1) || true
           echo "$out" | tail -3
-          current=$(echo "$out" | grep -oE '[0-9]+ error' | head -1 | grep -oE '[0-9]+')
+          # Anchor on pyright's summary-line shape, last match — a diagnostic
+          # containing "N error" text must not be parsed as the count.
+          current=$(echo "$out" | grep -oE '^[0-9]+ errors?, [0-9]+ warning' | tail -1 | grep -oE '^[0-9]+')
           [ -n "$current" ] || { echo "FATAL: no error count parsed — failing closed"; exit 1; }
           baseline=$(tr -dc '0-9' < .claude/typecheck-baseline)
           echo "pyright errors: $current (baseline $baseline)"

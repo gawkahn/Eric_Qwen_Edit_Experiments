@@ -68,5 +68,12 @@ install — unfixable from this repo without stub packages.
 ## Changelog
 
 - 2026-07-16 — accepted; baseline 1026 measured and committed with the gate.
+- 2026-07-16 — ratchet hardened after code-reviewer MEDIUM: the local hook
+  now reads the baseline from `git show HEAD:` (a same-commit bump cannot
+  self-legalize new errors), and the git-policy layer
+  (`pc_baseline_no_increase`, pre-commit + CI range check) blocks staged
+  baseline increases outright. Deliberate increases use `# user-approved`
+  (hook) / `Policy-override:` (git-policy). Count parsing anchored to
+  pyright's summary-line shape in both the hook and the CI job.
 
 AI-Disclosure: Claude (Fable 5) authored; Grant reviewed.

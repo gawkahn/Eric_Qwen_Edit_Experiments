@@ -37,6 +37,13 @@ no pc_no_floors '+    "foo[extra]^2.0",'
 ok pc_tech_debt_no_deletion $'@@ -1 +2 @@\n+Resolved: 2026-07-16 — done'
 no pc_tech_debt_no_deletion $'@@ -1 +0 @@\n-## 2026-01-01 — some entry header'
 
+# --- typecheck-ratchet baseline (ADR-032: may only decrease) ---
+ok pc_baseline_no_increase "1026" "1026"      # unchanged
+ok pc_baseline_no_increase "1026" "900"       # drawdown
+ok pc_baseline_no_increase ""     "1026"      # introducing the file
+no pc_baseline_no_increase "1026" "1076"      # bump — blocked
+ok pc_baseline_no_increase "1026\n" " 900 "   # whitespace/garble tolerated
+
 # --- more floor forms ---
 no pc_no_floors '+    "baz==latest",'
 no pc_no_floors '+    "bar==2.*",'

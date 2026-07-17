@@ -1345,3 +1345,14 @@ bump to. **Trigger:** any torch release note (watch the ADR-013 torch-pin
 lockstep: torchvision minor must move with it) — on the next torch bump, drop
 both ignores from the deps-cve recipe/osv config and re-scan. Both are pinned
 as documented ignores in the supply-chain gate so the CVE gate can be 0-red.
+
+**tests/ subdir LoRA-convert suites outside the test battery (2026-07-16)**
+`tests/test_lora_format_convert*.py` (5 suites + harness) are standalone-
+runnable but are NOT in the `just tests` battery (root-only glob) and appear
+in no gate. They predate ADR-013 and their docstrings reference the old
+comfy-dev venv; whether they pass under the uv `.venv` is unverified.
+**Why not now:** pulling them in blind could turn the new tests gate red on
+an environment mismatch rather than a real regression. **Trigger:** next time
+LoRA format conversion is touched — verify them against `./.venv/bin/python3`,
+then either add a `tests/test_*.py` arm to the justfile recipe or record why
+they stay manual. Surfaced by code-reviewer during the tests-gate slice.

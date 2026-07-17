@@ -87,6 +87,23 @@ pc_tech_debt_no_deletion() {
     return 0
 }
 
+# Typecheck-ratchet baseline may only decrease (ADR-032; code-reviewer
+# 2026-07-16 MEDIUM: a same-commit baseline bump must not self-legalize new
+# type errors). $1 = old value (empty if the file is new — allowed), $2 = new.
+pc_baseline_no_increase() {
+    local old new
+    old=$(printf '%s' "$1" | tr -dc '0-9')
+    new=$(printf '%s' "$2" | tr -dc '0-9')
+    [ -z "$old" ] && return 0   # introducing the baseline file is fine
+    [ -z "$new" ] && return 0   # deletion/garble is the typecheck gate's problem, not a ratchet bump
+    if [ "$new" -gt "$old" ]; then
+        echo "BLOCKED: .claude/typecheck-baseline raised $old -> $new (ADR-032: ratchet only goes down)." >&2
+        echo "  Fix the new type errors, or use the documented override for a deliberate bump." >&2
+        return 1
+    fi
+    return 0
+}
+
 # If any changed file is Red Zone, the message must reference an existing
 # ADR (kind=spec) or docs/security/review-*.md (kind=review), OR such a file
 # must itself be in the changed set. Mirrors require-redzone-*.sh.

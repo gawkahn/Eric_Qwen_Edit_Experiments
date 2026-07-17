@@ -24,4 +24,11 @@ while IFS= read -r td; do
     pc_tech_debt_no_deletion "$(git diff --cached --unified=0 -- "$td")" || rc=1
 done < <(printf '%s\n' "$staged" | grep -E '(^|/)TECH_DEBT\.md$' || true)
 
+# Typecheck-ratchet baseline may only decrease (ADR-032). Staged vs HEAD.
+if printf '%s\n' "$staged" | grep -qx '.claude/typecheck-baseline'; then
+    pc_baseline_no_increase \
+        "$(git show HEAD:.claude/typecheck-baseline 2>/dev/null || true)" \
+        "$(git show :.claude/typecheck-baseline 2>/dev/null || true)" || rc=1
+fi
+
 exit $rc

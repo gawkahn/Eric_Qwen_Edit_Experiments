@@ -60,6 +60,12 @@ for sha in $commits; do
             [ -z "$td" ] && continue
             pc_tech_debt_no_deletion "$(git diff --unified=0 "$parent" "$sha" -- "$td")" || range_rc=1
         done < <(printf '%s\n' "$changed" | grep -E '(^|/)TECH_DEBT\.md$' || true)
+        # Typecheck-ratchet baseline may only decrease (ADR-032).
+        if printf '%s\n' "$changed" | grep -qx '.claude/typecheck-baseline'; then
+            pc_baseline_no_increase \
+                "$(git show "$parent:.claude/typecheck-baseline" 2>/dev/null || true)" \
+                "$(git show "$sha:.claude/typecheck-baseline" 2>/dev/null || true)" || range_rc=1
+        fi
     fi
     # Floors: check EVERY pyproject.toml (incl. nested, for monorepos).
     while IFS= read -r pp; do

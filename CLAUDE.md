@@ -53,12 +53,12 @@ Rules:
 - **Do NOT edit `uv.lock` by hand.** It's machine output.
 - Fresh dev setup: `uv sync` (creates `.venv` matching the lock). ComfyUI install still uses pip as before — no change for downstream users.
 
-**Lint (no CI configured — run manually):**
+**Lint / syntax check (also gated in CI since 2026-07-16 — see §"Commit-time hooks & quality gates"):**
 ```bash
 python -m py_compile nodes/<file>.py   # syntax check a single file
 ```
 
-**Test suites (no CI, run manually):**
+**Test suites (`just tests` locally; gated in CI since 2026-07-16):**
 ```bash
 python3 test_manual_loop.py                 # 186 tests: samplers, manual loop, encode helper, Qwen edit
 python3 test_multistage.py                  # 141 tests: multistage infrastructure
@@ -79,7 +79,7 @@ python3 test_catalog_db.py                  # 125 tests: catalog DB metadata pla
 python3 test_nag.py                         # 101 tests: NAG negative guidance (ADR-023 Krea-2 + ADR-024 flux/flux2/flux2klein/zimage expansion) — formula vs reference equations, per-arch processor selection/dormancy/lane re-sync on tiny transformers (incl. Z-Image hand-swap + ragged captions, Flux2 dual/parallel variants, HF1-1 pooled-tiling negative control), pipeline routing guards, N1 boundary-warning pins
 python3 test_refine.py                       # 206 tests: refinement loop, ADR-027 slices 1-4 (COMPLETE) + judge-recipe amendment — verdict boundary + catalog layer + greedy hill-climb loop controller + seed-image entry. Closed two-key override allowlist (F1), numeric hygiene (F6: NaN/Infinity/huge-int rejected, weights |w|≤4, scores 1-10), reject-unknown + critique allowlist + verdict coercion (F7), judge image downscale + seed-image byte/pixel caps (F5); LoRA name→path ONLY via ADR-015 resolver (F2), path-stripped planner metadata + structural AST guard (F3); slice-4 seed-image entry (build_config_from_seed): full-schema-authority seeding, F4 loud echo w/ outside-roots flag, --params byte cap, seed-prompt char cap, .safetensors-strip→basename→catalog LoRA resolution w/ path_was_discarded, weight-0 honored, cold-path upscale-VAE parity
 ```
-All suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Expect 0 failures. **`just tests` runs the whole battery** (glob-based over `test_*.py`, excludes the live-GPU `test_flux2.py`, fails on any suite's nonzero exit) — the list above is descriptive; the glob is authoritative and picks up suites the list lags on (e.g. `test_enhance.py`, `test_hunyuan.py`, `test_owui_tool.py`).
+All suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Expect 0 failures. **`just tests` runs the whole battery** (glob-based over root-level `test_*.py`, excludes the live-GPU `test_flux2.py`, fails on any suite's nonzero exit) — the list above is descriptive; the glob is authoritative and picks up suites the list lags on (e.g. `test_enhance.py`, `test_hunyuan.py`, `test_owui_tool.py`). The `tests/test_lora_format_convert*.py` suites under `tests/` are deliberately OUTSIDE the battery — they date from the old comfy-dev venv and are unverified against the uv `.venv`; see the TECH_DEBT entry before pulling them in.
 
 `test_flux2.py` is a live GPU smoke test that performs an actual Flux.2 generation — separate from the unit suites above. Run only when you need to verify end-to-end Flux.2 behavior.
 
@@ -194,13 +194,25 @@ the kit README in `~/.claude/templates/quality-gate-kit-python-uv/`):
    message skips the Red Zone reference checks; smoke tests:
    `just policy-test`.
 3. **CI mirror (authoritative once branch protection exists):**
-   `.github/workflows/ci.yml` — git-policy smoke tests + gitleaks on every
-   push/PR; the commit-range policy check on PRs.
+   `.github/workflows/ci.yml`, six jobs — git-policy smoke tests, gitleaks,
+   semgrep sast, supply-chain (sources/licenses/CVE), pyright ratchet, and
+   the `just tests` battery on every push/PR; plus the commit-range policy
+   check on PRs.
+4. **Typecheck ratchet (ADR-032):** `.claude/typecheck-baseline` (1026 at
+   adoption) may only go DOWN. A second PreToolUse hook runs pyright (~11 s)
+   before every `git commit` and blocks a count above HEAD's baseline;
+   same-commit baseline bumps are blocked at the git-policy layer too.
+   Deliberate bump: `# user-approved` on the command / `Policy-override:` in
+   the message. When you fix type errors, lower the baseline in that commit.
 
-Toolchain pins: `mise.toml` (gitleaks, just — `mise trust ./mise.toml && mise
-install`). Recipes: `just secrets`, `just policy-test`. The gitleaks baseline
-is 0 (history measured clean at adoption; `.gitleaks.toml` has no allowlist —
-this repo's tests embed no credential-shaped fixtures).
+Toolchain pins: `mise.toml` (gitleaks, just, osv-scanner, node, pyright —
+`mise trust ./mise.toml && mise install`). Recipes: `just secrets`,
+`policy-test`, `sast`, `typecheck`, `tests`, `deps-cve`, `deps-licenses`,
+`deps-verify-sources`, `deps-report`. The gitleaks baseline is 0 (history
+measured clean at adoption; `.gitleaks.toml` has no allowlist — this repo's
+tests embed no credential-shaped fixtures). License policy: ADR-031. CVE
+ignores (torch/setuptools, no reachable fix): `osv-scanner.toml` + the
+`deps-cve` recipe flags, tied to the next torch bump.
 
 ## Architecture
 

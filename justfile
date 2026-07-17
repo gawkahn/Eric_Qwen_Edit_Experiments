@@ -1,6 +1,6 @@
-# Quality-gate recipes (kit adoption 2026-07-16 — secrets, commit-policy,
-# sast, and supply-chain adopted; types/tests still pending, see the kit
-# README in ~/.claude/templates/quality-gate-kit-python-uv/).
+# Quality-gate recipes (kit adoption 2026-07-16 — ALL SIX GATES: secrets,
+# commit-policy, sast, supply-chain, types, tests; kit README at
+# ~/.claude/templates/quality-gate-kit-python-uv/).
 # Requires: mise (pins in mise.toml), uv.
 
 # --redact keeps secret values out of the output; 0-baseline hard gate.

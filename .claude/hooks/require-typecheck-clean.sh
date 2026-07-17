@@ -19,8 +19,11 @@ set -euo pipefail
 # ─── project-specific config (ADR-032) ──────────────────────────────────────
 TYPECHECK_CMD="mise exec -- pyright"   # scope comes from pyproject [tool.pyright]
 BASELINE_FILE="${CLAUDE_PROJECT_DIR:-.}/.claude/typecheck-baseline"
-# pyright prints "N errors, M warnings, K informations".
-extract_count() { grep -oE '[0-9]+ error' | head -1 | grep -oE '[0-9]+' || true; }
+# pyright's summary is its LAST line: "N errors, M warnings, K informations".
+# Anchor on that shape and take the last match — a diagnostic message that
+# happens to contain "N error" text must not be parsed as the count
+# (code-reviewer 2026-07-16).
+extract_count() { grep -oE '^[0-9]+ errors?, [0-9]+ warning' | tail -1 | grep -oE '^[0-9]+' || true; }
 # ────────────────────────────────────────────────────────────────────────────
 
 input=$(cat)
@@ -37,6 +40,11 @@ if printf '%s' "$command" | grep -qE '[[:space:]]+#[[:space:]]+user-approved[[:s
     exit 0
 fi
 
+# Run from the project root — a `git -C <repo> commit` from elsewhere must not
+# typecheck the wrong tree (0 errors from an empty cwd would pass trivially;
+# a different repo's count could wedge a clean commit — code-reviewer 2026-07-16).
+cd "${CLAUDE_PROJECT_DIR:-.}"
+
 # Run the checker. Fail OPEN on any inability to produce a numeric count —
 # the local hook is convenience; CI is the real gate.
 output=$(eval "$TYPECHECK_CMD" 2>&1) || true
@@ -46,8 +54,17 @@ if ! printf '%s' "$current" | grep -qE '^[0-9]+$'; then
     exit 0
 fi
 
+# Baseline comes from HEAD, not the working tree — otherwise a commit that
+# introduces new errors AND bumps the integer in the same commit would
+# self-legalize past the ratchet (code-reviewer 2026-07-16, MEDIUM). A
+# legitimate drawdown (lowering the baseline) still passes: the current count
+# is compared against HEAD's higher number. Deliberate INCREASES need the
+# `# user-approved` override (or Policy-override at the git-policy layer).
 baseline=0
-if [ -f "$BASELINE_FILE" ]; then
+head_baseline=$(git show HEAD:.claude/typecheck-baseline 2>/dev/null | tr -dc '0-9' || true)
+if [ -n "$head_baseline" ]; then
+    baseline=$head_baseline
+elif [ -f "$BASELINE_FILE" ]; then
     baseline=$(tr -dc '0-9' < "$BASELINE_FILE")
     [ -n "$baseline" ] || baseline=0
 fi
