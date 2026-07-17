@@ -20,6 +20,10 @@ torchvision==0.26.0
 # torchao provides the fp8 quantize-on-load backend (ADR-019 slice A).
 # Torch-ecosystem package — keep its pin moving with torch's.
 torchao==0.17.0
+# mslk (ex-FBGEMM GenAI): fast triton nvfp4 quantize kernel behind torchao's
+# NVFP4 configs (ADR-019 slice NV). 1.1.x is the stable line for torch 2.11.x;
+# plain-PyPI wheel, declares only numpy. Keep moving with torch's minor.
+mslk-cuda==1.1.0
 # diffusers 0.39.0 (released 2026-07-03): first PyPI release with Krea2 —
 # replaces the krea-testing git pin (was rev 29a59fd9, 0.39.0.dev0).
 diffusers==0.39.0

@@ -37,6 +37,14 @@ dependencies = [
     # diffusers TorchAoConfig + Float8DynamicActivationFloat8WeightConfig.
     # Torch-ecosystem package — keep its pin moving with torch's.
     "torchao==0.17.0",
+    # mslk (Meta Superintelligence Labs Kernels, ex-FBGEMM GenAI) provides the
+    # fast triton nvfp4 quantize kernel torchao's NVFP4 configs route through
+    # (ADR-019 slice NV). mslk 1.1.x is the stable line FOR torch 2.11.x;
+    # 1.1.0 from plain PyPI (no custom index — this file must stay
+    # pip-compatible) already carries the load-bearing int32→int64 offset fix
+    # for >2^31-element activation tensors (MSLK PR #239). Declares only
+    # numpy. Keep its pin moving with torch's minor.
+    "mslk-cuda==1.1.0",
     # diffusers 0.39.0 (released 2026-07-03) is the first PyPI release with
     # Krea2Pipeline / Krea2Transformer2DModel — replaces the krea-testing git
     # pin (was rev 29a59fd9, 0.39.0.dev0). This pin is what ends the branch's

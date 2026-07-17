@@ -274,6 +274,7 @@ dependencies = [
     { name = "diffusers" },
     { name = "ftfy" },
     { name = "mcp" },
+    { name = "mslk-cuda" },
     { name = "numpy" },
     { name = "peft" },
     { name = "pillow" },
@@ -300,6 +301,7 @@ requires-dist = [
     { name = "diffusers", specifier = "==0.39.0" },
     { name = "ftfy", specifier = "==6.3.1" },
     { name = "mcp", specifier = "==1.28.1" },
+    { name = "mslk-cuda", specifier = "==1.1.0" },
     { name = "numpy", specifier = "==2.4.4" },
     { name = "peft", specifier = "==0.18.1" },
     { name = "pillow", specifier = "==12.3.0" },
@@ -797,6 +799,20 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/e0/47/dd32fa426cc72114383ac549964eecb20ecfd886d1e5ccf5340b55b02f57/mpmath-1.3.0.tar.gz", hash = "sha256:7a28eb2a9774d00c7bc92411c19a89209d5da7c4c9a9e227be8330a23a25b91f", size = 508106, upload-time = "2023-03-07T16:47:11.061Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/43/e3/7d92a15f894aa0c9c4b49b8ee9ac9850d6e63b03c9c32c0367a13ae62209/mpmath-1.3.0-py3-none-any.whl", hash = "sha256:a0b2b9fe80bbcd81a6647ff13108738cfb482d481d826cc0e02f5b35e5c88d2c", size = 536198, upload-time = "2023-03-07T16:47:09.197Z" },
+]
+
+[[package]]
+name = "mslk-cuda"
+version = "1.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e1/15/1d851cfa9acc5db4cfa601f735a2edd2d99c443b03003204dfdadf37551f/mslk_cuda-1.1.0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:7460a51991b1864f91a4e049734bb0788dddff9b92ffbd5a66c118fd281255cc", size = 44475682, upload-time = "2026-03-25T20:08:09.801Z" },
+    { url = "https://files.pythonhosted.org/packages/3b/86/dcb83c6b11811374cb9064eb8a37669e76fc6233673c0e27341d97846338/mslk_cuda-1.1.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:64bec303faa3f4ba3ca96923988ff469469a13ccf214c885eb1aeec5bf6e8cb1", size = 44475510, upload-time = "2026-03-25T20:08:24.08Z" },
+    { url = "https://files.pythonhosted.org/packages/fc/79/330e26bddd6f7e9b992ef53b2e04cbf67fad42f857df413d3f19cbdf3ceb/mslk_cuda-1.1.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:09c1950a28b2ed381dc3ae4104b9bfea65fc884c9b6c13ebd82203113cfbc412", size = 42879829, upload-time = "2026-03-25T20:09:13.102Z" },
+    { url = "https://files.pythonhosted.org/packages/25/75/8b416a3cfe31c70a5cd8c66d110752f9027d0203eca949fc7f2e89bca7db/mslk_cuda-1.1.0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:4e1d9e6e4050a4aea3382b3faaa5b58d5b5b0ed1ce34574d664d0f7b11800a84", size = 42879829, upload-time = "2026-03-25T20:08:34.968Z" },
 ]
 
 [[package]]
