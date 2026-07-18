@@ -1447,3 +1447,30 @@ takes the ADR-reference + security-auditor route — not a drive-by on the unit
 slice. **Trigger:** first real dual-launch collision, or the next
 `run_server` change. Surfaced by infra-auditor
 (docs/security/review-systemd-daemon-unit-2026-07-17.md, SHOULD 2).
+
+**Daemon LoRA path misses weight application + ignores weight-only changes** *(2026-07-17)*
+The `_apply_loras` weight fix (cumulative `set_adapters`, this date) covers
+the CLI/MCP paths only. `comfyless/server.py` (~:690-712) calls
+`load_lora_with_key_fix` directly with no post-load `set_adapters` — daemon
+LoRAs run at FULL trained strength regardless of the requested weight (the
+exact bug just fixed elsewhere; Grant's mystic/mcnl noise repros ran through
+the daemon). Worse, the LoRA diff keys on PATH only (`if lora_spec["path"]
+in loaded_paths: continue`), so a weight-only change on an already-loaded
+LoRA is silently ignored.
+Why not now: `server.py` is a Red Zone path (security-auditor + saved review
+required); folding it into the CLI-side fix slice would be scope creep into
+a gated file (review finding 2, 2026-07-17).
+Trigger: next `server.py` slice — treat as its FIRST item; until then,
+LoRA-weight-sensitive work should run foreground (no daemon on that GPU).
+
+**Node LoRA stacker: per-adapter singleton set_adapters deactivates earlier stack entries** *(2026-07-17)*
+`nodes/eric_diffusion_lora_stacker.py` (~:196-206) calls
+`_set_adapters_safe(pipe, name, w)` per adapter; diffusers' `set_adapters`
+REPLACES the active-adapter set, so in a multi-LoRA stack only the LAST
+adapter stays active at stage 1 on real diffusers (review finding 5,
+2026-07-17). The comfyless path now uses one cumulative call — same pattern
+applies here.
+Why not now: node-pack UI path, out of the comfyless fix slice's scope;
+needs a ComfyUI-side test pass.
+Trigger: next touch of the stacker node, or a user report of a multi-LoRA
+stack where only one LoRA takes effect.

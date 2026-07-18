@@ -1195,6 +1195,23 @@ def unload_adapters(pipe, adapter_names, log_prefix: str = "[LoRA]") -> None:
                   f"'{adapter_name}': {e}")
 
 
+def is_direct_merge_adapter(pipe, adapter_name: str) -> bool:
+    """True when `adapter_name` was applied via direct weight merge.
+
+    Direct-merge adapters bake the user weight into the model parameters at
+    merge time and have no PEFT tuner layers — ``set_adapters()`` must not
+    be pointed at them (it would either error or silently no-op). The
+    ``_type`` sniff matches the registry entries the direct-merge path
+    writes into ``transformer.peft_config``.
+    """
+    transformer = getattr(pipe, "transformer", None)
+    if transformer is None:
+        return False
+    peft_cfg = getattr(transformer, "peft_config", {})
+    cfg = peft_cfg.get(adapter_name, {})
+    return isinstance(cfg, dict) and cfg.get("_type", "").endswith("_direct")
+
+
 def _set_adapters_safe(pipe, adapter_name: str, weight: float,
                        log_prefix: str = "[LoRA]") -> None:
     """Call ``pipe.set_adapters()`` with graceful handling for direct-merge
@@ -1205,17 +1222,14 @@ def _set_adapters_safe(pipe, adapter_name: str, weight: float,
     parameters at load time, so ``set_adapters()`` is a no-op and we just
     log a note.
     """
-    # Check if this is a direct-merge adapter
-    transformer = getattr(pipe, "transformer", None)
-    if transformer is not None:
-        peft_cfg = getattr(transformer, "peft_config", {})
-        cfg = peft_cfg.get(adapter_name, {})
-        if isinstance(cfg, dict) and cfg.get("_type", "").endswith("_direct"):
-            if abs(weight - cfg.get("_weight", 1.0)) > 1e-6:
-                print(f"{log_prefix} NOTE: '{adapter_name}' was loaded via "
-                      f"direct weight merge (weight={cfg.get('_weight', 1.0)})."
-                      f" Changing weight requires reloading the LoRA.")
-            return
+    if is_direct_merge_adapter(pipe, adapter_name):
+        transformer = getattr(pipe, "transformer", None)
+        cfg = getattr(transformer, "peft_config", {}).get(adapter_name, {})
+        if abs(weight - cfg.get("_weight", 1.0)) > 1e-6:
+            print(f"{log_prefix} NOTE: '{adapter_name}' was loaded via "
+                  f"direct weight merge (weight={cfg.get('_weight', 1.0)})."
+                  f" Changing weight requires reloading the LoRA.")
+        return
 
     try:
         pipe.set_adapters([adapter_name], adapter_weights=[weight])
