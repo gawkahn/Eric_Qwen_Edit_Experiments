@@ -627,7 +627,6 @@ def _handle_generate(
     # ── LoRA diff ─────────────────────────────────────────────────────
     requested_loras = req.get("loras") or []
     requested_paths = {l["path"] for l in requested_loras}
-    loaded_paths    = {l["path"] for l in loaded_loras}
 
     # Remove dropped LoRAs; on failure evict and reload pipeline from scratch.
     to_remove = [l for l in loaded_loras if l["path"] not in requested_paths]
@@ -635,7 +634,6 @@ def _handle_generate(
         try:
             pipe.delete_adapters([lora_rec["adapter_name"]])
             loaded_loras.remove(lora_rec)
-            loaded_paths.discard(lora_rec["path"])
             _log(f"[server] LoRA removed: {lora_rec['path']}")
         except Exception as e:
             _log(f"[server] LoRA removal failed ({e}) — evicting refiner + pipeline and reloading")
@@ -681,16 +679,37 @@ def _handle_generate(
                 "refiner_pipeline": refiner_pipe,
             })
             loaded_loras = server_state["loaded_loras"]
-            loaded_paths = set()
             break  # all prior LoRAs are gone; add everything fresh below
 
-    # Add LoRAs not yet applied
+    # Add LoRAs not yet applied; update weights on already-loaded ones
+    # (slice DLW — the old diff keyed on path alone, so a weight-only
+    # change was silently ignored on the unquantized incremental path).
     lora_warnings: list = []
+    loaded_by_path = {l["path"]: l for l in loaded_loras}
     for lora_spec in requested_loras:
-        if lora_spec["path"] in loaded_paths:
-            continue
         lora_path    = lora_spec["path"]
         lora_weight  = float(lora_spec.get("weight", 1.0))
+        rec = loaded_by_path.get(lora_path)
+        if rec is not None:
+            if abs(rec["weight"] - lora_weight) <= 1e-9:
+                continue
+            from nodes.eric_qwen_edit_lora import is_direct_merge_adapter
+            if is_direct_merge_adapter(pipe, rec["adapter_name"]):
+                # Direct-merge adapters bake weight at merge time — a new
+                # weight CANNOT take effect without a reload. Loud, never
+                # silent (invariant 3); the old weight keeps serving.
+                msg = (f"LoRA weight change ignored for direct-merge "
+                       f"adapter (loaded at {rec['weight']}, requested "
+                       f"{lora_weight}) — reload the daemon or change "
+                       f"another parameter to force a fresh load: "
+                       f"{lora_path}")
+                _log(f"[server] WARNING: {msg}")
+                lora_warnings.append(msg)
+            else:
+                rec["weight"] = lora_weight
+                _log(f"[server] LoRA weight updated: {lora_path} -> "
+                     f"{lora_weight}")
+            continue
         adapter_name = sanitize_adapter_name(Path(lora_path).stem)
         try:
             success = load_lora_with_key_fix(
@@ -701,6 +720,12 @@ def _handle_generate(
             if success:
                 loaded_loras.append({"path": lora_path, "weight": lora_weight,
                                      "adapter_name": adapter_name})
+                # Register immediately so a duplicate path later in THIS
+                # request takes the weight-update branch (last wins) instead
+                # of double-loading under the same adapter name (review
+                # finding 1 — a direct-merge second load would merge twice
+                # into the served pipeline).
+                loaded_by_path[lora_path] = loaded_loras[-1]
                 _log(f"[server] LoRA loaded: {lora_path}")
             else:
                 msg = f"LoRA skipped (0 modules): {lora_path}"
@@ -710,6 +735,19 @@ def _handle_generate(
             msg = f"LoRA load failed: {lora_path}: {e}"
             _log(f"[server] WARNING: {msg}")
             lora_warnings.append(msg)
+
+    # Cumulative weight application over the FULL active set (slice DLW —
+    # the daemon previously never called set_adapters, so every PEFT
+    # adapter served at full trained strength regardless of the requested
+    # weight; the same tier-1 gap fixed on the CLI path in 1f52672).
+    # Covers newly-added, weight-updated, AND surviving adapters after a
+    # removal. Idempotent across requests.
+    if loaded_loras:
+        from .generate import apply_adapter_weights
+        _w = apply_adapter_weights(
+            pipe, [(l["adapter_name"], l["weight"]) for l in loaded_loras])
+        if _w:
+            lora_warnings.append(_w)
 
     # ── ADR-030: upscale VAE cache ────────────────────────────────────
     # Cached INDEPENDENTLY of the pipeline (its own key, not in

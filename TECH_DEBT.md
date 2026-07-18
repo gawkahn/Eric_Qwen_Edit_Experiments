@@ -1462,6 +1462,15 @@ required); folding it into the CLI-side fix slice would be scope creep into
 a gated file (review finding 2, 2026-07-17).
 Trigger: next `server.py` slice — treat as its FIRST item; until then,
 LoRA-weight-sensitive work should run foreground (no daemon on that GPU).
+Resolved: 2026-07-17 — slice DLW, same day: `apply_adapter_weights`
+extracted as the shared cumulative scaler (generate.py), daemon add-loop
+made weight-aware (PEFT weight-only changes apply in place; direct-merge
+weight changes warn loudly and keep the baked weight; duplicate paths in
+one request load once, last weight wins), one cumulative call over the
+full active set per request. security-auditor delta PASS-with-conditions
+(F10 fixed in-slice, F11 → its own TECH_DEBT entry below); code-reviewer
+findings folded. See docs/security/review-slice-DLW-daemon-lora-weights-
+2026-07-17.md + docs/vision/slice-DLW-daemon-lora-weights.md.
 
 **Node LoRA stacker: per-adapter singleton set_adapters deactivates earlier stack entries** *(2026-07-17)*
 `nodes/eric_diffusion_lora_stacker.py` (~:196-206) calls
@@ -1474,3 +1483,21 @@ Why not now: node-pack UI path, out of the comfyless fix slice's scope;
 needs a ComfyUI-side test pass.
 Trigger: next touch of the stacker node, or a user report of a multi-LoRA
 stack where only one LoRA takes effect.
+
+**Nonfinite LoRA weights pass the daemon boundary** *(2026-07-17)*
+`json.loads` at the socket accepts `NaN`/`Infinity` and `validate_lora_entry`
+type-checks weight as float with no `isfinite` gate. A same-uid client (or
+the future model-driven `--json` client) sending `"weight": NaN` causes:
+unquantized path — perpetual weight-change churn (`abs(rec - NaN) <= eps` is
+always False) and `set_adapters(NaN)` garbage output; quantized path —
+`NaN != NaN` makes the cache key never match → full evict+reload every
+request (availability churn, DQ F7 class). `refine.py` already rejects
+nonfinite at its LLM boundary (`parse_constant`); the daemon boundary is the
+odd one out. (Security review DLW F11, 2026-07-17.)
+Why not now: `params_validation.py` / the socket parse are outside slice
+DLW's declared edit scope — folding them in would be scope creep into a
+separately-gated boundary.
+Trigger: BINDING precondition of the `--json`/LLM-agent wiring commit (Red
+Zone per the Review bar), or the next `params_validation.py` slice,
+whichever comes first. Fix: `math.isfinite` in `validate_lora_entry` +
+`parse_constant` rejection at the socket `json.loads`.

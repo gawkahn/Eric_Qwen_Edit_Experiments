@@ -1151,43 +1151,63 @@ def _apply_loras(pipe, loras: Optional[List[Dict[str, Any]]]) -> List[Dict[str, 
     # tier-1 fast path — pipe.load_lora_weights + return — never applied
     # `weight`, so every fast-path LoRA silently ran at full trained
     # strength; the mystic/mcnl noise investigation surfaced it).
-    # Direct-merge adapters bake weight at merge time and are EXCLUDED.
-    # ONE cumulative set_adapters call: diffusers' set_adapters REPLACES
-    # the active-adapter set, so per-adapter singleton calls would
-    # deactivate every earlier adapter in a multi-LoRA run.
-    from nodes.eric_qwen_edit_lora import is_direct_merge_adapter
-    peft_applied = [
+    apply_adapter_weights(pipe, [
         (o["adapter_name"], float((loras[i] or {}).get("weight", 1.0)))
-        for i, o in enumerate(outcomes)
-        if o["applied"] and not is_direct_merge_adapter(pipe,
-                                                        o["adapter_name"])
-    ]
-    if peft_applied:
-        names = [n for n, _ in peft_applied]
-        weights = [w for _, w in peft_applied]
-        # Kohya-style LoRAs may carry a text-encoder half loaded under
-        # "<name>_te" (_apply_te_lora): set_adapters REPLACES the active
-        # set on EVERY component, so omitting the TE names would silently
-        # deactivate them (review finding 1). Same weight as the parent.
-        try:
-            _listed = pipe.get_list_adapters()
-            _known = {n for _comp in _listed.values() for n in _comp}
-        except Exception:  # noqa: BLE001 — discovery is best-effort
-            _known = set()
-        for _n, _w in list(peft_applied):
-            if f"{_n}_te" in _known:
-                names.append(f"{_n}_te")
-                weights.append(_w)
-        try:
-            pipe.set_adapters(names, adapter_weights=weights)
-            _log(f"[comfyless] LoRA weights applied: "
-                 f"{dict(zip(names, weights))}")
-        except Exception as e:  # noqa: BLE001 — scaling failure must not
-            # kill generation; the adapter IS loaded (at scale 1.0), so
-            # warn loudly instead (warn-don't-block).
-            _log(f"[comfyless] WARNING: set_adapters failed — LoRA(s) "
-                 f"{names} remain at full strength: {e}")
+        for i, o in enumerate(outcomes) if o["applied"]
+    ])
     return outcomes
+
+
+def apply_adapter_weights(pipe, pairs) -> Optional[str]:
+    """Scale PEFT-backed adapters with ONE cumulative set_adapters call.
+
+    `pairs` is [(adapter_name, weight)] for every adapter meant to be
+    ACTIVE — the full set, not a delta: diffusers' set_adapters REPLACES
+    the active-adapter set, so per-adapter singleton calls would
+    deactivate every earlier adapter in a multi-LoRA run. Direct-merge
+    adapters (weight baked at merge time) are EXCLUDED here; Kohya
+    "<name>_te" text-encoder halves ride at the parent's weight (a
+    replaced active set that omits them would silently deactivate them).
+    Shared by _apply_loras (CLI/MCP) and the daemon LoRA diff (slice DLW).
+
+    Returns a warning string when scaling failed (adapters stay loaded at
+    full strength — warn-don't-block), else None.
+    """
+    from nodes.eric_qwen_edit_lora import is_direct_merge_adapter
+    peft_pairs = [(n, w) for n, w in pairs
+                  if not is_direct_merge_adapter(pipe, n)]
+    if not peft_pairs:
+        return None
+    names = [n for n, _ in peft_pairs]
+    weights = [w for _, w in peft_pairs]
+    discovery_warn = None
+    try:
+        _listed = pipe.get_list_adapters()
+        _known = {n for _comp in _listed.values() for n in _comp}
+    except Exception as e:  # noqa: BLE001
+        # Never silent (security review DLW F10): with discovery down we
+        # cannot see Kohya "_te" halves, and the replacing set_adapters
+        # call below would deactivate any that exist.
+        _known = set()
+        discovery_warn = (f"adapter discovery failed ({e}) — Kohya "
+                          f"text-encoder LoRA halves, if any, may be "
+                          f"inactive")
+        _log(f"[comfyless] WARNING: {discovery_warn}")
+    for _n, _w in peft_pairs:
+        if f"{_n}_te" in _known:
+            names.append(f"{_n}_te")
+            weights.append(_w)
+    try:
+        pipe.set_adapters(names, adapter_weights=weights)
+        _log(f"[comfyless] LoRA weights applied: {dict(zip(names, weights))}")
+        return discovery_warn
+    except Exception as e:  # noqa: BLE001 — scaling failure must not kill
+        # generation; the adapters ARE loaded.
+        msg = (f"set_adapters failed — LoRA(s) {names} remain at their "
+               f"previously applied scale (full trained strength if never "
+               f"scaled): {e}")
+        _log(f"[comfyless] WARNING: {msg}")
+        return msg if not discovery_warn else f"{discovery_warn}; {msg}"
 
 
 def lora_failure_warnings(outcomes: List[Dict[str, Any]]) -> List[str]:

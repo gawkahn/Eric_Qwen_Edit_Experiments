@@ -1115,6 +1115,226 @@ finally:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Slice DLW: daemon LoRA weight application. The old add-loop keyed the
+# diff on path alone (weight-only changes silently ignored) and never
+# called set_adapters (every PEFT adapter served at full trained
+# strength — the tier-1 gap fixed on the CLI path in 1f52672).
+print("── slice DLW: daemon LoRA weights ─────────────────────────────")
+
+import comfyless.generate as _gen2
+import nodes.eric_qwen_edit_lora as _nlora
+
+
+import types as _types
+
+
+class _FakeLoraPipe:
+    def __init__(self, peft_config=None):
+        self.transformer = _types.SimpleNamespace(
+            peft_config=peft_config or {})
+        self.deleted = []
+        self.set_adapters_calls = []
+
+    def delete_adapters(self, names):
+        self.deleted.extend(names)
+
+    def get_list_adapters(self):
+        return {}
+
+    def set_adapters(self, names, adapter_weights=None):
+        self.set_adapters_calls.append((list(names), list(adapter_weights)))
+
+
+_dlw_load_calls: list = []
+_dlw_apply_calls: list = []
+_dlw_apply_result: list = [None]
+
+
+def _dlw_fake_loader(pipe, lora_path, adapter_name, log_prefix="[t]",
+                     weight=1.0):
+    _dlw_load_calls.append((lora_path, adapter_name, weight))
+    return True
+
+
+def _dlw_fake_apply(pipe, pairs):
+    _dlw_apply_calls.append(list(pairs))
+    return _dlw_apply_result[0]
+
+
+_orig_nlora_loader = _nlora.load_lora_with_key_fix
+_orig_apply = _gen2.apply_adapter_weights
+_orig_load2 = _gen2._load_pipeline
+_orig_generate2 = _gen2.generate
+_dlw_pipe_holder: list = []
+
+
+def _dlw_fake_load(model_path, **kw):
+    pipe = _FakeLoraPipe()
+    _dlw_pipe_holder.append(pipe)
+    return pipe, "qwen-image", False
+
+
+_nlora.load_lora_with_key_fix = _dlw_fake_loader
+_gen2.apply_adapter_weights = _dlw_fake_apply
+_gen2._load_pipeline = _dlw_fake_load
+_gen2.generate = lambda **kw: {"model_family": "qwen-image"}
+try:
+    _outdir2 = tempfile.mkdtemp()
+    _la = os.path.join(_outdir2, "la.safetensors")
+    _lb = os.path.join(_outdir2, "lb.safetensors")
+    for _p in (_la, _lb):
+        open(_p, "wb").close()
+
+    # 1. Fresh load of two LoRAs → ONE cumulative apply over both, at the
+    #    requested weights (NEGATIVE vs pre-slice: apply was never called).
+    _state2: dict = {}
+    _r = srv._handle_generate(
+        {"type": "generate", "model": _outdir2, "prompt": "x",
+         "loras": [{"path": _la, "weight": 0.7},
+                   {"path": _lb, "weight": 0.5}]},
+        _outdir2, _outdir2, "cuda", "bf16", _state2,
+    )
+    check("DLW: request ok", _r.get("status") == "ok", f"{_r!r}")
+    check("DLW: cumulative apply called once with both adapters at the "
+          "requested weights (invariant 1)",
+          len(_dlw_apply_calls) == 1
+          and [w for _, w in _dlw_apply_calls[0]] == [0.7, 0.5],
+          f"calls {_dlw_apply_calls}")
+
+    # 2. Weight-only change on a PEFT adapter → NO reload; record updated;
+    #    apply carries the new weight (invariant 2 — the old path-only
+    #    diff silently ignored this, which would fail here).
+    _n_loads = len(_dlw_load_calls)
+    _dlw_apply_calls.clear()
+    _r2 = srv._handle_generate(
+        {"type": "generate", "model": _outdir2, "prompt": "x",
+         "loras": [{"path": _la, "weight": 0.3},
+                   {"path": _lb, "weight": 0.5}]},
+        _outdir2, _outdir2, "cuda", "bf16", _state2,
+    )
+    check("DLW: weight-only change reloads NOTHING",
+          len(_dlw_load_calls) == _n_loads, f"loads {_dlw_load_calls}")
+    check("DLW: weight-only change applies the NEW weight (invariant 2 "
+          "NEGATIVE vs old behavior)",
+          _dlw_apply_calls and [w for _, w in _dlw_apply_calls[0]] == [0.3, 0.5],
+          f"calls {_dlw_apply_calls}")
+    check("DLW: loaded_loras record updated",
+          _state2["loaded_loras"][0]["weight"] == 0.3,
+          f"{_state2['loaded_loras']}")
+
+    # 3. Weight-only change on a DIRECT-MERGE adapter → loud warning in
+    #    metadata, record keeps the baked weight (invariant 3).
+    _pipe = _state2["pipeline"]
+    _an = _state2["loaded_loras"][0]["adapter_name"]
+    _pipe.transformer.peft_config = {_an: {"_type": "lora_direct",
+                                           "_weight": 0.3}}
+    _dlw_apply_calls.clear()
+    _r3 = srv._handle_generate(
+        {"type": "generate", "model": _outdir2, "prompt": "x",
+         "loras": [{"path": _la, "weight": 0.9},
+                   {"path": _lb, "weight": 0.5}]},
+        _outdir2, _outdir2, "cuda", "bf16", _state2,
+    )
+    _md3 = _r3.get("metadata") or {}
+    check("DLW: direct-merge weight change warns loudly (invariant 3)",
+          any("weight change ignored" in w
+              for w in _md3.get("lora_warnings", [])),
+          f"md {_md3!r}")
+    check("DLW: direct-merge record keeps the baked weight (NEGATIVE — "
+          "never silently pretend)",
+          _state2["loaded_loras"][0]["weight"] == 0.3,
+          f"{_state2['loaded_loras']}")
+    _pipe.transformer.peft_config = {}
+
+    # 4. Removal re-pins survivors: dropping lb leaves apply covering la
+    #    only (cumulative over the FULL active set).
+    _dlw_apply_calls.clear()
+    srv._handle_generate(
+        {"type": "generate", "model": _outdir2, "prompt": "x",
+         "loras": [{"path": _la, "weight": 0.3}]},
+        _outdir2, _outdir2, "cuda", "bf16", _state2,
+    )
+    check("DLW: dropped LoRA deleted from the pipe",
+          _pipe.deleted != [], f"deleted {_pipe.deleted}")
+    check("DLW: apply re-pins the SURVIVING adapter only",
+          _dlw_apply_calls and len(_dlw_apply_calls[0]) == 1
+          and _dlw_apply_calls[0][0][1] == 0.3,
+          f"calls {_dlw_apply_calls}")
+
+    # 5. apply_adapter_weights warning surfaces in response metadata.
+    _dlw_apply_result[0] = "set_adapters failed — LoRA(s) ['x'] remain"
+    _r5 = srv._handle_generate(
+        {"type": "generate", "model": _outdir2, "prompt": "x",
+         "loras": [{"path": _la, "weight": 0.3}]},
+        _outdir2, _outdir2, "cuda", "bf16", _state2,
+    )
+    _md5 = _r5.get("metadata") or {}
+    check("DLW: scaling-failure warning surfaces in metadata "
+          "(warn-don't-block)",
+          any("set_adapters failed" in w
+              for w in _md5.get("lora_warnings", [])), f"md {_md5!r}")
+    _dlw_apply_result[0] = None
+
+    # 6. No LoRAs → apply never called (no gratuitous set_adapters on
+    #    LoRA-free pipelines — NEGATIVE).
+    _dlw_apply_calls.clear()
+    srv._handle_generate(
+        {"type": "generate", "model": _outdir2, "prompt": "x"},
+        _outdir2, _outdir2, "cuda", "bf16", {})
+    check("DLW: LoRA-free request never touches set_adapters (NEGATIVE)",
+          _dlw_apply_calls == [], f"calls {_dlw_apply_calls}")
+
+    # 7. Duplicate path within ONE request loads once, last weight wins
+    #    (review finding 1 — the second occurrence must take the
+    #    weight-update branch, never double-load under the same adapter
+    #    name, which for a direct-merge fallback would merge twice into
+    #    the served pipeline).
+    _dlw_load_calls.clear()
+    _dlw_apply_calls.clear()
+    _state7: dict = {}
+    srv._handle_generate(
+        {"type": "generate", "model": _outdir2, "prompt": "x",
+         "loras": [{"path": _la, "weight": 0.7},
+                   {"path": _la, "weight": 0.4}]},
+        _outdir2, _outdir2, "cuda", "bf16", _state7,
+    )
+    check("DLW: duplicate path in one request loads ONCE (finding 1 "
+          "NEGATIVE)", len(_dlw_load_calls) == 1,
+          f"loads {_dlw_load_calls}")
+    check("DLW: duplicate path — last weight wins, one record",
+          len(_state7["loaded_loras"]) == 1
+          and _state7["loaded_loras"][0]["weight"] == 0.4
+          and _dlw_apply_calls[-1] == [(_state7["loaded_loras"][0]
+                                        ["adapter_name"], 0.4)],
+          f"recs {_state7['loaded_loras']} calls {_dlw_apply_calls}")
+
+    # 8. Seam test: run ONE scenario with the REAL apply_adapter_weights
+    #    (reviewer f) — pins the [(name, weight)] pair contract end-to-end
+    #    so both suites can't drift apart while the integration breaks.
+    _gen2.apply_adapter_weights = _orig_apply
+    _state8: dict = {}
+    srv._handle_generate(
+        {"type": "generate", "model": _outdir2, "prompt": "x",
+         "loras": [{"path": _la, "weight": 0.6}]},
+        _outdir2, _outdir2, "cuda", "bf16", _state8,
+    )
+    _pipe8 = _state8["pipeline"]
+    check("DLW: REAL helper end-to-end — daemon pipe receives the "
+          "cumulative set_adapters call (seam pin)",
+          _pipe8.set_adapters_calls
+          and _pipe8.set_adapters_calls[-1][1] == [0.6],
+          f"calls {_pipe8.set_adapters_calls}")
+    _gen2.apply_adapter_weights = _dlw_fake_apply
+finally:
+    _nlora.load_lora_with_key_fix = _orig_nlora_loader
+    _gen2.apply_adapter_weights = _orig_apply
+    _gen2._load_pipeline = _orig_load2
+    _gen2.generate = _orig_generate2
+    import shutil as _sh
+    _sh.rmtree(_outdir2, ignore_errors=True)
+
+
+# ──────────────────────────────────────────────────────────────────────
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print("──────────────────────────────────────────────────")
