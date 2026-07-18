@@ -554,6 +554,15 @@ ADR-blessed "upcast on load" shim, NOT the dead offline-script direction).
 CAUTION: the old `dequantize_nf4.py` failed for undiagnosed reasons; any
 implementation needs a numeric cross-check against bitsandbytes' own
 dequantize (one-off scratch install, not a pinned dep) before trusting it.
+Resolved: 2026-07-17 — trigger fired (Grant actively wants projectGaia;
+only released form is NF4). ADR-019 slice NF4 shipped same day (7171d71):
+"bnb4" classifier branch + pure-torch dequant-to-bf16 in fp8_ops (no bnb
+dep), goldens proven against bitsandbytes 0.49.2 (the old dequantize_nf4.py
+was NOT ported — its undiagnosed failure is moot), security contract reqs
+67-90 + delta addendum, both real files load (UNET + AIO, 314 families,
+11.90B-param FluxTransformer2DModel). Live generation gate passed by Grant
+2026-07-17 ("works" — Flux.1 quality itself underwhelming, but that's the
+model, not the loader).
 Trigger: a second wanted NF4 model appears, OR projectGaia becomes a model
 Grant actually reaches for.
 See `docs/decisions/ADR-019-native-quantization-support.md`,

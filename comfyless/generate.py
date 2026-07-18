@@ -2170,6 +2170,20 @@ def _run_json_mode() -> int:
 
 def _run_serve_mode(args: argparse.Namespace) -> int:
     """Start the persistent model server and block until --unload is received."""
+    # Daemon logs are line-oriented (journald under systemd): tqdm-style
+    # progress bars (transformers' per-tensor "Loading weights", HF Hub
+    # downloads, diffusers shard loading) emit ANSI cursor escapes that
+    # journald renders as one "[74B blob data]" line per refresh — hundreds
+    # per model load. Foreground CLI keeps its bars; the daemon disables
+    # them at startup.
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    for _modname in ("transformers", "diffusers"):
+        try:
+            _mod = __import__(f"{_modname}.utils.logging",
+                              fromlist=["disable_progress_bar"])
+            _mod.disable_progress_bar()
+        except Exception:  # noqa: BLE001 — logging cosmetics, never fatal
+            pass
     from .server import run_server
     if not args.model_base:
         print("Error: --model-base is required with --serve", file=sys.stderr)
