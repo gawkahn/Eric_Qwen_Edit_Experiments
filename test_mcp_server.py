@@ -1706,6 +1706,33 @@ with tempfile.TemporaryDirectory() as _td:
         detail=f"got {cat_mod.scan_model_family(_d)!r}",
     )
 
+# Z-Image-Turbo dir: the scan classifies via the "turbo" name-hint but must
+# stay SILENT — scan_model_family runs on every model dir under the roots, so
+# the Turbo-inference INFO print would fire for Z-Image dirs that merely EXIST,
+# reading as "wrong model loaded" when the target is something else entirely
+# (observed on the refine path 2026-07-18; announce=False at the call site).
+# The load path (detect_pipeline_class) still announces.
+import contextlib as _scan_ctl  # noqa: E402
+
+with tempfile.TemporaryDirectory() as _td:
+    _d = os.path.join(_td, "Z-Image-Turbo")
+    os.makedirs(_d)
+    with open(os.path.join(_d, "model_index.json"), "w") as f:
+        json.dump({"_class_name": "ZImagePipeline"}, f)
+    _scan_out = io.StringIO()
+    with _scan_ctl.redirect_stdout(_scan_out):
+        _fam = cat_mod.scan_model_family(_d)
+    check(
+        "scan_model_family Z-Image-Turbo dir -> 'zimage-turbo'",
+        _fam == "zimage-turbo",
+        detail=f"got {_fam!r}",
+    )
+    check(
+        "scan_model_family prints NO Turbo-inference notice (announce=False)",
+        _scan_out.getvalue() == "",
+        detail=repr(_scan_out.getvalue()[:120]),
+    )
+
 # Negative: model_dir does not exist
 check(
     "scan_model_family on nonexistent dir returns None",

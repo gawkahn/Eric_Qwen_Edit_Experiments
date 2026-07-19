@@ -796,6 +796,24 @@ check("name_hint 'turbo' is a no-op for non-zimage classes",
                          name_hint="/x/Flux-Turbo") == "flux")
 check("zimage: empty name_hint (default) → base, never turbo",
       infer_model_family("ZImagePipeline", False, name_hint="") == "zimage")
+# announce=False suppresses the Turbo-inference INFO print without changing the
+# classification — for catalog scans, which call this on every scanned model dir
+# (2026-07-18). The default (load path) still announces.
+import contextlib as _ann_ctl  # noqa: E402
+_ann_quiet = io.StringIO()
+with _ann_ctl.redirect_stdout(_ann_quiet):
+    _ann_fam = infer_model_family("ZImagePipeline", False,
+                                  name_hint="/x/Z-Image-Turbo", announce=False)
+check("zimage-turbo: announce=False classifies identically",
+      _ann_fam == "zimage-turbo")
+check("zimage-turbo: announce=False prints nothing",
+      _ann_quiet.getvalue() == "", detail=repr(_ann_quiet.getvalue()[:120]))
+_ann_loud = io.StringIO()
+with _ann_ctl.redirect_stdout(_ann_loud):
+    infer_model_family("ZImagePipeline", False, name_hint="/x/Z-Image-Turbo")
+check("zimage-turbo: default announce still prints the inference notice",
+      "Z-Image Turbo inferred" in _ann_loud.getvalue(),
+      detail=repr(_ann_loud.getvalue()[:120]))
 # Family-default values: base holds, turbo is the empirically-validated pair.
 check("zimage: cfg_scale=4.0 (base, Phase-A validated)",
       FAMILY_DEFAULTS["zimage"].get("cfg_scale") == 4.0)

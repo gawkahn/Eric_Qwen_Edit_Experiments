@@ -124,10 +124,15 @@ def scan_model_family(model_dir: str) -> Optional[str]:
     # import required — same scan-vs-load split documented above).
     # `name_hint` = the model dir: Z-Image-Turbo carries no is_distilled
     # marker, so its "turbo" dir/repo name is the discriminator (scoped to
-    # the zimage family; ADR-009 2026-07-06).
+    # the zimage family; ADR-009 2026-07-06). announce=False: this runs on
+    # EVERY scanned model dir, so the Turbo-inference INFO print would fire
+    # for Z-Image dirs that merely exist under the roots — misleading noise
+    # naming models the caller never asked to load (2026-07-18). The load
+    # path (detect_pipeline_class) still announces for the model actually
+    # being loaded.
     return infer_model_family(
         class_name, bool(index.get("is_distilled", False)),
-        name_hint=model_dir)
+        name_hint=model_dir, announce=False)
 
 
 # ════════════════════════════════════════════════════════════════════════

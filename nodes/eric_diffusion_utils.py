@@ -49,7 +49,7 @@ _FAMILY_PATTERNS = [
 
 
 def infer_model_family(class_name: str, is_distilled: bool = False,
-                       name_hint: str = "") -> str:
+                       name_hint: str = "", *, announce: bool = True) -> str:
     """Map a diffusers pipeline class name to a short family string.
 
     ``is_distilled`` lets one pipeline class resolve to two families when the
@@ -71,6 +71,16 @@ def infer_model_family(class_name: str, is_distilled: bool = False,
     ``zimage`` family so no other family is affected by a stray ``"turbo"``
     in a path. See ADR-009 changelog 2026-07-06.
 
+    ``announce`` controls the Z-Image-Turbo inference INFO print below. It
+    exists for CATALOG SCANS (``catalog.scan_model_family``), which call this
+    on every model directory under the scan roots: with the default, a scan
+    prints "Z-Image Turbo inferred" once per Z-Image dir that merely *exists*,
+    which reads as "wrong model loaded" when the target is a different model
+    entirely (observed 2026-07-18 on the refine path). Load-path callers
+    (``detect_pipeline_class``) keep the default — there the print concerns
+    the model actually being loaded, which is the code-review finding the
+    print exists for.
+
     The single-/two-arg call forms are unchanged for every existing caller.
     """
     lower = class_name.lower().replace("_", "").replace("-", "")
@@ -82,10 +92,13 @@ def infer_model_family(class_name: str, is_distilled: bool = False,
                 # INFO so a false positive (a base model under a path that
                 # happens to contain "turbo") surfaces in logs rather than
                 # silently getting Turbo defaults (code-review finding 3).
-                print(f"[comfyless] Z-Image Turbo inferred from path "
-                      f"({name_hint!r}) — using zimage-turbo defaults "
-                      f"(8 steps / cfg 1.0). If this is actually the base "
-                      f"model, its path contains 'turbo'.")
+                # Suppressed for catalog scans via announce=False — see
+                # docstring.
+                if announce:
+                    print(f"[comfyless] Z-Image Turbo inferred from path "
+                          f"({name_hint!r}) — using zimage-turbo defaults "
+                          f"(8 steps / cfg 1.0). If this is actually the base "
+                          f"model, its path contains 'turbo'.")
                 return "zimage-turbo"
             return family
     return lower  # best-effort fallback for unrecognised models
