@@ -422,8 +422,31 @@ Security section. The binding invariants the review established:
   fail-closed except. `test_refine.py` 188→206. Review saved:
   `docs/security/review-judge-recipe-2026-07-15.md`.
 
+- 2026-07-18 — **Family defaults on the fresh-CLI entry** (separate slice,
+  commit 71f51c4): refine now applies ADR-009 FAMILY_DEFAULTS via
+  `_overlay_family_defaults` — `--steps/--cfg/--width/--height` became None
+  "unset" sentinels, family values fill unset keys, backstops preserve the old
+  behavior for undetectable models. Fixes krea-turbo runs generating at 28
+  steps / cfg 3.5 instead of 8 / 0.0. Security-neutral — see ADR-009 and
+  `docs/security/review-refine-family-defaults-2026-07-18.md`.
+- 2026-07-18 — **Patience default flipped to disabled** (`DEFAULT_PATIENCE`
+  2 → 0; `patience <= 0` disables the no-improvement early stop in
+  `refine_loop`). Grant's first hot runs stopped after 2 non-improving
+  iterations — too early to evaluate whether refinement works at all. The loop
+  now runs until pass or `--max-iterations` (the authoritative spend bound;
+  §Security "Unbounded resource spend" is unaffected — the `for
+  range(max_iterations)` cap is structural on every path, patience only an
+  accelerator). `--patience N` opts back into the early stop. Accepted
+  consequence: a persistently unusable judge now burns iterations to the cap
+  instead of stopping after 2 (iterations are cheap on 8-step distilled
+  families; the failure is loud in the per-iteration logs). Security addendum:
+  `docs/security/review-refine-family-defaults-2026-07-18.md` §Patience
+  addendum.
+
 **AI-Disclosure:** Claude (Fable 5) authored the design record from a design
 conversation with Grant; Grant reviewed. Slice 3 implementation + review
 folding authored by Claude (Fable 5); Grant reviewed. Slice 4 implementation +
 review folding authored by Claude (Fable 5); Grant reviewed. Judge-recipe
 amendment + review folding authored by Claude (Fable 5); Grant reviewed.
+Patience-default flip + family-defaults overlay authored by Claude (Fable 5);
+Grant reviewed.

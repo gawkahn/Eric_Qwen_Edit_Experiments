@@ -1064,6 +1064,38 @@ _ov = _overlay_cfg("hunyuan-image", ["--width", "1024"]).base
 check("hunyuan-image: explicit --width beats the family dim",
       _ov["width"] == 1024 and _ov["height"] == 2048)
 
+# ── Patience disabled by default (2026-07-18): run to pass or cap ────────────
+# The original DEFAULT_PATIENCE=2 quit after two non-improving iterations —
+# too early to tell whether refinement was working at all. Default is now 0
+# (disabled): only pass_threshold and max_iterations stop the loop; --patience N
+# opts back into the early stop (existing tests above pin that behavior).
+print("== patience: 0/default disables the no-improvement early stop ==")
+check("DEFAULT_PATIENCE is 0 (disabled — run to pass or cap)",
+      refine.DEFAULT_PATIENCE == 0)
+_d, _o, _fg, _fj = _run_loop(
+    [_mkverdict(5, 5), _mkverdict(4, 4), _mkverdict(3, 3), _mkverdict(2, 2)],
+    max_iter=4, patience=0)
+check("patience=0: non-improving run reaches the iteration cap",
+      _o.iterations == 4, detail=f"iterations={_o.iterations}")
+check("patience=0: best-so-far still wins at the cap",
+      _o.best_composite == 5.0, detail=f"best={_o.best_composite}")
+_d, _o, _fg, _fj = _run_loop(
+    [RefineError("bad json"), RefineError("bad json"), RefineError("bad json")],
+    max_iter=3, patience=0)
+check("patience=0: unusable verdicts no longer stop the loop early",
+      _fj.calls == 3, detail=f"judge calls={_fj.calls}")
+# The documented contract is "patience <= 0 disables" — pin a negative too.
+_d, _o, _fg, _fj = _run_loop(
+    [_mkverdict(5, 5), _mkverdict(4, 4), _mkverdict(3, 3)],
+    max_iter=3, patience=-1)
+check("patience=-1: behaves as disabled (runs to cap)",
+      _o.iterations == 3, detail=f"iterations={_o.iterations}")
+# CLI default follows the constant.
+_pat_args = refine._build_arg_parser().parse_args(
+    ["--prompt", "x", "--model", "m", "--output-dir", "o", "--model-base", "mb",
+     "--judge-backend", "j"])
+check("--patience CLI default is 0", _pat_args.patience == 0)
+
 # Guard: the refine overlay can only apply family values to keys base
 # materializes with the None sentinel (steps/cfg_scale/true_cfg_scale/width/
 # height); refiner_steps/refiner_cfg are KNOWN and deliberately excluded (no

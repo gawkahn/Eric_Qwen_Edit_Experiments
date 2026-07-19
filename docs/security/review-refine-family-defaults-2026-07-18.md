@@ -67,6 +67,37 @@ a path or execution channel). The `AttributeError` arm (non-object JSON top
 level) was added post-audit on the code-reviewer's LOW finding; it narrows an
 operator-facing crash, no security delta.
 
+## Patience addendum (same day, separate slice)
+
+**Change:** `DEFAULT_PATIENCE` 2 → 0; `patience <= 0` disables the
+no-improvement early stop at both check sites in `refine_loop` (composite
+stall + unusable-verdict). Loop is then bounded by `verdict_passes` and
+`max_iterations` only; `--patience N` opts back in.
+
+**Verdict: security-neutral** (security-auditor, Fable, 2026-07-18).
+- **Spend:** all four loop paths (pass / cap / judge-error continue /
+  apply_overrides) terminate inside the structural
+  `for i in range(max_iterations)`; no retry logic exists anywhere in
+  refine.py; LLM output cannot reach `max_iterations` or `patience` through
+  the F1 allowlist. Worst case is exactly `max_iterations` generations and
+  judge calls.
+- **Authority:** more iterations = more applications of the same per-verdict
+  authority, not new authority — F1/F2/F3/F6 gates apply identically each
+  iteration, and a score-crafting adversary could already reach the cap under
+  `patience=2` by reporting monotonic sub-threshold improvements. Malformed
+  verdicts never reach `apply_overrides`.
+- **Daemon:** one unchanged validated wire request per iteration; containment
+  identical.
+- **INFO (accepted):** a persistently broken judge now burns up to
+  `max_iterations` identical generations (seed pinned, config unchanged)
+  instead of stopping after 2 — bounded, loud in logs, ^C-recoverable;
+  documented in the ADR-027 changelog. Optional future hardening: a
+  consecutive-judge-failure fail-fast distinct from patience.
+- **INFO (accepted as documented behavior):** negative `--patience` now
+  disables rather than stopping after iteration 1; the `<= 0` contract is
+  documented in the docstring/help and pinned by a `patience=-1` test
+  (warn-don't-block house style — no argparse rejection).
+
 ## Post-audit deltas folded into the slice (code-reviewer findings)
 
 - Guard test in `test_refine.py`: every `FAMILY_DEFAULTS` key must be known to

@@ -78,8 +78,13 @@ DEFAULT_W_PA, DEFAULT_W_AES = 0.6, 0.4
 DEFAULT_PASS_THRESHOLD = 8
 #: Hard cap on generations (bounds spend — the loop's authoritative stop).
 DEFAULT_MAX_ITERATIONS = 10
-#: Stop after this many iterations with no composite improvement.
-DEFAULT_PATIENCE = 2
+#: Early stop after this many iterations with no composite improvement.
+#: 0 = DISABLED (the default since 2026-07-18): the loop runs until it passes
+#: or hits --max-iterations. The original default of 2 quit before the
+#: hill-climb had room to show whether it was working — with 8-step distilled
+#: models an iteration is cheap, and --max-iterations is the authoritative
+#: spend bound. Pass --patience N to opt back into the early stop.
+DEFAULT_PATIENCE = 0
 #: Judge runs at temperature 0 for low-variance / reproducible scoring.
 DEFAULT_JUDGE_TEMPERATURE = 0.0
 
@@ -1025,7 +1030,11 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
     record → stop-check (pass / cap / patience) → apply overrides. A generation
     failure is FATAL (every iteration would fail identically); a malformed judge
     verdict only consumes an iteration (F7). Winner = the passing candidate, or the
-    top-composite candidate if none passed."""
+    top-composite candidate if none passed. patience <= 0 disables the
+    no-improvement early stop (the default since 2026-07-18) — the run is then
+    bounded by pass_threshold and max_iterations only, and a persistently
+    unusable judge burns iterations to the cap instead of stopping early
+    (accepted: iterations are cheap and the cap is the spend authority)."""
     from PIL import Image
     candidates_dir = os.path.join(output_dir, "candidates")
     winners_dir = os.path.join(output_dir, "winners")
@@ -1074,7 +1083,7 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 f"consuming iteration, config unchanged")
             _write_json(stem + ".verdict.json", {"iteration": i, "error": str(e)})
             no_improve += 1
-            if no_improve >= patience:
+            if patience > 0 and no_improve >= patience:
                 log(f"[refine] no usable improvement for {patience} iters — stopping")
                 break
             continue
@@ -1104,7 +1113,7 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
         if i == max_iterations - 1:
             log(f"[refine] iteration cap {max_iterations} reached — stopping")
             break
-        if no_improve >= patience:
+        if patience > 0 and no_improve >= patience:
             log(f"[refine] no composite improvement for {patience} iters — stopping")
             break
 
@@ -1202,7 +1211,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS,
                    help="Hard cap on generations (default 10)")
     p.add_argument("--patience", type=int, default=DEFAULT_PATIENCE,
-                   help="Stop after N iters with no composite gain (default 2)")
+                   help="Early-stop after N iters with no composite gain; "
+                        "0 disables — run until pass or --max-iterations "
+                        "(default 0)")
     p.add_argument("--w-prompt-adherence", type=float, default=DEFAULT_W_PA,
                    help="Composite weight for prompt-adherence (default 0.6)")
     p.add_argument("--w-aesthetics", type=float, default=DEFAULT_W_AES,
