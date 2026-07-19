@@ -41,7 +41,9 @@ import tomllib
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from comfyless.family_defaults import FAMILY_DEFAULTS
 
 # ── Bounds (security review F5/F6) ───────────────────────────────────────────
 #: Longest-side pixel cap for the image sent to the judge. Candidates can be
@@ -1208,11 +1210,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     # Generation params (fixed across the run; base of the working config).
     p.add_argument("--negative-prompt", default="")
     p.add_argument("--seed", type=int, default=-1)
-    p.add_argument("--steps", type=int, default=28)
-    p.add_argument("--cfg", type=float, default=3.5)
-    p.add_argument("--true-cfg", type=float, default=None)
-    p.add_argument("--width", type=int, default=1024)
-    p.add_argument("--height", type=int, default=1024)
+    # None = "unset" sentinel: build_config_from_args overlays FAMILY_DEFAULTS
+    # for the model's family (ADR-009), then _GEN_KEY_FALLBACKS. A value you
+    # pass here always wins over both.
+    p.add_argument("--steps", type=int, default=None,
+                   help="sampling steps (default: model-family default, else 28)")
+    p.add_argument("--cfg", type=float, default=None,
+                   help="guidance scale (default: model-family default, else 3.5)")
+    p.add_argument("--true-cfg", type=float, default=None,
+                   help="true-CFG scale (default: model-family default, else unset)")
+    p.add_argument("--width", type=int, default=None,
+                   help="image width (default: model-family default, else 1024)")
+    p.add_argument("--height", type=int, default=None,
+                   help="image height (default: model-family default, else 1024)")
     p.add_argument("--sampler", default="default")
     p.add_argument("--max-seq-len", type=int, default=512)
     p.add_argument("--quant", default="none")
@@ -1221,10 +1231,71 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def build_config_from_args(args, catalog, roots) -> WorkingConfig:
+#: Backstop values for gen keys whose CLI default is the None "unset" sentinel,
+#: applied AFTER the family overlay. These mirror generate.py's own argparse
+#: defaults (and refine's pre-2026-07-18 hardcoded defaults), so a model whose
+#: family cannot be detected — or has no FAMILY_DEFAULTS entry — generates
+#: exactly as before. true_cfg_scale is deliberately absent: None is meaningful
+#: to generate() ("no true-CFG"), so only a family entry (qwen-*) may set it.
+_GEN_KEY_FALLBACKS = {"steps": 28, "cfg_scale": 3.5, "width": 1024, "height": 1024}
+
+
+def _overlay_family_defaults(base: dict,
+                             log: Callable[[str], None] = print) -> None:
+    """Fill gen keys the CLI left unset (None) from FAMILY_DEFAULTS for the
+    model's detected family, then backstop anything still None from
+    _GEN_KEY_FALLBACKS. In place.
+
+    This is the ADR-009 precedence ladder (explicit --flag > family default >
+    schema default) as it applies to the refine entry path. refine cannot reuse
+    generate._apply_family_defaults' explicit_keys mechanism directly because it
+    materializes every key up front — the None sentinel is what distinguishes
+    "user typed --steps 28" from "nobody said anything" (the 2026-07-18 bug:
+    argparse defaults 28/3.5 always looked explicit, so krea-turbo generated at
+    28 steps / cfg 3.5 instead of 8 / 0.0). FAMILY_DEFAULTS stays the single
+    source of truth for the values.
+
+    Family detection failure (missing/unreadable model_index.json, class not in
+    installed diffusers) degrades silently to the backstops — identical to the
+    pre-overlay behavior.
+
+    generate._apply_family_defaults' distilled-transformer warning is
+    intentionally absent: refine exposes no transformer-override flag
+    (--transformer-path is a catalog scan root, not a weight override), so
+    base never carries transformer_path on this path. Port the warning if
+    refine ever grows one."""
+    from nodes.eric_diffusion_utils import detect_pipeline_class
+    family = None
+    try:
+        _, _, family = detect_pipeline_class(base["model"])
+    except (ValueError, OSError, AttributeError):
+        # AttributeError: model_index.json whose top level is valid JSON but
+        # not an object (index.get on a list/str) — degrade like the rest.
+        pass
+    applied: Dict[str, Any] = {}
+    if family:
+        for key, value in FAMILY_DEFAULTS.get(family, {}).items():
+            # Only keys refine's CLI exposes (present in base) participate;
+            # family entries like hunyuan's refiner_steps have no refine flag
+            # and must not ride into the daemon request unrequested.
+            if key in base and base[key] is None:
+                base[key] = value
+                applied[key] = value
+    if applied:
+        kv = ", ".join(f"{k}={v!r}" for k, v in sorted(applied.items()))
+        log(f"[refine] family={family} defaults applied: {kv}")
+    for key, value in _GEN_KEY_FALLBACKS.items():
+        if base.get(key) is None:
+            base[key] = value
+
+
+def build_config_from_args(args, catalog, roots,
+                           log: Callable[[str], None] = print) -> WorkingConfig:
     """Assemble the initial WorkingConfig from CLI args (pure w.r.t. generation).
-    Seed LoRAs are resolved through the ADR-015 resolver; all other fields are
-    trusted CLI input carried in `base`."""
+    Seed LoRAs are resolved through the ADR-015 resolver; gen keys left unset on
+    the CLI get FAMILY_DEFAULTS for the model's family (ADR-009 — see
+    _overlay_family_defaults); all other fields are trusted CLI input carried in
+    `base`."""
     seed_loras = _resolve_startup_loras(catalog, roots, args.lora)
     base = {
         "model": os.path.abspath(args.model),
@@ -1239,6 +1310,7 @@ def build_config_from_args(args, catalog, roots) -> WorkingConfig:
         "max_sequence_length": args.max_seq_len,
         "quant": args.quant,
     }
+    _overlay_family_defaults(base, log=log)
     return WorkingConfig(prompt=args.prompt, loras=seed_loras, base=base)
 
 
@@ -1486,7 +1558,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             if not args.model:
                 raise RefineError("--model is required with --prompt")
-            cfg = build_config_from_args(args, catalog, roots)
+            cfg = build_config_from_args(args, catalog, roots, log=log)
             target_prompt = args.prompt
     except RefineError as e:
         print(f"[refine] {e}", file=sys.stderr)

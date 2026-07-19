@@ -978,6 +978,106 @@ _jr_args = refine._build_arg_parser().parse_args(
      "--judge-backend", "j"])
 check("--judge-recipe defaults to 'generic'", _jr_args.judge_recipe == "generic")
 
+# ── Family-defaults overlay on the fresh-CLI entry (ADR-009, 2026-07-18) ─────
+# The bug: refine's argparse defaults (28/3.5) were baked into base
+# unconditionally, so FAMILY_DEFAULTS never applied — krea-turbo generated at
+# 28 steps / cfg 3.5 instead of its 8 / 0.0. The fix keys the overlay on None
+# sentinels: unset CLI flag → family default → _GEN_KEY_FALLBACKS backstop.
+print("== build_config_from_args: FAMILY_DEFAULTS overlay ==")
+import nodes.eric_diffusion_utils as _edu  # noqa: E402
+
+
+def _overlay_cfg(family, extra_flags=(), collect_logs=None):
+    """build_config_from_args with detect_pipeline_class stubbed to `family`
+    (None → raises ValueError, the undetectable-model case). No --lora, so the
+    catalog is never consulted."""
+    args = refine._build_arg_parser().parse_args(
+        ["--prompt", "x", "--model", "/fake/model", "--output-dir", "o",
+         "--model-base", "mb", "--judge-backend", "j", *extra_flags])
+    orig = _edu.detect_pipeline_class
+
+    def _stub(path):
+        if family is None:
+            raise ValueError("no model_index.json")
+        return (object, "StubPipeline", family)
+
+    _edu.detect_pipeline_class = _stub
+    try:
+        return refine.build_config_from_args(
+            args, None, ("mb",),
+            log=(collect_logs.append if collect_logs is not None else print))
+    finally:
+        _edu.detect_pipeline_class = orig
+
+
+_ov_logs = []
+_ov = _overlay_cfg("krea-turbo", collect_logs=_ov_logs).base
+check("krea-turbo: unset --steps gets family default 8", _ov["steps"] == 8,
+      detail=f"got {_ov['steps']!r}")
+check("krea-turbo: unset --cfg gets family default 0.0",
+      _ov["cfg_scale"] == 0.0, detail=f"got {_ov['cfg_scale']!r}")
+check("krea-turbo: width backstops to 1024 (no family opinion)",
+      _ov["width"] == 1024 and _ov["height"] == 1024)
+check("krea-turbo: true_cfg_scale stays None (no family opinion, no backstop)",
+      _ov["true_cfg_scale"] is None)
+check("overlay logs the applied family defaults",
+      any("family=krea-turbo" in m and "steps=8" in m for m in _ov_logs),
+      detail=str(_ov_logs)[:120])
+
+# Negative: an explicit flag must NEVER be overridden by the family value.
+_ov = _overlay_cfg("krea-turbo", ["--steps", "20"]).base
+check("krea-turbo: explicit --steps 20 beats family default",
+      _ov["steps"] == 20, detail=f"got {_ov['steps']!r}")
+check("krea-turbo: family cfg still applies alongside explicit --steps",
+      _ov["cfg_scale"] == 0.0)
+_ov = _overlay_cfg("krea-turbo", ["--cfg", "3.5"]).base
+check("krea-turbo: explicit --cfg 3.5 beats family default even at the old "
+      "hardcoded value", _ov["cfg_scale"] == 3.5)
+
+# Undetectable model (no model_index.json, single-file, etc.) → the
+# pre-overlay behavior exactly: 28 / 3.5 / 1024x1024.
+_ov = _overlay_cfg(None).base
+check("undetectable family: backstops 28/3.5/1024x1024",
+      (_ov["steps"], _ov["cfg_scale"], _ov["width"], _ov["height"])
+      == (28, 3.5, 1024, 1024), detail=str({k: _ov[k] for k in
+          ("steps", "cfg_scale", "width", "height")}))
+
+# Family with no FAMILY_DEFAULTS entry → same backstops.
+_ov = _overlay_cfg("mystery-family").base
+check("unknown family: backstops apply", _ov["steps"] == 28
+      and _ov["cfg_scale"] == 3.5)
+
+# qwen-image: true_cfg_scale is family-set; cfg_scale backstops.
+_ov = _overlay_cfg("qwen-image").base
+check("qwen-image: true_cfg_scale 4.0 + steps 50 from family",
+      _ov["true_cfg_scale"] == 4.0 and _ov["steps"] == 50)
+check("qwen-image: cfg_scale backstops to 3.5", _ov["cfg_scale"] == 3.5)
+
+# hunyuan-image: dimension defaults apply (2K-native), but family keys refine
+# has no flag for (refiner_steps/refiner_cfg) must NOT ride into base.
+_ov = _overlay_cfg("hunyuan-image").base
+check("hunyuan-image: 2048x2048 family dims applied",
+      _ov["width"] == 2048 and _ov["height"] == 2048)
+check("hunyuan-image: refiner_* family keys do NOT enter base",
+      "refiner_steps" not in _ov and "refiner_cfg" not in _ov)
+_ov = _overlay_cfg("hunyuan-image", ["--width", "1024"]).base
+check("hunyuan-image: explicit --width beats the family dim",
+      _ov["width"] == 1024 and _ov["height"] == 2048)
+
+# Guard: the refine overlay can only apply family values to keys base
+# materializes with the None sentinel (steps/cfg_scale/true_cfg_scale/width/
+# height); refiner_steps/refiner_cfg are KNOWN and deliberately excluded (no
+# refine flag). If FAMILY_DEFAULTS grows any other key (say a family sampler
+# opinion), generate.py would honor it while refine silently would not —
+# fail here to force a deliberate decision on the refine path (code review
+# 2026-07-18, MEDIUM). See _overlay_family_defaults' docstring.
+_OVERLAY_KNOWN_KEYS = {"steps", "cfg_scale", "true_cfg_scale", "width",
+                       "height", "refiner_steps", "refiner_cfg"}
+from comfyless.family_defaults import FAMILY_DEFAULTS as _FD  # noqa: E402
+_unknown_fd_keys = {k for fam in _FD.values() for k in fam} - _OVERLAY_KNOWN_KEYS
+check("every FAMILY_DEFAULTS key is known to the refine overlay",
+      not _unknown_fd_keys, detail=f"unhandled: {sorted(_unknown_fd_keys)}")
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
