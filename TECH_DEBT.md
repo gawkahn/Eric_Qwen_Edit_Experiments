@@ -1519,3 +1519,21 @@ Why not now: slice V2's declared trust model is CLI-local (Vision
 security-auditor gate where these belong.
 Trigger: BINDING precondition of the ADR-033 slice-6 (LLM planner / MCP
 exposure) commit — the security review for that slice must confirm all five.
+
+**Unused `EricQwenEditInpaintTransfer` node — removal candidate** *(2026-07-20)*
+`nodes/eric_qwen_edit_inpaint_transfer.py` is imported and registered
+(`nodes/__init__.py:28`, `:63`) so it loads into the ComfyUI graph, but it is
+Eric's original code untouched since the initial release commit (`79c12b9`)
+and has never been used in practice — Grant never adopted Eric's inpaint node
+nor built one. It carries a hardcoded `ref_flags=[True, False]`
+(`inpaint_transfer.py:455-456`) that encodes an inpaint-specific dual-path
+arrangement nothing else depends on. Surfaced while surveying the edit
+surface for ADR-035; recorded there under Deferred / Out of Scope.
+Why not now: removing a registered node changes the node-pack's public
+surface (a workflow JSON referencing it would break on load), which is a
+separate decision from the comfyless schema work ADR-035 covers. Deleting it
+mid-ADR would also be exactly the "clean up while here" §4 forbids.
+Trigger: the next deliberate node-pack surface slice (any commit that adds or
+removes entries in `NODE_CLASS_MAPPINGS`). Fix: confirm no workflow JSON in
+`workflows/` references it, then remove the module, both `__init__.py` lines,
+and its display-name mapping in one slice.
