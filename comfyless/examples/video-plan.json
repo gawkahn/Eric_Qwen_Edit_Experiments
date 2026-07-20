@@ -9,27 +9,27 @@
   "segments": [
     {
       "prompt": "A golden retriever trots along a misty forest path at dawn, low sun rays through the trees, steady tracking shot",
-      "keyframe_start": "keyframes/kf_000.png",
-      "keyframe_end": "keyframes/kf_001.png"
+      "keyframe_start": "keyframes/kf_000.jpg",
+      "keyframe_end": "keyframes/kf_001.jpg"
     },
     {
       "prompt": "The dog slows and stops at a moss-covered fallen log, sniffing it curiously, mist thinning",
-      "keyframe_start": "keyframes/kf_001.png",
-      "keyframe_end": "keyframes/kf_002.png",
+      "keyframe_start": "keyframes/kf_001.jpg",
+      "keyframe_end": "keyframes/kf_002.jpg",
       "seed": 7
     },
     {
       "prompt": "Close-up of the dog's face lifting toward camera, ears perking up, warm morning light",
-      "keyframe_start": "keyframes/kf_002.png",
-      "keyframe_end": "keyframes/kf_003.png",
+      "keyframe_start": "keyframes/kf_002.jpg",
+      "keyframe_end": "keyframes/kf_003.jpg",
       "frames": 49,
       "steps": 6,
       "cfg": 1.0
     },
     {
       "prompt": "Wide shot from a hilltop: the forest valley below in full morning sun, birds crossing the sky",
-      "keyframe_start": "keyframes/kf_100.png",
-      "keyframe_end": "keyframes/kf_101.png"
+      "keyframe_start": "keyframes/kf_100.jpg",
+      "keyframe_end": "keyframes/kf_101.jpg"
     }
   ]
 }
