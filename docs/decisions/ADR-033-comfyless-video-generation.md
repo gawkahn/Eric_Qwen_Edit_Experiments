@@ -168,5 +168,11 @@ when a specific frame must be preserved, judge-gated via the refine loop
   matrix (both same day).
 - 2026-07-19: Accepted by Grant same day. Eval cache `/mnt/nvme-2tb/hf-eval`
   deleted after promotion verified (incl. the redundant Wan2.1-FLF2V download).
+- 2026-07-19 (slice V1): default model/LoRA resolution in `comfyless/video.py`
+  is `--model-base` flag, falling back to the `COMFYLESS_MODEL_BASE` env var —
+  a new convention introduced by this slice (generate.py takes the flag only).
+  `--offload` added (CPU-offload, peak ~30–40 GB) after the live smoke hit a
+  shared-GPU OOM. Sidecar `comfyless-video/1` carries `crf` and absolute
+  model/LoRA paths per code review.
 
 **AI-Disclosure:** Claude (Fable 5) authored; Grant reviewed.

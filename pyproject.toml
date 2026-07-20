@@ -76,6 +76,7 @@ dependencies = [
     "protobuf==7.35.1",
     "tiktoken==0.13.0",
     "ftfy==6.3.1",
+    "av==18.0.0",
 ]
 
 # Type checker config (ADR-032). pyright is a Node tool pinned in mise.toml,
