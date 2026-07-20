@@ -290,6 +290,19 @@ check("user content is a vision array", isinstance(content, list) and len(conten
 check("text part present", content[0]["type"] == "text" and content[0]["text"] == "score this")
 check("image part carries data URI", content[1]["type"] == "image_url"
       and content[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+# Runaway-generation cap: max_tokens always on the wire, default 1024.
+check("payload max_tokens default caps the response",
+      payload["max_tokens"] == refine.DEFAULT_JUDGE_MAX_TOKENS == 1024)
+check("explicit max_tokens honored",
+      refine.build_judge_payload("gemma", "SYS", "t", uri,
+                                 max_tokens=512)["max_tokens"] == 512)
+# Backend-cfg max_tokens is validated before any image/HTTP work, so the
+# rejection path needs no real image or endpoint.
+_mt_cfg = refine.WorkingConfig(prompt="p", loras=[], base={})
+for _bad in (0, -5, True, "1024", 512.5):
+    raises(f"judge backend max_tokens={_bad!r} rejected",
+           lambda _b=_bad: refine.judge_candidate(
+               None, "p", _mt_cfg, {"url": "u", "model": "m", "max_tokens": _b}, []))
 
 print("== F5: seed-image byte cap ==")
 raises("oversize seed image rejected", lambda: refine.load_seed_image_capped(

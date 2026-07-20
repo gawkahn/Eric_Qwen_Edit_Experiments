@@ -112,7 +112,8 @@ check("cfg supplies repetition_penalty when recipe omits it", _s["repetition_pen
 check("cfg temperature used when recipe omits it",
       E._resolve_endpoint_sampling({}, {"temperature": 0.99})["temperature"] == 0.99)
 _sn = E._resolve_endpoint_sampling({}, {})
-check("no knobs set -> only temperature default 0.8", _sn == {"temperature": 0.8})
+check("no knobs set -> only temperature 0.8 + max_tokens cap defaults",
+      _sn == {"temperature": 0.8, "max_tokens": 1024})
 check("top_k/repetition_penalty NOT emitted unless set",
       "top_k" not in _sn and "repetition_penalty" not in _sn)
 # min_p (vLLM extension) follows the same recipe>cfg>default emit-only-when-set rule
@@ -121,6 +122,36 @@ check("recipe min_p overrides cfg",
       E._resolve_endpoint_sampling({"min_p": 0.05}, {"min_p": 0.2})["min_p"] == 0.05)
 check("cfg supplies min_p when recipe omits it",
       E._resolve_endpoint_sampling({}, {"min_p": 0.1})["min_p"] == 0.1)
+# max_tokens: always emitted (runaway-generation cap), recipe > cfg > default
+check("max_tokens default is DEFAULT_MAX_TOKENS 1024",
+      _sn["max_tokens"] == E.DEFAULT_MAX_TOKENS == 1024)
+check("recipe max_tokens overrides cfg",
+      E._resolve_endpoint_sampling({"max_tokens": 256},
+                                   {"max_tokens": 2048})["max_tokens"] == 256)
+check("cfg supplies max_tokens when recipe omits it",
+      E._resolve_endpoint_sampling({}, {"max_tokens": 2048})["max_tokens"] == 2048)
+# Negative: a cap of zero or less would disable output entirely — reject
+# loudly, at BOTH source layers (recipe and backend cfg).
+for _layer, _rc_mt, _cc_mt in (("cfg", {}, {"max_tokens": 0}),
+                               ("cfg", {}, {"max_tokens": -1}),
+                               ("recipe", {"max_tokens": 0}, {})):
+    try:
+        E._resolve_endpoint_sampling(_rc_mt, _cc_mt)
+        check(f"{_layer}-sourced non-positive max_tokens rejected "
+              f"({_rc_mt or _cc_mt})", False)
+    except E.EnhanceError:
+        check(f"{_layer}-sourced non-positive max_tokens rejected "
+              f"({_rc_mt or _cc_mt})", True)
+# Negative: huge TOML int must surface as EnhanceError, not raw OverflowError
+# (TOML ints are arbitrary-precision; float(10**400) overflows).
+try:
+    E._resolve_endpoint_sampling({}, {"max_tokens": 10**400})
+    check("huge max_tokens raises EnhanceError not OverflowError", False)
+except E.EnhanceError:
+    check("huge max_tokens raises EnhanceError not OverflowError", True)
+except OverflowError:
+    check("huge max_tokens raises EnhanceError not OverflowError", False,
+          "raw OverflowError escaped")
 
 # Payload construction: mock the HTTP POST + model resolve, capture the wire payload
 _captured_payloads = []
@@ -148,6 +179,8 @@ try:
         {"system_prompt": "SP"}, 1)
     _pay2 = _captured_payloads[-1]
     check("clean run emits temperature default 0.8", _pay2["temperature"] == 0.8)
+    check("clean run emits max_tokens cap 1024 on the wire",
+          _pay2["max_tokens"] == 1024)
     check("clean run sends NO top_k/repetition_penalty/min_p (OpenAI-standard)",
           "top_k" not in _pay2 and "repetition_penalty" not in _pay2
           and "min_p" not in _pay2)
@@ -165,6 +198,9 @@ with tempfile.TemporaryDirectory() as tmpc:
         ("bool min_p", 'system_prompt="S"\nmin_p=true\n'),
         # non-integer float top_k must not silently truncate to 20.
         ("non-integer-float top_k", 'system_prompt="S"\ntop_k=20.5\n'),
+        # max_tokens is a recognized knob → same bool/non-integer rejection.
+        ("bool max_tokens", 'system_prompt="S"\nmax_tokens=true\n'),
+        ("non-integer-float max_tokens", 'system_prompt="S"\nmax_tokens=512.5\n'),
     ):
         _write(tmpc, "bad.toml", _toml)
         try:
@@ -172,8 +208,11 @@ with tempfile.TemporaryDirectory() as tmpc:
         except E.EnhanceError:
             check(f"recipe {_label} rejected", True)
     _write(tmpc, "ok.toml",
-           'system_prompt="S"\ntop_k=40\nrepetition_penalty=1.1\ntop_p=0.8\nmin_p=0.05\n')
+           'system_prompt="S"\ntop_k=40\nrepetition_penalty=1.1\ntop_p=0.8\n'
+           'min_p=0.05\nmax_tokens=2048\n')
     _ok = E.load_recipe("ok", tmpc)
+    check("recipe max_tokens accepted as int",
+          _ok["max_tokens"] == 2048 and isinstance(_ok["max_tokens"], int))
     check("recipe coerces top_k to int",
           _ok["top_k"] == 40 and isinstance(_ok["top_k"], int))
     check("recipe coerces repetition_penalty to float", _ok["repetition_penalty"] == 1.1)
@@ -186,7 +225,8 @@ with tempfile.TemporaryDirectory() as tmpc:
 
 # cfg-sourced bad types raise EnhanceError (clean message), not a raw ValueError
 for _cfgbad in ({"temperature": "hot"}, {"top_k": True}, {"top_p": "x"},
-                {"min_p": True}):
+                {"min_p": True}, {"max_tokens": True}, {"max_tokens": "notint"},
+                {"max_tokens": 512.5}):
     try:
         E._resolve_endpoint_sampling({}, _cfgbad)
         check(f"cfg bad type {_cfgbad} raises EnhanceError", False)

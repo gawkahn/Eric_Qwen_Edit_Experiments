@@ -87,6 +87,10 @@ DEFAULT_MAX_ITERATIONS = 10
 DEFAULT_PATIENCE = 0
 #: Judge runs at temperature 0 for low-variance / reproducible scoring.
 DEFAULT_JUDGE_TEMPERATURE = 0.0
+#: Hard output cap on the judge/planner call (backend-cfg `max_tokens`
+#: overridable). A verdict JSON is a few hundred tokens; without a cap a
+#: judge that misses its stop token churns KV cache until the HTTP timeout.
+DEFAULT_JUDGE_MAX_TOKENS = 1024
 
 #: Load-plane path keys that must NEVER appear in a planner-visible payload (F3).
 _FORBIDDEN_CONTEXT_KEYS = ("abs_path", "path", "root", "relative_path")
@@ -380,9 +384,12 @@ def image_to_data_uri(img) -> str:
 
 
 def build_judge_payload(model: str, system_prompt: str, user_text: str,
-                        image_data_uri: str, temperature: float = 0.0) -> dict:
+                        image_data_uri: str, temperature: float = 0.0,
+                        max_tokens: int = DEFAULT_JUDGE_MAX_TOKENS) -> dict:
     """Build the OpenAI-compatible chat/completions payload with a vision content
-    array (text + image_url). Judge runs at temperature 0 for reproducible scoring."""
+    array (text + image_url). Judge runs at temperature 0 for reproducible scoring;
+    max_tokens caps the response so a runaway generation can't hold the KV cache
+    until the HTTP timeout."""
     return {
         "model": model,
         "messages": [
@@ -393,6 +400,7 @@ def build_judge_payload(model: str, system_prompt: str, user_text: str,
             ]},
         ],
         "temperature": temperature,
+        "max_tokens": max_tokens,
         "stream": False,
     }
 
@@ -853,6 +861,15 @@ def judge_candidate(image, target_prompt: str, cfg: WorkingConfig, backend_cfg: 
     if not url:
         raise RefineError("judge backend config missing 'url'")
     key = _backend_key(backend_cfg)
+    # Backend-cfg override for the response cap (enhancers.toml `max_tokens`).
+    # TOML ints arrive as ints; bool is an int subclass, hence the explicit
+    # check. Validated BEFORE the model-autodetect fallback (a live GET) so a
+    # static config error never costs network work. main() mirrors this check
+    # at startup so the loop path fails before the first generation.
+    max_tokens = backend_cfg.get("max_tokens", DEFAULT_JUDGE_MAX_TOKENS)
+    if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1:
+        raise RefineError(
+            f"judge backend 'max_tokens' must be a positive integer, got {max_tokens!r}")
     # The model id is normally pre-resolved + cached in main() (one GET /models at
     # startup). This fallback keeps direct callers/tests working; a failure here
     # becomes a RefineError so it stays within the F7 iteration contract rather than
@@ -869,7 +886,7 @@ def judge_candidate(image, target_prompt: str, cfg: WorkingConfig, backend_cfg: 
     user_text = build_judge_user_text(target_prompt, cfg, planner_loras,
                                       search_offers=search_offers)
     payload = build_judge_payload(model, system_prompt, user_text, data_uri,
-                                  temperature=temperature)
+                                  temperature=temperature, max_tokens=max_tokens)
     raw = _post_judge(endpoint, payload, key=key, timeout=timeout)
     return parse_verdict(raw)
 
@@ -1531,6 +1548,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[refine] judge backend {args.judge_backend!r} must be type "
               f"'openai-endpoint' (the vision path), got "
               f"{backend_cfg.get('type')!r}", file=sys.stderr)
+        return 2
+    # Mirror judge_candidate's max_tokens validation at startup: a static
+    # config typo must fail HERE, not after the first (expensive) generation
+    # of every iteration (security review 2026-07-20, MEDIUM-2 shape).
+    _mt = backend_cfg.get("max_tokens", DEFAULT_JUDGE_MAX_TOKENS)
+    if isinstance(_mt, bool) or not isinstance(_mt, int) or _mt < 1:
+        print(f"[refine] judge backend 'max_tokens' must be a positive "
+              f"integer, got {_mt!r}", file=sys.stderr)
         return 2
 
     # Resolve + cache the judge model id ONCE at startup (one GET /models). Doing it

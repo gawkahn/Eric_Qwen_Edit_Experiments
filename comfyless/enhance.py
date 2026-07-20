@@ -166,13 +166,20 @@ def _coerce_sampling_value(key: str, val: Any, want_int: bool, layer: str):
                     f"{layer} {key} must be {kind}, got {val!r}")
             return int(f)
         return float(val)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: TOML ints are arbitrary-precision; float(10**400)
+        # must not escape the EnhanceError contract as a raw traceback.
         raise EnhanceError(f"{layer} {key} must be {kind}, got {val!r}")
 
 
 _SAMPLING_KNOBS = (("temperature", False), ("top_p", False),
                    ("repetition_penalty", False), ("top_k", True),
-                   ("min_p", False))
+                   ("min_p", False), ("max_tokens", True))
+
+#: Hard output cap sent on EVERY openai-endpoint request (recipe/backend-cfg
+#: overridable). Without a cap, a model that misses its stop token churns KV
+#: cache until the HTTP timeout; 1024 tokens is ample for an enhancement.
+DEFAULT_MAX_TOKENS = 1024
 
 
 def load_recipe(name: str, recipes_dir: Optional[str] = None) -> dict:
@@ -475,13 +482,15 @@ def _post_chat(endpoint: str, payload: dict, key: str) -> List[str]:
 def _resolve_endpoint_sampling(recipe: dict, cfg: dict) -> dict:
     """Resolve openai-endpoint sampling knobs: recipe value > cfg value > default.
 
-    ``temperature`` always resolves (default 0.8). ``top_p`` / ``top_k`` /
-    ``repetition_penalty`` / ``min_p`` are included ONLY when a recipe or backend
-    cfg sets them — so a plain request stays OpenAI-standard (``top_k`` /
-    ``repetition_penalty`` / ``min_p`` are vLLM extensions that stricter servers
-    reject if sent unconditionally). This is the single source of truth for which sampling
-    fields reach the wire; the recipe layer owns per-recipe values, the cfg layer
-    supplies per-backend defaults.
+    ``temperature`` always resolves (default 0.8), and ``max_tokens`` always
+    resolves (default DEFAULT_MAX_TOKENS — both are OpenAI-standard, and an
+    uncapped generation can churn KV cache until the HTTP timeout). ``top_p`` /
+    ``top_k`` / ``repetition_penalty`` / ``min_p`` are included ONLY when a
+    recipe or backend cfg sets them — so a plain request stays OpenAI-standard
+    (``top_k`` / ``repetition_penalty`` / ``min_p`` are vLLM extensions that
+    stricter servers reject if sent unconditionally). This is the single source
+    of truth for which sampling fields reach the wire; the recipe layer owns
+    per-recipe values, the cfg layer supplies per-backend defaults.
     """
     def pick(key):
         if recipe.get(key) is not None:
@@ -497,6 +506,13 @@ def _resolve_endpoint_sampling(recipe: dict, cfg: dict) -> dict:
         "temperature": _coerce_sampling_value("temperature", temp, False,
                                               "backend cfg:")
         if temp is not None else 0.8}
+    mt = pick("max_tokens")
+    out["max_tokens"] = (_coerce_sampling_value("max_tokens", mt, True,
+                                                "backend cfg:")
+                         if mt is not None else DEFAULT_MAX_TOKENS)
+    if out["max_tokens"] < 1:
+        raise EnhanceError(
+            f"max_tokens must be a positive integer, got {out['max_tokens']!r}")
     for key, want_int in (("top_p", False), ("top_k", True),
                           ("repetition_penalty", False), ("min_p", False)):
         v = pick(key)
@@ -525,9 +541,9 @@ def enhance_openai_endpoint(text: str, cfg: dict, recipe: dict, n: int) -> List[
     # Cache the resolved id back so a multi-prompt offline batch (which calls
     # this per source prompt with the same cfg dict) resolves /models once.
     cfg["model"] = model
-    # recipe > cfg > default for every sampling knob (temperature/top_p/top_k/
-    # repetition_penalty/min_p). top_k + repetition_penalty + min_p are vLLM
-    # extensions, emitted only when set.
+    # recipe > cfg > default for every sampling knob (temperature/max_tokens/
+    # top_p/top_k/repetition_penalty/min_p). top_k + repetition_penalty + min_p
+    # are vLLM extensions, emitted only when set.
     sampling = _resolve_endpoint_sampling(recipe, cfg)
     system_prompt = recipe["system_prompt"]
     endpoint = url.rstrip("/") + "/chat/completions"

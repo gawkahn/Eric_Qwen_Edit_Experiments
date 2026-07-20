@@ -30,7 +30,10 @@ precision = "bf16"     # optional (bf16|fp16|fp32; default bf16)
 # diversity in the recipe, not here — the knobs below are the fallback for
 # recipes that omit them. temperature defaults to 0.8; top_p/top_k/
 # repetition_penalty/min_p are emitted only when set (top_k + repetition_penalty
-# + min_p are vLLM extensions stricter servers reject).
+# + min_p are vLLM extensions stricter servers reject). max_tokens is ALWAYS
+# emitted (default 1024): an uncapped model that misses its stop token churns
+# KV cache until the HTTP timeout. The refine judge reads the same key from
+# its backend entry and requires a bare positive TOML integer.
 [gemma-dense]
 type    = "openai-endpoint"
 url     = "http://localhost:8016/v1"
@@ -38,6 +41,7 @@ temperature = 0.9    # default 0.8 (shadowed by a recipe that sets temperature)
 top_p       = 0.95
 top_k       = 20
 repetition_penalty = 1.05
+# max_tokens = 1024         # response cap; default 1024, always sent
 # min_p     = 0.05          # optional vLLM extension; emitted only when set
 # batch_variations = true   # request all --variations in ONE call via the
                             #   OpenAI `n` param (throughput win on vLLM). It is
