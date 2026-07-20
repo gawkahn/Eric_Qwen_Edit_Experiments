@@ -174,5 +174,18 @@ when a specific frame must be preserved, judge-gated via the refine loop
   `--offload` added (CPU-offload, peak ~30–40 GB) after the live smoke hit a
   shared-GPU OOM. Sidecar `comfyless-video/1` carries `crf` and absolute
   model/LoRA paths per code review.
+- 2026-07-20 (slice V2, `docs/vision/slice-video-2-chaining.md`): §2–3
+  implemented. Vision-level calls settled: per-segment mp4s kept for
+  judging/resume + one streaming master re-encode; parallel dispatch =
+  per-device worker subprocesses (`--devices`, round-robin shards, one
+  pipeline load per worker); plan schema `comfyless-video-plan/1` with
+  fps/dims/lightning global-only and per-segment
+  seed/frames/steps/cfg/negative_prompt overrides. Cuts (non-shared boundary
+  keyframes) are legal: loud notice, no dedup, no color correction at that
+  join. Color correction is measure-then-apply per-join AdaIN (max abs
+  per-channel mean delta, default threshold 2.0/255; `--color-correct off`
+  disables applying, never measuring; deltas always recorded in the master
+  sidecar). `--resume` / `--stitch-only` / `--only-segments` give
+  failure-recovery without re-rendering.
 
 **AI-Disclosure:** Claude (Fable 5) authored; Grant reviewed.
