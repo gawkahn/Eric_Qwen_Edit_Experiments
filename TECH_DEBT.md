@@ -1501,3 +1501,21 @@ Trigger: BINDING precondition of the `--json`/LLM-agent wiring commit (Red
 Zone per the Review bar), or the next `params_validation.py` slice,
 whichever comes first. Fix: `math.isfinite` in `validate_lora_entry` +
 `parse_constant` rejection at the socket `json.loads`.
+
+**plan.json ingestion: hardening preconditions for the LLM planner (slice 6)** *(2026-07-20)*
+`comfyless/video.py` `load_plan` validates ADR-012-style (byte cap, unknown
+keys, types/ranges, keyframe decode) under a CLI-local trust model — plans
+are user-authored today. The slice-V2 code review (Fable, 2026-07-20) flagged
+what must land BEFORE an LLM emits plans: (1) keyframe path containment —
+no allowed-roots check, any PIL-decodable file on the machine can become
+video content (ADR-018 `_check_paths` union pattern); (2) duplicate JSON
+keys silently last-win — reject via `object_pairs_hook`; (3) TOCTOU on the
+byte cap — `getsize` then separate `open`; read capped bytes from the open
+handle; (4) no aggregate resource cap — 200 segments × 100k frames permits a
+~20M-frame plan; add total-frames/runtime cap; (5) error messages echo
+caller-supplied paths verbatim into what will become agent transcripts.
+Why not now: slice V2's declared trust model is CLI-local (Vision
+`slice-video-2-chaining.md`); slice 6 is Red Zone with its own spec +
+security-auditor gate where these belong.
+Trigger: BINDING precondition of the ADR-033 slice-6 (LLM planner / MCP
+exposure) commit — the security review for that slice must confirm all five.
