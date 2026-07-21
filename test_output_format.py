@@ -227,6 +227,32 @@ with tempfile.TemporaryDirectory() as d:
     check(loaded.get("seed") == 5, "replay keeps real params")
 
 
+# ── D6: --params on a non-png image gives a directed sidecar error ────────
+# A .jpg carries no embedded metadata; replay must point at the .json sidecar
+# rather than JSON-parsing image bytes into a confusing decode traceback.
+print("D6 --params directed error for non-png images")
+from comfyless.generate import _load_params  # noqa: E402
+# Include an uppercase spelling — the branch's `.lower()` is load-bearing.
+for ext in (".jpg", ".jpeg", ".webp", ".JPG"):
+    with tempfile.TemporaryDirectory() as d:
+        img = os.path.join(d, f"pic{ext}")
+        open(img, "wb").write(b"\xff\xd8\xff\xe0not-json")  # jpeg-ish bytes
+        raised_directed = False
+        try:
+            _load_params(img)
+        except ValueError as e:  # JSONDecodeError is a ValueError subclass
+            msg = str(e)
+            # A raw JSON decode message would not name the sidecar — the
+            # directed D6 error does, so this distinguishes the two.
+            raised_directed = os.path.join(d, "pic.json") in msg and "sidecar" in msg
+        check(bool(raised_directed), f"{ext}: directed error names the .json sidecar")
+# A real .json sidecar still loads (the branch didn't over-reach).
+with tempfile.TemporaryDirectory() as d:
+    sc = os.path.join(d, "ok.json")
+    json.dump({"model": "/m/x", "seed": 9}, open(sc, "w"))
+    check(_load_params(sc).get("seed") == 9, ".json path still loads normally")
+
+
 print()
 if _failures:
     print(f"{len(_failures)} FAILURE(S):")

@@ -1556,3 +1556,9 @@ whichever wires machine-facing output next. Fix: thread the resolved
 OutputFormat through the bridge request contract + cascade `_save_with_metadata`,
 replacing the rejections with real handling; add the bridge to ADR-034's
 Proposed slices list.
+Partial-resolution: 2026-07-21 — the **Stable Cascade half landed** in ADR-034
+slice 4 (commit `9faa17a`): `cascade.py` dispatch now resolves
+`--output-format`/`--quality` and saves format-aware; the slice-1 reject
+stopgap in `generate.py` is gone. The **`--json` bridge (`_run_json_mode`)
+half remains OPEN** and unchanged — still its own future Red Zone slice per the
+Trigger above (spec + `security-auditor` gate; never assigned an ADR-034 slice).

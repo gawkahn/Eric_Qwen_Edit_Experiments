@@ -255,6 +255,17 @@ Sequenced so each is independently revertible. Slices 2, 3, 5 are Red Zone.
 
 ## Changelog
 
+- 2026-07-21 — **Slice 6 landed (D6 `--params` negative branch).**
+  `_load_params` (`generate.py`) now raises a directed `ValueError` naming the
+  `.json` sidecar when `--params` is pointed at a non-png image (`.jpg`,
+  `.jpeg`, `.webp`, `.gif`, `.bmp`, `.tif`, `.tiff`) — those carry no embedded
+  comfyless metadata, so the prior fall-through to `_load_sidecar` JSON-parsed
+  image bytes into a confusing decode traceback. `.png` (tEXt chunk) and real
+  `.json` sidecars are unaffected. Negative test added per the ADR proof hook.
+  TECH_DEBT: the `--json` bridge output-format entry got a partial-resolution
+  note (the cascade half closed in slice 4; the bridge half stays a future Red
+  Zone slice). **Non-Red-Zone** (`_load_params` is not on `_red-zone-paths.sh`
+  nor function-scoped Red Zone) — `code-reviewer` only.
 - 2026-07-21 — **Slice 4 landed (cascade).** The Stable Cascade dispatch
   (`cascade.py`) resolves `--output-format {png,jpeg,jpg}` + `--quality` itself
   and threads the resolved `OutputFormat` extension through the numbering

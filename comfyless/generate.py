@@ -177,10 +177,27 @@ def _load_sidecar(path: str) -> dict:
     return _validate_params(data, source=f"sidecar:{path}")
 
 
+# Image extensions that carry NO embedded comfyless metadata — only PNG has a
+# tEXt chunk (ADR-034 §2/D6). --params replay reads the JSON sidecar written
+# beside such an image, never the image bytes.
+_NON_PNG_IMAGE_EXTS = (".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff")
+
+
 def _load_params(path: str) -> dict:
     """Load base params from a comfyless sidecar JSON or a PNG with embedded metadata."""
-    if path.lower().endswith(".png"):
+    low = path.lower()
+    if low.endswith(".png"):
         return _load_params_from_png(path)
+    if low.endswith(_NON_PNG_IMAGE_EXTS):
+        # ADR-034 D6: a .jpg/.jpeg (etc.) has no embedded provenance; JSON-parsing
+        # its bytes would raise a confusing decode traceback. Direct the caller to
+        # the sidecar instead of falling through to _load_sidecar.
+        stem = os.path.splitext(path)[0]
+        raise ValueError(
+            f"{path!r} is an image with no embedded comfyless metadata "
+            f"(only PNG carries a tEXt chunk). --params replays from the JSON "
+            f"sidecar written beside it — pass '{stem}.json' instead."
+        )
     return _load_sidecar(path)
 
 
