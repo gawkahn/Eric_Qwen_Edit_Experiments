@@ -11,6 +11,15 @@ See **ADR-010** for the design rationale.
 ## Quick start
 
 ```bash
+# NOTE: Stable Cascade uses the comfy-dev venv on PURPOSE — NOT the repo's own
+# ./.venv. Cascade builds on diffusers' Würstchen pipeline
+# (`diffusers.pipelines.wuerstchen`), which diffusers REMOVED after 0.37.x. The
+# repo pins diffusers 0.39.0 in ./.venv (uv.lock), where that module is gone, so
+# cascade generation there dies with `ModuleNotFoundError: No module named
+# 'diffusers.pipelines.wuerstchen'`. The comfy-dev venv still ships diffusers
+# 0.37.1, so run cascade generation there. (Every OTHER comfyless family runs in
+# ./.venv as usual — this interpreter split is cascade-only. See TECH_DEBT.md
+# "Stable Cascade generation broken in ./.venv".)
 PY=/home/gawkahn/projects/ai-lab/ai-stack-data/comfy-dev/run/venv/bin/python3
 cd /home/gawkahn/projects/ai-lab/code/Eric_Qwen_Edit_Experiments
 
@@ -23,6 +32,12 @@ $PY -m comfyless.generate \
 ```
 
 `cascade_default.json` is shipped in `comfyless/examples/` and points at the SAI `stabilityai/stable-cascade` repo with full-variant defaults. Edit a copy to swap stages or tune params.
+
+> **Note — the code under test is always the repo's, not the venv's.** Running
+> `$PY -m comfyless.generate` from the repo root imports `comfyless/` from this
+> checkout regardless of which venv `$PY` belongs to; the venv only supplies
+> torch/diffusers. So cascade changes in this repo are still exercised when you
+> run them under the comfy-dev interpreter.
 
 ---
 

@@ -1562,3 +1562,29 @@ slice 4 (commit `9faa17a`): `cascade.py` dispatch now resolves
 stopgap in `generate.py` is gone. The **`--json` bridge (`_run_json_mode`)
 half remains OPEN** and unchanged — still its own future Red Zone slice per the
 Trigger above (spec + `security-auditor` gate; never assigned an ADR-034 slice).
+
+**Stable Cascade generation broken in the pinned `./.venv` (diffusers 0.39.0 dropped Würstchen)** *(2026-07-21)*
+Stable Cascade generation builds on `diffusers.pipelines.wuerstchen`
+(`DDPMWuerstchenScheduler` + the Würstchen pipeline classes), which diffusers
+REMOVED after ~0.37.x. The repo pins `diffusers==0.39.0` in `./.venv`
+(`uv.lock`), where that module is gone, so `build_pipelines` for any cascade
+config dies at import with `ModuleNotFoundError: No module named
+'diffusers.pipelines.wuerstchen'`. Confirmed 2026-07-21: `./.venv` diffusers
+0.39.0 fails; the comfy-dev venv (diffusers 0.37.1) still has it and cascade
+runs there. The pyright baseline already flags these imports as unresolved
+(`cascade.py` wuerstchen import + `DDPMWuerstchenScheduler`), and `test_cascade.py`
+passes only because it deliberately never builds a real pipeline (dispatch /
+path / save-helper logic only) — so the runtime break is invisible to CI.
+Impact: cascade is a supported family whose live path works ONLY under an
+interpreter with diffusers ≤ ~0.37.x (currently comfy-dev's venv, incidentally
+ComfyUI's). ADR-034 slice 4's cascade output-format code is therefore
+unit-tested but NOT live-validated in `./.venv`; validate it under comfy-dev.
+Why not now: fixing it means either (a) vendoring/shimming the removed
+Würstchen pipeline into the repo, (b) pinning a second diffusers for a
+cascade-only extra, or (c) formally declaring cascade a comfy-dev-only family —
+each is a deliberate dep-architecture decision (ADR-013 territory), out of
+ADR-034's output-format scope.
+Trigger: the next diffusers bump (re-check wuerstchen availability), any move to
+run cascade from `./.venv`, or a decision to make CI actually exercise a cascade
+build. Interim: `docs/comfyless-stable-cascade.md` now documents the comfy-dev
+requirement inline.
