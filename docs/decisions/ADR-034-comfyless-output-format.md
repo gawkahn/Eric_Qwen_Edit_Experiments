@@ -240,6 +240,18 @@ Sequenced so each is independently revertible. Slices 2, 3, 5 are Red Zone.
 4. D5's threat model: confirm the MCP output directory is not, and is not
    planned to be, reachable by the agent or exposed over a transport. The
    full-path sidecar is safe only while that holds.
+   **Direction (Grant, 2026-07-21, gating slice 3):** the MCP *will* need
+   output access for iterative loops (LLM-as-judge, multi-round editing) — so
+   "output dir never touched by the MCP surface" is NOT the long-term model.
+   Instead the access must be **transparent/opaque at the agent boundary**: the
+   caller receives the output (image/result) but never filesystem details —
+   where it came from, or the path — unless deliberately granted. This means
+   D5's full-path sidecar must remain operator-only and never cross to the
+   agent; anything the agent sees is path-stripped (extends the ADR-011/ADR-015
+   opaque-handle principle to output provenance). Slice 3 must design the
+   judge/edit-loop output hand-back around opaque handles, not paths. This
+   supersedes the narrow "is the dir reachable?" framing: assume it becomes
+   agent-adjacent, and keep the boundary opaque by construction.
 
 ## Changelog
 
