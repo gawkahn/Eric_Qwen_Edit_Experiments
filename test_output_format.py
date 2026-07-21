@@ -28,6 +28,12 @@ _failures = []
 
 
 def check(cond, label):
+    # Guard against reversed-argument calls: a truthy label string would make
+    # every check vacuously pass. Conditions here are always bool.
+    if not isinstance(cond, bool):
+        raise TypeError(
+            f"check() condition must be bool, got {type(cond).__name__} "
+            f"({cond!r}) — arguments likely reversed for label {label!r}")
     if cond:
         print(f"  ok: {label}")
     else:
@@ -169,31 +175,31 @@ with tempfile.TemporaryDirectory() as d:
 print("unsupported-path flags rejected loudly")
 import comfyless.generate as _gen  # noqa: E402
 _src = open(_gen.__file__).read()
-check("--json rejects --output-format/--quality (OutputFormatNotSupported)",
-      "OutputFormatNotSupported" in _src
-      and "args.output_format is not None or args.quality is not None" in _src)
-check("cascade dispatch rejects --output-format/--quality",
-      "not supported for " in _src and "Stable Cascade yet (ADR-034 slice 4)" in _src)
+check("OutputFormatNotSupported" in _src
+      and "args.output_format is not None or args.quality is not None" in _src,
+      "--json rejects --output-format/--quality (OutputFormatNotSupported)")
+check("not supported for " in _src and "Stable Cascade yet (ADR-034 slice 4)" in _src,
+      "cascade dispatch rejects --output-format/--quality")
 
 
 # ── Sidecar provenance is recorded but never replayed (ADR-034) ──────────
 print("output-format sidecar provenance is replay-filtered")
 from comfyless.generate import _load_sidecar, _SKIP_SIDECAR_KEYS  # noqa: E402
-check("output_format + quality in _SKIP_SIDECAR_KEYS",
-      {"output_format", "quality"} <= _SKIP_SIDECAR_KEYS)
+check({"output_format", "quality"} <= _SKIP_SIDECAR_KEYS,
+      "output_format + quality in _SKIP_SIDECAR_KEYS")
 # The recorded fraction is carried on the resolved OutputFormat.
-check("OutputFormat carries the quality fraction",
-      resolve_output_format("jpeg", 0.9, None).quality_fraction == 0.9)
-check("default fraction carried when --quality omitted",
-      resolve_output_format("jpeg", None, None).quality_fraction == DEFAULT_QUALITY_FRACTION)
+check(resolve_output_format("jpeg", 0.9, None).quality_fraction == 0.9,
+      "OutputFormat carries the quality fraction")
+check(resolve_output_format("jpeg", None, None).quality_fraction == DEFAULT_QUALITY_FRACTION,
+      "default fraction carried when --quality omitted")
 with tempfile.TemporaryDirectory() as d:
     sc = os.path.join(d, "s.json")
     json.dump({"model": "/m/x", "prompt": "p", "seed": 5,
                "output_format": "jpeg", "quality": 0.9}, open(sc, "w"))
     loaded = _load_sidecar(sc)
-    check("replay drops output_format (not a generation input)", "output_format" not in loaded)
-    check("replay drops quality (not a generation input)", "quality" not in loaded)
-    check("replay keeps real params", loaded.get("seed") == 5)
+    check("output_format" not in loaded, "replay drops output_format (not a generation input)")
+    check("quality" not in loaded, "replay drops quality (not a generation input)")
+    check(loaded.get("seed") == 5, "replay keeps real params")
 
 
 print()
