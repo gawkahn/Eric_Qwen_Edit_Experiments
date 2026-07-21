@@ -127,7 +127,15 @@ _SKIP_SIDECAR_KEYS = {"timestamp", "elapsed_seconds", "contract_version",
                       # ADR-034: output format/quality are an OUTPUT concern,
                       # recorded as provenance on jpeg runs but never a replay
                       # param — re-pass --output-format/--quality to replay.
-                      "output_format", "quality"}
+                      "output_format", "quality",
+                      # ADR-035: ref_images is a recognized schema key, but its
+                      # replay TRUST treatment (decision 7: F4 echo + outside-roots
+                      # refusal) lands in slice 5. Until then the replay channel is
+                      # held closed here — a --params sidecar's ref_images is
+                      # dropped, so only a typed --ref-image (row-1 authority) can
+                      # introduce a reference. Slice 5 removes this and adds the
+                      # trust treatment.
+                      "ref_images"}
 
 
 def _type_name(t) -> str:
@@ -226,8 +234,14 @@ def _extract_eric_save_params(params_json: str, path: str) -> dict:
     # sampler_s3, model_path, etc.) as "unknown keys".  loras is a schema key
     # but Eric Diffusion Save stores it in an unreplayable format — warn and
     # drop before validation so the user relies on --lora explicitly.
-    if "loras" in data:
-        data = {k: v for k, v in data.items() if k != "loras"}
+    #
+    # ref_images (ADR-035) is likewise a schema key, but this chunk path bypasses
+    # _SKIP_SIDECAR_KEYS — so drop it here too, mirroring _load_sidecar's replay
+    # suppression, until the slice-5 replay-trust treatment lands. Without this a
+    # crafted 'parameters' chunk would plant an unvalidated ref_images path.
+    for _drop in ("loras", "ref_images"):
+        if _drop in data:
+            data = {k: v for k, v in data.items() if k != _drop}
 
     out = _validate_params(data, source=f"eric-save:{path}")
 
@@ -1978,6 +1992,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--lora", action="append", default=[],
                    metavar="PATH:WEIGHT",
                    help="LoRA to apply (repeatable).  Format: path or path:weight")
+    p.add_argument("--ref-image", action="append", default=[],
+                   metavar="PATH[:MODE]",
+                   help="Reference image for edit / img2img conditioning (repeatable, "
+                        "max 8; ADR-035). MODE selects conditioning paths: both "
+                        "(default, scene lock), vl (semantic only — geometry free), "
+                        "ref (pixel only). A path containing a colon must append an "
+                        "explicit :MODE. Consumed by the qwen-edit family "
+                        "(execution lands in ADR-035 slice 3).")
     p.add_argument("--sampler", choices=SAMPLER_NAMES, default=None,
                    help="Sampler algorithm")
     p.add_argument("--schedule", choices=SCHEDULE_NAMES, default=None,
@@ -2182,6 +2204,62 @@ def _parse_lora_arg(spec: str) -> Dict[str, Any]:
         except ValueError:
             pass
     return {"path": spec, "weight": 1.0}
+
+
+# ADR-035 reference-image surface. MODE selects the per-image conditioning paths
+# (decision 2a); the cap bounds a daemon request's transient allocation (6f).
+_REF_MODES = ("both", "vl", "ref")
+_MAX_REF_IMAGES = 8
+
+
+def _parse_ref_image(spec: str) -> Dict[str, str]:
+    """Parse a ``--ref-image`` ``PATH[:MODE]`` spec into ``{"path","mode"}``
+    (ADR-035 decisions 1 / 2a).
+
+    Split on the LAST colon like ``_parse_lora_arg``, but — unlike a LoRA weight —
+    the suffix MUST be a valid MODE (``both``/``vl``/``ref``) or it is a HARD error:
+    a silent fallback here would quietly change what the model conditions on. A
+    path that itself contains a colon must therefore append an explicit mode, e.g.
+    ``'my:file.png:both'``. Omitting ``:MODE`` selects ``both`` (scene lock).
+    """
+    if ":" in spec:
+        idx = spec.rfind(":")
+        suffix = spec[idx + 1:]
+        if suffix in _REF_MODES:
+            return {"path": spec[:idx], "mode": suffix}
+        raise ValueError(
+            f"--ref-image {spec!r}: unknown MODE {suffix!r} "
+            f"(expected one of {', '.join(_REF_MODES)}). A path containing a colon "
+            f"must append an explicit mode, e.g. '{spec}:both'.")
+    return {"path": spec, "mode": "both"}
+
+
+def _validate_ref_image_specs(specs: List[str]) -> List[Dict[str, str]]:
+    """Parse + validate all ``--ref-image`` specs (ADR-035 slice 1).
+
+    Raises ``ValueError`` (offending value named) — touches no GPU and decodes
+    nothing (ingestion caps + decode are slice 2). Enforces MODE validity
+    (``_parse_ref_image``), the per-request reference cap (decision 6f), and the
+    colon-filename disambiguation (decision 1): if a valid-mode suffix was stripped
+    but the stripped path is absent while the FULL spec exists as a file, the user
+    most likely meant the whole spec as a filename — say so by name rather than
+    reporting a misleading bare not-found.
+    """
+    if len(specs) > _MAX_REF_IMAGES:
+        raise ValueError(
+            f"--ref-image: {len(specs)} references exceeds the per-request cap of "
+            f"{_MAX_REF_IMAGES} (ADR-035 decision 6f); pass at most {_MAX_REF_IMAGES}.")
+    out: List[Dict[str, str]] = []
+    for spec in specs:
+        entry = _parse_ref_image(spec)  # raises on an unknown MODE suffix
+        if entry["path"] != spec and not os.path.exists(entry["path"]) \
+                and os.path.isfile(spec):
+            raise ValueError(
+                f"--ref-image {spec!r}: the mode-stripped path {entry['path']!r} "
+                f"does not exist, but a file named {spec!r} does. If the colon is "
+                f"part of the filename, append an explicit mode: '{spec}:both'.")
+        out.append(entry)
+    return out
 
 
 def _run_json_mode() -> int:
@@ -3397,6 +3475,20 @@ def _split_model_arg(args: argparse.Namespace) -> List[str]:
 def main() -> int:
     args = _parse_args()
     cascade_extras = _split_model_arg(args)
+
+    # ── Reference images (ADR-035 slice 1) ────────────────────────────────
+    # Parse + validate --ref-image before any dispatch or GPU touch, so a bad
+    # spec (unknown MODE, > 8 refs, colon-filename ambiguity) exits nonzero with
+    # the value named and nothing written. Slice 1 is parse/validate only — the
+    # validated set is deliberately NOT yet threaded into generation, the daemon
+    # wire, or --params replay; ingestion (slice 2), qwen-edit execution
+    # (slice 3), daemon containment (slice 4), and replay trust (slice 5) each
+    # add their guard before consuming it.
+    try:
+        _validate_ref_image_specs(args.ref_image)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
 
     # ── Stable Cascade dispatch fork ──────────────────────────────────────
     # Sentinel `--model stablecascade <config.json> [config2.json] ...` activates

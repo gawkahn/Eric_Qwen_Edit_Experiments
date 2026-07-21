@@ -69,6 +69,15 @@ SCHEMA_KIND = types.MappingProxyType({
     "true_cfg_scale":       _KIND_FLOAT_NONE,
     "vae_from_transformer": _KIND_BOOL,
     "loras":                _KIND_LIST,
+    # ADR-035: reference images for edit / img2img conditioning — a list of
+    # {path, mode} entries, order-significant ("Picture N"). A GENERATION input
+    # (affects output, sidecar-recorded for replay per decision 7), hence a
+    # SCHEMA_KIND member. NOTE the transitional state: replay trust (decision 7)
+    # and daemon containment (decision 6a) land in later ADR-035 slices, so until
+    # then ref_images is held out of --params replay via _SKIP_SIDECAR_KEYS and is
+    # not carried on the daemon wire. Per-entry wire validation lands with the
+    # daemon slice; here it is a plain _KIND_LIST.
+    "ref_images":           _KIND_LIST,
     # Quantize-on-load triple (ADR-019). MOVED from _RUNTIME_KIND on
     # 2026-07-08: originally classed a runtime/VRAM knob, but slice R1/R2/R3
     # made quant affect output CORRECTNESS (some transformer/LoRA combos

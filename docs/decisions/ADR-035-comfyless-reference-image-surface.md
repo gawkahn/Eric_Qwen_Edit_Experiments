@@ -544,6 +544,24 @@ convention, and Qwen-Image-Edit-2511 is the *Plus* multi-reference variant where
 
 ## Changelog
 
+- 2026-07-21 — **Slice 1 landed (CLI parse + schema key).** `--ref-image
+  PATH[:MODE]` (argparse `action="append"`), `_parse_ref_image` (last-colon
+  split; MODE ∈ {both,vl,ref}, hard error on any other suffix; colon-in-path
+  needs explicit `:MODE`), and `_validate_ref_image_specs` (count cap 8,
+  decision 6f; colon-filename disambiguation, decision 1). Validated early in
+  `main()` before the cascade fork / any GPU. `ref_images` added to
+  `SCHEMA_KIND` + `_FIELD_DEFAULTS`. **Deliberately inert:** not threaded into
+  `generate()` (slice 3), not on the daemon wire (slice 4), and replay-dropped
+  via `_SKIP_SIDECAR_KEYS` (slice 5's trust treatment) — consumed by nothing, so
+  it opens no channel ahead of its guards. `code-reviewer` (Fable): the two
+  in-scope findings fixed in-slice — the wire-inertness test is now functional
+  (calls `_build_server_request`) not a source grep, and `_extract_eric_save_params`
+  now drops `ref_images` alongside `loras` (the PNG-chunk path bypasses
+  `_SKIP_SIDECAR_KEYS`). One out-of-scope regression the schema-key addition
+  opened — MCP `extract_params` leaking `ref_images` absolute paths — is logged
+  in TECH_DEBT and closed immediately in slice 1b (`mcp_server.py`, Red Zone →
+  `security-auditor`). Non-Red-Zone (parse only; the §12 ingestion trigger is
+  slice 2).
 - 2026-07-20 — Proposed. Scope confirmed as CLI + daemon with MCP deferred;
   video keyframe authoring as the first consumer. Records the generate/edit
   split as explicitly rejected, and the ADR-011 `edit`-stub drift as found.

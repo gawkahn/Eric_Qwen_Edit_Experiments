@@ -75,6 +75,8 @@ _FIELD_DEFAULTS: Dict[str, object] = {
     "text_encoder_2_path":  "",
     "vae_from_transformer": False,
     "loras":                [],
+    # ADR-035: reference images (list of {path, mode}); empty = pure generation.
+    "ref_images":           [],
     # Quantize-on-load triple — sidecar-replayable since 2026-07-08 (some
     # transformer/LoRA combos depend on the quant path for correct output).
     "quant":                "none",

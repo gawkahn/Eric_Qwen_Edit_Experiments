@@ -93,7 +93,15 @@ _source = Path(g.__file__).read_text()
 # Every canonical key should appear somewhere in the source beyond just
 # the schema definition itself — proves it's wired into either the
 # generate() signature, the CLI merge, or sidecar building.
+#
+# Deliberately-inert keys are exempt: ADR-035 adds `ref_images` to the schema in
+# slice 1 (recognized + replay-dropped) but does NOT thread it into generate()
+# until slice 3 — so it correctly appears only once in generate.py (the
+# _SKIP_SIDECAR_KEYS entry) for now. Slice 3 removes it from this exemption.
+_INERT_PENDING_WIRING = {"ref_images"}
 for key in schema:
+    if key in _INERT_PENDING_WIRING:
+        continue
     # Count occurrences; must be > 1 (the schema definition counts as one)
     count = _source.count(f"\"{key}\"")
     check(f"schema key {key!r} referenced outside the schema dict",
@@ -1266,6 +1274,108 @@ check("dormant NAG on unsupported family raises no warning (NEGATIVE)",
       _ng_dormant == (False, None), f"got {_ng_dormant!r}")
 check("gate table and dispatch map cover the same families",
       set(g._NAG_CFG_OWNS_NEGATIVE) == set(g._NAG_MODULES))
+
+
+# ── ADR-035 slice 1: --ref-image parsing + schema key ────────────────────────
+import os as _os        # noqa: E402
+import tempfile as _tf  # noqa: E402
+from comfyless.params_schema import COMFYLESS_SCHEMA as _SCHEMA  # noqa: E402
+
+print("\n── ADR-035 slice 1: --ref-image parse + schema ──")
+
+# _parse_ref_image: default MODE + each valid MODE + last-colon split.
+check("no :MODE defaults to both",
+      g._parse_ref_image("car.jpg") == {"path": "car.jpg", "mode": "both"})
+for _m in ("both", "vl", "ref"):
+    check(f":{_m} parses to mode {_m}",
+          g._parse_ref_image(f"car.jpg:{_m}") == {"path": "car.jpg", "mode": _m})
+check("colon-in-path parses via last-colon split (explicit mode)",
+      g._parse_ref_image("my:file.png:both") == {"path": "my:file.png", "mode": "both"})
+
+# Unknown MODE is a HARD error naming the value (no silent fallback).
+_bad = None
+try:
+    g._parse_ref_image("car.jpg:blah")
+except ValueError as e:
+    _bad = str(e)
+check("unknown MODE raises, names the value", bool(_bad) and "'blah'" in _bad)
+check("unknown-MODE error documents the colon escape",
+      bool(_bad) and "car.jpg:blah:both" in _bad)
+
+# Ref-count cap (decision 6f) = 8.
+_capmsg = None
+try:
+    g._validate_ref_image_specs(["a.png"] * 9)
+except ValueError as e:
+    _capmsg = str(e)
+check("9 refs exceed the cap, error names the count/limit",
+      bool(_capmsg) and "9 references" in _capmsg and "8" in _capmsg)
+check("exactly 8 refs is accepted",
+      len(g._validate_ref_image_specs(["a.png"] * 8)) == 8)
+
+# Colon-filename disambiguation (decision 1): stripped path absent but the FULL
+# spec exists as a file → error names the full spec, not a bare not-found.
+with _tf.TemporaryDirectory() as _d:
+    _colon_file = _os.path.join(_d, "frame:ref")
+    open(_colon_file, "wb").write(b"x")  # a real file literally named 'frame:ref'
+    _dis = None
+    try:
+        g._validate_ref_image_specs([_colon_file])  # splits to path=<d>/frame, mode=ref
+    except ValueError as e:
+        _dis = str(e)
+    check("colon-filename ambiguity names the full-spec file",
+          bool(_dis) and _colon_file in _dis and "append an explicit mode" in _dis)
+    # But a genuinely mode-stripped, existing image is fine (no false positive).
+    _img = _os.path.join(_d, "real.png")
+    open(_img, "wb").write(b"x")
+    check("existing image with a real :MODE validates cleanly",
+          g._validate_ref_image_specs([f"{_img}:vl"]) == [{"path": _img, "mode": "vl"}])
+
+check("empty --ref-image list is a clean no-op", g._validate_ref_image_specs([]) == [])
+
+# Schema recognition + fail-closed deferral.
+check("ref_images is a recognized schema key (list, default [])",
+      _SCHEMA.get("ref_images") == (list, []))
+check("ref_images is replay-dropped until slice 5 (fail-closed)",
+      "ref_images" in g._SKIP_SIDECAR_KEYS)
+
+# Wire inertness — FUNCTIONAL, not a source grep (review Finding 1): a params
+# dict carrying ref_images must NOT produce a wire request that carries it.
+import argparse as _ap  # noqa: E402
+_stub_ns = _ap.Namespace(
+    precision="bf16", device="cuda:0", offload_vae=False, attention_slicing=False,
+    sequential_offload=False, vae_tiling="auto", rebalance=False, rebalance_mult=0.0,
+    rebalance_weights=None, savepath=None, output_format=None, quality=None)
+_req = g._build_server_request(
+    _stub_ns, {"model": "/m/x", "prompt": "p",
+               "ref_images": [{"path": "/abs/secret.png", "mode": "vl"}]},
+    [], savepath_override=None)
+check("_build_server_request does NOT carry ref_images (wire-inert)",
+      "ref_images" not in _req)
+
+# Eric-Diffusion-Save chunk path drops ref_images (review Finding 3) — a crafted
+# 'parameters' chunk must not plant an unvalidated ref_images into merged params.
+_es = g._extract_eric_save_params(
+    json.dumps({"model": "/m/x", "seed": 5,
+                "ref_images": [{"path": "/abs/x.png", "mode": "both"}]}),
+    "/tmp/crafted.png")
+check("_extract_eric_save_params drops ref_images (no chunk side-door)",
+      "ref_images" not in _es)
+
+# main()-level ordering: a bad --ref-image exits 2 BEFORE any dispatch/GPU
+# (pins the Vision's first invariant, not just code position).
+import sys as _sys  # noqa: E402
+_old_argv = _sys.argv
+try:
+    _sys.argv = ["comfyless.generate", "--model", "/tmp/nomodel_xyz",
+                 "--prompt", "p", "--ref-image", "a.png:blah"]
+    _buf = io.StringIO()
+    with redirect_stderr(_buf):
+        _rc = g.main()
+    check("main() rejects a bad --ref-image with exit 2, value named",
+          _rc == 2 and "blah" in _buf.getvalue())
+finally:
+    _sys.argv = _old_argv
 
 
 print("\n──────────────────────────────────────────────────")

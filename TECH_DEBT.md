@@ -1588,3 +1588,23 @@ Trigger: the next diffusers bump (re-check wuerstchen availability), any move to
 run cascade from `./.venv`, or a decision to make CI actually exercise a cascade
 build. Interim: `docs/comfyless-stable-cascade.md` now documents the comfy-dev
 requirement inline.
+
+**MCP `extract_params` leaks `ref_images` absolute paths (ADR-035 slice-1 regression)** *(2026-07-21)*
+ADR-035 slice 1 made `ref_images` a recognized `SCHEMA_KIND` key. `mcp_server.py`
+`_handle_extract_params` normalizes a sidecar with `_validate_params` ALONE
+(deliberately bypassing `_SKIP_SIDECAR_KEYS`), and `_render_extracted_params`
+neither resolves nor drops `ref_images` — so a sidecar under `--output-dir`
+carrying `"ref_images":[{"path":"/abs/..."}]` survives normalization and its
+absolute paths cross the MCP boundary verbatim, breaking that function's stated
+"no absolute path or directory survives" invariant (code-reviewer Fable,
+2026-07-21, slice-1 review Finding 2). Before slice 1 the key was dropped as
+unknown. Not consumable for generation and low-exploitability today (no writer
+records `ref_images` in a sidecar yet), but it becomes a LIVE path leak the
+moment ADR-035 slice 5 starts recording `ref_images`.
+Why not now: the fix is in `mcp_server.py`, a Red-Zone-gated path OUTSIDE
+ADR-035 slice 1's edit scope — it needs its own slice with `security-auditor`
+(repo review bar) + a pin test. Not folded into slice 1 per §4 edit-scope split.
+Trigger: MUST close before ADR-035 slice 5 (sidecar recording) lands; addressed
+immediately as slice 1b. Fix: filter `_SKIP_SIDECAR_KEYS` (or pop `ref_images`)
+in/before `_handle_extract_params`, with a pin test mirroring the existing
+"no absolute path survives" assertions.
