@@ -278,6 +278,34 @@ try:
     check("daemon: omitted rebalance_weights -> None (generate applies preset)",
           _captured.get("rebalance_weights") is None)
 
+    # 3b. ADR-034 slice 2: output_format rides the wire and the daemon owns the
+    #     extension; cross-format runs in one --output-dir must NOT collide on
+    #     the per-stem .json sidecar (security review MEDIUM, 2026-07-21).
+    _fmtdir = tempfile.mkdtemp()
+    _captured.clear(); _state = {}
+    srv._handle_generate(
+        {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "a cat",
+         "output_format": "jpeg", "quality": 0.9},
+        _fmtdir, _fmtdir, "cuda", "bf16", _state,
+    )
+    _op1 = _captured.get("output_path", "")
+    check("daemon: jpeg run reserves comfyless0001.jpg",
+          _op1.endswith("comfyless0001.jpg"), f"got {_op1!r}")
+    check("daemon: output_format forwarded to generate() as OutputFormat(jpeg)",
+          getattr(_captured.get("output_format"), "name", None) == "jpeg")
+    check("daemon: jpeg run atomically reserves the .json stem too",
+          (Path(_fmtdir) / "comfyless0001.json").exists())
+    # A png run in the SAME dir must skip stem 0001 (its .json is taken) rather
+    # than clobber the jpeg run's provenance.
+    _captured.clear(); _state = {}
+    srv._handle_generate(
+        {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "a cat"},
+        _fmtdir, _fmtdir, "cuda", "bf16", _state,
+    )
+    _op2 = _captured.get("output_path", "")
+    check("daemon: next png run skips taken stem 0001, uses comfyless0002.png",
+          _op2.endswith("comfyless0002.png"), f"got {_op2!r}")
+
     # 4. Device is PINNED to the daemon's --device; the request payload's
     #    `device` is ignored (security review Finding 2). A daemon on cuda:1
     #    must run on cuda:1 even when the caller asks for cuda:0.
@@ -614,6 +642,8 @@ _args_q = _ap.Namespace(precision="bf16", device="cuda", offload_vae=False,
                         vae_tiling="auto",
                         savepath=None, quant=None,
                         quant_skip=None, quant_only=None,
+                        # ADR-034: builder reads args.output_format / args.quality.
+                        output_format=None, quality=None,
                         # krea-testing's builder also reads the rebalance
                         # fields; inert extras on main (attributes unread).
                         rebalance=False, rebalance_mult=4.0)
@@ -633,22 +663,50 @@ check("wire request passes server validation end-to-end",
       srv._validate_request(dict(_wire)) is None,
       f"err={srv._validate_request(dict(_wire))!r}")
 
+# ── ADR-034 slice 2: output format rides the wire + daemon boundary ──
+_args_jpg = _ap.Namespace(precision="bf16", device="cuda", offload_vae=False,
+                          attention_slicing=False, sequential_offload=False,
+                          vae_tiling="auto", savepath=None, quant=None,
+                          quant_skip=None, quant_only=None,
+                          output_format="jpeg", quality=0.9,
+                          rebalance=False, rebalance_mult=4.0)
+_wire_jpg = _gen._build_server_request(_args_jpg, {"model": "/m", "prompt": "p"}, [])
+check("wire carries output_format", _wire_jpg.get("output_format") == "jpeg",
+      f"got {_wire_jpg.get('output_format')!r}")
+check("wire carries quality (the fraction)", _wire_jpg.get("quality") == 0.9,
+      f"got {_wire_jpg.get('quality')!r}")
+check("png wire request omits explicit format (None passes through)",
+      _wire.get("output_format") is None)
+# Boundary value checks (server-specific semantic validation, ADR-034).
+check("daemon accepts valid output_format",
+      srv._validate_request({"type": "generate", "model": "m", "prompt": "p",
+                             "output_format": "jpg", "quality": 0.5}) is None)
+check("daemon rejects unknown output_format",
+      srv._validate_request({"type": "generate", "model": "m", "prompt": "p",
+                             "output_format": "gif"}) is not None)
+check("daemon rejects out-of-range quality (>1)",
+      srv._validate_request({"type": "generate", "model": "m", "prompt": "p",
+                             "quality": 1.5}) is not None)
+check("daemon rejects zero quality",
+      srv._validate_request({"type": "generate", "model": "m", "prompt": "p",
+                             "quality": 0}) is not None)
+check("daemon rejects non-numeric quality",
+      srv._validate_request({"type": "generate", "model": "m", "prompt": "p",
+                             "quality": "hi"}) is not None)
+
 _gen_src = Path(_gen.__file__).read_text()
 check("delegation-skip branch removed from generate.py",
       "daemon delegation skipped" not in _gen_src)
 # Positive property (review N-2): the delegation guard exists and no longer
-# consults args.quant anywhere. The guard condition gained an ADR-034 slice-1
-# clause (`and out_fmt.name == "png"`) so JPEG runs in-process until the daemon
-# format slice lands — matched on the stable condition substring, not the full
-# literal, so that clause does not falsely fail this quant-free guard.
+# consults args.quant anywhere. ADR-034 slice 2 removed the slice-1 png-only
+# clause, so jpeg delegates like any other request.
 check("delegation guard present and quant-free",
       "args.savepath or using_default_output" in _gen_src
       and 'args.quant != "none" and (args.savepath' not in _gen_src)
-# ADR-034 slice 1: JPEG output is forced in-process (daemon ignores
-# --output-format until slice 2). Pin it so the transitional guard is removed
-# deliberately with the daemon slice, not silently.
-check("ADR-034 slice-1 jpeg-forces-in-process guard present",
-      'out_fmt.name == "png"' in _gen_src)
+# The slice-1 jpeg-forces-in-process clause must be GONE from the delegation
+# guard (jpeg now delegates). Pinned so a regression re-adding it is caught.
+check("ADR-034 slice-2: delegation guard no longer png-gates",
+      'and out_fmt.name == "png"' not in _gen_src)
 
 
 print("\n── NAG (ADR-023): key freedom + forwarding + wire carriage ────")
@@ -658,6 +716,10 @@ print("\n── NAG (ADR-023): key freedom + forwarding + wire carriage ──�
 # attention processors are installed per-call and restored in a finally
 # (pipelines/nag_krea2.py), so a cached pipeline serves any NAG config.
 # A key that discriminated on nag_* would evict/reload on every NAG tweak.
+check("output_format/quality do NOT change the cache key (output concern)",
+      _K(dict(_r0, output_format="jpeg", quality=0.9), "bf16", "cuda") == _k_none)
+check("output_format does NOT change the cache key under quant either",
+      _K(dict(_r0, quant="fp8", output_format="jpeg", quality=0.5), "bf16", "cuda") == _k_fp8)
 check("nag params do NOT change the cache key (per-request safe)",
       _K(dict(_r0, nag_scale=5.0, nag_tau=3.0, nag_alpha=0.5, nag_end=0.75),
          "bf16", "cuda") == _k_none)

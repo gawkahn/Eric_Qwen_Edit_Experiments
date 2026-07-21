@@ -482,7 +482,14 @@ def _resolve_savepath(
     counter = 1
     while True:
         candidate = parent / f"{stem}{counter:04d}{extension}"
-        if not candidate.exists():
+        # The sidecar is per-stem (.json), the image per-extension — require
+        # BOTH free so a .jpg run cannot reuse a stem whose .json a prior .png
+        # run wrote, silently clobbering its provenance (ADR-034 slice 2 /
+        # security review). Non-atomic here (savepath/in-process), matching this
+        # path's existing exists()-then-write guarantee; the daemon auto-number
+        # branch reserves both atomically.
+        sidecar = parent / f"{stem}{counter:04d}.json"
+        if not candidate.exists() and not sidecar.exists():
             return str(candidate)
         counter += 1
 
@@ -2478,6 +2485,15 @@ def _build_server_request(
         "nag_alpha":           p.get("nag_alpha", 0.25),
         "nag_end":             p.get("nag_end", 1.0),
     }
+    # ADR-034 output format. Raw CLI values (name + 0.0-1.0 fraction); the
+    # daemon resolves the OutputFormat and owns the on-disk extension. Omitted
+    # when None (like rebalance_weights) so the canonical str/float validator
+    # never sees a null. Type-checked via _RUNTIME_KIND, value-checked in
+    # server._validate_request, never in the pipeline cache key.
+    if args.output_format is not None:
+        req["output_format"] = args.output_format
+    if args.quality is not None:
+        req["quality"] = args.quality
     # Pre-expanded template (iteration tokens resolved client-side) takes
     # precedence over args.savepath when provided.
     wire_savepath = savepath_override if savepath_override is not None else args.savepath
@@ -3193,15 +3209,9 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
         # quant delegates too since slice DQ: the wire request carries the
         # quant triple and the daemon keys its pipeline cache on it (see
         # docs/security/review-slice-DQ-daemon-quant-2026-07-03.md).
-        #
-        # ADR-034 slice 1: JPEG output is wired only on the in-process path.
-        # Force non-png in-process so a running daemon — which ignores
-        # --output-format until ADR-034 slice 2 — cannot silently emit PNG.
-        # Removed when the daemon slice lands.
-        if out_fmt.name != "png" and (args.savepath or using_default_output):
-            _log("[comfyless] JPEG output runs in-process (daemon format "
-                 "support lands in ADR-034 slice 2).")
-        if (args.savepath or using_default_output) and out_fmt.name == "png":
+        # ADR-034 slice 2: output_format/quality ride the wire request and the
+        # daemon owns the extension, so jpeg delegates like any other request.
+        if args.savepath or using_default_output:
             # Pre-expand iteration tokens client-side so the daemon receives a
             # template it can finish resolving (%seed%, %model%, etc.) without
             # needing to know about iteration at all.

@@ -120,6 +120,16 @@ _RUNTIME_KIND = types.MappingProxyType({
     "rebalance":          _KIND_BOOL,
     "rebalance_mult":     _KIND_FLOAT,
     "rebalance_weights":  _KIND_LIST,
+    # Output format/quality (ADR-034). Output concerns, NOT sidecar-shaped
+    # (deliberately absent from SCHEMA_KIND/COMFYLESS_SCHEMA so they never
+    # round-trip as replay params). Type-checked here so the canonical
+    # validator (ADR-012: sole owner of machine-boundary type predicates)
+    # rejects a non-str output_format / non-float quality before generate;
+    # the allowed-VALUE checks (format allowlist, 0<q<=1) live in
+    # server._validate_request. Callers omit them when None (like
+    # rebalance_weights), so a str/float kind never sees a null.
+    "output_format":      _KIND_STR,
+    "quality":            _KIND_FLOAT,
     # (The quant triple lived here until 2026-07-08 — now in SCHEMA_KIND;
     # see the note there. The wire union below is unchanged by the move.)
 })

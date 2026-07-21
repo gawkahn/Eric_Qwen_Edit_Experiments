@@ -221,6 +221,12 @@ Sequenced so each is independently revertible. Slices 2, 3, 5 are Red Zone.
   deliberately rather than drifting.
 - Daemon concurrency: two daemons, same output dir, JPEG — no collision, no
   overwrite (extends the parallel-daemon reservation test).
+- Daemon **mixed-format** in one output dir: a png run and a jpeg run must not
+  collide on the per-stem `.json` sidecar. The auto-number reservation
+  atomically claims BOTH `comfyless{NNNN}.{png,jpg}` and `comfyless{NNNN}.json`,
+  so a jpeg run cannot reuse a stem whose sidecar a prior png run wrote (added
+  after the slice-2 security review MEDIUM finding; `test_server_robustness`
+  daemon reservation 3b + `test_output_format` `_resolve_savepath` sidecar-skip).
 
 ## Open Questions
 
@@ -237,6 +243,21 @@ Sequenced so each is independently revertible. Slices 2, 3, 5 are Red Zone.
 
 ## Changelog
 
+- 2026-07-21 — **Slice 2 landed (daemon).** `--output-format`/`--quality` ride
+  the daemon wire request; the daemon resolves the `OutputFormat` server-side
+  and owns the on-disk extension for the O_EXCL reservation and the savepath
+  branch. Wire fields are type-checked via `_RUNTIME_KIND` (NOT `SCHEMA_KIND` —
+  they stay out of replay params) and value-checked in `server._validate_request`;
+  deliberately excluded from `_request_cache_key` (output concern, not pipeline
+  shape). The slice-1 in-process JPEG force is removed — jpeg now delegates.
+  `security-auditor` (Fable) gate:
+  `docs/security/review-adr-034-slice2-daemon-output-format-2026-07-21.md` —
+  Red Zone invariants (enum-derived extension, O_EXCL atomicity, `_within`,
+  boundary completeness, accept-loop survival) all hold; one MEDIUM
+  (cross-format runs clobbered the per-stem `.json` sidecar) **fixed in-slice**
+  by atomically co-reserving the sidecar stem (daemon) + a sibling-existence
+  check in `_resolve_savepath` (savepath/in-process). Open Questions Q3/Q4
+  remain binding preconditions for slice 3 (MCP).
 - 2026-07-21 — **Slice 1 follow-ups** (validated live: q0.9 1024² visually
   PNG-identical at ~5.5× smaller). (a) `--output-format` accepts `jpg` as an
   alias for `jpeg`. (b) Output format + quality are now recorded as **sidecar

@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 from comfyless.params_validation import QUANT_MODES, validate_machine_request
+from comfyless.output_format import resolve_output_format
 
 
 # Wire-protocol guardrails (see docs/security/review-comfyless-server-2026-04-23.md)
@@ -190,6 +191,19 @@ def _validate_request(req: Any) -> Optional[str]:
     if q not in (None, "") and q not in QUANT_MODES:
         return (f"Field 'quant': unknown mode {q!r}. "
                 f"Expected: {' | '.join(QUANT_MODES)}")
+
+    # Output format/quality allowed-VALUE checks (ADR-034). The canonical
+    # validator (validate_machine_request, via _RUNTIME_KIND) has already
+    # type-checked output_format as str and quality as float — so these are
+    # pure value checks, mirroring the quant-mode allowlist above and keeping
+    # this function free of isinstance predicates (N19 invariant).
+    of = req.get("output_format")
+    if of not in (None, "", "png", "jpeg", "jpg"):
+        return (f"Field 'output_format': unknown value {of!r}. "
+                f"Expected: png | jpeg | jpg")
+    ql = req.get("quality")
+    if ql is not None and not (0.0 < ql <= 1.0):
+        return f"Field 'quality': must be in (0.0, 1.0]; got {ql}"
 
     # Null-byte path defense. Kept server-specific rather than migrated into
     # the canonical validator (option discussed in the step-1 security
@@ -779,6 +793,17 @@ def _handle_generate(
     # atomically claims a name (Finding 1); it is unlinked if generation fails so
     # a failed run does not leave an orphan file that also burns a counter slot.
     _reserved: Optional[str] = None
+    _reserved_sidecar: Optional[str] = None
+    # Resolve output format (ADR-034). Values were value-checked in
+    # _validate_request; no --output path here (server owns the name), so no
+    # contradiction is possible. The extension is an enum-derived constant
+    # (".png"/".jpg"), never a caller string — the reservation/containment
+    # below therefore keep operating on a controlled suffix.
+    try:
+        out_fmt = resolve_output_format(req.get("output_format") or None,
+                                        req.get("quality"), None)
+    except ValueError as e:
+        return {"status": "error", "error_type": "ValidationError", "error": str(e)}
     savepath = req.get("savepath")
     if savepath:
         # Strip leading slashes so template can't escape output_dir.
@@ -802,6 +827,7 @@ def _handle_generate(
                 req.get("seed", -1), req.get("steps", 28),
                 req.get("cfg_scale", 3.5), req.get("sampler", "default"),
                 transformer_path=_txp,
+                extension=out_fmt.extension,
             )
         except Exception as e:
             return {"status": "error", "error_type": "PathError", "error": str(e)}
@@ -812,10 +838,19 @@ def _handle_generate(
         # comfyless0001.png and silently overwrite each other. Closes security
         # review Finding 1 (review-parallel-daemon-2026-07-03). The 0-byte
         # placeholder holds the name for the whole generation; generate()
-        # overwrites it with the real PNG.
+        # overwrites it with the real image.
+        #
+        # ADR-034 slice 2: the image name is now per-EXTENSION but the sidecar
+        # (comfyless{NNNN}.json, written client-side) is per-STEM. Reserving
+        # only the image would let a .jpg run reuse stem 0001 while a prior
+        # .png run's comfyless0001.json still exists, silently clobbering that
+        # run's provenance (its only record, for jpeg). So the counter must be
+        # free for BOTH the image and the sidecar stem — atomically claim the
+        # .json too (security review MEDIUM, 2026-07-21).
         counter = 1
         while True:
-            candidate = str(Path(output_dir) / f"comfyless{counter:04d}.png")
+            candidate = str(Path(output_dir) / f"comfyless{counter:04d}{out_fmt.extension}")
+            sidecar_candidate = str(Path(output_dir) / f"comfyless{counter:04d}.json")
             try:
                 _fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
             except FileExistsError:
@@ -828,9 +863,24 @@ def _handle_generate(
                 # has to preserve the daemon-survival promise. (code-review,
                 # slice 3 — same class as the slice-2 TypeError regression.)
                 return {"status": "error", "error_type": "IOError", "error": str(e)}
+            # Sidecar stem must also be free (a sibling-extension run may hold
+            # it). Release the image placeholder and advance if it is taken.
+            try:
+                _sfd = os.open(sidecar_candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                os.close(_fd)
+                os.unlink(candidate)
+                counter += 1
+                continue
+            except OSError as e:
+                os.close(_fd)
+                os.unlink(candidate)
+                return {"status": "error", "error_type": "IOError", "error": str(e)}
             os.close(_fd)
+            os.close(_sfd)
             output_path = candidate
             _reserved = candidate
+            _reserved_sidecar = sidecar_candidate
             break
 
     # Belt-and-suspenders: re-verify the final resolved path.
@@ -894,6 +944,10 @@ def _handle_generate(
             refiner_path=req.get("refiner_path", "") or "",
             refiner_steps=req.get("refiner_steps", 4),
             refiner_cfg=req.get("refiner_cfg", 3.5),
+            # ADR-034: output format is resolved server-side from the wire
+            # fields; deliberately NOT in _request_cache_key (output concern,
+            # not pipeline shape — same rationale as NAG).
+            output_format=out_fmt,
             _cached_pipeline=cached,
             # Explicit pause opt-out (slice PAUSE, 2026-07-17): the daemon
             # runs generation on its MAIN thread, usually in a foreground
@@ -904,13 +958,15 @@ def _handle_generate(
         )
     except Exception as e:
         import traceback
-        # No image was written — drop the reserved 0-byte placeholder so a failed
-        # run neither litters output_dir nor permanently consumes its counter.
-        if _reserved is not None:
-            try:
-                os.unlink(_reserved)
-            except OSError:
-                pass
+        # No image was written — drop the reserved 0-byte placeholders (image +
+        # sidecar stem) so a failed run neither litters output_dir nor
+        # permanently consumes its counter.
+        for _p in (_reserved, _reserved_sidecar):
+            if _p is not None:
+                try:
+                    os.unlink(_p)
+                except OSError:
+                    pass
         return {
             "status":     "error",
             "error_type": "InferenceError",

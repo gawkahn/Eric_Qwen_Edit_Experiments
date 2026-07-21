@@ -165,6 +165,23 @@ with tempfile.TemporaryDirectory() as d:
     p_jpg = _resolve_savepath(tmpl + "j", "m", 1, 10, 4.0, "default", extension=".jpg")
     check(p_jpg.endswith("0001.jpg"), "extension='.jpg' yields .jpg counter file")
 
+# Cross-format: a .jpg run must skip a stem whose .json sidecar a prior .png run
+# wrote, so it cannot clobber that run's provenance (ADR-034 slice 2 / review).
+print("_resolve_savepath skips a taken sidecar stem across formats")
+with tempfile.TemporaryDirectory() as d:
+    base = os.path.join(d, "img")
+    # Simulate a prior png run: image + sidecar at stem 0001.
+    open(base + "0001.png", "w").close()
+    open(base + "0001.json", "w").close()
+    p = _resolve_savepath(base, "m", 1, 10, 4.0, "default", extension=".jpg")
+    check(p.endswith("0002.jpg"),
+          "jpg run skips stem 0001 (its .json exists), uses 0002")
+    # Sanity: with no sidecar, the .jpg run is free to take 0001.
+    with tempfile.TemporaryDirectory() as d2:
+        p2 = _resolve_savepath(os.path.join(d2, "img"), "m", 1, 10, 4.0,
+                               "default", extension=".jpg")
+        check(p2.endswith("0001.jpg"), "clean dir: jpg run takes 0001")
+
 
 # ── Unsupported-path flags are rejected loudly, not ignored (review N-2) ──
 # ADR-034 D2 loudness: the --json bridge and cascade dispatch don't handle
