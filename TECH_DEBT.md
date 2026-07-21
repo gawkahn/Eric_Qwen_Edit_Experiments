@@ -1636,3 +1636,26 @@ Fix: in `_render_extracted_params`, coerce numeric/bool schema fields to
 type-or-drop (mirror `_CASCADE_NUMERIC_FIELDS`), value-allowlist `model_family`,
 or run `_validate_params` in a strict drop-on-mismatch mode for the extract path.
 Needs `security-auditor` (Red-Zone path).
+
+**ref-image ingestion: non-regular-file path hangs the decode (slice-4 daemon DoS precondition)** *(2026-07-21)*
+Surfaced by the ADR-035 slice-2 `security-auditor` (Fable) review
+(`docs/security/review-adr-035-slice2-ref-image-ingestion-2026-07-21.md`,
+Finding 2, LOW). `load_ref_image_capped` (`comfyless/ref_image.py`) opens the
+path with plain `open(path, "rb")`. On a FIFO this blocks in `open(2)` until a
+writer appears (a `/dev/tty`-style path blocks in `read`), an indefinite hang
+that no byte/pixel cap can reach. Benign under slice 2's CLI-local trust
+(operator self-harm; the repo prefers warn-don't-block for user-typed paths).
+Why not now: out of ADR-035 slice-2 edit scope (the helper's content-safety core
+only). Becomes a real DoS at slice 4: the daemon decodes paths inside
+`ref_image_roots`, which defaults to `--output-dir` — a tree lower-trust flows
+write into — so a same-UID `mkfifo output/kf_003.png` hangs the VRAM-holding
+daemon on the next chained keyframe request. An `os.fstat`+`S_ISREG` check does
+NOT close it (the hang is in `open` itself, before any fstat); the fix is a
+non-blocking open at the daemon decode site (`os.open(path, O_RDONLY|O_NONBLOCK)`
+then reject non-regular / would-block).
+Trigger: slice 4 (daemon `ref_image_roots` exposure) — this is a HARD
+precondition of that slice, not an optional hardening. Do not land daemon
+ref-image decode without a non-regular-file rejection at the decode site.
+Fix: `O_NONBLOCK` open + `S_ISREG` check in the daemon's ref-image decode path;
+mirror the existing `_PATH_FIELDS` NUL-byte pre-check (6e) that guards the same
+boundary.

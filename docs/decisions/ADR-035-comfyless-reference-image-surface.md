@@ -544,6 +544,32 @@ convention, and Qwen-Image-Edit-2511 is the *Plus* multi-reference variant where
 
 ## Changelog
 
+- 2026-07-21 — **Slice 2 landed (ingestion helper).** New `comfyless/ref_image.py`
+  — the decode/cap/hash security core (decisions 6c/6d/6g). One entry point,
+  `load_ref_image_capped(path)`: bounded single read (`read(max_bytes+1)`, no
+  prior `os.stat` → no TOCTOU window) → 64 MB byte cap → SHA-256 over the exact
+  bytes → format-allowlisted lazy `Image.open(formats=["PNG","JPEG","WEBP"])` →
+  ~67 Mi-px cap on the lazy header **before** `convert("RGB")` (decompression-bomb
+  guard) → first-frame RGB. Returns `LoadedRefImage(image, sha256, path,
+  size_bytes)`. `RefImageError` messages name path + reason and never echo file
+  bytes (6g). Containment (`ref_image_roots`) and the count cap (=8) are
+  deliberately the caller's job (6b/6f) — this helper decides only whether the
+  *content* is safe to decode. `test_ref_image.py` (42 cases): byte-cap
+  boundary + no-leak, forged decompression bomb proving our header cap fires
+  below Pillow's coarser backstop, format-allowlist rejection (GIF/BMP/TIFF),
+  sidecar-JSON-no-leak, convert-branch-no-leak, SHA determinism, first-frame-only
+  WEBP, RGB normalization. `security-auditor` (Fable,
+  `docs/security/review-adr-035-slice2-ref-image-ingestion-2026-07-21.md`):
+  design contract **met**, no CRITICAL/HIGH. LOW-1 (rewrapped PIL `{e}` could
+  echo a ≤4-byte PNG chunk id — real in Pillow 12.3.0 source, wraps to
+  content-free errors on the CLI-reachable paths) **closed in-slice** by
+  surfacing `type(e).__name__` only. LOW-2 (FIFO/device path hangs `open()` —
+  benign at CLI trust, a daemon-DoS precondition for slice 4) **deferred to
+  slice 4** with a hard TECH_DEBT precondition (`O_NONBLOCK` + `S_ISREG` at the
+  daemon decode site). INFO: MPO dispatches via the JPEG opener (not an escape;
+  noted in the 6c comment); the pixel cap bounds count not decode-buffer bytes
+  (intentional, mirrors `refine.py`). Still §12 non-Red-Zone here (foreground
+  content decode; daemon exposure and containment are slices 3/4).
 - 2026-07-21 — **Slice 1 landed (CLI parse + schema key).** `--ref-image
   PATH[:MODE]` (argparse `action="append"`), `_parse_ref_image` (last-colon
   split; MODE ∈ {both,vl,ref}, hard error on any other suffix; colon-in-path
