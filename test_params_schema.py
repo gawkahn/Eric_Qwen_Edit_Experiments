@@ -141,6 +141,10 @@ _generate_canonical = {
         # prompt-enhancement original prompt + backend/recipe, ADR-026 §7).
         # Not a sidecar-input schema key.
         "extra_metadata",
+        # Output format is an OUTPUT concern, not a generation parameter
+        # (ADR-034 Deferred): it must NOT enter the replay params — it belongs
+        # alongside output_path/savepath in the non-schema set. Runtime-only.
+        "output_format",
     }
 }
 _missing_from_schema = _generate_canonical - set(schema.keys())

@@ -104,6 +104,10 @@ def _log(msg: str) -> None:
 # names are re-exported here so external consumers (test_params_schema.py,
 # downstream importers) keep working.
 from comfyless.params_schema import COMFYLESS_SCHEMA, _CLI_TO_CANONICAL  # noqa: E402,F401
+from comfyless.output_format import (  # noqa: E402
+    OutputFormat,
+    resolve_output_format,
+)
 
 
 # ── Sidecar / override helpers ───────────────────────────────────────────
@@ -457,8 +461,13 @@ def _resolve_savepath(
     sampler: str,
     transformer_path: str = "",
     iterate_inputs: Optional[Dict[str, str]] = None,
+    extension: str = ".png",
 ) -> str:
-    """Expand template, create parent dirs, return first available counter slot."""
+    """Expand template, create parent dirs, return first available counter slot.
+
+    ``extension`` is the resolved output-format suffix (ADR-034); it defaults
+    to ``.png`` so every existing caller is byte-for-byte unchanged.
+    """
     expanded = _expand_savepath_template(
         template, model_path, seed, steps, cfg_scale, sampler, transformer_path,
         iterate_inputs=iterate_inputs,
@@ -468,7 +477,7 @@ def _resolve_savepath(
     stem = Path(expanded).name
     counter = 1
     while True:
-        candidate = parent / f"{stem}{counter:04d}.png"
+        candidate = parent / f"{stem}{counter:04d}{extension}"
         if not candidate.exists():
             return str(candidate)
         counter += 1
@@ -480,8 +489,15 @@ def _save_with_metadata(
     metadata: dict,
     *,
     mcp_caller: bool = False,
+    output_format: Optional[OutputFormat] = None,
 ) -> None:
-    """Save a PIL image as PNG with comfyless metadata embedded as a tEXt chunk.
+    """Save a PIL image with comfyless metadata (ADR-034 format-aware).
+
+    PNG (the default, and ``output_format is None``) embeds metadata as a
+    ``tEXt`` chunk keyed ``"comfyless"`` — byte-for-byte the prior behavior.
+    JPEG (and any future non-tEXt format) carries no embedded chunk; its
+    provenance is the JSON sidecar the caller writes alongside, so the tEXt
+    channel is simply absent (ADR-034 §2, D4).
 
     When mcp_caller=True (slice-1 invariant 12 / N26-N28), the embedded
     metadata is passed through the MCP redaction map first: path-typed
@@ -491,16 +507,26 @@ def _save_with_metadata(
     mcp_caller=False and the on-disk PNG embeds full paths (existing
     behavior; N29 regression guard).
     """
-    from PIL.PngImagePlugin import PngInfo
     if mcp_caller:
         # Lazy import keeps comfyless.mcp_server off the import path for
         # callers that never touch MCP (avoids transitively requiring the
         # mcp SDK at every generate() entry).
         from comfyless.mcp_server import redact_metadata_for_png
         metadata = redact_metadata_for_png(metadata)
-    pnginfo = PngInfo()
-    pnginfo.add_text("comfyless", json.dumps(metadata, default=str))
-    pil_image.save(path, pnginfo=pnginfo)
+
+    if output_format is None or output_format.embeds_text_chunk:
+        # PNG path — unchanged; the tEXt chunk is the embedded metadata record.
+        from PIL.PngImagePlugin import PngInfo
+        pnginfo = PngInfo()
+        pnginfo.add_text("comfyless", json.dumps(metadata, default=str))
+        pil_image.save(path, pnginfo=pnginfo)
+    else:
+        # JPEG (and future non-tEXt formats): no embedded chunk. JPEG has no
+        # alpha channel, so flatten modes PIL would otherwise reject.
+        img = pil_image
+        if img.mode in ("RGBA", "LA", "P"):
+            img = img.convert("RGB")
+        img.save(path, format=output_format.pil_format, quality=output_format.quality)
 
 
 def _apply_overrides(params: dict, overrides: list) -> dict:
@@ -1459,6 +1485,7 @@ def generate(
     mcp_caller: bool = False,
     interactive_pause: bool = True,
     extra_metadata: Optional[Dict[str, Any]] = None,
+    output_format: Optional[OutputFormat] = None,
 ) -> Dict[str, Any]:
     """Generate a single image and save it.
 
@@ -1861,7 +1888,8 @@ def generate(
 
     # ── Save PNG with embedded metadata ──────────────────────────────
     pil_image = final_pil
-    _save_with_metadata(pil_image, output_path, metadata, mcp_caller=mcp_caller)
+    _save_with_metadata(pil_image, output_path, metadata, mcp_caller=mcp_caller,
+                        output_format=output_format)
     _log(f"[comfyless] Saved: {output_path}")
 
     # ── Clean up VAE ──────────────────────────────────────────────────
@@ -2046,6 +2074,16 @@ def _parse_args() -> argparse.Namespace:
                    help="Output path template with %%date:MM-dd-YY%%, %%model:12%%, "
                         "%%seed%%, %%steps%%, %%cfg%%, %%sampler%%, %%input%%. "
                         "Auto-creates dirs; always writes comfyless0001.png, 0002, ...")
+    # ── Output format (ADR-034) ──
+    p.add_argument("--output-format", choices=["png", "jpeg"], default=None,
+                   help="Output image format. Default: png, or inferred from the "
+                        "--output extension (.jpg/.jpeg -> jpeg). An explicit value "
+                        "that contradicts the extension is an error, not a rewrite. "
+                        "JPEG runs in-process (daemon support: ADR-034 slice 2).")
+    p.add_argument("--quality", type=float, default=None, metavar="0.0-1.0",
+                   help="JPEG quality as a 0.0-1.0 fraction (default 0.7 -> PIL 70). "
+                        "Higher is better; the useful ceiling is 1.0 -> 95. "
+                        "Ignored (with a notice) for png output.")
     # ── Iteration mode (see docs/decisions/ADR-008-comfyless-iterate.md) ──
     p.add_argument("--iterate", nargs=2, action="append", default=[],
                    metavar=("PARAM", "FILE"),
@@ -3122,12 +3160,33 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                     "enhance_recipe": getattr(args, "enhance_recipe", None) or "default",
                 }
 
+        using_default_output = args.output == "/tmp/comfyless.png"
+
+        # Resolve output format (ADR-034 D2/D3). Extension inference applies
+        # only to a caller-authored --output path — not the default sentinel
+        # or a savepath template, whose extensions are not user intent.
+        infer_path = None if (args.savepath or using_default_output) else args.output
+        try:
+            out_fmt = resolve_output_format(args.output_format, args.quality, infer_path)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 2
+        if out_fmt.name == "png" and args.quality is not None:
+            _log("[comfyless] --quality is ignored for png output.")
+
         # Delegate to daemon when --savepath or default --output; skip on explicit --output.
         # quant delegates too since slice DQ: the wire request carries the
         # quant triple and the daemon keys its pipeline cache on it (see
         # docs/security/review-slice-DQ-daemon-quant-2026-07-03.md).
-        using_default_output = args.output == "/tmp/comfyless.png"
-        if args.savepath or using_default_output:
+        #
+        # ADR-034 slice 1: JPEG output is wired only on the in-process path.
+        # Force non-png in-process so a running daemon — which ignores
+        # --output-format until ADR-034 slice 2 — cannot silently emit PNG.
+        # Removed when the daemon slice lands.
+        if out_fmt.name != "png" and (args.savepath or using_default_output):
+            _log("[comfyless] JPEG output runs in-process (daemon format "
+                 "support lands in ADR-034 slice 2).")
+        if (args.savepath or using_default_output) and out_fmt.name == "png":
             # Pre-expand iteration tokens client-side so the daemon receives a
             # template it can finish resolving (%seed%, %model%, etc.) without
             # needing to know about iteration at all.
@@ -3158,10 +3217,15 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                 p_cur.get("sampler", COMFYLESS_SCHEMA["sampler"][1]),
                 transformer_path=p_cur.get("transformer_path", ""),
                 iterate_inputs=iterate_inputs,
+                extension=out_fmt.extension,
             )
             _log(f"[comfyless] Output: {output_path}")
         else:
             output_path = args.output
+            # The default sentinel is /tmp/comfyless.png; when jpeg is selected
+            # without an explicit --output, follow the resolved extension.
+            if using_default_output and out_fmt.extension != ".png":
+                output_path = os.path.splitext(args.output)[0] + out_fmt.extension
 
         try:
             metadata = generate(
@@ -3211,6 +3275,7 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                 nag_tau=p_cur.get("nag_tau", 2.5),
                 nag_alpha=p_cur.get("nag_alpha", 0.25),
                 nag_end=p_cur.get("nag_end", 1.0),
+                output_format=out_fmt,
             )
             if iterate_batch_id:
                 metadata["iterate_batch_id"] = iterate_batch_id
@@ -3297,6 +3362,13 @@ def main() -> int:
     # standard --model path. See ADR-010 + docs/comfyless-stable-cascade.md.
     from comfyless.cascade import CASCADE_SENTINEL, dispatch as _cascade_dispatch
     if args.model == CASCADE_SENTINEL:
+        # Cascade output-format handling lands in ADR-034 slice 4 (cascade
+        # numbering + _save_with_metadata). Until then, reject rather than emit
+        # PNG while the caller asked for jpeg.
+        if args.output_format is not None or args.quality is not None:
+            print("Error: --output-format / --quality are not supported for "
+                  "Stable Cascade yet (ADR-034 slice 4).", file=sys.stderr)
+            return 2
         return _cascade_dispatch(args, cascade_extras)
     if cascade_extras:
         # User passed multiple values to --model but the first wasn't `stablecascade`.
@@ -3323,6 +3395,19 @@ def main() -> int:
                          "supported in --json mode; iteration semantics will be "
                          "added to the JSON bridge contract in a future release",
                 "error_type": "IterationNotSupported",
+                "contract_version": CONTRACT_VERSION,
+            }, sys.stdout, indent=2)
+            return 1
+        # Output format is not wired on the JSON bridge yet (ADR-034: the bridge
+        # is a future slice). Reject loudly rather than emit PNG while the caller
+        # asked for jpeg — same contract as the iteration rejection above.
+        if args.output_format is not None or args.quality is not None:
+            json.dump({
+                "status": "error",
+                "error": "--output-format / --quality are not supported in "
+                         "--json mode yet; output-format handling for the JSON "
+                         "bridge lands in a future ADR-034 slice",
+                "error_type": "OutputFormatNotSupported",
                 "contract_version": CONTRACT_VERSION,
             }, sys.stdout, indent=2)
             return 1

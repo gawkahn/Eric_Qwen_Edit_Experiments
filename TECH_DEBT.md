@@ -1537,3 +1537,22 @@ Trigger: the next deliberate node-pack surface slice (any commit that adds or
 removes entries in `NODE_CLASS_MAPPINGS`). Fix: confirm no workflow JSON in
 `workflows/` references it, then remove the module, both `__init__.py` lines,
 and its display-name mapping in one slice.
+
+**`--json` bridge + Stable Cascade output-format handling (ADR-034)** *(2026-07-20)*
+ADR-034 slice 1 wired `--output-format`/`--quality` on the CLI in-process
+path only. The `--json` bridge (`generate.py` `_run_json_mode`, a
+function-scoped Red Zone surface) and the Stable Cascade dispatch
+(`comfyless/cascade.py`) currently **reject** both flags loudly (structured
+error / stderr) rather than honor them — a deliberate slice-1 stopgap so
+neither silently emits PNG when jpeg was requested. Cascade support is
+already scoped to ADR-034 slice 4; the `--json` bridge was never assigned to
+any ADR-034 slice (gap surfaced by the slice-1 code review, 2026-07-20).
+Why not now: the bridge is machine-facing Red Zone — adding format there is
+its own slice with a spec + security-auditor gate (it changes the bridge
+contract and the sidecar/tEXt provenance channel per ADR-034 D4), out of
+slice 1's non-Red-Zone edit scope.
+Trigger: the ADR-034 daemon slice (slice 2) or the LLM-agent-bridge slice,
+whichever wires machine-facing output next. Fix: thread the resolved
+OutputFormat through the bridge request contract + cascade `_save_with_metadata`,
+replacing the rejections with real handling; add the bridge to ADR-034's
+Proposed slices list.

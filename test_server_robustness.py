@@ -637,10 +637,18 @@ _gen_src = Path(_gen.__file__).read_text()
 check("delegation-skip branch removed from generate.py",
       "daemon delegation skipped" not in _gen_src)
 # Positive property (review N-2): the delegation guard exists and no longer
-# consults args.quant anywhere.
+# consults args.quant anywhere. The guard condition gained an ADR-034 slice-1
+# clause (`and out_fmt.name == "png"`) so JPEG runs in-process until the daemon
+# format slice lands — matched on the stable condition substring, not the full
+# literal, so that clause does not falsely fail this quant-free guard.
 check("delegation guard present and quant-free",
-      "if args.savepath or using_default_output:" in _gen_src
+      "args.savepath or using_default_output" in _gen_src
       and 'args.quant != "none" and (args.savepath' not in _gen_src)
+# ADR-034 slice 1: JPEG output is forced in-process (daemon ignores
+# --output-format until slice 2). Pin it so the transitional guard is removed
+# deliberately with the daemon slice, not silently.
+check("ADR-034 slice-1 jpeg-forces-in-process guard present",
+      'out_fmt.name == "png"' in _gen_src)
 
 
 print("\n── NAG (ADR-023): key freedom + forwarding + wire carriage ────")

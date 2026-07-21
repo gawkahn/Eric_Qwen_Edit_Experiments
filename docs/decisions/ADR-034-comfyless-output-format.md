@@ -237,6 +237,21 @@ Sequenced so each is independently revertible. Slices 2, 3, 5 are Red Zone.
 
 ## Changelog
 
+- 2026-07-20 — **Slice 1 landed** (`output_format.py` + CLI flags +
+  `generate.py` in-process path; PNG byte-identical, verified by
+  `test_output_format.py`). `code-reviewer` (Fable) surfaced two low findings,
+  both addressed in-slice: (1) the `--json` bridge and cascade dispatch parse
+  the new flags but exit before format resolution — now **reject loudly**
+  (structured error / stderr) rather than silently emit PNG, per D2. This also
+  closed an ADR gap the review flagged: the `--json` bridge
+  (`generate.py:_run_json_mode`, Context §1) was never assigned to a slice —
+  **assigned here to a future bridge slice**, tracked in TECH_DEBT. (2) A
+  contrived sentinel corner — an explicit `--output /tmp/comfyless.png
+  --output-format jpeg` is indistinguishable from the default sentinel and gets
+  a silent rewrite to `.jpg` rather than the D2 contradiction error. Left as-is
+  (the real use case — default output + `--output-format jpeg` → `.jpg` — is
+  the intended behavior); noted so a future `--output default=None` refactor can
+  close it if wanted.
 - 2026-07-20 — **Accepted and adopted by the ref-image session.** The
   concurrent work this ADR was blocked on is ADR-035 (reference-image surface,
   accepted same day); that session now owns both, resolving the overlapping-file
