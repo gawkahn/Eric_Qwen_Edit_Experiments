@@ -3387,13 +3387,8 @@ def main() -> int:
     # standard --model path. See ADR-010 + docs/comfyless-stable-cascade.md.
     from comfyless.cascade import CASCADE_SENTINEL, dispatch as _cascade_dispatch
     if args.model == CASCADE_SENTINEL:
-        # Cascade output-format handling lands in ADR-034 slice 4 (cascade
-        # numbering + _save_with_metadata). Until then, reject rather than emit
-        # PNG while the caller asked for jpeg.
-        if args.output_format is not None or args.quality is not None:
-            print("Error: --output-format / --quality are not supported for "
-                  "Stable Cascade yet (ADR-034 slice 4).", file=sys.stderr)
-            return 2
+        # ADR-034 slice 4: cascade dispatch resolves --output-format / --quality
+        # itself (numbering + _save_with_metadata are format-aware); no stopgap.
         return _cascade_dispatch(args, cascade_extras)
     if cascade_extras:
         # User passed multiple values to --model but the first wasn't `stablecascade`.

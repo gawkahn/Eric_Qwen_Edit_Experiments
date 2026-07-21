@@ -72,6 +72,7 @@ def make_cli_args(**overrides):
         offload_vae=False, attention_slicing=False, sequential_offload=False,
         allow_hf_download=False,
         output="/tmp/cascade-test.png", savepath=None,
+        output_format=None, quality=None,
         iterate=[], max_iterations=500, limit=None, batch=1, yes=True,
         output_dir=None, model_base=None,
         model="stablecascade",
@@ -287,8 +288,8 @@ with tempfile.TemporaryDirectory() as tmp:
 
     # Non-matching files don't affect offset.
     Path(os.path.join(tmp, "random.png")).touch()
-    Path(os.path.join(tmp, "cascade.png")).touch()  # no number, ignored
-    Path(os.path.join(tmp, "cascade_0001.json")).touch()  # sidecar, ignored
+    Path(os.path.join(tmp, "cascade.png")).touch()  # no number, never matches
+    Path(os.path.join(tmp, "cascade_0001.json")).touch()  # sidecar matches, but 1 < 50
     check("non-matching files don't change offset", c._scan_existing_offset(tmp) == 50)
 
     # Sparse / non-contiguous: highest wins.
@@ -361,6 +362,97 @@ with tempfile.TemporaryDirectory() as tmp:
                                        iterate_inputs={})
     check("%seed% expands",
           out == os.path.join(tmp, "seed_42", "cascade_0001.png"))
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n── ADR-034 slice 4: format-aware cascade output ─────────────")
+
+from comfyless.output_format import resolve_output_format as _rof
+from PIL import Image as _PILImage
+
+_JPEG = _rof("jpeg", 0.9, None)          # name=jpeg, extension=.jpg, quality=90
+_PNG = _rof(None, None, None)            # name=png,  extension=.png
+
+# _resolve_output_path honors the resolved extension (D1: no hand-composed ext).
+with tempfile.TemporaryDirectory() as tmp:
+    check("dir + single + offset 0 → cascade.jpg",
+          c._resolve_output_path(tmp, total_iterations=1, run_index=0,
+                                 extension=".jpg") == os.path.join(tmp, "cascade.jpg"))
+    check("dir + multi → cascade_0001.jpg",
+          c._resolve_output_path(tmp, total_iterations=3, run_index=0,
+                                 extension=".jpg") == os.path.join(tmp, "cascade_0001.jpg"))
+    # File base + multi-run: numbered suffix takes the resolved extension, not
+    # the base's own suffix (routes through the helper, ADR-034 D1).
+    fbase = os.path.join(tmp, "pic.jpg")
+    check("file base + multi → pic_0001.jpg",
+          c._resolve_output_path(fbase, total_iterations=2, run_index=0,
+                                 extension=".jpg") == os.path.join(tmp, "pic_0001.jpg"))
+    # PNG default extension is byte-for-byte the legacy form.
+    check("dir + single + default ext → cascade.png (unchanged)",
+          c._resolve_output_path(tmp, total_iterations=1, run_index=0)
+          == os.path.join(tmp, "cascade.png"))
+
+# _scan_existing_offset is format-agnostic (mixed-format sidecar-clobber guard).
+with tempfile.TemporaryDirectory() as tmp:
+    Path(os.path.join(tmp, "cascade_0003.jpg")).touch()
+    check("offset counts existing .jpg (mixed-format)",
+          c._scan_existing_offset(tmp) == 3)
+with tempfile.TemporaryDirectory() as tmp:
+    # A prior run left ONLY the .json sidecar (image deleted); the next run must
+    # still number past it so it can't clobber that sidecar's stem.
+    Path(os.path.join(tmp, "cascade_0005.json")).touch()
+    check("offset counts orphan .json sidecar",
+          c._scan_existing_offset(tmp) == 5)
+
+# _resolve_cascade_savepath: extension threading + sidecar-collision guard.
+with tempfile.TemporaryDirectory() as tmp:
+    template = os.path.join(tmp, "run", "cascade")
+    out = c._resolve_cascade_savepath(template, eff_seed=1, cfg=sp_cfg,
+                                      iterate_inputs={}, extension=".jpg")
+    check("savepath honors .jpg extension",
+          out == os.path.join(tmp, "run", "cascade_0001.jpg"))
+    # A sidecar alone (no image) blocks that slot — a jpeg run can't reuse a
+    # stem whose .json a prior png run wrote.
+    Path(os.path.join(tmp, "run", "cascade_0002.json")).touch()
+    out2 = c._resolve_cascade_savepath(template, eff_seed=1, cfg=sp_cfg,
+                                       iterate_inputs={}, extension=".jpg")
+    # 0001 is free (nothing touched it), so counter returns 0001; touch it and
+    # confirm the sidecar-guarded skip over 0002.
+    Path(out2).touch(); Path(os.path.splitext(out2)[0] + ".json").touch()
+    out3 = c._resolve_cascade_savepath(template, eff_seed=1, cfg=sp_cfg,
+                                       iterate_inputs={}, extension=".jpg")
+    check("savepath counter skips slot whose .json sidecar exists",
+          out3 == os.path.join(tmp, "run", "cascade_0003.jpg"))
+
+# _save_with_metadata is format-aware: JPEG carries no tEXt chunk, PNG does.
+with tempfile.TemporaryDirectory() as tmp:
+    meta = {"prompt": "x", "seed": 1}
+    # JPEG: RGBA input must flatten; output decodable; no comfyless tEXt chunk.
+    jp = os.path.join(tmp, "j.jpg")
+    c._save_with_metadata(_PILImage.new("RGBA", (16, 16)), jp, meta,
+                          output_format=_JPEG)
+    with _PILImage.open(jp) as im:
+        check("jpeg save is decodable JPEG", im.format == "JPEG")
+        check("jpeg carries no comfyless tEXt chunk",
+              "comfyless" not in getattr(im, "text", {}))
+    # PNG: default path unchanged — embeds the comfyless tEXt chunk.
+    pp = os.path.join(tmp, "p.png")
+    c._save_with_metadata(_PILImage.new("RGB", (16, 16)), pp, meta,
+                          output_format=_PNG)
+    with _PILImage.open(pp) as im:
+        check("png save is PNG with comfyless tEXt chunk",
+              im.format == "PNG" and "comfyless" in im.text
+              and json.loads(im.text["comfyless"])["seed"] == 1)
+    # output_format=None keeps the legacy PNG behavior (byte-for-byte guard).
+    pn = os.path.join(tmp, "n.png")
+    c._save_with_metadata(_PILImage.new("RGB", (16, 16)), pn, meta)
+    with _PILImage.open(pn) as im:
+        check("output_format=None → legacy PNG tEXt chunk",
+              im.format == "PNG" and "comfyless" in im.text)
+
+# Replay round-trip: jpeg provenance keys are recognized (no unknown-key warn).
+check("output_format/quality in cascade _KNOWN_KEYS (clean replay)",
+      {"output_format", "quality"} <= c._KNOWN_KEYS)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -532,6 +624,88 @@ with tempfile.TemporaryDirectory() as tmp:
     check("--limit smaller than total does not pre-reject",
           rc != 2 or rc == 3,
           f"expected pipeline-build failure (rc=3), got rc={rc}")
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n── dispatch: output-format wiring (ADR-034 slice 4) ─────────")
+
+# D2 contradiction is resolved BEFORE any pipeline build, so it returns rc 2
+# with no weights loaded (invariant 3).
+with tempfile.TemporaryDirectory() as tmp:
+    cfg_path = os.path.join(tmp, "cfg.json")
+    write_json(minimal, cfg_path)
+    rc = c.dispatch(make_cli_args(output=os.path.join(tmp, "x.png"),
+                                  output_format="jpeg"), [cfg_path])
+    check("D2: --output x.png + --output-format jpeg → exit 2 (contradiction)",
+          rc == 2)
+    # An agreeing png flag on a .png path passes resolution and fails downstream
+    # at build (rc 3) — i.e. it is NOT the resolve-time rejection.
+    rc = c.dispatch(make_cli_args(output=os.path.join(tmp, "y.png"),
+                                  output_format="png"), [cfg_path])
+    check("D2: agreeing png flag + .png path passes resolve (build fails, rc 3)",
+          rc == 3, f"got rc={rc}")
+
+# Behavioral: mock the GPU stages so the run loop actually writes files, then
+# assert (a) the default-sentinel jpeg swap lands on <stem>.jpg (invariant 4),
+# (b) a png run replaying a jpeg sidecar emits NO stale provenance (review
+# Finding 1), and (c) a jpeg run DOES record provenance.
+class _FakePil:
+    mode = "RGB"
+    def convert(self, m):  # pragma: no cover - not hit at mode RGB
+        return self
+    def save(self, path, **kw):
+        Path(path).write_bytes(b"fake")
+
+_orig = (c.build_pipelines, c.run_one, c.dispose_pipelines)
+c.build_pipelines = lambda cfg, **kw: (object(), object())
+c.run_one = lambda *a, **kw: (_FakePil(), {"prior_seconds": 0.0, "decoder_seconds": 0.0})
+c.dispose_pipelines = lambda *a, **kw: None
+try:
+    # (a) Sentinel default output + jpeg → /tmp/comfyless.jpg (extension swap).
+    sentinel_jpg = "/tmp/comfyless.jpg"
+    sentinel_json = "/tmp/comfyless.json"
+    for p in (sentinel_jpg, sentinel_json):
+        if os.path.exists(p):
+            os.remove(p)
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg_path = os.path.join(tmp, "cfg.json")
+        write_json(minimal, cfg_path)
+        rc = c.dispatch(make_cli_args(output="/tmp/comfyless.png",
+                                      output_format="jpeg"), [cfg_path])
+        check("invariant 4: sentinel + jpeg → /tmp/comfyless.jpg written",
+              rc == 0 and os.path.exists(sentinel_jpg))
+    for p in (sentinel_jpg, sentinel_json):
+        if os.path.exists(p):
+            os.remove(p)
+
+    # (b) png run replaying a jpeg sidecar (cfg carries output_format/quality via
+    # _KNOWN_KEYS) must NOT leak them into the new png run's sidecar.
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg_path = os.path.join(tmp, "jpeg-sidecar.json")
+        write_json({**minimal, "output_format": "jpeg", "quality": 0.9}, cfg_path)
+        outdir = os.path.join(tmp, "out")
+        os.makedirs(outdir)  # exists → dir branch → cascade.png
+        rc = c.dispatch(make_cli_args(output=outdir), [cfg_path])  # png default
+        sc = json.load(open(os.path.join(outdir, "cascade.json")))
+        check("Finding 1: png replay of jpeg sidecar drops stale output_format",
+              rc == 0 and "output_format" not in sc and "quality" not in sc,
+              f"sidecar keys: {sorted(sc)}")
+
+    # (c) jpeg run records provenance (the fraction the file can't reveal).
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg_path = os.path.join(tmp, "cfg.json")
+        write_json(minimal, cfg_path)
+        outdir = os.path.join(tmp, "out")
+        os.makedirs(outdir)  # exists → dir branch → cascade.jpg
+        rc = c.dispatch(make_cli_args(output=outdir, output_format="jpeg",
+                                      quality=0.8), [cfg_path])
+        sc = json.load(open(os.path.join(outdir, "cascade.json")))
+        check("jpeg run records output_format + quality provenance",
+              rc == 0 and sc.get("output_format") == "jpeg" and sc.get("quality") == 0.8,
+              f"sidecar: {{'output_format': {sc.get('output_format')!r}, "
+              f"'quality': {sc.get('quality')!r}}}")
+finally:
+    c.build_pipelines, c.run_one, c.dispose_pipelines = _orig
 
 
 # ──────────────────────────────────────────────────────────────────────

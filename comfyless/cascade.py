@@ -27,6 +27,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from comfyless.output_format import OutputFormat, resolve_output_format
+
 # ════════════════════════════════════════════════════════════════════════
 #  Constants
 # ════════════════════════════════════════════════════════════════════════
@@ -86,6 +88,11 @@ _KNOWN_KEYS = {
     "model_family", "config_source", "output_path",
     "iterate_batch_id", "run_index", "total_runs",
     "timestamp", "elapsed_seconds", "prior_seconds", "decoder_seconds",
+    # ADR-034 slice 4: jpeg-run output provenance (the format name + the
+    # 0.0-1.0 quality fraction the file cannot reveal). Recorded on jpeg runs
+    # only; an OUTPUT concern, not a generation param — accepted here so a
+    # saved sidecar round-trips without warning, never consumed as topology.
+    "output_format", "quality",
 }
 
 
@@ -464,17 +471,20 @@ def run_one(
 #  Output path resolution + sidecar write
 # ════════════════════════════════════════════════════════════════════════
 
-_NUMBERED_PNG_RE = __import__("re").compile(r"^(.+?)_(\d+)\.png$")
-
-
 def _scan_existing_offset(base: str) -> int:
-    """Return the highest existing `<stem>_NNNN.png` index that would collide
+    """Return the highest existing `<stem>_NNNN.<ext>` index that would collide
     with the names this dispatch is about to write. Returns 0 if nothing
     matches. Used to continue numbering across multiple invocations writing
     to the same directory rather than clobbering — e.g. a bash loop that
     runs `--iterate prompt prompt1-100.json`, then `prompt101-200.json`,
     each with `--output <same-dir>`, gets cascade_0001…0100, then
     cascade_0101…0200, and so on.
+
+    The scan is format-agnostic (matches png / jpg / jpeg / the .json sidecar,
+    ADR-034 slice 4): every run writes a per-stem `.json` sidecar regardless of
+    image format, so counting any of them prevents a jpeg run from reusing a
+    stem whose sidecar a prior png run wrote — the mixed-format collision the
+    slice-2 security review flagged for the daemon/savepath paths.
     """
     import re
     if os.path.isdir(base):
@@ -486,7 +496,7 @@ def _scan_existing_offset(base: str) -> int:
         stem = p.stem
     if not os.path.isdir(parent):
         return 0
-    pattern = re.compile(rf"^{re.escape(stem)}_(\d+)\.png$")
+    pattern = re.compile(rf"^{re.escape(stem)}_(\d+)\.(?:png|jpe?g|json)$")
     highest = 0
     try:
         entries = os.listdir(parent)
@@ -502,30 +512,35 @@ def _scan_existing_offset(base: str) -> int:
 
 
 def _resolve_output_path(
-    base: str, total_iterations: int, run_index: int, *, dir_offset: int = 0
+    base: str, total_iterations: int, run_index: int, *, dir_offset: int = 0,
+    extension: str = ".png",
 ) -> str:
     """Pick the output filename for one run.
 
     Rules:
-    - `base` is a directory: emit `<base>/cascade_NNNN.png`. NNNN starts at
+    - `base` is a directory: emit `<base>/cascade_NNNN<ext>`. NNNN starts at
       `dir_offset + 1` so multiple invocations to the same dir continue
       numbering rather than clobbering. Special case: if `total_iterations == 1`
-      AND `dir_offset == 0`, emit `<base>/cascade.png` (single-shot, no
+      AND `dir_offset == 0`, emit `<base>/cascade<ext>` (single-shot, no
       number — the legacy unnumbered form).
     - `base` is a file path AND `total_iterations == 1`: write exactly to
-      `base` (caller chose the exact path; overwrite is their call).
+      `base` (caller chose the exact path; overwrite is their call). The
+      caller pre-swaps the default sentinel's extension to `<ext>` before
+      calling, so a jpeg default-output run lands on `<base>.jpg`.
     - `base` is a file path AND `total_iterations > 1`: emit
-      `<dir>/<stem>_NNNN<.ext>`, NNNN starts at `dir_offset + 1`.
+      `<dir>/<stem>_NNNN<ext>`, NNNN starts at `dir_offset + 1`.
 
+    `extension` is the resolved output-format suffix (ADR-034 slice 4); it
+    defaults to `.png` so every existing caller is byte-for-byte unchanged.
     `dir_offset` is computed once per dispatch via `_scan_existing_offset` so
     the run loop can pass it in cheaply per call.
     """
     if os.path.isdir(base):
         Path(base).mkdir(parents=True, exist_ok=True)
         if total_iterations == 1 and dir_offset == 0:
-            return os.path.join(base, "cascade.png")
+            return os.path.join(base, f"cascade{extension}")
         nnnn = dir_offset + run_index + 1
-        return os.path.join(base, f"cascade_{nnnn:04d}.png")
+        return os.path.join(base, f"cascade_{nnnn:04d}{extension}")
 
     if total_iterations == 1:
         Path(base).parent.mkdir(parents=True, exist_ok=True)
@@ -534,9 +549,8 @@ def _resolve_output_path(
     p = Path(base)
     p.parent.mkdir(parents=True, exist_ok=True)
     stem = p.stem
-    suffix = p.suffix or ".png"
     nnnn = dir_offset + run_index + 1
-    return str(p.parent / f"{stem}_{nnnn:04d}{suffix}")
+    return str(p.parent / f"{stem}_{nnnn:04d}{extension}")
 
 
 def _resolve_cascade_savepath(
@@ -545,14 +559,21 @@ def _resolve_cascade_savepath(
     eff_seed: int,
     cfg: Dict[str, Any],
     iterate_inputs: Dict[str, str],
+    extension: str = ".png",
 ) -> str:
     """Resolve --savepath for cascade. Expands the standard comfyless tokens
     (%input%, %date:fmt%, %seed%, %model%, etc.) via the same machinery the
-    other families use, then appends `_NNNN.png` with an auto-counter that
+    other families use, then appends `_NNNN<ext>` with an auto-counter that
     scans the resolved parent directory each call to avoid collisions —
-    matches the cascade `_NNNN.png` naming convention used by --output.
+    matches the cascade `_NNNN<ext>` naming convention used by --output.
     Family-specific tokens map to: %cfg% → prior_cfg_scale, %steps% →
     prior_steps, %sampler% → "default".
+
+    `extension` is the resolved output-format suffix (ADR-034 slice 4;
+    defaults to `.png`). The counter requires BOTH the image AND its per-stem
+    `.json` sidecar free, so a jpeg run cannot reuse a slot whose sidecar a
+    prior png run wrote (mirrors generate.py `_resolve_savepath`; the
+    mixed-format collision the slice-2 security review flagged).
     """
     from comfyless.generate import _expand_savepath_template
     expanded = _expand_savepath_template(
@@ -570,8 +591,9 @@ def _resolve_cascade_savepath(
     stem = Path(expanded).name or "cascade"
     counter = 1
     while True:
-        candidate = parent / f"{stem}_{counter:04d}.png"
-        if not candidate.exists():
+        candidate = parent / f"{stem}_{counter:04d}{extension}"
+        sidecar = parent / f"{stem}_{counter:04d}.json"
+        if not candidate.exists() and not sidecar.exists():
             return str(candidate)
         counter += 1
 
@@ -590,8 +612,16 @@ def _save_with_metadata(
     metadata: Dict[str, Any],
     *,
     mcp_caller: bool = False,
+    output_format: Optional[OutputFormat] = None,
 ) -> None:
-    """Save PNG with a comfyless tEXt chunk. Mirrors generate.py's helper.
+    """Save an image with comfyless metadata (ADR-034 format-aware). Mirrors
+    generate.py's helper.
+
+    PNG (the default, and ``output_format is None``) embeds metadata as a
+    ``tEXt`` chunk keyed ``"comfyless"`` — byte-for-byte the prior behavior.
+    JPEG carries no embedded chunk; its provenance is the JSON sidecar the
+    caller writes alongside (ADR-034 §2, D4), so the tEXt channel is simply
+    absent.
 
     When mcp_caller=True (slice-1 invariant 12 / N22), the embedded metadata
     is run through the MCP redaction map first: path-typed fields (including
@@ -599,13 +629,23 @@ def _save_with_metadata(
     output_path / savepath dropped, non-path fields retained verbatim. CLI
     callers leave mcp_caller=False and embed full paths (existing behavior).
     """
-    from PIL.PngImagePlugin import PngInfo
     if mcp_caller:
         from comfyless.mcp_server import redact_metadata_for_png
         metadata = redact_metadata_for_png(metadata)
-    pnginfo = PngInfo()
-    pnginfo.add_text("comfyless", json.dumps(metadata, default=str))
-    pil_image.save(path, pnginfo=pnginfo)
+
+    if output_format is None or output_format.embeds_text_chunk:
+        # PNG path — unchanged; the tEXt chunk is the embedded metadata record.
+        from PIL.PngImagePlugin import PngInfo
+        pnginfo = PngInfo()
+        pnginfo.add_text("comfyless", json.dumps(metadata, default=str))
+        pil_image.save(path, pnginfo=pnginfo)
+    else:
+        # JPEG: no embedded chunk. JPEG has no alpha channel, so flatten modes
+        # PIL would otherwise reject.
+        img = pil_image
+        if img.mode in ("RGBA", "LA", "P"):
+            img = img.convert("RGB")
+        img.save(path, format=output_format.pil_format, quality=output_format.quality)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -804,15 +844,39 @@ def dispatch(args: argparse.Namespace, config_paths: List[str]) -> int:
     cli_neg      = args.negative_prompt or ""
     cli_seed_raw = args.seed
 
+    # ── Output format (ADR-034 slice 4) ───────────────────────────────
+    # Extension inference applies only to a caller-authored --output path —
+    # not the default sentinel or a --savepath template, whose extensions are
+    # not user intent (mirrors generate.py's in-process resolution). An
+    # explicit --output-format that contradicts a caller-authored extension is
+    # an error, not a rewrite (D2), raised by resolve_output_format.
+    using_default_output = args.output == "/tmp/comfyless.png"
+    infer_path = None if (args.savepath is not None or using_default_output) else args.output
+    try:
+        out_fmt = resolve_output_format(args.output_format, args.quality, infer_path)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    if out_fmt.name == "png" and args.quality is not None:
+        _log("[comfyless] --quality is ignored for png output.")
+
+    # The default sentinel is /tmp/comfyless.png; when a non-png format is
+    # selected without an explicit --output, follow the resolved extension so
+    # a jpeg default-output run lands on /tmp/comfyless.jpg (matches
+    # generate.py). Explicit --output paths are left verbatim.
+    output_base = args.output
+    if using_default_output and out_fmt.extension != ".png":
+        output_base = os.path.splitext(args.output)[0] + out_fmt.extension
+
     # ── Output path setup ─────────────────────────────────────────────
-    # --output mode: scan target dir once for existing cascade_NNNN.png to
+    # --output mode: scan target dir once for existing cascade_NNNN.<ext> to
     # continue numbering rather than clobber. --savepath mode auto-counters
     # per-template-expanded-dir at write time, so no offset needed here.
     if args.savepath is None:
-        output_offset = _scan_existing_offset(args.output)
+        output_offset = _scan_existing_offset(output_base)
         if output_offset > 0:
             _log(f"[comfyless] continuing numbering past existing files: "
-                 f"first new image will be cascade_{output_offset+1:04d}.png")
+                 f"first new image will be cascade_{output_offset+1:04d}{out_fmt.extension}")
     else:
         output_offset = 0
 
@@ -904,10 +968,12 @@ def dispatch(args: argparse.Namespace, config_paths: List[str]) -> int:
                 eff_seed=eff_seed,
                 cfg=cfg,
                 iterate_inputs=iterate_inputs,
+                extension=out_fmt.extension,
             )
         else:
             out_path = _resolve_output_path(
-                args.output, total, run_index, dir_offset=output_offset,
+                output_base, total, run_index, dir_offset=output_offset,
+                extension=out_fmt.extension,
             )
         _log(f"[comfyless] cascade run {run_index + 1}/{total} : seed={eff_seed} → {out_path}")
 
@@ -945,8 +1011,20 @@ def dispatch(args: argparse.Namespace, config_paths: List[str]) -> int:
             "total_runs":       total,
             "timestamp":        time.strftime("%Y-%m-%dT%H:%M:%S"),
         })
+        # Record output provenance on non-png runs only (ADR-034 slice 1
+        # follow-up parity): the format name + the 0.0-1.0 quality fraction the
+        # jpeg file itself cannot reveal. These are OUTPUT concerns filtered on
+        # replay, never generation topology. Strip any inherited from a replayed
+        # jpeg sidecar first (they ride cfg via _KNOWN_KEYS) so THIS run's format
+        # is the sole source of truth — a png replay of a jpeg sidecar must not
+        # emit false jpeg provenance (generate.py filters via _SKIP_SIDECAR_KEYS).
+        sidecar.pop("output_format", None)
+        sidecar.pop("quality", None)
+        if out_fmt.name != "png":
+            sidecar["output_format"] = out_fmt.name
+            sidecar["quality"] = out_fmt.quality_fraction
 
-        _save_with_metadata(pil, out_path, sidecar)
+        _save_with_metadata(pil, out_path, sidecar, output_format=out_fmt)
         sidecar_path = _write_sidecar(out_path, sidecar)
         _log(f"[comfyless] saved {out_path}  (sidecar: {sidecar_path})")
 

@@ -184,8 +184,8 @@ with tempfile.TemporaryDirectory() as d:
 
 
 # ── Unsupported-path flags are rejected loudly, not ignored (review N-2) ──
-# ADR-034 D2 loudness: the --json bridge and cascade dispatch don't handle
-# --output-format yet, so they must reject rather than silently emit PNG.
+# ADR-034 D2 loudness: the --json bridge still doesn't handle --output-format
+# (a future bridge slice), so it must reject rather than silently emit PNG.
 # Source-inspected (the repo's pattern for dispatch guards, cf.
 # test_server_robustness delegation guard) — behavioral invocation would pull
 # the full torch import graph.
@@ -195,8 +195,16 @@ _src = open(_gen.__file__).read()
 check("OutputFormatNotSupported" in _src
       and "args.output_format is not None or args.quality is not None" in _src,
       "--json rejects --output-format/--quality (OutputFormatNotSupported)")
-check("not supported for " in _src and "Stable Cascade yet (ADR-034 slice 4)" in _src,
-      "cascade dispatch rejects --output-format/--quality")
+# ── Cascade now HANDLES --output-format (ADR-034 slice 4 replaced the reject) ──
+# The slice-1 reject stopgap is gone; the sentinel branch delegates straight to
+# the cascade dispatch, which resolves the format itself.
+check("Stable Cascade yet (ADR-034 slice 4)" not in _src,
+      "slice-1 cascade reject stopgap removed")
+import comfyless.cascade as _casc  # noqa: E402
+_csrc = open(_casc.__file__).read()
+check("resolve_output_format(args.output_format, args.quality" in _csrc
+      and "output_format=out_fmt" in _csrc,
+      "cascade dispatch resolves output-format and saves format-aware")
 
 
 # ── Sidecar provenance is recorded but never replayed (ADR-034) ──────────

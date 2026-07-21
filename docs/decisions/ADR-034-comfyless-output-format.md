@@ -255,6 +255,26 @@ Sequenced so each is independently revertible. Slices 2, 3, 5 are Red Zone.
 
 ## Changelog
 
+- 2026-07-21 — **Slice 4 landed (cascade).** The Stable Cascade dispatch
+  (`cascade.py`) resolves `--output-format {png,jpeg,jpg}` + `--quality` itself
+  and threads the resolved `OutputFormat` extension through the numbering
+  (`_resolve_output_path`, `_resolve_cascade_savepath`), the offset scan, and a
+  format-aware `_save_with_metadata` (png → tEXt chunk unchanged; jpeg → RGB
+  flatten + `format`/`quality`, no chunk). The slice-1 reject stopgap in
+  `generate.py` is removed — the sentinel branch delegates straight through.
+  D2 contradiction errors loudly before any pipeline build; the default
+  sentinel `/tmp/comfyless.png` swaps to `/tmp/comfyless.jpg` under jpeg.
+  `_scan_existing_offset` is now **format-agnostic** (png|jpg|jpeg|json) and
+  `_resolve_cascade_savepath` requires both the image AND its per-stem `.json`
+  free — closing the mixed-format sidecar-clobber the slice-2 review flagged,
+  on the cascade path too. jpeg runs record `output_format` + `quality`
+  provenance in the sidecar (added to `_KNOWN_KEYS` for clean replay);
+  `code-reviewer` (Fable) Finding 1 **fixed in-slice**: a png run replaying a
+  jpeg sidecar stripped the inherited `output_format`/`quality` so it can't emit
+  false provenance (mirrors generate.py's `_SKIP_SIDECAR_KEYS` filter). Dead
+  `_NUMBERED_PNG_RE` removed; +18 cascade tests (unit + mocked-dispatch
+  behavioral for D2, the sentinel swap, and the Finding-1 regression).
+  **Non-Red-Zone** — `code-reviewer` only, no `security-auditor`.
 - 2026-07-21 — **Slice 2 landed (daemon).** `--output-format`/`--quality` ride
   the daemon wire request; the daemon resolves the `OutputFormat` server-side
   and owns the on-disk extension for the O_EXCL reservation and the savepath
