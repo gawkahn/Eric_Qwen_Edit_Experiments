@@ -94,11 +94,11 @@ _source = Path(g.__file__).read_text()
 # the schema definition itself — proves it's wired into either the
 # generate() signature, the CLI merge, or sidecar building.
 #
-# Deliberately-inert keys are exempt: ADR-035 adds `ref_images` to the schema in
-# slice 1 (recognized + replay-dropped) but does NOT thread it into generate()
-# until slice 3 — so it correctly appears only once in generate.py (the
-# _SKIP_SIDECAR_KEYS entry) for now. Slice 3 removes it from this exemption.
-_INERT_PENDING_WIRING = {"ref_images"}
+# No keys are inert now: ADR-035 slice 1 added `ref_images` recognized +
+# replay-dropped, and slice 3 threaded it into generate() (routing + the
+# _run_qwen_edit_refs call site), so it is no longer exempt — the count check
+# below now proves it is genuinely wired, not just skip/drop plumbing.
+_INERT_PENDING_WIRING: set = set()
 for key in schema:
     if key in _INERT_PENDING_WIRING:
         continue
@@ -153,6 +153,11 @@ _generate_canonical = {
         # (ADR-034 Deferred): it must NOT enter the replay params — it belongs
         # alongside output_path/savepath in the non-schema set. Runtime-only.
         "output_format",
+        # ADR-035 slice 3: a routing flag (whether the caller set --width AND
+        # --height, so the qwen-edit path forwards them instead of deriving dims
+        # from the reference). Not sidecar-shaped — the dims themselves persist
+        # via width/height. ref_images, by contrast, IS a schema key.
+        "ref_dims_explicit",
     }
 }
 _missing_from_schema = _generate_canonical - set(schema.keys())

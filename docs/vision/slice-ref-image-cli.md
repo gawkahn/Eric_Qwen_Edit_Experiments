@@ -31,7 +31,12 @@ or viewpoint change (`:vl`).
 
 Deferred to their own Vision slices: daemon `ref_image_roots` + wire strictness
 + NUL defense + cache-key pin (ADR-035 6a/6b-daemon/6e/6f-daemon/3-test,
-decision 2 wire flag); sidecar recording + replay trust (decision 7).
+decision 2 wire flag); replay trust (decision 7). **Amended 2026-07-21 (slice-3
+code review):** sidecar *recording* of ref provenance (path/mode/sha256) landed
+early in slice 3 — an edit sidecar that masqueraded as text2img was a
+truthfulness defect, and the sha256 was already computed by the ingestion
+helper. Replay *trust* (removing `ref_images` from `_SKIP_SIDECAR_KEYS`, the
+moved-file / hash-mismatch / outside-roots refusal) remains slice 5.
 
 ## Decisions inherited from ADR-035 (settled, not re-opened here)
 

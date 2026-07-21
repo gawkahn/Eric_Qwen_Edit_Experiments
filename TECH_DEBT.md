@@ -5,6 +5,48 @@ Format: **Item** — why deferred, what triggers revisiting.
 
 ---
 
+## ADR-035 reference-image edit
+
+**qwen-edit foreground run does not arm ^C pause/resume (single ^C hard-aborts)** *(2026-07-21)*
+Slice-3 `code-reviewer` (Fable) finding 7 (minor). The reference-image edit
+branch in `generate()` calls `_run_qwen_edit_refs` → `generate_qwen_edit`
+directly, bypassing the `sigint_pause` context the text2img path wraps its
+`pipe.__call__` in (slice PAUSE). So a foreground edit loses pause-at-step and a
+single ^C aborts instead of pausing. `generate_qwen_edit` accepts a `progress_cb`
+that could drive the pause.
+Why not now: out of ADR-035 slice-3 scope (execution wiring); pause is a UX
+nicety, not correctness. Trigger: a later edit-UX slice, or whenever
+`generate_qwen_edit`'s `progress_cb` is wired for progress reporting — do both
+together. Fix: adapt `comfyless.pause.sigint_pause` to the manual loop via
+`progress_cb`.
+
+**`_REF_MODE_FLAGS[spec["mode"]]` KeyErrors on a malformed mode from a non-CLI caller** *(2026-07-21)*
+Slice-3 `code-reviewer` (Fable) finding 8 (minor). `_run_qwen_edit_refs`
+indexes `_REF_MODE_FLAGS` by `spec["mode"]` with no local guard. Safe today —
+the only caller, the CLI, validates modes via `_validate_ref_image_specs`
+before `generate()`. But slice 4 (daemon wire) and slice 5 (`--params` replay)
+introduce callers whose `ref_images` specs are NOT CLI-validated.
+Why not now: no unvalidated caller exists in slice 3; adding a redundant guard
+now is dead code. Trigger: HARD precondition of BOTH slice 4 and slice 5 — each
+must validate `ref_images[].mode ∈ {both,vl,ref}` at its own boundary before
+forwarding to `generate()` (mirrors the mode check `_parse_ref_image` already
+does for the CLI). Add to those slices' boundary checklists.
+
+**Edit-run sidecar records ref provenance but `--params` replay silently drops it (until slice 5)** *(2026-07-21)*
+Slice 3 records `ref_images` (path/mode/sha256) in the edit sidecar for a
+truthful record (code review F1, resolved early), but a `--params` replay of
+that sidecar drops `ref_images` via `_SKIP_SIDECAR_KEYS` and regenerates WITHOUT
+references — with no warning, because slice 5's replay-trust treatment (the loud
+"recorded ref dropped — re-supply --ref-image", moved-file / hash-mismatch
+notices, outside-roots refusal) is not yet built. This is not a regression
+(pre-slice-3 there was nothing to drop) but the silent half remains.
+Why not now: replay TRUST is ADR-035 decision 7 / slice 5 by design; only the
+safe RECORDING half was pulled into slice 3. Trigger: slice 5 — remove
+`ref_images` from `_SKIP_SIDECAR_KEYS`, add the replay-side warnings + F4 echo +
+outside-roots refusal. Fix: as specified in ADR-035 decision 7.
+
+---
+
 ## Security
 
 **MCP: `refiner_path` not covered by output-metadata basename redaction** *(2026-07-11)*

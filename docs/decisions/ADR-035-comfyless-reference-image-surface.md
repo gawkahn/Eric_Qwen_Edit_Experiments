@@ -544,6 +544,40 @@ convention, and Qwen-Image-Edit-2511 is the *Plus* multi-reference variant where
 
 ## Changelog
 
+- 2026-07-21 — **Slice 3 landed (foreground qwen-edit execution).** comfyless
+  can now run a real Qwen-Image-Edit pass from the CLI: `--model <qwen-edit
+  ckpt> --prompt … --ref-image PATH[:MODE]` (1–8 refs). New in
+  `comfyless/generate.py`: `_REF_MODE_FLAGS` (MODE→(vl,ref) per decision 2a),
+  `_pil_to_comfy_image` (PIL→ComfyUI IMAGE tensor), and `_run_qwen_edit_refs`
+  — the routing helper that decodes each spec through the slice-2 ingestion
+  core (the single decode site, ADR-035 6b), maps MODE→flags, calls the
+  node-pack's `generate_qwen_edit` (lazy import) + `decode_qwen_latents`, and
+  returns the PIL + resolved dims + per-ref provenance. `generate()` gains
+  `ref_images` / `ref_dims_explicit`; a qwen-edit run forks before the text2img
+  call machinery (decision 3/5). Non-qwen-edit families with refs take the drop
+  path (warn + proceed). A `--ref-image` run forces the in-process path
+  (`_should_delegate_to_server`): the daemon can't honor refs until slice 4, so
+  delegating would silently drop them. Output dims derive from the last
+  reference (~1MP) unless both width and height are user-set (via
+  `--width/--height`, `--override`, or `--params` — tracked by `explicit_keys`).
+  `ref_images` removed from the `test_params_schema` `_INERT_PENDING_WIRING`
+  exemption (now genuinely wired). Tests: `test_ref_edit.py` (31 cases — flag
+  table, PIL→tensor, routing/order/provenance, dim forwarding, and the
+  delegation predicate as an explicit negative for the silent-drop regression).
+  Live GPU smoke = Grant. `code-reviewer` (Fable): **no boundary/security
+  violation**; core routing, height/width ordering, single-decode-site,
+  delegation-skip, and caller-isolation all verified. Findings resolved
+  in-slice — F1 record ref provenance (path/mode/sha256) for a truthful sidecar
+  (**recording only; replay-trust remains slice 5**, decision 7); F2 `--sampler`
+  warn-and-ignore + record the actual `flow_heun` (the namespaces diverge); F3
+  dims-explicit signal switched from `args.width` to `explicit_keys` (covers
+  `--override`/`--params`); F4 delegation predicate extracted + negative-tested;
+  F5 skip the text2img `call_kwargs` build for the edit path (kills a spurious
+  introspection log); F6 warn on width-XOR-height. Findings deferred to
+  TECH_DEBT — F7 (^C pause not armed on the edit loop) and F8 (non-CLI callers
+  must validate `mode` at the slice-4/5 boundaries). Still §12 non-Red-Zone
+  (foreground content decode inheriting slice 2's audit; daemon exposure +
+  containment are slice 4, replay trust slice 5).
 - 2026-07-21 — **Slice 2 landed (ingestion helper).** New `comfyless/ref_image.py`
   — the decode/cap/hash security core (decisions 6c/6d/6g). One entry point,
   `load_ref_image_capped(path)`: bounded single read (`read(max_bytes+1)`, no

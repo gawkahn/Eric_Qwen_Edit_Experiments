@@ -40,7 +40,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -1476,6 +1476,83 @@ def _decode_upscale_2x(packed_latents, pipe, upscale_vae, height, width,
     return Image.fromarray(arr)
 
 
+# ── ADR-035: reference-image edit (qwen-edit) ────────────────────────────────
+#: MODE → (vl_path, ref_path) conditioning flags (ADR-035 decision 2a). `both`
+#: locks the scene (output geometry follows the reference); `vl` carries only
+#: semantics (geometry free — the car-reorientation case); `ref` pins pixels
+#: without the semantic path. There is no `none` — an ignored image is an
+#: omitted flag, not a mode (decision 2).
+_REF_MODE_FLAGS = {
+    "both": (True, True),
+    "vl":   (True, False),
+    "ref":  (False, True),
+}
+
+
+def _pil_to_comfy_image(pil) -> "torch.Tensor":
+    """PIL RGB image → ComfyUI IMAGE tensor (1, H, W, 3) float32 in [0, 1] — the
+    inverse of the tensor→PIL idiom in `_decode_upscale_2x`. `generate_qwen_edit`
+    consumes references in exactly this layout (manual_loop.py:2408)."""
+    import numpy as np
+    arr = np.asarray(pil.convert("RGB"), dtype=np.float32) / 255.0
+    return torch.from_numpy(arr).unsqueeze(0)
+
+
+def _run_qwen_edit_refs(
+    pipe, prompt: str, negative_prompt: Optional[str],
+    ref_images: List[Dict[str, str]], *,
+    num_steps: int, guidance_scale: float, sigma_schedule: str,
+    generator, max_sequence_length: int,
+    output_width: Optional[int], output_height: Optional[int],
+) -> Tuple[Any, int, int, List[Dict[str, Any]]]:
+    """Ingest --ref-image specs and run the qwen-edit denoising loop (ADR-035
+    slice 3). Each spec's path is decoded through `comfyless/ref_image.py` — the
+    SINGLE decode site (byte/pixel caps, PNG/JPEG/WEBP allowlist, SHA-256; ADR-035
+    6b) — into a ComfyUI IMAGE tensor, and its MODE selects the (VL, Ref)
+    conditioning flags. Order is preserved: the Nth reference becomes "Picture N".
+    When output_width/height are None the loop derives them from the last
+    reference's aspect (~1MP, decision 4 / B8). Returns
+    (final_pil, out_height, out_width, ref_provenance) — the provenance list
+    records each reference's path, mode, and SHA-256 (over the exact decoded
+    bytes) for a truthful sidecar; every reference here is applied (the drop path
+    is upstream, for non-qwen-edit families). The node-pack import is lazy —
+    comfyless only pays it on an actual edit run, and `comfyless.__init__` has
+    already stubbed the ComfyUI-only `folder_paths` by the time this runs."""
+    import numpy as np
+    from PIL import Image
+
+    from comfyless.ref_image import load_ref_image_capped
+    from nodes.eric_diffusion_manual_loop import (
+        decode_qwen_latents, generate_qwen_edit)
+
+    ref_tensors: List[Any] = []
+    vl_flags: List[bool] = []
+    ref_flags: List[bool] = []
+    ref_provenance: List[Dict[str, Any]] = []
+    for spec in ref_images:
+        loaded = load_ref_image_capped(spec["path"])
+        ref_tensors.append(_pil_to_comfy_image(loaded.image))
+        vl, rf = _REF_MODE_FLAGS[spec["mode"]]
+        vl_flags.append(vl)
+        ref_flags.append(rf)
+        ref_provenance.append({
+            "path": spec["path"], "mode": spec["mode"],
+            "sha256": loaded.sha256, "applied": True,
+        })
+
+    latents, out_h, out_w = generate_qwen_edit(
+        pipe, prompt, negative_prompt, ref_tensors,
+        vl_flags=vl_flags, ref_flags=ref_flags,
+        output_width=output_width, output_height=output_height,
+        num_inference_steps=num_steps, guidance_scale=guidance_scale,
+        sigma_schedule=sigma_schedule, generator=generator,
+        max_sequence_length=max_sequence_length,
+    )
+    img = decode_qwen_latents(pipe, latents, out_h, out_w)  # [1,H,W,3] in [0,1]
+    arr = (img[0].clamp(0.0, 1.0).numpy() * 255.0).round().astype(np.uint8)
+    return Image.fromarray(arr), out_h, out_w, ref_provenance
+
+
 def generate(
     model_path: str,
     prompt: str,
@@ -1528,6 +1605,8 @@ def generate(
     interactive_pause: bool = True,
     extra_metadata: Optional[Dict[str, Any]] = None,
     output_format: Optional[OutputFormat] = None,
+    ref_images: Optional[List[Dict[str, str]]] = None,
+    ref_dims_explicit: bool = False,
 ) -> Dict[str, Any]:
     """Generate a single image and save it.
 
@@ -1660,6 +1739,25 @@ def generate(
             file=sys.stderr,
         )
 
+    # ── ADR-035: reference-image edit routing ─────────────────────────
+    # qwen-edit is the only family with a reference-image edit path (decision 3);
+    # any other family takes the drop path — a loud warning, then generate
+    # without the references (warn-don't-block; Vision failure semantics). The
+    # references are consumed only on the qwen-edit branch at the call site below.
+    ref_images = ref_images or []
+    is_qwen_edit = bool(ref_images) and model_family == "qwen-edit"
+    if ref_images and not is_qwen_edit:
+        print(f"[comfyless] WARNING: --ref-image ignored — model family "
+              f"{model_family!r} has no reference-image edit path (only "
+              f"qwen-edit); generating without references.", file=sys.stderr)
+    # Recorded-in-metadata provenance for a truthful edit sidecar (code review
+    # 2026-07-21): the sampler qwen-edit actually ran (its own flow_heun loop,
+    # not --sampler, whose namespace differs), any ignored-knob warnings, and the
+    # per-reference path/mode/sha256. Defaults leave text2img runs untouched.
+    recorded_sampler = sampler
+    edit_warnings: List[str] = []
+    ref_provenance: List[Dict[str, Any]] = []
+
     # ── Load LoRAs ────────────────────────────────────────────────────
     lora_outcomes: List[Dict[str, Any]] = []
     loras = loras or []
@@ -1675,7 +1773,10 @@ def generate(
 
     # ── Build call kwargs (CFG routing) ───────────────────────────────
     neg = negative_prompt.strip() or None
-    call_kwargs = _build_call_kwargs(
+    # qwen-edit runs its own denoising loop (generate_qwen_edit); the text2img
+    # call kwargs would be built and discarded — and worse, log a spurious
+    # "unknown model_family qwen-edit — introspecting" (code review 2026-07-21).
+    call_kwargs = {} if is_qwen_edit else _build_call_kwargs(
         pipe, model_family, guidance_embeds,
         prompt, neg, height, width, steps, cfg_scale,
         true_cfg_scale, max_sequence_length, generator,
@@ -1761,8 +1862,11 @@ def generate(
         print(f"[comfyless] WARNING: --rebalance ignored — only applies to "
               f"krea/krea-turbo (model_family={model_family!r})", file=sys.stderr)
 
-    _log(f"[comfyless] Generating: {width}x{height}, "
-         f"steps={steps}, cfg={cfg_scale}, seed={seed}, sampler={sampler}")
+    if not is_qwen_edit:
+        # qwen-edit derives its own output dims from the reference at the call
+        # site below; width/height here are the unused text2img defaults.
+        _log(f"[comfyless] Generating: {width}x{height}, "
+             f"steps={steps}, cfg={cfg_scale}, seed={seed}, sampler={sampler}")
 
     # ── VAE: move back to GPU for decode ──────────────────────────────
     if offload_vae and hasattr(pipe, "vae"):
@@ -1790,14 +1894,19 @@ def generate(
     # sigmas. Orthogonal to --sampler (spacing vs integration order — they
     # compose). Warn-and-ignore everywhere else — the warning is carried in
     # metadata (schedule_warnings) so the daemon/MCP client sees it.
-    _sched_warn = _apply_sigma_schedule(
-        call_kwargs, pipe, schedule, model_family, steps)
-    schedule_warnings = [_sched_warn] if _sched_warn else []
-    if "sigmas" in call_kwargs:
-        _log(f"[comfyless] sigma schedule: {schedule} (flow-match, {steps} steps)")
-    elif _sched_warn is not None:
-        print(f"[comfyless] WARNING: --schedule {schedule!r} ignored — "
-              f"{_sched_warn}; using the pipeline default", file=sys.stderr)
+    schedule_warnings: List[str] = []
+    if not is_qwen_edit:
+        # qwen-edit honors `schedule` directly via generate_qwen_edit's
+        # sigma_schedule arg; running the text2img sigma path here would emit a
+        # spurious "ignored" warning into the sidecar.
+        _sched_warn = _apply_sigma_schedule(
+            call_kwargs, pipe, schedule, model_family, steps)
+        schedule_warnings = [_sched_warn] if _sched_warn else []
+        if "sigmas" in call_kwargs:
+            _log(f"[comfyless] sigma schedule: {schedule} (flow-match, {steps} steps)")
+        elif _sched_warn is not None:
+            print(f"[comfyless] WARNING: --schedule {schedule!r} ignored — "
+                  f"{_sched_warn}; using the pipeline default", file=sys.stderr)
 
     # ── Inference (with optional sampler swap) ────────────────────────
     # When the Hunyuan-Image refiner chain is active, run_chain handles both
@@ -1806,7 +1915,33 @@ def generate(
     # ADR-016 §(g) / Vision Inv 8. hunyuan-image is not a NAG family, so the
     # refiner and NAG paths are mutually exclusive.
     t0 = time.monotonic()
-    if refiner_pipe is not None:
+    if is_qwen_edit:
+        # ADR-035 slice 3: reference-image edit — bypasses the text2img
+        # call/CFG machinery entirely (generate_qwen_edit runs its own manual
+        # denoising loop with its own sigma handling). output_width/height are
+        # forwarded only when the user set --width AND --height; otherwise None
+        # so the loop derives dims from the last reference (decision 4 / B8).
+        # `width`/`height` are then set to the resolved dims for metadata.
+        if sampler != "default":
+            # The comfyless --sampler namespace (multistep2/res_2m/…) does not
+            # map onto the edit loop's (flow_heun/flow_euler/…); the loop runs
+            # flow_heun. Warn-and-ignore + record the truth (code review F2).
+            _sw = (f"--sampler {sampler!r} ignored — qwen-edit runs its own "
+                   f"flow_heun denoising loop")
+            print(f"[comfyless] WARNING: {_sw}", file=sys.stderr)
+            edit_warnings.append(_sw)
+        recorded_sampler = "flow_heun"
+        final_pil, height, width, ref_provenance = _run_qwen_edit_refs(
+            pipe, prompt, neg, ref_images,
+            num_steps=steps,
+            guidance_scale=(true_cfg_scale if true_cfg_scale is not None
+                            else cfg_scale),
+            sigma_schedule=schedule, generator=generator,
+            max_sequence_length=max_sequence_length,
+            output_width=(width if ref_dims_explicit else None),
+            output_height=(height if ref_dims_explicit else None),
+        )
+    elif refiner_pipe is not None:
         from comfyless import hunyuan_chain
         with swap_sampler(pipe, effective_sampler, log_prefix="[comfyless]"):
             final_pil = hunyuan_chain.run_chain(
@@ -1868,7 +2003,10 @@ def generate(
         "true_cfg_scale": true_cfg_scale,
         "width": width,
         "height": height,
-        "sampler": sampler,
+        # recorded_sampler == sampler for text2img; on a qwen-edit run it is the
+        # loop's actual flow_heun (the requested --sampler is warn-ignored) so the
+        # sidecar never claims a sampler that did not run (code review F2).
+        "sampler": recorded_sampler,
         "schedule": schedule,
         # Loud-across-the-wire: a --schedule that was warn-and-ignored (wrong
         # family/scheduler) records WHY here, so a daemon/MCP client sees
@@ -1912,6 +2050,15 @@ def generate(
     # scales, exception text from a local import only).
     if nag_warnings:
         metadata["nag_warnings"] = nag_warnings
+    # ADR-035 slice 3: record reference provenance (path/mode/sha256) so an edit
+    # sidecar is truthful and distinguishable from a text2img one. RECORDING only
+    # — a --params replay still drops ref_images via _SKIP_SIDECAR_KEYS (the
+    # replay-trust treatment is slice 5). edit_warnings carries the ignored
+    # --sampler notice across the daemon/MCP boundary (invariant N1 pattern).
+    if ref_provenance:
+        metadata["ref_images"] = ref_provenance
+    if edit_warnings:
+        metadata["edit_warnings"] = edit_warnings
     if rebalance and model_family in ("krea", "krea-turbo"):
         metadata["rebalance"] = {
             "mult": rebalance_mult,
@@ -2595,6 +2742,19 @@ def _build_server_request(
     if wire_savepath:
         req["savepath"] = wire_savepath
     return req
+
+
+def _should_delegate_to_server(args: argparse.Namespace,
+                               using_default_output: bool) -> bool:
+    """Whether a run may be handed to the daemon (ADR-035 slice 3).
+
+    Delegation happens on --savepath or the default output sentinel, and is
+    skipped on an explicit --output (the server owns path resolution). A
+    --ref-image run ALSO never delegates: the daemon cannot honor references
+    until slice 4, so delegating would silently generate WITHOUT them — the
+    exact silent-drop the Vision names. Extracted as a predicate so this
+    one-token guard is unit-testable (the regression mode is a silent ref drop)."""
+    return (bool(args.savepath) or using_default_output) and not args.ref_image
 
 
 def _delegate_to_server(
@@ -3288,6 +3448,15 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
 
         using_default_output = args.output == "/tmp/comfyless.png"
 
+        # ADR-035 slice 3 (code review F6): a ref run needs BOTH width and height
+        # to override the reference-derived output size; exactly one is a no-op.
+        if args.ref_image and (("width" in explicit_keys)
+                               != ("height" in explicit_keys)):
+            print("[comfyless] WARNING: --ref-image with only one of "
+                  "width/height set — both are required to override the "
+                  "reference-derived output size; deriving from the reference "
+                  "instead.", file=sys.stderr)
+
         # Resolve output format (ADR-034 D2/D3). Extension inference applies
         # only to a caller-authored --output path — not the default sentinel
         # or a savepath template, whose extensions are not user intent.
@@ -3306,7 +3475,10 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
         # docs/security/review-slice-DQ-daemon-quant-2026-07-03.md).
         # ADR-034 slice 2: output_format/quality ride the wire request and the
         # daemon owns the extension, so jpeg delegates like any other request.
-        if args.savepath or using_default_output:
+        # ADR-035 slice 3: a --ref-image run forces the in-process path (the
+        # daemon can't honor references until slice 4 — delegating would silently
+        # drop them). See _should_delegate_to_server for the full predicate.
+        if _should_delegate_to_server(args, using_default_output):
             # Pre-expand iteration tokens client-side so the daemon receives a
             # template it can finish resolving (%seed%, %model%, etc.) without
             # needing to know about iteration at all.
@@ -3396,6 +3568,15 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                 nag_alpha=p_cur.get("nag_alpha", 0.25),
                 nag_end=p_cur.get("nag_end", 1.0),
                 output_format=out_fmt,
+                # ADR-035 slice 3: reference-image edit. Re-parse is idempotent
+                # (main() already validated these; no GPU, no decode) and yields
+                # the {path, mode} specs. Dims derive from the reference unless
+                # the user set BOTH width and height — via --width/--height,
+                # --override, or a --params sidecar — which explicit_keys tracks
+                # (code review F3; args.width alone would miss override/params).
+                ref_images=_validate_ref_image_specs(args.ref_image),
+                ref_dims_explicit=("width" in explicit_keys
+                                   and "height" in explicit_keys),
             )
             if iterate_batch_id:
                 metadata["iterate_batch_id"] = iterate_batch_id
