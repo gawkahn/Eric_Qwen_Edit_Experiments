@@ -4679,6 +4679,30 @@ with tempfile.TemporaryDirectory() as _tp_out, \
           and "_load_sidecar(" not in _rp_src
           and not _imports_argparse)
 
+    # ── ADR-035 slice-1b: ref_images abs paths never survive extract_params ──
+    # ref_images became a recognized schema key in ADR-035 slice 1, so a crafted
+    # sidecar could carry {"path": "/abs/..."} through _validate_params. The
+    # renderer must drop it outright (no catalog to launder an arbitrary image
+    # file through), preserving "no absolute path or directory survives".
+    _ri_out, _ri_notices, _ri_hits = mcps._render_extracted_params(
+        {"model": "q", "prompt": "p",
+         "ref_images": [{"path": "/home/gawkahn/secret/private.png", "mode": "vl"}]},
+        model_family="qwen-image", index={}, catalog={})
+    check("ADR-035 1b: ref_images dropped by _render_extracted_params",
+          "ref_images" not in _ri_out)
+    check("ADR-035 1b: no /home/ abs path survives the render blob",
+          not any("/home/" in str(v) for v in _ri_out.values()))
+    # End-to-end (review INFO-2): a ref_images-bearing sidecar through the FULL
+    # extract_params handler must not echo the key or its abs path in the returned
+    # body — guards against a future re-route bypassing the pinned renderer.
+    _ri_sc = _write_sidecar("ri_leak.json", {
+        "model": "/models/checkpoints/My-Model", "prompt": "p", "seed": 3,
+        "ref_images": [{"path": "/home/gawkahn/secret/private.png", "mode": "vl"}]})
+    _ri_res = _run(mcps._call_tool_impl(_cfg4, "extract_params", {"path": _ri_sc}))
+    _ri_body = _ri_res[0].text if _ri_res else ""
+    check("ADR-035 1b (e2e): extract_params body drops ref_images + its abs path",
+          "ref_images" not in _ri_body and "/home/gawkahn/secret" not in _ri_body)
+
     # ── N22/N23: audit on stderr only; path echoed, params blob NOT ──
     _cap_err = io.StringIO()
     _cap_out = io.StringIO()

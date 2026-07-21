@@ -383,8 +383,12 @@ def _render_extracted_params(normalized: dict, *, model_family,
 
     # Drop every remaining abs-path-bearing field (invariant 8). savepath /
     # output_path are non-schema and normally already gone; popped defensively.
+    # ref_images (ADR-035) is an abs-path-bearing schema key with no catalog to
+    # launder through (reference images are arbitrary files, not weights), so it
+    # is dropped outright like vae_path — no absolute path or directory survives
+    # this boundary (slice-1b close of the slice-1 extract_params regression).
     for k in ("vae_path", "text_encoder_path", "text_encoder_2_path",
-              "output_path", "savepath", "lora_warnings"):
+              "output_path", "savepath", "lora_warnings", "ref_images"):
         out.pop(k, None)
 
     if model_family:

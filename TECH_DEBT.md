@@ -1608,3 +1608,31 @@ Trigger: MUST close before ADR-035 slice 5 (sidecar recording) lands; addressed
 immediately as slice 1b. Fix: filter `_SKIP_SIDECAR_KEYS` (or pop `ref_images`)
 in/before `_handle_extract_params`, with a pin test mirroring the existing
 "no absolute path survives" assertions.
+Resolved: 2026-07-21 — slice 1b added `ref_images` to the drop-outright tuple in
+`_render_extracted_params` (cascade render path structurally can't emit it —
+allowlist). `security-auditor` (Fable) PASS,
+`docs/security/review-adr-035-slice1b-mcp-ref-images-leak-2026-07-21.md`. Pin
+tests (unit + end-to-end through `_handle_extract_params`) in `test_mcp_server.py`.
+
+**MCP extract_params: type-mismatched non-path schema fields egress arbitrary strings** *(2026-07-21)*
+Pre-existing (slice-4 vintage), surfaced by the slice-1b `security-auditor`
+(Fable) review. `_validate_params` (`generate.py:171-177`) KEEPS values on type
+mismatch (warn-and-keep), and `_render_extracted_params` passes non-path schema
+fields through verbatim — so a crafted sidecar `{"steps":"/home/gawkahn/secret"}`
+egresses an absolute-path string through a numeric field across the MCP boundary,
+breaking the letter of "no absolute path or directory survives". Same class the
+cascade render path already closed with number-or-None coercion
+(`mcp_server.py` `_CASCADE_NUMERIC_FIELDS`) and LoRA-weight coercion. Also:
+`model_family` is re-injected verbatim from the raw sidecar on both render paths
+(arbitrary-string egress), inconsistent with the cascade dtype value-allowlist.
+Exfiltration value is LOW (prompt/negative_prompt already pass arbitrary sidecar
+text verbatim by design), which is why the auditor rated it MEDIUM, not a 1b
+blocker, and explicitly said fixing it in 1b would be scope creep.
+Why not now: out of ADR-035 slice-1b edit scope (the 1b fix is the `ref_images`
+drop only); this is a distinct, pre-existing hardening on a Red-Zone path.
+Trigger: next deliberate `mcp_server.py` extract-hardening slice, or when the MCP
+output/opaque-handle work (ADR-034 slice 3 / MCP edit ADR) touches this surface.
+Fix: in `_render_extracted_params`, coerce numeric/bool schema fields to
+type-or-drop (mirror `_CASCADE_NUMERIC_FIELDS`), value-allowlist `model_family`,
+or run `_validate_params` in a strict drop-on-mismatch mode for the extract path.
+Needs `security-auditor` (Red-Zone path).
