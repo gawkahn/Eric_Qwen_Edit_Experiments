@@ -237,6 +237,16 @@ Sequenced so each is independently revertible. Slices 2, 3, 5 are Red Zone.
 
 ## Changelog
 
+- 2026-07-21 — **Slice 1 follow-ups** (validated live: q0.9 1024² visually
+  PNG-identical at ~5.5× smaller). (a) `--output-format` accepts `jpg` as an
+  alias for `jpeg`. (b) Output format + quality are now recorded as **sidecar
+  provenance on jpeg runs** — `output_format` (the name) and `quality` (the
+  0.0-1.0 fraction the user set, which the output file cannot reveal). This
+  refines, and stays consistent with, the Deferred "must NOT enter the schema"
+  decision: they go in `_SKIP_SIDECAR_KEYS` (the non-schema provenance set that
+  `rebalance`/`output_path`/`savepath` already occupy), so `--params` replay
+  filters them and they never become generation inputs or touch the cache key.
+  PNG sidecars are unchanged (recorded on non-png runs only).
 - 2026-07-20 — **Slice 1 landed** (`output_format.py` + CLI flags +
   `generate.py` in-process path; PNG byte-identical, verified by
   `test_output_format.py`). `code-reviewer` (Fable) surfaced two low findings,

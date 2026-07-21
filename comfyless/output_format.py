@@ -17,6 +17,9 @@ _FORMATS = {
     "jpeg": (".jpg", "JPEG"),
 }
 
+# Accepted --output-format spellings that normalize onto a canonical name.
+_FORMAT_ALIASES = {"jpg": "jpeg"}
+
 # Extensions that infer a format when --output-format is absent (ADR-034 D2).
 _EXT_TO_NAME = {
     ".png":  "png",
@@ -40,6 +43,11 @@ class OutputFormat:
     extension: str     # ".png" | ".jpg"
     pil_format: str    # "PNG" | "JPEG"
     quality: int       # PIL 1..95 (meaningful for jpeg; unused for png)
+    # The effective 0.0-1.0 fraction (the --quality knob; default when omitted).
+    # Recorded as jpeg sidecar provenance — the value a user would re-set, which
+    # the output file cannot reveal. Defaulted so positional construction in
+    # tests/callers predating this field keeps working.
+    quality_fraction: float = DEFAULT_QUALITY_FRACTION
 
     @property
     def embeds_text_chunk(self) -> bool:
@@ -99,12 +107,12 @@ def resolve_output_format(
     if format_flag is None:
         name = inferred or "png"
     else:
-        if format_flag not in _FORMATS:
+        name = _FORMAT_ALIASES.get(format_flag, format_flag)
+        if name not in _FORMATS:
+            accepted = sorted(set(_FORMATS) | set(_FORMAT_ALIASES))
             raise ValueError(
-                f"--output-format must be one of {sorted(_FORMATS)}; "
-                f"got {format_flag!r}"
+                f"--output-format must be one of {accepted}; got {format_flag!r}"
             )
-        name = format_flag
         if inferred is not None and inferred != name:
             raise ValueError(
                 f"--output-format {name} contradicts the output path extension "
@@ -113,9 +121,9 @@ def resolve_output_format(
             )
 
     # Validate quality unconditionally when supplied; apply only for jpeg.
-    qi = quality_fraction_to_int(
-        DEFAULT_QUALITY_FRACTION if quality is None else quality
-    )
+    frac = DEFAULT_QUALITY_FRACTION if quality is None else quality
+    qi = quality_fraction_to_int(frac)
 
     ext, pil_fmt = _FORMATS[name]
-    return OutputFormat(name=name, extension=ext, pil_format=pil_fmt, quality=qi)
+    return OutputFormat(name=name, extension=ext, pil_format=pil_fmt,
+                        quality=qi, quality_fraction=float(frac))

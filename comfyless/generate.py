@@ -123,7 +123,11 @@ _SKIP_SIDECAR_KEYS = {"timestamp", "elapsed_seconds", "contract_version",
                       "rebalance",
                       # ADR-030: derived provenance (output is 2× gen res), not
                       # an input param — re-pass --upscale-vae to replay instead.
-                      "upscale_factor"}
+                      "upscale_factor",
+                      # ADR-034: output format/quality are an OUTPUT concern,
+                      # recorded as provenance on jpeg runs but never a replay
+                      # param — re-pass --output-format/--quality to replay.
+                      "output_format", "quality"}
 
 
 def _type_name(t) -> str:
@@ -1886,7 +1890,17 @@ def generate(
         metadata["refiner_steps"] = refiner_steps
         metadata["refiner_cfg"]   = refiner_cfg
 
-    # ── Save PNG with embedded metadata ──────────────────────────────
+    # Output-format provenance (ADR-034): recorded on non-png runs only, so png
+    # sidecars are unchanged. These are non-schema keys (in _SKIP_SIDECAR_KEYS),
+    # so --params replay filters them — they never become generation inputs.
+    # quality is the 0.0-1.0 fraction (the --quality knob), unrecoverable from
+    # the output file; format is inferable from the file but recorded for a
+    # complete record.
+    if output_format is not None and output_format.name != "png":
+        metadata["output_format"] = output_format.name
+        metadata["quality"] = output_format.quality_fraction
+
+    # ── Save image with embedded metadata (PNG tEXt only) ─────────────
     pil_image = final_pil
     _save_with_metadata(pil_image, output_path, metadata, mcp_caller=mcp_caller,
                         output_format=output_format)
@@ -2075,11 +2089,12 @@ def _parse_args() -> argparse.Namespace:
                         "%%seed%%, %%steps%%, %%cfg%%, %%sampler%%, %%input%%. "
                         "Auto-creates dirs; always writes comfyless0001.png, 0002, ...")
     # ── Output format (ADR-034) ──
-    p.add_argument("--output-format", choices=["png", "jpeg"], default=None,
-                   help="Output image format. Default: png, or inferred from the "
-                        "--output extension (.jpg/.jpeg -> jpeg). An explicit value "
-                        "that contradicts the extension is an error, not a rewrite. "
-                        "JPEG runs in-process (daemon support: ADR-034 slice 2).")
+    p.add_argument("--output-format", choices=["png", "jpeg", "jpg"], default=None,
+                   help="Output image format (jpg is an alias for jpeg). Default: "
+                        "png, or inferred from the --output extension "
+                        "(.jpg/.jpeg -> jpeg). An explicit value that contradicts "
+                        "the extension is an error, not a rewrite. JPEG runs "
+                        "in-process (daemon support: ADR-034 slice 2).")
     p.add_argument("--quality", type=float, default=None, metavar="0.0-1.0",
                    help="JPEG quality as a 0.0-1.0 fraction (default 0.7 -> PIL 70). "
                         "Higher is better; the useful ceiling is 1.0 -> 95. "

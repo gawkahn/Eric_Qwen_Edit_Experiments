@@ -77,6 +77,10 @@ check(resolve_output_format(None, None, "/tmp/noext").name == "png", "no extensi
 
 print("D2 explicit flag wins")
 check(resolve_output_format("jpeg", None, None).name == "jpeg", "explicit jpeg, no path")
+check(resolve_output_format("jpg", None, None).name == "jpeg", "jpg alias -> jpeg")
+check(resolve_output_format("jpg", None, None).extension == ".jpg", "jpg alias ext is .jpg")
+check(resolve_output_format("jpg", None, "/tmp/x.jpg").name == "jpeg", "jpg alias agrees with .jpg path")
+expect_raises(lambda: resolve_output_format("jpg", None, "/tmp/x.png"), "jpg alias vs .png path -> error")
 check(resolve_output_format("jpeg", None, "/tmp/x.jpg").extension == ".jpg", "jpeg ext is .jpg")
 check(resolve_output_format("png", None, "/tmp/x.png").extension == ".png", "png ext is .png")
 check(resolve_output_format("jpeg", None, "/tmp/x.jpg").pil_format == "JPEG", "jpeg pil_format")
@@ -170,6 +174,26 @@ check("--json rejects --output-format/--quality (OutputFormatNotSupported)",
       and "args.output_format is not None or args.quality is not None" in _src)
 check("cascade dispatch rejects --output-format/--quality",
       "not supported for " in _src and "Stable Cascade yet (ADR-034 slice 4)" in _src)
+
+
+# ── Sidecar provenance is recorded but never replayed (ADR-034) ──────────
+print("output-format sidecar provenance is replay-filtered")
+from comfyless.generate import _load_sidecar, _SKIP_SIDECAR_KEYS  # noqa: E402
+check("output_format + quality in _SKIP_SIDECAR_KEYS",
+      {"output_format", "quality"} <= _SKIP_SIDECAR_KEYS)
+# The recorded fraction is carried on the resolved OutputFormat.
+check("OutputFormat carries the quality fraction",
+      resolve_output_format("jpeg", 0.9, None).quality_fraction == 0.9)
+check("default fraction carried when --quality omitted",
+      resolve_output_format("jpeg", None, None).quality_fraction == DEFAULT_QUALITY_FRACTION)
+with tempfile.TemporaryDirectory() as d:
+    sc = os.path.join(d, "s.json")
+    json.dump({"model": "/m/x", "prompt": "p", "seed": 5,
+               "output_format": "jpeg", "quality": 0.9}, open(sc, "w"))
+    loaded = _load_sidecar(sc)
+    check("replay drops output_format (not a generation input)", "output_format" not in loaded)
+    check("replay drops quality (not a generation input)", "quality" not in loaded)
+    check("replay keeps real params", loaded.get("seed") == 5)
 
 
 print()
