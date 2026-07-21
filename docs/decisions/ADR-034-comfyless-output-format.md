@@ -255,6 +255,26 @@ Sequenced so each is independently revertible. Slices 2, 3, 5 are Red Zone.
 
 ## Changelog
 
+- 2026-07-21 — **Slice 5 landed (D7, refine — Red Zone).** The refinement loop
+  gains `--output-format {png,jpeg,jpg}` + `--quality`; `main()` resolves one
+  `OutputFormat` (loop owns candidate names → `output_path=None`, no inference)
+  and threads it through `refine_loop` → `run_generation`. The canonical
+  candidate path `candidates/candidate_NN<ext>` follows the resolved extension;
+  the cold path forwards `output_format` to `generate()`; the daemon path sends
+  the raw name + fraction via `_daemon_namespace` into the one canonical wire
+  builder. The judge's in-memory PNG data-URI (refine.py:381) stays PNG
+  (transport). **Also closes a latent slice-2 regression:** slice 2 added
+  `output_format`/`quality` reads to `_build_server_request`, but refine's
+  `_daemon_namespace` (a second caller) did not supply them — refine's daemon
+  path raised `AttributeError`. `security-auditor` (Fable) gate:
+  `docs/security/review-adr-034-slice5-refine-output-format-2026-07-21.md` —
+  **Approve with findings**, no CRITICAL/HIGH; path containment, wire
+  validation, audit-trail integrity, and the D5 boundary all hold. Two MEDIUM
+  (warn-level provenance hardening) + one INFO, **all fixed in-slice**: (M-1)
+  daemon extension-skew now warns + relabels honestly instead of renaming PNG
+  bytes to `.jpg`; (M-2) a stale other-extension sibling on a reused
+  `--output-dir` warns (not deletes, warn-don't-block); (INFO) `_daemon_namespace`
+  docstring corrected. +19 refine tests.
 - 2026-07-21 — **Slice 6 landed (D6 `--params` negative branch).**
   `_load_params` (`generate.py`) now raises a directed `ValueError` naming the
   `.json` sidecar when `--params` is pointed at a non-png image (`.jpg`,

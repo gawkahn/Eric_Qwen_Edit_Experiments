@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from comfyless.family_defaults import FAMILY_DEFAULTS
+from comfyless.output_format import _EXT_TO_NAME, OutputFormat, resolve_output_format
 
 # ── Bounds (security review F5/F6) ───────────────────────────────────────────
 #: Longest-side pixel cap for the image sent to the judge. Candidates can be
@@ -898,27 +899,42 @@ class GenOutcome:
     metadata: dict
 
 
-def _daemon_namespace(device: str, precision: str, savepath: str) -> argparse.Namespace:
+def _daemon_namespace(device: str, precision: str, savepath: str,
+                      output_format: Optional[OutputFormat] = None) -> argparse.Namespace:
     """A minimal argparse Namespace carrying just the attributes
     generate._build_server_request reads, so we reuse the ONE canonical daemon
     wire-request builder (it abspaths the model/LoRA/component path fields the
     daemon validates against --model-base) instead of duplicating the wire contract.
     NOTE: `savepath` is a TEMPLATE, not one of those validated path fields — the
     daemon re-roots it under its own --output-dir, so run_generation normalizes the
-    returned path back into our candidates/ tree."""
+    returned path back into our candidates/ tree.
+
+    ADR-034 slice 5: `_build_server_request` reads `output_format`/`quality`
+    (added in slice 2); this Namespace MUST supply them or that access raises
+    AttributeError — a latent break slice 2 left on this path. Send the raw CLI
+    values (name + 0.0-1.0 fraction) so the daemon owns extension resolution,
+    exactly as the generate.py CLI path does. `main()` always resolves an
+    OutputFormat, so a CLI-driven png run DOES send `output_format="png"` +
+    `quality=0.7` (harmless — the daemon value-checks and resolves png). The
+    `output_format is None` branch omits both fields and is reached only by
+    programmatic / test callers of run_generation, not the CLI."""
     return argparse.Namespace(
         precision=precision, device=device, offload_vae=False,
         attention_slicing=False, sequential_offload=False, vae_tiling="auto",
         rebalance=False, rebalance_mult=0.0, rebalance_weights=None,
         savepath=savepath,
+        output_format=(output_format.name if output_format is not None else None),
+        quality=(output_format.quality_fraction if output_format is not None else None),
     )
 
 
 def run_generation(cfg: WorkingConfig, *, device: str, output_dir: str,
                    stem: str, precision: str = "bf16",
+                   output_format: Optional[OutputFormat] = None,
                    log: Callable[[str], None] = print) -> GenOutcome:
     """Generate one candidate, returning it at the canonical path
-    `output_dir/stem.png`. DAEMON-FIRST: when a server is running for `device`,
+    `output_dir/stem<ext>` (ADR-034 D7: `<ext>` follows the resolved
+    output_format; default png). DAEMON-FIRST: when a server is running for `device`,
     reuse its warm pipeline (the ADR-027 performance assumption — a prompt-only
     change reuses the pipeline, a LoRA change evicts+reloads server-side). Falls
     back to a COLD in-process generate() when no daemon is reachable.
@@ -932,11 +948,28 @@ def run_generation(cfg: WorkingConfig, *, device: str, output_dir: str,
 
     params = cfg.to_generate_params()
     loras = params.get("loras", [])
-    canonical = os.path.join(output_dir, f"{stem}.png")
+    ext = output_format.extension if output_format is not None else ".png"
+    canonical = os.path.join(output_dir, f"{stem}{ext}")
+
+    # Security review slice-5 MEDIUM-2: candidate stems are deterministic, so a
+    # rerun into the same --output-dir with a DIFFERENT --output-format leaves
+    # the prior run's other-extension image beside this run's fresh sidecar — the
+    # stem then no longer identifies one image. Warn (don't delete — the
+    # operator's files, warn-don't-block) so a mispaired stem isn't mistaken for
+    # a matched one. _EXT_TO_NAME is the canonical known-extension set.
+    for _other in _EXT_TO_NAME:
+        if _other == ext.lower():
+            continue
+        _stale = os.path.join(output_dir, f"{stem}{_other}")
+        if os.path.exists(_stale):
+            log(f"[refine] WARNING: {os.path.basename(_stale)} from a prior run "
+                f"survives beside this {ext} candidate — the sidecar/verdict will "
+                f"describe the NEW image; remove the stale file to avoid a "
+                f"mispaired stem.")
 
     if socket_path(device).exists():
         savepath = os.path.join(output_dir, stem)
-        args_ns = _daemon_namespace(device, precision, savepath)
+        args_ns = _daemon_namespace(device, precision, savepath, output_format)
         req = gen._build_server_request(args_ns, params, loras,
                                         savepath_override=savepath)
         resp = gen._send_server_command(req, device)
@@ -949,9 +982,23 @@ def run_generation(cfg: WorkingConfig, *, device: str, output_dir: str,
                 # status=ok with no path shouldn't happen; fail loud rather than
                 # silently re-generate in-process (code review slice-3, LOW-5b).
                 raise RefineError("daemon returned status=ok but no output_path")
-            if os.path.abspath(out_path) != os.path.abspath(canonical):
-                shutil.move(out_path, canonical)
-            return GenOutcome(image_path=canonical, metadata=resp.get("metadata", {}))
+            # Security review slice-5 MEDIUM-1: a stale pre-slice-2 daemon ignores
+            # output_format and returns e.g. PNG bytes; renaming those to a .jpg
+            # canonical would mislabel the content and silently drop --quality. If
+            # the daemon's own extension disagrees, keep its HONEST extension and
+            # warn (warn-don't-block; the daemon is operator-owned and likely just
+            # needs a restart to pick up ADR-034 slice 2).
+            daemon_ext = os.path.splitext(out_path)[1].lower()
+            move_target = canonical
+            if daemon_ext and daemon_ext != ext.lower():
+                move_target = os.path.join(output_dir, f"{stem}{daemon_ext}")
+                log(f"[refine] WARNING: daemon returned {daemon_ext} but "
+                    f"--output-format expects {ext} — likely a stale daemon "
+                    f"(restart it to honor the format). Saving the daemon's bytes "
+                    f"honestly as {os.path.basename(move_target)}.")
+            if os.path.abspath(out_path) != os.path.abspath(move_target):
+                shutil.move(out_path, move_target)
+            return GenOutcome(image_path=move_target, metadata=resp.get("metadata", {}))
         # resp is None: socket present but the connection failed. Say so — running
         # in-process now risks a VRAM collision with the resident daemon (code
         # review slice-3, LOW-5a).
@@ -998,6 +1045,9 @@ def run_generation(cfg: WorkingConfig, *, device: str, output_dir: str,
         nag_tau=params.get("nag_tau", 2.5),
         nag_alpha=params.get("nag_alpha", 0.25),
         nag_end=params.get("nag_end", 1.0),
+        # ADR-034 D7: cold path honors the resolved output format (canonical
+        # path already carries the matching extension). None → png, unchanged.
+        output_format=output_format,
     )
     return GenOutcome(image_path=canonical, metadata=metadata)
 
@@ -1042,6 +1092,7 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 w_pa: float = DEFAULT_W_PA, w_aes: float = DEFAULT_W_AES,
                 judge_timeout: int = JUDGE_HTTP_TIMEOUT,
                 judge_system_prompt: str = JUDGE_SYSTEM_PROMPT,
+                output_format: Optional[OutputFormat] = None,
                 log: Callable[[str], None] = print) -> LoopOutcome:
     """Greedy hill-climb (ADR-027 §Loop). Each iteration: generate → judge+plan →
     record → stop-check (pass / cap / patience) → apply overrides. A generation
@@ -1067,7 +1118,7 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
         iters_run = i + 1
         outcome = run_generation(cfg, device=device, output_dir=candidates_dir,
                                  stem=f"candidate_{i:02d}", precision=precision,
-                                 log=log)
+                                 output_format=output_format, log=log)
         stem = os.path.splitext(outcome.image_path)[0]
         # Load-plane sidecar (carries paths — the human's --params replay artifact,
         # NOT planner-facing; distinct from the path-free *.verdict.json below).
@@ -1256,6 +1307,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--quant", default="none")
     p.add_argument("--device", default="cuda")
     p.add_argument("--precision", default="bf16", choices=["bf16", "fp16", "fp32"])
+    # ADR-034 D7: output format for the generated candidates (png default; the
+    # loop owns candidate filenames, so there is no --output path to infer from).
+    # Intermediate iterations are exactly where jpeg's size win matters.
+    p.add_argument("--output-format", choices=["png", "jpeg", "jpg"], default=None,
+                   help="candidate image format (default: png)")
+    p.add_argument("--quality", type=float, default=None,
+                   help="JPEG quality as a 0.0-1.0 fraction (default 0.7; "
+                        "ignored for png)")
     return p
 
 
@@ -1603,6 +1662,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not os.path.isdir(args.output_dir):
         os.makedirs(args.output_dir, exist_ok=True)
 
+    # Resolve the candidate output format (ADR-034 D7). No caller-authored path
+    # to infer from (the loop names candidates), so pass output_path=None; an
+    # out-of-range --quality is rejected here, before the first generation.
+    try:
+        out_fmt = resolve_output_format(args.output_format, args.quality, None)
+    except ValueError as e:
+        print(f"[refine] {e}", file=sys.stderr)
+        return 2
+    if out_fmt.name == "png" and args.quality is not None:
+        log("[refine] --quality is ignored for png output.")
+
     try:
         result = refine_loop(
             cfg, target_prompt=target_prompt, catalog=catalog, roots=roots,
@@ -1611,7 +1681,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             pass_threshold=args.pass_threshold, max_iterations=args.max_iterations,
             patience=args.patience, w_pa=args.w_prompt_adherence,
             w_aes=args.w_aesthetics, judge_timeout=args.judge_timeout,
-            judge_system_prompt=judge_system_prompt, log=log)
+            judge_system_prompt=judge_system_prompt, output_format=out_fmt, log=log)
     except RefineError as e:
         # A fatal generation error (e.g. daemon failure, model not found) surfaces
         # here as a clean exit, not a traceback (code review slice-3, LOW-8).

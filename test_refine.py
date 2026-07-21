@@ -604,6 +604,26 @@ check("_daemon_namespace pins device/precision/savepath",
 check("_daemon_namespace defaults rebalance off (no accidental Krea path)",
       _ns.rebalance is False and _ns.rebalance_weights is None)
 
+# ADR-034 slice 5: _build_server_request reads output_format/quality (added in
+# slice 2), so the Namespace MUST supply them — a missing attr is an
+# AttributeError on the refine daemon path (the latent break slice 5 closes).
+check("_daemon_namespace supplies output_format/quality (slice-2 regression guard)",
+      _ns.output_format is None and _ns.quality is None)
+from comfyless.output_format import resolve_output_format as _rof  # noqa: E402
+_nsj = refine._daemon_namespace("cuda:0", "bf16", "/out/c", _rof("jpeg", 0.9, None))
+check("_daemon_namespace carries jpeg name + fraction onto the wire attrs",
+      _nsj.output_format == "jpeg" and _nsj.quality == 0.9)
+# The wire builder must actually emit them (end-to-end through the real builder).
+import comfyless.generate as _gen  # noqa: E402
+_req = _gen._build_server_request(_nsj, {"model": "/m", "prompt": "p"}, [],
+                                  savepath_override="/out/c")
+check("wire request carries output_format=jpeg + quality=0.9",
+      _req.get("output_format") == "jpeg" and _req.get("quality") == 0.9)
+_reqdef = _gen._build_server_request(_ns, {"model": "/m", "prompt": "p"}, [],
+                                     savepath_override="/out/c")
+check("default (png) wire request omits output_format (no AttributeError)",
+      "output_format" not in _reqdef and "quality" not in _reqdef)
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Slice 3 — refine_loop controller (monkeypatched generation + judge)
 #
@@ -625,17 +645,22 @@ def _mkverdict(pa, aes, vstr="revise"):
 
 
 class _FakeGen:
-    """Stands in for refine.run_generation: writes a 4px PNG at the canonical path
-    and records the seed each call actually saw (to prove seed pinning)."""
+    """Stands in for refine.run_generation: writes a 4px image at the canonical
+    path (honoring the resolved output_format extension, ADR-034 slice 5) and
+    records the seed + format each call saw (to prove seed pinning + D7 wiring)."""
     def __init__(self, seed=123):
         self.seed = seed
         self.seeds_seen = []
+        self.formats_seen = []
 
-    def __call__(self, cfg, *, device, output_dir, stem, precision="bf16", log=print):
+    def __call__(self, cfg, *, device, output_dir, stem, precision="bf16",
+                 output_format=None, log=print):
         self.seeds_seen.append(cfg.base.get("seed"))
+        self.formats_seen.append(output_format.name if output_format is not None else None)
         os.makedirs(output_dir, exist_ok=True)
-        path = os.path.join(output_dir, f"{stem}.png")
-        _PILImage.new("RGB", (4, 4), (7, 8, 9)).save(path)
+        ext = output_format.extension if output_format is not None else ".png"
+        path = os.path.join(output_dir, f"{stem}{ext}")
+        _PILImage.new("RGB", (4, 4), (7, 8, 9)).save(path)  # PIL infers fmt from ext
         return refine.GenOutcome(image_path=path, metadata={"seed": self.seed})
 
 
@@ -658,12 +683,14 @@ class _FakeJudge:
 
 
 def _run_loop(script, *, max_iter=10, patience=2, threshold=8, seed=123,
-              judge_system_prompt=None):
+              judge_system_prompt=None, output_format=None):
     d = _tf.mkdtemp(prefix="refine_loop_test_")
     fg, fj = _FakeGen(seed=seed), _FakeJudge(script)
     _rg, _jc = refine.run_generation, refine.judge_candidate
     refine.run_generation, refine.judge_candidate = fg, fj
     extra = {} if judge_system_prompt is None else {"judge_system_prompt": judge_system_prompt}
+    if output_format is not None:
+        extra["output_format"] = output_format
     try:
         cfg = WorkingConfig(prompt="p", loras=[], base={"seed": -1})
         out = refine.refine_loop(
@@ -705,6 +732,98 @@ check("patience halts after 2 non-improving iters", _o.iterations == 3)
 check("best-so-far (iter 0) wins on a patience stop", _o.best_composite == 7.0)
 check("winner basename is the best candidate (iter 0)",
       os.path.basename(_o.winner_path) == "candidate_00.png")
+
+print("\n== slice 5: refine_loop — jpeg output format threads to candidates (D7) ==")
+_d, _o, _fg, _fj = _run_loop([_mkverdict(9, 9)], threshold=8,
+                             output_format=_rof("jpeg", 0.85, None))
+check("jpeg format reaches run_generation each iteration",
+      _fg.formats_seen == ["jpeg"])
+check("candidate + winner land as .jpg (canonical extension follows D7)",
+      _o.winner_path.endswith(".jpg")
+      and os.path.isfile(os.path.join(_d, "candidates", "candidate_00.jpg"))
+      and os.listdir(os.path.join(_d, "winners")) == ["candidate_00.jpg"])
+# Stem-derived audit artifacts stay format-agnostic (sidecar/verdict off the stem).
+check("sidecar + verdict use the stem, not a hardcoded .png",
+      os.path.isfile(os.path.join(_d, "candidates", "candidate_00.json"))
+      and os.path.isfile(os.path.join(_d, "candidates", "candidate_00.verdict.json")))
+# Default (no --output-format) still lands on .png — byte-for-byte prior behavior.
+_d, _o, _fg, _fj = _run_loop([_mkverdict(9, 9)], threshold=8)
+check("default output format keeps .png candidates",
+      _fg.formats_seen == [None] and _o.winner_path.endswith(".png"))
+
+print("\n== slice 5: run_generation security-review warnings (MEDIUM-1/2) ==")
+import comfyless.generate as _rg_gen  # noqa: E402
+import comfyless.server as _rg_srv  # noqa: E402
+
+
+class _FakeSock:
+    def __init__(self, exists): self._e = exists
+    def exists(self): return self._e
+
+
+def _drive_run_generation(*, output_format, stem="candidate_00",
+                          pre_create=None, daemon_ext=None):
+    """Drive the REAL run_generation with socket/daemon/cold heavy paths stubbed,
+    capturing log lines. daemon_ext set → daemon branch (its image lands under a
+    daemon_out/ subdir with that extension); else → cold path (stub generate())."""
+    d = _tf.mkdtemp(prefix="refine_rg_test_")
+    if pre_create:
+        open(os.path.join(d, pre_create), "wb").write(b"old")
+    logs = []
+    cfg = WorkingConfig(prompt="p", loras=[], base={"seed": 1, "model": "/tmp/m"})
+    _osock, _ogen, _osend = (_rg_srv.socket_path, _rg_gen.generate,
+                             _rg_gen._send_server_command)
+    try:
+        if daemon_ext is not None:
+            _rg_srv.socket_path = lambda dev: _FakeSock(True)
+            dout = os.path.join(d, "daemon_out")
+
+            def _send(req, dev, _dout=dout, _ext=daemon_ext):
+                os.makedirs(_dout, exist_ok=True)
+                op = os.path.join(_dout, f"srv{_ext}")
+                _PILImage.new("RGB", (4, 4)).save(op)
+                return {"status": "ok", "output_path": op, "metadata": {"seed": 1}}
+            _rg_gen._send_server_command = _send
+        else:
+            _rg_srv.socket_path = lambda dev: _FakeSock(False)
+
+            def _fakegen(**kw):
+                _PILImage.new("RGB", (4, 4)).save(kw["output_path"])
+                return {"seed": 1}
+            _rg_gen.generate = _fakegen
+        outcome = refine.run_generation(cfg, device="cpu", output_dir=d, stem=stem,
+                                        output_format=output_format, log=logs.append)
+    finally:
+        (_rg_srv.socket_path, _rg_gen.generate,
+         _rg_gen._send_server_command) = _osock, _ogen, _osend
+    return d, outcome, logs
+
+
+# MEDIUM-1: stale daemon returns .png while jpeg was requested → warn + relabel
+# honestly to the daemon's extension (never rename PNG bytes to .jpg).
+_d, _oc, _lg = _drive_run_generation(output_format=_rof("jpeg", 0.8, None),
+                                     daemon_ext=".png")
+check("MEDIUM-1: daemon ext-skew warns about a stale daemon",
+      any("stale daemon" in m and ".png" in m for m in _lg))
+check("MEDIUM-1: bytes kept honestly labeled (.png), not renamed to .jpg",
+      _oc.image_path.endswith(".png") and os.path.isfile(_oc.image_path))
+# Matching-extension daemon response → no skew warning, lands on canonical .jpg.
+_d, _oc, _lg = _drive_run_generation(output_format=_rof("jpeg", 0.8, None),
+                                     daemon_ext=".jpg")
+check("MEDIUM-1: matching daemon ext → no warning, canonical .jpg",
+      not any("stale daemon" in m for m in _lg) and _oc.image_path.endswith(".jpg"))
+
+# MEDIUM-2: a prior-run .png beside a fresh jpeg candidate stem → warn (not delete).
+_d, _oc, _lg = _drive_run_generation(output_format=_rof("jpeg", 0.8, None),
+                                     pre_create="candidate_00.png")
+check("MEDIUM-2: stale other-extension sibling triggers a mispair warning",
+      any("mispaired stem" in m and "candidate_00.png" in m for m in _lg))
+check("MEDIUM-2: stale file is warned about, NOT deleted (warn-don't-block)",
+      os.path.isfile(os.path.join(_d, "candidate_00.png")))
+# No stale sibling → clean, no warning.
+_d, _oc, _lg = _drive_run_generation(output_format=_rof("jpeg", 0.8, None))
+check("MEDIUM-2: no stale sibling → no mispair warning",
+      not any("mispaired stem" in m for m in _lg) and _oc.image_path.endswith(".jpg"))
 
 print("\n== slice 3: refine_loop — F7 malformed verdict consumes an iteration ==")
 _d, _o, _fg, _fj = _run_loop([RefineError("bad json"), RefineError("bad json")],
