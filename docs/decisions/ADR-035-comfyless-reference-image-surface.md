@@ -367,9 +367,16 @@ missing reference.
 never honoring it as a path — LoRA references are reduced to basename and
 re-resolved through the ADR-015 catalog (`refine.py:1443`). Reference images
 have no catalog to launder through, so a replayed sidecar's `ref_images`
-entries can only ever be honored as literal filesystem paths — and sidecar /
-PNG-chunk metadata is attacker-craftable (the F4 channel
-`build_config_from_seed` documents). The content hash is no defense: the
+entries can only ever be honored as literal filesystem paths — and the metadata
+that carries them is attacker-craftable (the F4 channel
+`build_config_from_seed` documents). That channel is the JSON **sidecar** for
+every output format, plus the PNG `tEXt` chunk when output is PNG; once JPEG
+output exists (ADR-034), JPEG carries provenance in the sidecar *only* (no tEXt
+chunk), so the sidecar is the sole and sufficient channel to treat as
+untrusted. The three-trust-class table below is written in terms of the path's
+*source* (typed / file-derived / wire), not the container it arrived in, so it
+already covers both — this note exists only so the PNG-specific wording is not
+mistaken for a PNG-specific threat. The content hash is no defense: the
 attacker writes the hash to match. Without further treatment, a crafted sidecar
 directs comfyless to read any user-readable file and VAE-encode its bytes into
 the conditioning of an image that may later be shared.
@@ -586,6 +593,15 @@ convention, and Qwen-Image-Edit-2511 is the *Plus* multi-reference variant where
   decision 6g); output-dir read-back loop willed to the MCP ADR; and
   `ref_images` excluded from the ADR-027 planner allowlist with
   typed-replaces-file-derived (Finding 8, decision 7).
+- 2026-07-20 — Coupling note with ADR-034 (JPEG output, adopted same session,
+  sequenced first). Decision 7's replay-channel prose corrected: the
+  attacker-craftable metadata channel is the JSON sidecar for all formats (plus
+  the PNG tEXt chunk only when output is PNG) — not PNG-specific. The
+  three-trust-class table was already source-based and needs no structural
+  change. Reconciliation points for the later ref-image slices 4–5: ADR-034 D6
+  (`--params` .png/sidecar dispatch, `generate.py:172`), D7 (refine canonical
+  path), D4 (sidecar as the sole JPEG provenance channel) — all land in
+  ADR-034's own slices and are consumed, not duplicated, by ref-image replay.
 
 ---
 
