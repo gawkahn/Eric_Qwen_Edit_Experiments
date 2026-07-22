@@ -242,8 +242,43 @@ them. The dict is therefore designed for one-edit changes:
   human-authored. **Deferred:** per-*model* default overrides (an operator
   manifest) would generalize beyond name-heuristics if more no-marker
   distills appear; not built until a second case exists.
+- **2026-07-22** — FLUX.2 Klein distilled/base split (defect fix, Grant's
+  live-review catch). The single `flux2klein` row (24 steps / cfg 3.5,
+  claimed "BFL Klein model card") matched **neither** Klein checkpoint's
+  README: the step-distilled flagship `FLUX.2-klein-9B` documents
+  `guidance_scale=1.0, num_inference_steps=4`; the non-distilled
+  `FLUX.2-klein-base-9B` documents `guidance_scale=4.0, steps=50`. Both are
+  bare `Flux2KleinPipeline`, but the flagship carries `is_distilled: true`
+  in `model_index.json` — the same reliable marker as Krea-2, so this is
+  the Krea pattern, not the Z-Image name-hint fallback. **Naming
+  orientation is inverted from Krea, matching BFL's own:** the *marked
+  distilled* checkpoint keeps the plain `"flux2klein"` (now 4 steps / cfg
+  1.0, added to `DISTILLED_FAMILIES` — a 4-step budget destroys
+  non-distilled weights); the *unmarked* checkpoint maps to new
+  `"flux2klein-base"` (50 / 4.0). `flux2klein-base` added to
+  `_build_call_kwargs`'s flux branch, `_NAG_CFG_OWNS_NEGATIVE` /
+  `_NAG_MODULES` (nag_flux2, same rows as flux2klein), `_REF_FAMILY_KINDS`
+  (ADR-036: refs work identically on both), and the catalog
+  `_FAMILY_HINT_RULES` (`klein-base` hints, placed before the plain
+  `klein` rules). Note `Flux2KleinPipeline` runs REAL CFG at cfg>1 (unlike
+  flux/flux2 guidance embeds) — cfg 1.0 on the distill = CFG off, single
+  pass. **Residual risk:** a distilled Klein repack that strips
+  `is_distilled` gets base defaults (slow/overcooked, recognizable) — the
+  safer failure direction than 4 steps on base weights (pure noise, the
+  zimage-turbo lesson). Catalog DBs built before this split record the
+  base checkpoint as `flux2klein`; rebuild via `catalog_cli build`. A
+  second catalog consequence (code review 2026-07-22): LoRA sidecars
+  hinting plain "klein" resolve to `flux2klein` (the distilled family)
+  and so will not surface for `flux2klein-base` models under
+  exact-family matching, even though Klein LoRAs are most plausibly
+  base-trained — acceptable for now; revisit if Klein LoRA
+  recommendations misfire. The sweep also covers the ComfyUI node layer
+  (`eric_diffusion_{generate,multistage,ultragen,advanced_generate,
+  advanced_multistage,flux2_edit}.py` family tuples), which shares
+  `infer_model_family` via `detect_pipeline_class`.
 
 ## AI-Disclosure
 
 Claude (Opus 4.7) authored; Grant reviewed. 2026-07-06 zimage-turbo
-amendment: Claude (Fable 5) authored; Grant reviewed.
+amendment: Claude (Fable 5) authored; Grant reviewed. 2026-07-22 Klein
+split: Claude (Fable 5) authored; Grant reviewed.

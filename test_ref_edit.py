@@ -272,7 +272,7 @@ check("drop: flux + refs STRICT → ValueError naming the family + 'Refusing'",
 # flux2klein AND flux2 resolve to the native image= path, in BOTH strictness
 # modes (no drop — the family supports refs). MODE vl/ref is a hard error in
 # BOTH modes (decision 3: a typed :vl is deliberate, never stumbled into).
-for _fam in ("flux2klein", "flux2"):
+for _fam in ("flux2klein", "flux2klein-base", "flux2"):
     for _strict in (True, False):
         _kind, _warn = cg._resolve_ref_family_support(
             [{"path": "kf.png", "mode": "both"}], _fam, _strict)

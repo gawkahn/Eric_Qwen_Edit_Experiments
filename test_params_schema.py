@@ -728,9 +728,13 @@ check("distilled-warn: membership is not a cfg_scale==0 rule",
       g.FAMILY_DEFAULTS["krea-turbo"]["cfg_scale"] == 0.0
       and g.FAMILY_DEFAULTS["zimage-turbo"]["cfg_scale"] == 1.0
       and {"krea-turbo", "zimage-turbo"} <= set(DISTILLED_FAMILIES))
-check("distilled-warn: flux2klein excluded (ordinary 24-step schedule)",
-      "flux2klein" not in DISTILLED_FAMILIES
-      and g.FAMILY_DEFAULTS["flux2klein"]["steps"] == 24)
+check("distilled-warn: flux2klein INCLUDED (4-step distill, 2026-07-22 fix)",
+      "flux2klein" in DISTILLED_FAMILIES
+      and g.FAMILY_DEFAULTS["flux2klein"] == {"cfg_scale": 1.0, "steps": 4})
+check("distilled-warn: flux2klein-base excluded (non-distilled sibling)",
+      "flux2klein-base" not in DISTILLED_FAMILIES
+      and g.FAMILY_DEFAULTS["flux2klein-base"]
+      == {"cfg_scale": 4.0, "steps": 50})
 
 # 6. Unknown family → no-op (class not in diffusers).
 _unknown = _make_fake_model("ThisPipelineClassDoesNotExist__zzz")
@@ -790,9 +794,23 @@ check("krea: Krea2Pipeline + is_distilled=False → 'krea'",
       infer_model_family("Krea2Pipeline", False) == "krea")
 check("krea-turbo: Krea2Pipeline + is_distilled=True → 'krea-turbo'",
       infer_model_family("Krea2Pipeline", True) == "krea-turbo")
-# is_distilled only flips the krea family — never leaks onto other classes.
-check("krea: is_distilled is a no-op for non-krea classes",
+# is_distilled only flips marker-aware families — never leaks onto others.
+check("krea: is_distilled is a no-op for non-marker classes",
       infer_model_family("FluxPipeline", True) == "flux")
+
+# FLUX.2 Klein: same marker, opposite naming orientation (BFL's own —
+# the step-distilled flagship carries is_distilled:true and keeps the plain
+# name; the unmarked base checkpoint gets the -base suffix). ADR-009
+# changelog 2026-07-22.
+check("flux2klein: Flux2KleinPipeline + is_distilled=True → 'flux2klein'",
+      infer_model_family("Flux2KleinPipeline", True) == "flux2klein")
+check("flux2klein-base: Flux2KleinPipeline unmarked → 'flux2klein-base'",
+      infer_model_family("Flux2KleinPipeline") == "flux2klein-base")
+check("flux2klein-base: explicit is_distilled=False → 'flux2klein-base'",
+      infer_model_family("Flux2KleinPipeline", False) == "flux2klein-base")
+check("flux2klein split never leaks onto flux2 (Flux2Pipeline unmarked)",
+      infer_model_family("Flux2Pipeline") == "flux2"
+      and infer_model_family("Flux2Pipeline", True) == "flux2")
 
 # ── zimage base vs turbo: name-hint discriminator (ADR-009 2026-07-06) ──
 # Z-Image ships NO is_distilled marker; Turbo detected by "turbo" in path.

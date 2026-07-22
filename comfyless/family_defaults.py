@@ -64,10 +64,21 @@ FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
     # Source: BFL Flux.2-dev release notes.
     "flux2":      {"cfg_scale": 3.5, "steps": 28},
 
-    # ── flux2klein (Flux.2 Klein) ───────────────────────────────────────
-    # Distilled variant; tolerates fewer steps but keeps cfg shape.
-    # Source: BFL Klein model card.
-    "flux2klein": {"cfg_scale": 3.5, "steps": 24},
+    # ── flux2klein (FLUX.2-klein-9B, the step-distilled flagship) ───────
+    # is_distilled:true in its model_index.json keeps the plain family name
+    # (BFL's own naming: the flagship is just "klein"). Step-distilled to 4
+    # inference steps; guidance_scale 1.0 = CFG off (Flux2KleinPipeline runs
+    # REAL CFG at cfg>1, unlike flux/flux2 guidance embeds). The prior
+    # 24/3.5 row matched neither Klein card (ADR-009 changelog 2026-07-22).
+    # Source: FLUX.2-klein-9B README (guidance_scale=1.0, steps=4).
+    "flux2klein": {"cfg_scale": 1.0, "steps": 4},
+
+    # ── flux2klein-base (FLUX.2-klein-base-9B, non-distilled) ───────────
+    # Same Flux2KleinPipeline class, NO is_distilled marker → this family
+    # (infer_model_family). Trained without step or guidance distillation;
+    # real CFG wants the full schedule.
+    # Source: FLUX.2-klein-base-9B README (guidance_scale=4.0, steps=50).
+    "flux2klein-base": {"cfg_scale": 4.0, "steps": 50},
 
     # ── krea (Krea-2-Raw) ───────────────────────────────────────────────
     # Krea2Pipeline, non-distilled. Single-pass guidance_scale (flux-like).
@@ -172,12 +183,14 @@ FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
 #: that produces an under-denoised, noisy image if applied to non-distilled
 #: weights. Membership is NOT derivable from the values: krea-turbo disables
 #: CFG (0.0) while zimage-turbo runs real CFG at 1.0; what they share is the
-#: 8-step budget that only a distill can close.
+#: few-step budget that only a distill can close.
 #:
-#: flux2klein is distilled but is deliberately ABSENT: its 24-step / cfg 3.5
-#: schedule is an ordinary one that a non-distilled override survives.
+#: flux2klein joined 2026-07-22 when its defaults were corrected to the
+#: 4-step distilled schedule (a prior 24-step row — matching neither Klein
+#: card — was deliberately absent here as "ordinary"). flux2klein-base is
+#: the non-distilled sibling and stays out.
 #:
 #: Consumed by _apply_family_defaults to warn when a --transformer override
 #: silently inherits one of these schedules from the base model's path.
 #: Keep in sync with the table above.
-DISTILLED_FAMILIES = frozenset({"krea-turbo", "zimage-turbo"})
+DISTILLED_FAMILIES = frozenset({"krea-turbo", "zimage-turbo", "flux2klein"})

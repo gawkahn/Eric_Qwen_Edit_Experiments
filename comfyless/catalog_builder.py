@@ -29,6 +29,8 @@ from . import catalog_db
 # (exact, then prefix, then substring) so hint text can only ever map to a
 # family that actually exists in hf-local.
 _FAMILY_HINT_RULES: Tuple[Tuple[str, str], ...] = (
+    ("klein-base", "flux2klein-base"), ("klein base", "flux2klein-base"),
+    ("klein_base", "flux2klein-base"), ("kleinbase", "flux2klein-base"),
     ("flux2klein", "flux2klein"), ("klein", "flux2klein"),
     ("flux.2", "flux2"), ("flux 2", "flux2"), ("flux2", "flux2"),
     ("flux", "flux"),

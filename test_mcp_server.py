@@ -1652,7 +1652,9 @@ _CHARACTERIZATION_CASES = [
     ("QwenImageEditPlusPipeline",    "qwen-edit"),
     ("FluxPipeline",                 "flux"),
     ("Flux2Pipeline",                "flux2"),
-    ("Flux2KleinPipeline",           "flux2klein"),
+    # Unmarked Klein = the non-distilled base; the distilled flagship
+    # carries is_distilled:true in model_index.json (2026-07-22 split).
+    ("Flux2KleinPipeline",           "flux2klein-base"),
     ("ChromaPipeline",               "chroma"),
     ("AuraFlowPipeline",             "auraflow"),
     ("StableDiffusion3Pipeline",     "sd3"),

@@ -671,27 +671,32 @@ def _apply_family_defaults(
 #   True  → NAG is gated to the cfg<=0 regime (krea/zimage conventions:
 #           their pipelines run real CFG at guidance>0, which already
 #           consumes the negative — NAG on top is out of scope).
-#   False → always NAG-eligible (flux-family guidance EMBEDS are not CFG;
-#           comfyless never routes negatives to these families at all).
+#   False → always NAG-eligible. For flux/flux2 the guidance EMBEDS are
+#           not CFG; the Klein rows run REAL CFG at cfg>1 but their
+#           pipeline accepts no negative_prompt string (hardcodes "" for
+#           the CFG pass), so classic CFG never owns a user negative on
+#           any of these — comfyless never routes negatives to them.
 # Each family's NAG machinery lives in the module named in _NAG_MODULES.
 _NAG_CFG_OWNS_NEGATIVE: Dict[str, bool] = {
-    "krea":         True,
-    "krea-turbo":   True,
-    "zimage":       True,
-    "zimage-turbo": True,
-    "flux":         False,
-    "flux2":        False,
-    "flux2klein":   False,
+    "krea":            True,
+    "krea-turbo":      True,
+    "zimage":          True,
+    "zimage-turbo":    True,
+    "flux":            False,
+    "flux2":           False,
+    "flux2klein":      False,
+    "flux2klein-base": False,
 }
 
 _NAG_MODULES: Dict[str, str] = {
-    "krea":         "pipelines.nag_krea2",
-    "krea-turbo":   "pipelines.nag_krea2",
-    "flux":         "pipelines.nag_flux",
-    "flux2":        "pipelines.nag_flux2",
-    "flux2klein":   "pipelines.nag_flux2",
-    "zimage":       "pipelines.nag_zimage",
-    "zimage-turbo": "pipelines.nag_zimage",
+    "krea":            "pipelines.nag_krea2",
+    "krea-turbo":      "pipelines.nag_krea2",
+    "flux":            "pipelines.nag_flux",
+    "flux2":           "pipelines.nag_flux2",
+    "flux2klein":      "pipelines.nag_flux2",
+    "flux2klein-base": "pipelines.nag_flux2",
+    "zimage":          "pipelines.nag_zimage",
+    "zimage-turbo":    "pipelines.nag_zimage",
 }
 
 
@@ -782,7 +787,8 @@ def _build_call_kwargs(
             kwargs["negative_prompt"] = negative_prompt
         return kwargs
 
-    if model_family in ("flux", "flux2", "flux2klein", "chroma"):
+    if model_family in ("flux", "flux2", "flux2klein", "flux2klein-base",
+                        "chroma"):
         kwargs = {**base, "guidance_scale": cfg_scale}
         sig = inspect.signature(pipe.__call__)
         if "max_sequence_length" in sig.parameters:
@@ -1610,9 +1616,10 @@ def _run_qwen_edit_refs(
 #: refs into the stock pipeline's `image=` kwarg (Flux2Pipeline and
 #: Flux2KleinPipeline share the signature and semantics — ADR-036 finding 4).
 _REF_FAMILY_KINDS: Dict[str, str] = {
-    "qwen-edit":  "qwen-edit",
-    "flux2klein": "flux2-native",
-    "flux2":      "flux2-native",
+    "qwen-edit":       "qwen-edit",
+    "flux2klein":      "flux2-native",
+    "flux2klein-base": "flux2-native",
+    "flux2":           "flux2-native",
 }
 
 
@@ -2362,8 +2369,8 @@ def _parse_args() -> argparse.Namespace:
     # explicitly overrides them; resolved to schema defaults post-merge.
     p.add_argument("--nag-scale", type=float, default=None,
                    help="Normalized Attention Guidance scale (ADR-023/024). "
-                        ">1 activates NAG on krea/flux/flux2/flux2klein/"
-                        "zimage families, making --negative-prompt work "
+                        ">1 activates NAG on krea/flux/flux2/flux2klein"
+                        "(-base)/zimage families, making --negative-prompt work "
                         "where CFG is dead (guidance-distilled and cfg-0 "
                         "checkpoints). krea/zimage need --cfg 0 (at cfg>0 "
                         "classic CFG owns the negative). Try 4-5. Costs "

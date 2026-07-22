@@ -60,6 +60,15 @@ def infer_model_family(class_name: str, is_distilled: bool = False,
     steps / cfg 3.5; Turbo: 8 steps / cfg 0.0). The distilled krea variant
     is reported as ``"krea-turbo"`` so ``FAMILY_DEFAULTS`` can carry both.
 
+    FLUX.2 Klein uses the same marker with the opposite naming orientation
+    (matching BFL's own): the step-distilled flagship ``FLUX.2-klein-9B``
+    carries ``is_distilled: true`` and keeps the plain ``"flux2klein"``
+    family (4 steps / cfg 1.0 per its README); the unmarked, non-distilled
+    ``FLUX.2-klein-base-9B`` is reported as ``"flux2klein-base"`` (50 steps
+    / cfg 4.0). Both are bare ``Flux2KleinPipeline``. See ADR-009 changelog
+    2026-07-22 — the prior single-family defaults (24 / 3.5) matched
+    NEITHER model card.
+
     ``name_hint`` is the model directory / repo path; it exists ONLY for
     Z-Image, which — unlike Krea-2 — ships **no** ``is_distilled`` marker:
     Z-Image-base and Z-Image-Turbo are both bare ``ZImagePipeline``,
@@ -88,6 +97,10 @@ def infer_model_family(class_name: str, is_distilled: bool = False,
         if substr in lower:
             if family == "krea" and is_distilled:
                 return "krea-turbo"
+            if family == "flux2klein" and not is_distilled:
+                # Unmarked Flux2KleinPipeline = the non-distilled base
+                # checkpoint (the distilled flagship carries the marker).
+                return "flux2klein-base"
             if family == "zimage" and "turbo" in name_hint.lower():
                 # INFO so a false positive (a base model under a path that
                 # happens to contain "turbo") surfaces in logs rather than

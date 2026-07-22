@@ -177,7 +177,9 @@ print("── infer_model_family: existing family non-regression sweep ───
 EXISTING_FAMILY_FIXTURES = [
     ("QwenImageEditPlusPipeline",   "qwen-edit"),
     ("QwenImagePipeline",           "qwen-image"),
-    ("Flux2KleinPipeline",          "flux2klein"),
+    # Unmarked Klein = non-distilled base; the distilled flagship carries
+    # is_distilled:true (ADR-009 changelog 2026-07-22).
+    ("Flux2KleinPipeline",          "flux2klein-base"),
     ("Flux2Pipeline",               "flux2"),
     ("ChromaPipeline",              "chroma"),
     ("FluxPipeline",                "flux"),
@@ -580,7 +582,7 @@ check(
 # pre-existing behavior on 8×/16× VAEs).
 AUTO_TILED_FAMILIES = [
     "qwen-edit", "qwen-image",
-    "flux", "flux2", "flux2klein",
+    "flux", "flux2", "flux2klein", "flux2klein-base",
     "chroma", "auraflow",
     "sd1", "sd3", "sdxl",
     "zimage",

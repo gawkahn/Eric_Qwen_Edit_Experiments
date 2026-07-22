@@ -27,7 +27,7 @@ from .eric_diffusion_utils import build_model_metadata
 from .eric_qwen_edit_utils import pil_to_tensor
 
 
-_SUPPORTED_FAMILIES = ("flux2klein", "flux2")
+_SUPPORTED_FAMILIES = ("flux2klein", "flux2klein-base", "flux2")
 
 
 def _tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
