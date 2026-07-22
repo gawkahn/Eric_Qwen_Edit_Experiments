@@ -752,6 +752,14 @@ convention, and Qwen-Image-Edit-2511 is the *Plus* multi-reference variant where
   (`--params` .png/sidecar dispatch, `generate.py:172`), D7 (refine canonical
   path), D4 (sidecar as the sole JPEG provenance channel) — all land in
   ADR-034's own slices and are consumed, not duplicated, by ref-image replay.
+- 2026-07-22 — flux2klein (and flux2, via the "other families" row) execution
+  path settled in ADR-036. Investigation outcome for decision 3's pressure
+  point: the detected `Flux2KleinPipeline` / `Flux2Pipeline` classes natively
+  accept `image=` — no class swap, no cache-key discriminator. Decision 4
+  amendment: the native Flux.2 reference path has **no** denoise-strength
+  parameter (strength exists only on the mask-requiring
+  `Flux2KleinInpaintPipeline`), so no `--strength` flag is introduced — see
+  ADR-036 decision 4.
 
 ---
 
