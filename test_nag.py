@@ -394,8 +394,10 @@ check("nag_end=0.0 never applies NAG",
 _gen_src = Path("comfyless/generate.py").read_text()
 check("generate() routes NAG through nag_pipe_call under swap_sampler",
       "nag_pipe_call(pipe, **call_kwargs)" in _gen_src)
-check("generate() gates NAG by family via _nag_gate (cfg-aware, ADR-024)",
-      "_nag_gate(model_family, nag_scale, cfg_scale)" in _gen_src)
+check("generate() gates NAG by family via _nag_gate (cfg-aware, ADR-024; "
+      "ref-kind-aware, ADR-036)",
+      "_nag_gate(model_family, nag_scale, cfg_scale," in _gen_src
+      and "ref_kind=ref_kind)" in _gen_src)
 check("generate() dispatches NAG modules per family (ADR-024)",
       "_NAG_MODULES[model_family]" in _gen_src)
 

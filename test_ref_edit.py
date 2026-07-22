@@ -239,22 +239,24 @@ finally:
     _srvmod.socket_path = _orig_socket_path
     cg._send_server_command = _orig_send
 
-# ── Drop strictness predicate (ADR-035 slice 4, decision 2 / Finding 4) ──────
-# A reference handed to a family with no edit path: STRICT (machine/scripted) →
-# hard ValueError before generation; LENIENT (interactive) → (False, loud
-# warning) so it can be recorded + surfaced. qwen-edit + refs → (True, None).
-_is_qe, _warn = cg._resolve_ref_family_support(
+# ── Ref-execution-kind predicate (ADR-035 slice 4 / ADR-036 decision 1) ──────
+# Returns (ref_kind, warn): "qwen-edit" (manual loop), "flux2-native" (stock
+# pipeline image= kwarg), or None (no refs / drop path). Unsupported family:
+# STRICT (machine/scripted) → hard ValueError before generation; LENIENT
+# (interactive) → (None, loud warning) so it can be recorded + surfaced.
+_kind, _warn = cg._resolve_ref_family_support(
     [{"path": "kf.png", "mode": "both"}], "qwen-edit", True)
-check("drop: qwen-edit + refs → (True, no warning)", _is_qe is True and _warn is None)
+check("kind: qwen-edit + refs → ('qwen-edit', no warning)",
+      _kind == "qwen-edit" and _warn is None)
 
-_is_qe, _warn = cg._resolve_ref_family_support([], "flux", True)
-check("drop: no refs → (False, no warning), strict irrelevant",
-      _is_qe is False and _warn is None)
+_kind, _warn = cg._resolve_ref_family_support([], "flux", True)
+check("kind: no refs → (None, no warning), strict irrelevant",
+      _kind is None and _warn is None)
 
-_is_qe, _warn = cg._resolve_ref_family_support(
+_kind, _warn = cg._resolve_ref_family_support(
     [{"path": "kf.png", "mode": "both"}], "flux", False)
-check("drop: flux + refs LENIENT → (False, loud warning)",
-      _is_qe is False and _warn is not None and "not supported" in _warn
+check("drop: flux + refs LENIENT → (None, loud warning)",
+      _kind is None and _warn is not None and "not supported" in _warn
       and "without references" in _warn)
 
 _raised = None
@@ -265,6 +267,97 @@ except ValueError as e:
     _raised = str(e)
 check("drop: flux + refs STRICT → ValueError naming the family + 'Refusing'",
       _raised is not None and "flux" in _raised and "Refusing" in _raised)
+
+# ── flux2-native kind (ADR-036 decisions 1/2/3) ──────────────────────────────
+# flux2klein AND flux2 resolve to the native image= path, in BOTH strictness
+# modes (no drop — the family supports refs). MODE vl/ref is a hard error in
+# BOTH modes (decision 3: a typed :vl is deliberate, never stumbled into).
+for _fam in ("flux2klein", "flux2"):
+    for _strict in (True, False):
+        _kind, _warn = cg._resolve_ref_family_support(
+            [{"path": "kf.png", "mode": "both"}], _fam, _strict)
+        check(f"flux2-native: {_fam} + both (strict={_strict}) → "
+              f"('flux2-native', None)",
+              _kind == "flux2-native" and _warn is None)
+
+for _strict in (True, False):
+    _raised = None
+    try:
+        cg._resolve_ref_family_support(
+            [{"path": "kf.png", "mode": "vl"}], "flux2klein", _strict)
+    except ValueError as e:
+        _raised = str(e)
+    check(f"flux2-native: MODE vl → hard ValueError even when strict={_strict}",
+          _raised is not None and "flux2klein" in _raised
+          and "vl" in _raised and "both" in _raised)
+
+_raised = None
+try:
+    cg._resolve_ref_family_support(
+        [{"path": "a.png", "mode": "both"}, {"path": "b.png", "mode": "ref"}],
+        "flux2", True)
+except ValueError as e:
+    _raised = str(e)
+check("flux2-native: mixed modes → ValueError names the offending mode(s)",
+      _raised is not None and "ref" in _raised and "flux2" in _raised)
+
+# ── _load_ref_pils shared ingestion (ADR-036 decision 7) ─────────────────────
+_pils, _prov2 = cg._load_ref_pils(_specs)
+check("load_ref_pils: one PIL per spec, real ingestion (RGB, right size)",
+      len(_pils) == 2 and _pils[0].mode == "RGB"
+      and _pils[0].size == (32, 48) and _pils[1].size == (16, 16))
+check("load_ref_pils: provenance path/mode/sha256/applied in order",
+      _prov2[0]["path"] == _p_both and _prov2[0]["mode"] == "both"
+      and _prov2[0]["sha256"] == _sha_both
+      and _prov2[1]["mode"] == "vl" and all(e["applied"] for e in _prov2))
+
+# ── _apply_flux2_native_refs call-kwargs threading (ADR-036 d1/d5/d7) ────────
+_both_specs = [{"path": _p_both, "mode": "both"}, {"path": _p_vl, "mode": "both"}]
+
+_ck = {"prompt": "p", "height": 1024, "width": 1024, "guidance_scale": 4.0}
+_prov3 = cg._apply_flux2_native_refs(_ck, _both_specs, False)
+check("flux2 refs: image= gets the PIL list in order",
+      isinstance(_ck.get("image"), list) and len(_ck["image"]) == 2
+      and _ck["image"][0].size == (32, 48))
+check("flux2 refs: dims NOT explicit → height/width dropped (pipeline derives)",
+      "height" not in _ck and "width" not in _ck)
+check("flux2 refs: other call kwargs untouched",
+      _ck["prompt"] == "p" and _ck["guidance_scale"] == 4.0)
+check("flux2 refs: provenance returned (same shape as qwen-edit)",
+      len(_prov3) == 2 and _prov3[0]["sha256"] == _sha_both
+      and all(e["applied"] for e in _prov3))
+
+_ck2 = {"prompt": "p", "height": 768, "width": 512}
+cg._apply_flux2_native_refs(_ck2, _both_specs, True)
+check("flux2 refs: dims explicit → height/width forwarded verbatim",
+      _ck2["height"] == 768 and _ck2["width"] == 512)
+
+# ── NAG pre-gate on the flux2-native ref path (ADR-036 decision 6) ───────────
+# nag_flux2's HF2-1 guard would skip at runtime on the daemon's stderr —
+# invisible to a delegated client. _nag_gate deactivates NAG client-visibly.
+_active, _nwarn = cg._nag_gate("flux2klein", 5.0, 0.0, ref_kind="flux2-native")
+check("nag pre-gate: flux2-native refs → inactive + loud warning",
+      _active is False and _nwarn is not None
+      and "reference-image" in _nwarn and "WITHOUT negative guidance" in _nwarn)
+_active, _nwarn = cg._nag_gate("flux2klein", 5.0, 0.0)
+check("nag pre-gate: no refs → NAG still activates on flux2klein",
+      _active is True and _nwarn is None)
+_active, _nwarn = cg._nag_gate("flux2klein", None, 0.0, ref_kind="flux2-native")
+check("nag pre-gate: dormant nag_scale stays silent even with refs",
+      _active is False and _nwarn is None)
+
+# ── Dims read-back for a truthful sidecar (ADR-036 decision 5) ───────────────
+# When dims are pipeline-derived (not explicit), generate() must read the
+# resolved size back off the output image BEFORE building metadata, so the
+# sidecar records the truth. Source-text pin (the test_nag.py idiom) — the
+# full generate() path needs a GPU; end-to-end dims are the live smoke.
+_gen_src = Path(__file__).parent.joinpath("comfyless", "generate.py").read_text()
+check("dims read-back: final_pil.size gated on flux2-native + derived dims",
+      'if ref_kind == "flux2-native" and not ref_dims_explicit:' in _gen_src
+      and "width, height = final_pil.size" in _gen_src)
+check("dims read-back precedes metadata build (sidecar records the truth)",
+      _gen_src.index("width, height = final_pil.size")
+      < _gen_src.index('metadata: Dict[str, Any] = {'))
 
 # ── Wire carriage of ref fields (ADR-035 slice 4) ────────────────────────────
 # _build_server_request must send ref_images (abspath'd) + ref_dims_explicit,

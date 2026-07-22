@@ -696,13 +696,20 @@ _NAG_MODULES: Dict[str, str] = {
 
 
 def _nag_gate(model_family: str, nag_scale: Optional[float],
-              cfg_scale: float = 0.0) -> tuple:
+              cfg_scale: float = 0.0,
+              ref_kind: Optional[str] = None) -> tuple:
     """Decide whether NAG activates (family table + CFG-interplay rule).
 
     Returns (active, warning). nag_scale unset/<=1 is the documented off
     state — dormant, no warning. An unsupported family, or a cfg-gated
     family with classic CFG active, stays inactive with a loud warning
     (warn-don't-block; a silent no-op is invariant N1's failure mode).
+
+    ADR-036 decision 6: a flux2-native reference run also deactivates NAG
+    loudly HERE — nag_flux2's own HF2-1 guard skips at runtime, but that
+    surfaces on the daemon's stderr, invisible to a delegated client. Gating
+    in this function puts the skip into nag_warnings, which rides the wire
+    metadata (invariant N1); the in-pipeline guard stays as defense in depth.
     """
     if nag_scale is None or nag_scale <= 1.0:
         return False, None
@@ -713,6 +720,12 @@ def _nag_gate(model_family: str, nag_scale: Optional[float],
             f"{'/'.join(sorted(_NAG_CFG_OWNS_NEGATIVE))} only "
             f"(model_family={model_family!r}). Generation proceeds "
             f"WITHOUT negative guidance."
+        )
+    if ref_kind == "flux2-native":
+        return False, (
+            f"nag_scale {nag_scale} skipped — NAG does not support the "
+            f"reference-image path on {model_family} (nag_flux2 HF2-1). "
+            f"Generation proceeds WITHOUT negative guidance."
         )
     if cfg_owns and cfg_scale > 0:
         return False, (
@@ -1498,6 +1511,53 @@ def _pil_to_comfy_image(pil) -> "torch.Tensor":
     return torch.from_numpy(arr).unsqueeze(0)
 
 
+def _load_ref_pils(
+    ref_images: List[Dict[str, str]],
+) -> Tuple[List[Any], List[Dict[str, Any]]]:
+    """Decode --ref-image specs through `comfyless/ref_image.py` — the SINGLE
+    decode site (byte/pixel caps, PNG/JPEG/WEBP allowlist, single-read SHA-256;
+    ADR-035 6b) — into PIL RGB images plus the sidecar provenance records
+    ({path, mode, sha256, applied}; ADR-036 decision 7). Shared by both
+    execution kinds: qwen-edit converts the PILs to ComfyUI tensors for its
+    manual loop; flux2-native hands them straight to the stock pipeline's
+    `image=` kwarg. Order is preserved."""
+    from comfyless.ref_image import load_ref_image_capped
+
+    pils: List[Any] = []
+    provenance: List[Dict[str, Any]] = []
+    for spec in ref_images:
+        loaded = load_ref_image_capped(spec["path"])
+        pils.append(loaded.image)
+        provenance.append({
+            "path": spec["path"], "mode": spec["mode"],
+            "sha256": loaded.sha256, "applied": True,
+        })
+    return pils, provenance
+
+
+def _apply_flux2_native_refs(
+    call_kwargs: Dict[str, Any],
+    ref_images: List[Dict[str, str]],
+    ref_dims_explicit: bool,
+) -> List[Dict[str, Any]]:
+    """Thread validated refs into the generic text2img call (ADR-036).
+
+    The detected Flux2/Flux2Klein pipeline class natively consumes references
+    via its `image=` kwarg (multi-reference kontext-style conditioning), so no
+    fork, no class swap (ADR-035 decision 3 invariant), and no strength — the
+    native path has none (ADR-036 decision 4). When the user did not set BOTH
+    --width and --height, the dims are dropped from the call so the pipeline
+    derives them from the FIRST reference (upstream convention, ≤1MP, aligned;
+    decision 5) — the caller reads the resolved size back off the output image
+    for a truthful sidecar. Returns the provenance records (decision 7)."""
+    pils, provenance = _load_ref_pils(ref_images)
+    call_kwargs["image"] = pils
+    if not ref_dims_explicit:
+        call_kwargs.pop("height", None)
+        call_kwargs.pop("width", None)
+    return provenance
+
+
 def _run_qwen_edit_refs(
     pipe, prompt: str, negative_prompt: Optional[str],
     ref_images: List[Dict[str, str]], *,
@@ -1506,9 +1566,8 @@ def _run_qwen_edit_refs(
     output_width: Optional[int], output_height: Optional[int],
 ) -> Tuple[Any, int, int, List[Dict[str, Any]]]:
     """Ingest --ref-image specs and run the qwen-edit denoising loop (ADR-035
-    slice 3). Each spec's path is decoded through `comfyless/ref_image.py` — the
-    SINGLE decode site (byte/pixel caps, PNG/JPEG/WEBP allowlist, SHA-256; ADR-035
-    6b) — into a ComfyUI IMAGE tensor, and its MODE selects the (VL, Ref)
+    slice 3). Each spec is decoded via `_load_ref_pils` (the single decode
+    site) into a ComfyUI IMAGE tensor, and its MODE selects the (VL, Ref)
     conditioning flags. Order is preserved: the Nth reference becomes "Picture N".
     When output_width/height are None the loop derives them from the last
     reference's aspect (~1MP, decision 4 / B8). Returns
@@ -1521,24 +1580,17 @@ def _run_qwen_edit_refs(
     import numpy as np
     from PIL import Image
 
-    from comfyless.ref_image import load_ref_image_capped
     from nodes.eric_diffusion_manual_loop import (
         decode_qwen_latents, generate_qwen_edit)
 
-    ref_tensors: List[Any] = []
+    pils, ref_provenance = _load_ref_pils(ref_images)
+    ref_tensors: List[Any] = [_pil_to_comfy_image(p) for p in pils]
     vl_flags: List[bool] = []
     ref_flags: List[bool] = []
-    ref_provenance: List[Dict[str, Any]] = []
     for spec in ref_images:
-        loaded = load_ref_image_capped(spec["path"])
-        ref_tensors.append(_pil_to_comfy_image(loaded.image))
         vl, rf = _REF_MODE_FLAGS[spec["mode"]]
         vl_flags.append(vl)
         ref_flags.append(rf)
-        ref_provenance.append({
-            "path": spec["path"], "mode": spec["mode"],
-            "sha256": loaded.sha256, "applied": True,
-        })
 
     latents, out_h, out_w = generate_qwen_edit(
         pipe, prompt, negative_prompt, ref_tensors,
@@ -1553,29 +1605,58 @@ def _run_qwen_edit_refs(
     return Image.fromarray(arr), out_h, out_w, ref_provenance
 
 
+#: family → ref-execution kind (ADR-035 decision 2 routing table, executed by
+#: ADR-036). "qwen-edit" runs the manual edit loop; "flux2-native" threads the
+#: refs into the stock pipeline's `image=` kwarg (Flux2Pipeline and
+#: Flux2KleinPipeline share the signature and semantics — ADR-036 finding 4).
+_REF_FAMILY_KINDS: Dict[str, str] = {
+    "qwen-edit":  "qwen-edit",
+    "flux2klein": "flux2-native",
+    "flux2":      "flux2-native",
+}
+
+
 def _resolve_ref_family_support(
     ref_images: List[Dict[str, str]], model_family: str, ref_drop_strict: bool,
-) -> Tuple[bool, Optional[str]]:
-    """Decide how a family handles reference images (ADR-035 decision 2 / Finding 4).
+) -> Tuple[Optional[str], Optional[str]]:
+    """Decide how a family executes reference images (ADR-035 decision 2 /
+    Finding 4; generalized to execution kinds by ADR-036).
 
-    Returns ``(is_qwen_edit, drop_warning)``. ``drop_warning`` is a loud message
-    to BOTH record in ``edit_warnings`` (so it rides the wire metadata and is
-    visible to a delegated interactive client — invariant N1) and print, when a
-    non-qwen-edit family is handed references on the lenient path.
+    Returns ``(ref_kind, drop_warning)`` — ``ref_kind`` is ``"qwen-edit"``,
+    ``"flux2-native"``, or ``None`` (no refs, or the drop path).
+    ``drop_warning`` is a loud message to BOTH record in ``edit_warnings`` (so
+    it rides the wire metadata and is visible to a delegated interactive
+    client — invariant N1) and print, when an unsupported family is handed
+    references on the lenient path.
 
-    Raises ``ValueError`` when references are handed to an unsupported family
-    under STRICT mode — machine clients and scripted CLI runs — because a silent
-    keyframe drop in an unattended chain is the exact failure Finding 4 prevents.
-    Extracted as a predicate so both branches are unit-testable without a GPU."""
-    is_qwen_edit = bool(ref_images) and model_family == "qwen-edit"
-    if not ref_images or is_qwen_edit:
-        return is_qwen_edit, None
+    Raises ``ValueError`` (a) when references are handed to an unsupported
+    family under STRICT mode — machine clients and scripted CLI runs — because
+    a silent keyframe drop in an unattended chain is the exact failure Finding
+    4 prevents; and (b) when a flux2-native family is handed a ``vl``/``ref``
+    MODE — those select qwen-edit's dual conditioning paths, which Flux.2's
+    reference conditioning does not have. (b) is hard in BOTH strictness modes
+    (ADR-036 decision 3): a typed ``:vl`` suffix is deliberate, never stumbled
+    into — the decision-2a unknown-suffix reasoning, not a droppable extra.
+    Extracted as a predicate so all branches are unit-testable without a GPU."""
+    if not ref_images:
+        return None, None
+    ref_kind = _REF_FAMILY_KINDS.get(model_family)
+    if ref_kind == "flux2-native":
+        bad_modes = sorted({s["mode"] for s in ref_images} - {"both"})
+        if bad_modes:
+            raise ValueError(
+                f"--ref-image mode(s) {', '.join(bad_modes)} not supported "
+                f"for model family {model_family!r} — its reference "
+                f"conditioning has no VL/Ref dual path; only 'both' (the "
+                f"default) is valid (ADR-036 decision 3).")
+    if ref_kind is not None:
+        return ref_kind, None
     msg = (f"--ref-image not supported for model family {model_family!r} "
-           f"(only qwen-edit has a reference-image edit path).")
+           f"(supported: {'/'.join(sorted(_REF_FAMILY_KINDS))}).")
     if ref_drop_strict:
         raise ValueError(
             msg + " Refusing rather than silently dropping the reference(s).")
-    return False, msg + " Generated without references."
+    return None, msg + " Generated without references."
 
 
 def generate(
@@ -1765,11 +1846,13 @@ def generate(
             file=sys.stderr,
         )
 
-    # ── ADR-035: reference-image edit routing ─────────────────────────
-    # qwen-edit is the only family with a reference-image edit path (decision 3);
-    # any other family takes the drop path — a loud warning, then generate
-    # without the references (warn-don't-block; Vision failure semantics). The
-    # references are consumed only on the qwen-edit branch at the call site below.
+    # ── ADR-035 / ADR-036: reference-image routing by execution kind ──
+    # ref_kind resolves the family's reference path (ADR-036 decision 1):
+    # "qwen-edit" runs the manual edit loop at the dispatch site below;
+    # "flux2-native" (flux2klein/flux2) threads the refs into the stock
+    # pipeline's image= kwarg on the generic call path; any other family
+    # takes the drop path — a loud warning, then generate without the
+    # references (warn-don't-block; Vision failure semantics).
     ref_images = ref_images or []
     # Recorded-in-metadata provenance for a truthful edit sidecar (code review
     # 2026-07-21): the sampler qwen-edit actually ran (its own flow_heun loop,
@@ -1789,8 +1872,9 @@ def generate(
     # message must ride the wire metadata to be surfaced client-side (invariant
     # N1, the nag/lora pattern) — otherwise the interactive user gets a silent
     # drop, which is exactly what the "loud warn-and-proceed" promise forbids.
-    is_qwen_edit, _ref_drop_warn = _resolve_ref_family_support(
+    ref_kind, _ref_drop_warn = _resolve_ref_family_support(
         ref_images, model_family, ref_drop_strict)
+    is_qwen_edit = ref_kind == "qwen-edit"
     if _ref_drop_warn:
         edit_warnings.append(_ref_drop_warn)
         print(f"[comfyless] WARNING: {_ref_drop_warn}", file=sys.stderr)
@@ -1819,6 +1903,19 @@ def generate(
         true_cfg_scale, max_sequence_length, generator,
     )
 
+    # ── flux2-native reference conditioning (ADR-036) ─────────────────
+    # Refs thread through the generic call path as the stock pipeline's
+    # `image=` kwarg; dims are dropped unless the user set both, so the
+    # pipeline derives them from the first reference (read back after the
+    # call for the sidecar). Decoding happens here, in the process that
+    # generates (ADR-035 6b) — same single decode site as qwen-edit.
+    if ref_kind == "flux2-native":
+        ref_provenance = _apply_flux2_native_refs(
+            call_kwargs, ref_images, ref_dims_explicit)
+        _log(f"[comfyless] {model_family} reference conditioning: "
+             f"{len(ref_images)} ref(s)"
+             + ("" if ref_dims_explicit else ", dims derived from reference"))
+
     # ── NAG negative guidance (ADR-023; krea family only) ────────────
     # Every skip/oddity lands in nag_warnings AND stderr: generate() may run
     # inside the daemon or MCP server, where this stderr is a server log the
@@ -1832,7 +1929,8 @@ def generate(
     # so those are always eligible. The per-pipeline mirrors carry the same
     # guards for standalone users — gating here makes every skip visible
     # across the daemon/MCP boundary.
-    nag_active, nag_warning = _nag_gate(model_family, nag_scale, cfg_scale)
+    nag_active, nag_warning = _nag_gate(model_family, nag_scale, cfg_scale,
+                                        ref_kind=ref_kind)
     if nag_warning:
         nag_warnings.append(nag_warning)
     if nag_active:
@@ -1901,8 +1999,12 @@ def generate(
 
     if not is_qwen_edit:
         # qwen-edit derives its own output dims from the reference at the call
-        # site below; width/height here are the unused text2img defaults.
-        _log(f"[comfyless] Generating: {width}x{height}, "
+        # site below; width/height here are the unused text2img defaults. A
+        # flux2-native ref run without explicit dims likewise derives them in
+        # the pipeline, so the defaults would be a lie in the log.
+        _dims = ("ref-derived" if ref_kind == "flux2-native"
+                 and not ref_dims_explicit else f"{width}x{height}")
+        _log(f"[comfyless] Generating: {_dims}, "
              f"steps={steps}, cfg={cfg_scale}, seed={seed}, sampler={sampler}")
 
     # ── VAE: move back to GPU for decode ──────────────────────────────
@@ -2018,6 +2120,11 @@ def generate(
                 result.images, pipe, upscale_vae, height, width, device)
         else:
             final_pil = result.images[0]
+    if ref_kind == "flux2-native" and not ref_dims_explicit:
+        # ADR-036 decision 5: dims were pipeline-derived from the first
+        # reference — read the resolved size back so the sidecar records the
+        # truth (upscale never coexists: it is Qwen/Wan-gated above).
+        width, height = final_pil.size
     elapsed = time.monotonic() - t0
     _log(f"[comfyless] Generated in {elapsed:.1f}s")
 
