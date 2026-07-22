@@ -158,6 +158,11 @@ _generate_canonical = {
         # from the reference). Not sidecar-shaped — the dims themselves persist
         # via width/height. ref_images, by contrast, IS a schema key.
         "ref_dims_explicit",
+        # ADR-035 slice 4: drop-strictness for a family that can't consume a
+        # reference (decision 2 / Finding 4). A wire/runtime control (absent =
+        # strict on the daemon), not sidecar-shaped — a dropped-vs-applied
+        # record is provenance, but the strictness knob itself does not replay.
+        "ref_drop_strict",
     }
 }
 _missing_from_schema = _generate_canonical - set(schema.keys())
@@ -1317,6 +1322,15 @@ check("9 refs exceed the cap, error names the count/limit",
       bool(_capmsg) and "9 references" in _capmsg and "8" in _capmsg)
 check("exactly 8 refs is accepted",
       len(g._validate_ref_image_specs(["a.png"] * 8)) == 8)
+
+# The ref cap + mode allowlist are duplicated in generate.py (CLI parse) and
+# params_validation.py (daemon wire). Pin them equal so the two boundaries can
+# never silently drift out of sync (slice-4 code review).
+import comfyless.params_validation as _pv  # noqa: E402
+check("_MAX_REF_IMAGES matches between CLI and wire validators",
+      g._MAX_REF_IMAGES == _pv._MAX_REF_IMAGES == 8)
+check("ref MODE allowlist matches between CLI and wire validators",
+      tuple(g._REF_MODES) == tuple(_pv._REF_IMAGE_MODES) == ("both", "vl", "ref"))
 
 # Colon-filename disambiguation (decision 1): stripped path absent but the FULL
 # spec exists as a file → error names the full spec, not a bare not-found.

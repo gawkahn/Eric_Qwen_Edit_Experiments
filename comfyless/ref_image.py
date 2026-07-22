@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
+import stat as _stat
 from dataclasses import dataclass
 
 #: Byte cap on a single reference-image read. Mirrors refine's
@@ -78,15 +80,37 @@ def load_ref_image_capped(
     the caller's concern, not this helper's (6b)."""
     from PIL import Image
 
+    # Non-regular-file guard (ADR-035 slice 4; closes slice-2 LOW-2). Open
+    # NON-BLOCKING and reject anything that is not S_ISREG *before* reading a
+    # byte. A FIFO / device / socket path would otherwise block open() or read()
+    # forever; at the daemon decode site that wedges the single-threaded accept
+    # loop — a one-request DoS. O_NONBLOCK makes the open return immediately even
+    # for a writer-less FIFO, and the fstat then rejects it; for a regular file
+    # O_NONBLOCK has no effect on the read. os.open follows symlinks (no
+    # O_NOFOLLOW) deliberately — a symlinked keyframe is legitimate and the guard
+    # cares about the final target's TYPE, which fstat reports.
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as e:
+        raise RefImageError(f"cannot read reference image {path!r}: {e}") from e
     # Single bounded read (6d): read at most max_bytes + 1 so an oversize file
     # is detected without ever pulling its full length into memory. This read is
     # authoritative — there is no prior os.stat, hence no check-then-use window
     # between a size check and the read the caps and hash actually describe.
     try:
-        with open(path, "rb") as fp:
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode):
+            raise RefImageError(
+                f"reference image {path!r} is not a regular file "
+                f"(mode {_stat.S_IFMT(st.st_mode):#o})")
+        with os.fdopen(fd, "rb") as fp:
+            fd = -1  # fdopen owns the fd now; the with-block closes it
             data = fp.read(max_bytes + 1)
     except OSError as e:
         raise RefImageError(f"cannot read reference image {path!r}: {e}") from e
+    finally:
+        if fd >= 0:
+            os.close(fd)
     if len(data) > max_bytes:
         raise RefImageError(
             f"reference image {path!r} exceeds byte cap {max_bytes}")

@@ -233,6 +233,42 @@ check("multi-frame WEBP decodes FRAME 0 only (red, not blue)",
 check("multi-frame WEBP size is a single frame", anim_res.image.size == (8, 8),
       detail=str(anim_res.image.size))
 
+# ── Non-regular-file guard (ADR-035 slice 4; closes slice-2 LOW-2) ────────────
+# A FIFO / device / directory passed as a reference must be rejected BEFORE any
+# read, so open()/read() cannot block forever and wedge the daemon accept loop.
+
+# Directory: fstat reports S_ISDIR, not S_ISREG.
+dir_path = os.path.join(tmp, "a_directory")
+os.mkdir(dir_path)
+e = expect_error("directory rejected as non-regular file",
+                 lambda: load_ref_image_capped(dir_path))
+check("directory error names 'not a regular file'",
+      e is not None and "not a regular file" in str(e), detail=str(e))
+
+# FIFO: a writer-less named pipe would block a plain open()/read() forever. The
+# O_NONBLOCK + S_ISREG guard must reject it immediately with no writer present.
+fifo_path = os.path.join(tmp, "a_fifo")
+os.mkfifo(fifo_path)
+e = expect_error("writer-less FIFO rejected without hanging",
+                 lambda: load_ref_image_capped(fifo_path))
+check("FIFO error names 'not a regular file'",
+      e is not None and "not a regular file" in str(e), detail=str(e))
+
+# A symlink whose TARGET is a regular file is still accepted (the guard cares
+# about the final target type; symlinked keyframes are legitimate).
+sym_ok = os.path.join(tmp, "sym_to_png.png")
+os.symlink(png_path, sym_ok)
+check("symlink to a regular PNG is accepted",
+      load_ref_image_capped(sym_ok).image.mode == "RGB")
+
+# A symlink whose target is a FIFO is rejected (fstat follows to the FIFO).
+sym_fifo = os.path.join(tmp, "sym_to_fifo")
+os.symlink(fifo_path, sym_fifo)
+e = expect_error("symlink to a FIFO rejected",
+                 lambda: load_ref_image_capped(sym_fifo))
+check("symlink-to-FIFO error names 'not a regular file'",
+      e is not None and "not a regular file" in str(e), detail=str(e))
+
 # ── Module constants sanity ──────────────────────────────────────────────────
 check("byte cap mirrors seed 64 MB", REF_IMAGE_MAX_BYTES == 64 * 1024 ** 2)
 check("pixel cap mirrors seed ~67 MP", REF_IMAGE_MAX_PIXELS == 64 * 1024 ** 2)

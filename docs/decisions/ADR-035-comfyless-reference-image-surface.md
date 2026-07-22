@@ -544,6 +544,53 @@ convention, and Qwen-Image-Edit-2511 is the *Plus* multi-reference variant where
 
 ## Changelog
 
+- 2026-07-21 — **Slice 4 landed (daemon reference-image path).** The persistent
+  daemon (ADR-020) now honors `--ref-image`, so a qwen-edit run reuses a resident
+  pipeline instead of the slice-3 forced in-process path. New/changed:
+  `comfyless/ref_image.py` — non-regular-file guard (`O_NONBLOCK` open +
+  `S_ISREG` fstat before any read; closes the slice-2 LOW-2 daemon-DoS
+  precondition, 6b). `comfyless/params_validation.py` — `validate_ref_image_entry`
+  (dict + str `path` + `mode ∈ {both,vl,ref}` allowlist, called from
+  `validate_machine_request` with the 8-count-cap re-check, 6f) so a non-CLI
+  wire caller can never reach `_REF_MODE_FLAGS[mode]` with a bad mode (TECH_DEBT
+  precondition 2); plus `ref_dims_explicit` / `ref_drop_strict` wire kinds.
+  `comfyless/server.py` — `ref_images[i].path` NUL defense (6e); `_check_ref_paths`
+  containment against a **disjoint** `ref_image_roots` (= `--output-dir` ∪
+  `--ref-root`, never merged with the weight roots, 6a); `_resolve_ref_roots`
+  (validation + `/`/mount/`$HOME` breadth warning, Finding 6); `_handle_generate`
+  threads `ref_images`/`ref_dims_explicit`/`ref_drop_strict` into its daemon-side
+  `generate()` (decode runs in the daemon process via the single decode site).
+  `comfyless/generate.py` — `--ref-root` flag (spawn + client); `_build_server_request`
+  sends the ref fields (abspath'd; `ref_drop_strict` TTY-gated, strict by
+  omission); `_should_delegate_to_server` loses the blanket ref skip and delegates
+  only when every typed ref is inside a CLI-known ref root (`--ref-root` only —
+  a subset of the daemon's set so a delegated ref is never wrongly refused,
+  Finding 2); `_resolve_ref_family_support` (the drop-strict predicate: strict =
+  hard-fail for machine/scripted, lenient = loud warn recorded in `edit_warnings`
+  so a delegated interactive drop is visible client-side). Decision 3 cache-key
+  invariant pinned (ref presence never changes `_request_cache_key`). Tests:
+  `test_ref_image.py` (FIFO/dir/symlink guard), `test_machine_boundary_validator.py`
+  (wire shape/mode/count), `test_server_robustness.py` (NUL/containment-disjoint/
+  cache-key/breadth-warning), `test_ref_edit.py` (delegation seam/drop predicate/
+  wire carriage), `test_params_schema.py` (constant cross-assert). Live GPU smoke =
+  Grant. **Reviews (Fable):** `security-auditor` — design contract MET, no
+  CRITICAL/HIGH; `code-reviewer` — findings resolved in-slice. Closed in-slice:
+  the in-process drop-strictness was unconditionally lenient (strictness must not
+  depend on daemon availability → in-process call now TTY-gated, security MEDIUM);
+  the lenient drop warning was daemon-stderr-only on a delegated run (→ rides
+  `edit_warnings`, surfaced client-side, code-review PROMISE DRIFT); `--model-base`
+  was wrongly in the CLI delegation roots causing guaranteed daemon refusal of a
+  legit typed path (→ removed, Finding 2 restored); `os.path.ismount` added to the
+  breadth guard; `sys.stdin` None-guarded on both TTY checks. Deferred (TECH_DEBT):
+  a check→open TOCTOU symlink-swap (same-UID confused-deputy, willed to the MCP
+  ADR with the output-dir read-back loop); a slice-4-client → pre-slice-4-daemon
+  silent ref drop (no wire capability handshake yet — restart daemons on upgrade).
+  **INFO (security):** `ref_drop_strict` is a client-declared leniency field —
+  any wire client can send `false` to opt itself into silent drops; this confers
+  no path authority (decision 7's forgeable-trust bar is met) and today's only
+  lenient sender is the interactive CLI (MCP strips refs entirely), but when LLM
+  agents gain a raw-wire or MCP ref path the daemon should hard-code strict for
+  non-CLI transports. Replay trust (decision 7) remains slice 5.
 - 2026-07-21 — **Slice 3 landed (foreground qwen-edit execution).** comfyless
   can now run a real Qwen-Image-Edit pass from the CLI: `--model <qwen-edit
   ckpt> --prompt … --ref-image PATH[:MODE]` (1–8 refs). New in

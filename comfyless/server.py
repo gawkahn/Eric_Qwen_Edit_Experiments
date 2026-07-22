@@ -213,6 +213,14 @@ def _validate_request(req: Any) -> Optional[str]:
     for i, lora in enumerate(req.get("loras") or []):
         if "\x00" in lora["path"]:
             return f"loras[{i}].path: null byte not allowed"
+    # ADR-035 6e: list-shaped ref_images joins the NUL defense. By this point
+    # validate_machine_request has confirmed each entry is a dict with a str
+    # 'path' (validate_ref_image_entry), so ref["path"] is safe with no
+    # isinstance predicate (N19). A NUL here would otherwise escape
+    # os.path.realpath in _check_ref_paths and kill the accept loop.
+    for i, ref in enumerate(req.get("ref_images") or []):
+        if "\x00" in ref["path"]:
+            return f"ref_images[{i}].path: null byte not allowed"
     for field in _PATH_FIELDS:
         val = req.get(field, "")
         if val and "\x00" in val:
@@ -277,6 +285,37 @@ def _check_paths(req: dict, roots: Union[str, Sequence[str]]) -> Optional[str]:
             if not _in_any(p):
                 return f"loras[{i}].path outside the allowed roots: {p!r}"
 
+    return None
+
+
+def _check_ref_paths(req: dict, ref_roots: Sequence[str]) -> Optional[str]:
+    """Return an error string if any ref_images path is outside every ref root.
+
+    ADR-035 6a: reference-image reads are a DIFFERENT permission from weight
+    loads, so ref_images is validated against `ref_image_roots` — the daemon's
+    --output-dir plus --ref-root spawn additions — NOT the {model_base} ∪ lora ∪
+    transformer weight roots of _check_paths. The two allowlists share the
+    `_within` mechanism but are disjoint in purpose and never merged: adding
+    --output-dir to the weight roots would reopen the 2026-06-01 refiner-path
+    CRITICAL, and exempting ref_images from containment entirely would let any
+    same-UID wire client VAE-encode any user-readable file.
+
+    Entries are already validated dicts with str, NUL-free paths (canonical
+    validator + _validate_request), so this only decides containment. An empty
+    ref_roots means no tree is readable — every ref path is refused (fail-closed).
+    """
+    if not req.get("ref_images"):
+        return None
+
+    def _in_any(p: str) -> bool:
+        return any(_within(p, b) for b in ref_roots)
+
+    for i, ref in enumerate(req["ref_images"]):
+        p = ref.get("path", "")
+        if not p.startswith("/"):
+            return f"ref_images[{i}].path must be absolute: {p!r}"
+        if not _in_any(p):
+            return f"ref_images[{i}].path outside the ref-image roots: {p!r}"
     return None
 
 
@@ -349,6 +388,7 @@ def _handle_connection(
     precision: str,
     server_state: dict,
     extra_roots: Tuple[str, ...] = (),
+    ref_roots: Tuple[str, ...] = (),
 ) -> bool:
     """
     Process one client connection.
@@ -399,6 +439,17 @@ def _handle_connection(
         # disconnected (now a graceful no-op). Prompt kept out deliberately.
         redacted = {k: v for k, v in req.items() if k != "prompt"}
         _log(f"PathError: {err} req={redacted!r}")
+        _send_safe(conn, {"status": "error", "error_type": "PathError", "error": err})
+        return True
+
+    # ── Reference-image containment (ADR-035 6a) ─────────────────────────
+    # A DISJOINT allowlist from _check_paths above: ref reads are validated
+    # against ref_image_roots (--output-dir ∪ --ref-root), never the weight
+    # roots. Runs before decode — the daemon opens/VAE-encodes these files.
+    err = _check_ref_paths(req, ref_roots)
+    if err:
+        redacted = {k: v for k, v in req.items() if k != "prompt"}
+        _log(f"RefPathError: {err} req={redacted!r}")
         _send_safe(conn, {"status": "error", "error_type": "PathError", "error": err})
         return True
 
@@ -948,6 +999,18 @@ def _handle_generate(
             # fields; deliberately NOT in _request_cache_key (output concern,
             # not pipeline shape — same rationale as NAG).
             output_format=out_fmt,
+            # ADR-035 slice 4: reference-image edit over the wire. ref_images
+            # entries are already shape/mode/NUL-validated and contained to
+            # ref_image_roots above; generate() decodes each through the single
+            # decode site (load_ref_image_capped) IN THIS daemon process (6b).
+            # ref_dims_explicit is the client's "user set both width+height"
+            # signal. ref_drop_strict defaults to True on the wire (absent =
+            # strict, decision 2 / Finding 4): a machine client whose family
+            # cannot consume a reference gets a hard InferenceError, never a
+            # silent drop; only the interactive CLI sends False.
+            ref_images=req.get("ref_images") or [],
+            ref_dims_explicit=bool(req.get("ref_dims_explicit")),
+            ref_drop_strict=bool(req.get("ref_drop_strict", True)),
             _cached_pipeline=cached,
             # Explicit pause opt-out (slice PAUSE, 2026-07-17): the daemon
             # runs generation on its MAIN thread, usually in a foreground
@@ -987,6 +1050,33 @@ def _log(msg: str) -> None:
     print(f"[comfyless-server] {msg}", file=sys.stderr, flush=True)
 
 
+def _resolve_ref_roots(output_dir: str, ref_roots: Sequence[str]) -> Tuple[str, ...]:
+    """Build ref_image_roots = {output_dir} ∪ validated --ref-root additions
+    (ADR-035 6a). `output_dir` is assumed already realpath'd by the caller.
+
+    Each --ref-root is NUL-checked, realpath'd, and required to be an existing
+    directory (fail-closed FileNotFoundError otherwise). A broad root — `/`, a
+    mount root, or the user's home dir — emits a loud breadth warning and
+    proceeds (re-review Finding 6, warn-don't-block: the root is operator-typed,
+    not attacker-reachable). Extracted from run_server so the warning + fail-
+    closed validation are unit-testable without binding a socket."""
+    roots: Tuple[str, ...] = (output_dir,)
+    home = os.path.realpath(os.path.expanduser("~"))
+    for p in ref_roots:
+        if "\x00" in p:
+            raise FileNotFoundError("--ref-root contains embedded NUL byte")
+        root_real = os.path.realpath(p)
+        if not os.path.isdir(root_real):
+            raise FileNotFoundError(f"--ref-root not found: {p}")
+        if root_real == os.sep or root_real == home or os.path.ismount(root_real):
+            _log(f"WARNING: --ref-root {root_real!r} is extremely broad — every "
+                 f"user-readable image under it becomes readable and "
+                 f"VAE-encodable by any same-UID client for this daemon's "
+                 f"lifetime. Narrow it to the keyframe/working directory.")
+        roots += (root_real,)
+    return roots
+
+
 def run_server(
     output_dir: str,
     model_base: str,
@@ -994,6 +1084,7 @@ def run_server(
     precision: str = "bf16",
     lora_paths: Tuple[str, ...] = (),
     transformer_paths: Tuple[str, ...] = (),
+    ref_roots: Tuple[str, ...] = (),
 ) -> None:
     """Start the comfyless model server and block until --unload is received.
 
@@ -1001,6 +1092,11 @@ def run_server(
     allowlist roots; request paths pass `_check_paths` when within ANY of
     {model_base} ∪ these roots. Validated fail-closed here exactly like
     model_base.
+
+    `ref_roots` (ADR-035 6a): the --ref-root spawn additions to
+    `ref_image_roots` = {output_dir} ∪ these. This is a DISJOINT allowlist from
+    the weight roots above — reference images are read (and VAE-encoded), never
+    deserialized as weights, so they get their own root set (never merged).
     """
     output_dir = os.path.realpath(output_dir)
     model_base = os.path.realpath(model_base)
@@ -1023,6 +1119,11 @@ def run_server(
                 raise FileNotFoundError(f"{flag} not found: {p}")
             extra_roots += (root_real,)
 
+    # ref_image_roots = {output_dir} ∪ --ref-root additions (ADR-035 6a). The
+    # output dir is a default ref root (keyframes are prior segment outputs).
+    # Validation + breadth warning live in the extracted helper (unit-tested).
+    ref_image_roots = _resolve_ref_roots(output_dir, ref_roots)
+
     sock_path = socket_path(device)
     if sock_path.exists():
         sock_path.unlink()
@@ -1037,6 +1138,8 @@ def run_server(
     _log(f"model-base : {model_base}")
     for r in extra_roots:
         _log(f"extra-root : {r}")
+    for r in ref_image_roots:
+        _log(f"ref-root   : {r}")
     _log(f"device     : {device} / {precision}")
 
     server_state: dict = {}
@@ -1047,7 +1150,7 @@ def run_server(
             with conn:
                 keep_running = _handle_connection(
                     conn, output_dir, model_base, device, precision,
-                    server_state, extra_roots,
+                    server_state, extra_roots, ref_image_roots,
                 )
     finally:
         srv.close()

@@ -31,6 +31,12 @@ now is dead code. Trigger: HARD precondition of BOTH slice 4 and slice 5 — eac
 must validate `ref_images[].mode ∈ {both,vl,ref}` at its own boundary before
 forwarding to `generate()` (mirrors the mode check `_parse_ref_image` already
 does for the CLI). Add to those slices' boundary checklists.
+Partially resolved: 2026-07-21 — ADR-035 slice 4 closed the DAEMON-WIRE half.
+`validate_ref_image_entry` (`comfyless/params_validation.py`), called from
+`validate_machine_request`, rejects any `ref_images[].mode ∉ {both,vl,ref}` at
+the canonical boundary before `generate()` runs (pinned in
+`test_machine_boundary_validator.py`). The slice-5 `--params`-replay half is
+still open — replay must validate `mode` at its own boundary before forwarding.
 
 **Edit-run sidecar records ref provenance but `--params` replay silently drops it (until slice 5)** *(2026-07-21)*
 Slice 3 records `ref_images` (path/mode/sha256) in the edit sidecar for a
@@ -1701,3 +1707,43 @@ ref-image decode without a non-regular-file rejection at the decode site.
 Fix: `O_NONBLOCK` open + `S_ISREG` check in the daemon's ref-image decode path;
 mirror the existing `_PATH_FIELDS` NUL-byte pre-check (6e) that guards the same
 boundary.
+Resolved: 2026-07-21 — ADR-035 slice 4. `load_ref_image_capped`
+(`comfyless/ref_image.py`) now opens with `os.open(path, O_RDONLY|O_NONBLOCK)`,
+`fstat`s, and raises `RefImageError` on any non-`S_ISREG` target before the read
+(fd never leaked/double-closed across the reject/success/error paths). Shared
+decode site, so foreground benefits too. Negatives pinned in `test_ref_image.py`
+(FIFO / directory / symlink-to-FIFO rejected; symlink-to-regular accepted).
+
+**ref-image daemon: TOCTOU symlink-swap between containment and decode** *(2026-07-21)*
+ADR-035 slice-4 `security-auditor` (Fable) LOW. `_check_ref_paths`
+(`comfyless/server.py`) resolves each ref path with `realpath` at check time,
+but `load_ref_image_capped` re-resolves at `os.open` time. An actor able to
+write inside a ref root (note: the daemon's own `--output-dir` is always a ref
+root) can swap an in-root symlink to an out-of-root target between check and
+open, so the daemon reads + VAE-encodes a file outside every ref root; the pixels
+land in the returned image. Why not now: under the same-UID solo model, anyone
+who can plant symlinks in a ref root can already read the target directly — this
+is a confused-deputy defense-in-depth gap, not a privilege boundary. It is the
+same trust-class shift the ADR already wills to the MCP ADR (output-dir
+read-back / cross-plant loop, ADR-035 Deferred). Trigger: when an agent-driven /
+less-trusted transport fronts the daemon (the MCP edit ADR). Fix: write the
+realpath back into `req["ref_images"][i]["path"]` after `_check_ref_paths`
+passes (shrinks the race to a single component), or open-then-fstat containment
+for full closure.
+
+**ref-image daemon: slice-4 client → pre-slice-4 daemon silently drops refs** *(2026-07-21)*
+ADR-035 slice-4 `code-reviewer` (Fable) LOW (operational). ADR-020 daemons are
+long-lived and persist across upgrades. A slice-4 client that delegates a
+`--ref-image` run to a daemon started from PRE-slice-4 code sends `ref_images`
+on the wire; the old daemon passes it through (`ref_images` is `_KIND_LIST`
+since slice 1 / unknown-key passthrough before) but its `_handle_generate` never
+forwards refs to `generate()` → the image is generated WITHOUT references and
+returns `ok` → silent keyframe drop, defeating the very invariant slice 3's
+blanket no-delegate guard protected. There is no wire version/capability
+handshake on the daemon socket. Why not now: the cheap mitigation (restart
+daemons after upgrade before ref-delegated runs) matches the existing DLW
+daemon-restart guidance; a capability gate is a clean separate slice. Trigger:
+the next daemon-protocol slice, OR any report of a delegated ref run producing
+a text2img result. Fix: client checks a daemon `ping`-reply capability/version
+before including `ref_images`; until then, restart daemons on upgrade (add to
+the Comfyless manual's daemon-restart note).

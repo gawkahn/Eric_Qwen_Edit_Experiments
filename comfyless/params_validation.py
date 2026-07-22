@@ -34,6 +34,14 @@ _KIND_FLOAT_NONE = "float|None"
 _KIND_BOOL       = "bool"
 _KIND_LIST       = "list"
 
+# ADR-035 reference-image surface. The daemon wire is the FIRST caller that is
+# not the CLI argparse layer, so mode validity, entry shape, and the count cap
+# (decision 6f) are enforced here at the canonical boundary — not by a later
+# _REF_MODE_FLAGS[...] KeyError inside generate(). Kept local so this module
+# carries no dependency on comfyless.generate (the constants there mirror these).
+_REF_IMAGE_MODES = ("both", "vl", "ref")
+_MAX_REF_IMAGES  = 8
+
 
 # Canonical-key → kind. Mirrors COMFYLESS_SCHEMA (the sidecar-shaped fields)
 # plus runtime fields the daemon adds at the wire boundary. Schema collapse
@@ -139,6 +147,19 @@ _RUNTIME_KIND = types.MappingProxyType({
     # rebalance_weights), so a str/float kind never sees a null.
     "output_format":      _KIND_STR,
     "quality":            _KIND_FLOAT,
+    # Reference-image runtime controls (ADR-035 slice 4). NOT sidecar-shaped —
+    # ref_images itself is (SCHEMA_KIND), but these two are wire-only:
+    #   ref_dims_explicit — the client's "user set BOTH width and height" signal
+    #     (from explicit_keys), so the daemon knows whether to derive output dims
+    #     from the last reference or honor --width/--height. The wire always
+    #     carries width/height (defaults 1024), so the daemon can't infer intent
+    #     without this bool.
+    #   ref_drop_strict — decision 2 / Finding 4: a reference handed to a family
+    #     with no edit path is a hard failure for machine clients and a
+    #     warn-and-proceed for the interactive CLI. Absent = strict (fail-closed);
+    #     only the interactive CLI on a TTY sends False.
+    "ref_dims_explicit":  _KIND_BOOL,
+    "ref_drop_strict":    _KIND_BOOL,
     # (The quant triple lived here until 2026-07-08 — now in SCHEMA_KIND;
     # see the note there. The wire union below is unchanged by the move.)
 })
@@ -315,6 +336,56 @@ def validate_lora_entry(entry: Any, index: int) -> ValidationResult:
     return ValidationResult(ok=True, payload=cleaned)
 
 
+def validate_ref_image_entry(entry: Any, index: int) -> ValidationResult:
+    """Validate one entry of a 'ref_images' list (ADR-035 slice 4).
+
+    Each entry is a dict with a str 'path' and a str 'mode' ∈ {both,vl,ref}.
+    Mirrors validate_lora_entry: rejects not-a-dict, missing path/mode, wrong
+    types, and any mode outside the allowlist — the LATTER is the security
+    point. The daemon wire is the first non-CLI caller of the reference surface;
+    an unvalidated 'mode' here would reach _REF_MODE_FLAGS[mode] inside
+    generate() and raise a KeyError from the ML path (TECH_DEBT precondition 2).
+    NUL-in-path is deliberately NOT checked here — it is filesystem
+    defense-in-depth owned by server._validate_request alongside the loras[i]
+    NUL check (ADR-035 6e), matching how loras split the two concerns.
+    """
+    if not isinstance(entry, dict):
+        return _make_err(
+            "invalid_type",
+            f"ref_images[{index}]",
+            f"expected dict, got {type(entry).__name__}",
+        )
+    if "path" not in entry:
+        return _make_err(
+            "missing_field", f"ref_images[{index}].path", "required field absent",
+        )
+    if "mode" not in entry:
+        return _make_err(
+            "missing_field", f"ref_images[{index}].mode", "required field absent",
+        )
+    path = entry["path"]
+    mode = entry["mode"]
+    if not isinstance(path, str):
+        return _make_err(
+            "invalid_type",
+            f"ref_images[{index}].path",
+            f"expected str, got {type(path).__name__}",
+        )
+    if not isinstance(mode, str):
+        return _make_err(
+            "invalid_type",
+            f"ref_images[{index}].mode",
+            f"expected str, got {type(mode).__name__}",
+        )
+    if mode not in _REF_IMAGE_MODES:
+        return _make_err(
+            "invalid_value",
+            f"ref_images[{index}].mode",
+            f"unknown mode {mode!r}; expected one of {', '.join(_REF_IMAGE_MODES)}",
+        )
+    return ValidationResult(ok=True, payload=dict(entry))
+
+
 def validate_machine_request(payload: Any) -> ValidationResult:
     """Validate a machine-boundary request payload against the canonical schema.
 
@@ -357,6 +428,25 @@ def validate_machine_request(payload: Any) -> ValidationResult:
                 return lora_result
             cleaned_loras.append(lora_result.payload)
         validated["loras"] = cleaned_loras
+
+    # ref_images (ADR-035 slice 4). Count cap re-checked here (decision 6f) so a
+    # non-CLI wire client cannot exceed it — 6d reads each reference wholly into
+    # memory, so N × 64 MB has no aggregate bound without this. Per-entry shape +
+    # mode allowlist via validate_ref_image_entry.
+    if "ref_images" in validated and isinstance(validated["ref_images"], list):
+        if len(validated["ref_images"]) > _MAX_REF_IMAGES:
+            return _make_err(
+                "invalid_value", "ref_images",
+                f"too many references ({len(validated['ref_images'])} > "
+                f"{_MAX_REF_IMAGES}, ADR-035 decision 6f)",
+            )
+        cleaned_refs = []
+        for i, entry in enumerate(validated["ref_images"]):
+            ref_result = validate_ref_image_entry(entry, i)
+            if not ref_result.ok:
+                return ref_result
+            cleaned_refs.append(ref_result.payload)
+        validated["ref_images"] = cleaned_refs
 
     # quant_skip / quant_only entries are component slot names from
     # model_index.json ("transformer", "text_encoder", ...). Slot names are

@@ -149,27 +149,121 @@ check("MODE ref → vl_flags=F, ref_flags=T",
       _captured["vl_flags"] == [False] and _captured["ref_flags"] == [True])
 check("negative_prompt forwarded when set", _captured["neg"] == "ugly")
 
-# ── Delegation predicate (F4): a --ref-image run NEVER delegates ─────────────
-# The regression mode of this one-token guard is a SILENT ref drop, so it gets
-# an explicit negative case (both --savepath and default-output shapes).
+# ── Delegation seam (ADR-035 slice 4, decision 7 Finding 2) ──────────────────
+# A --ref-image run delegates ONLY when every typed reference resolves inside a
+# CLI-known ref_image_root (--ref-root ∪ --model-base). Outside all roots → the
+# run stays in-process (row-1 user authority, never a silent drop). Without
+# --ref-root a ref run is unchanged from slice 3 (in-process).
 from types import SimpleNamespace
 
 
-def _args(*, savepath=None, ref_image=()):
-    return SimpleNamespace(savepath=savepath, ref_image=list(ref_image))
+def _args(*, savepath=None, ref_image=(), ref_root=(), model_base=None):
+    return SimpleNamespace(savepath=savepath, ref_image=list(ref_image),
+                           ref_root=list(ref_root), model_base=model_base)
 
 
+# Non-ref shapes unchanged.
 check("delegate: savepath + no ref → True",
       cg._should_delegate_to_server(_args(savepath="out/%seed%.png"), False) is True)
 check("delegate: default-output + no ref → True",
       cg._should_delegate_to_server(_args(), True) is True)
 check("delegate: explicit --output + no ref → False",
       cg._should_delegate_to_server(_args(), False) is False)
-check("delegate: savepath + REF → False (no silent drop)",
-      cg._should_delegate_to_server(
-          _args(savepath="out/%seed%.png", ref_image=["a.png:both"]), False) is False)
-check("delegate: default-output + REF → False (no silent drop)",
-      cg._should_delegate_to_server(_args(ref_image=["a.png"]), True) is False)
+
+# Ref shapes: roots-aware. Use a real dir so realpath containment is exercised.
+with tempfile.TemporaryDirectory() as _rroot:
+    _in_root = os.path.join(_rroot, "kf.png")
+    Path(_in_root).write_bytes(b"stub")  # existence not required, but realistic
+    _outside = os.path.join(tempfile.gettempdir(), "elsewhere_ref_xyz.png")
+
+    check("delegate: REF, no --ref-root → False (slice-3 parity, in-process)",
+          cg._should_delegate_to_server(
+              _args(savepath="out/%seed%.png", ref_image=[f"{_in_root}:both"]),
+              False) is False)
+    check("delegate: REF inside --ref-root → True",
+          cg._should_delegate_to_server(
+              _args(savepath="out/%seed%.png", ref_image=[f"{_in_root}:both"],
+                    ref_root=[_rroot]), False) is True)
+    # --model-base is a WEIGHT root, NOT a daemon ref root (6a) — a ref under it
+    # must NOT delegate (the daemon would refuse it), so it runs in-process.
+    check("delegate: REF inside --model-base only → False (weight root ≠ ref root)",
+          cg._should_delegate_to_server(
+              _args(ref_image=[_in_root], model_base=_rroot), True) is False)
+    check("delegate: REF outside all roots → False (row-1 in-process)",
+          cg._should_delegate_to_server(
+              _args(ref_image=[_outside], ref_root=[_rroot]), True) is False)
+    check("delegate: one REF in-root + one out-of-root → False (ALL must pass)",
+          cg._should_delegate_to_server(
+              _args(savepath="out/%seed%.png",
+                    ref_image=[f"{_in_root}:both", _outside],
+                    ref_root=[_rroot]), False) is False)
+    check("delegate: REF in-root but explicit --output → False (server owns path)",
+          cg._should_delegate_to_server(
+              _args(ref_image=[_in_root], ref_root=[_rroot]), False) is False)
+
+# ── Drop strictness predicate (ADR-035 slice 4, decision 2 / Finding 4) ──────
+# A reference handed to a family with no edit path: STRICT (machine/scripted) →
+# hard ValueError before generation; LENIENT (interactive) → (False, loud
+# warning) so it can be recorded + surfaced. qwen-edit + refs → (True, None).
+_is_qe, _warn = cg._resolve_ref_family_support(
+    [{"path": "kf.png", "mode": "both"}], "qwen-edit", True)
+check("drop: qwen-edit + refs → (True, no warning)", _is_qe is True and _warn is None)
+
+_is_qe, _warn = cg._resolve_ref_family_support([], "flux", True)
+check("drop: no refs → (False, no warning), strict irrelevant",
+      _is_qe is False and _warn is None)
+
+_is_qe, _warn = cg._resolve_ref_family_support(
+    [{"path": "kf.png", "mode": "both"}], "flux", False)
+check("drop: flux + refs LENIENT → (False, loud warning)",
+      _is_qe is False and _warn is not None and "not supported" in _warn
+      and "without references" in _warn)
+
+_raised = None
+try:
+    cg._resolve_ref_family_support(
+        [{"path": "kf.png", "mode": "both"}], "flux", True)
+except ValueError as e:
+    _raised = str(e)
+check("drop: flux + refs STRICT → ValueError naming the family + 'Refusing'",
+      _raised is not None and "flux" in _raised and "Refusing" in _raised)
+
+# ── Wire carriage of ref fields (ADR-035 slice 4) ────────────────────────────
+# _build_server_request must send ref_images (abspath'd) + ref_dims_explicit,
+# and — because this test process is NOT an interactive TTY — OMIT ref_drop_strict
+# so the daemon inherits its strict (fail-closed) default (decision 2 / Finding 4).
+import argparse as _ap
+
+_wire_args = _ap.Namespace(
+    precision="bf16", device="cuda", offload_vae=False,
+    attention_slicing=False, sequential_offload=False, vae_tiling="auto",
+    savepath="out/%seed%.png", quant=None, quant_skip=None, quant_only=None,
+    output_format=None, quality=None, rebalance=False, rebalance_mult=4.0,
+    ref_image=["kf.png:vl", "car.jpg"])
+_wire = cg._build_server_request(
+    _wire_args, {"model": "/m", "prompt": "p"}, [],
+    ref_dims_explicit=True)
+check("wire: ref_images present with 2 entries",
+      len(_wire.get("ref_images", [])) == 2)
+check("wire: ref_images paths absolutized",
+      all(r["path"].startswith("/") for r in _wire["ref_images"]))
+check("wire: ref_images modes preserved in order",
+      [r["mode"] for r in _wire["ref_images"]] == ["vl", "both"])
+check("wire: ref_dims_explicit forwarded", _wire.get("ref_dims_explicit") is True)
+check("wire: ref_drop_strict OMITTED when not a TTY (daemon defaults strict)",
+      "ref_drop_strict" not in _wire)
+
+# No --ref-image → none of the ref fields appear (byte-identical to pre-slice).
+_wire_noref = cg._build_server_request(
+    _ap.Namespace(precision="bf16", device="cuda", offload_vae=False,
+                  attention_slicing=False, sequential_offload=False,
+                  vae_tiling="auto", savepath="out/x.png", quant=None,
+                  quant_skip=None, quant_only=None, output_format=None,
+                  quality=None, rebalance=False, rebalance_mult=4.0,
+                  ref_image=[]),
+    {"model": "/m", "prompt": "p"}, [])
+check("wire: no --ref-image → no ref_images key",
+      "ref_images" not in _wire_noref and "ref_dims_explicit" not in _wire_noref)
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 print(f"\n{passed} passed, {failed} failed")

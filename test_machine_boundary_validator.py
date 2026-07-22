@@ -192,6 +192,72 @@ check("N17: loras[0].weight=1 (int) accepted and cast to 1.0 (float)",
       and isinstance(result.payload["loras"][0]["weight"], float))
 
 # ──────────────────────────────────────────────────────────────────────
+print("\n== ADR-035: ref_images list per-entry validation ==")
+
+# Positive: a well-formed ref_images entry is accepted and round-tripped.
+result = validate_machine_request(base_payload(
+    ref_images=[{"path": "/out/kf.png", "mode": "both"}]))
+check("ref: {path, mode=both} accepted",
+      result.ok and result.payload["ref_images"][0]["mode"] == "both")
+for _m in ("vl", "ref"):
+    r = validate_machine_request(base_payload(
+        ref_images=[{"path": "/out/kf.png", "mode": _m}]))
+    check(f"ref: mode={_m} accepted", r.ok)
+
+# The security point: an unknown mode is rejected at the boundary, never
+# reaching _REF_MODE_FLAGS[mode] inside generate() (TECH_DEBT precondition 2).
+result = validate_machine_request(base_payload(
+    ref_images=[{"path": "/out/kf.png", "mode": "evil"}]))
+check("ref: unknown mode 'evil' rejected",
+      not result.ok
+      and result.error["field"] == "ref_images[0].mode"
+      and result.error["error"] == "invalid_value")
+
+result = validate_machine_request(base_payload(
+    ref_images=[{"path": "/out/kf.png"}]))
+check("ref: missing mode rejected",
+      not result.ok
+      and result.error["field"] == "ref_images[0].mode"
+      and result.error["error"] == "missing_field")
+
+result = validate_machine_request(base_payload(
+    ref_images=[{"mode": "both"}]))
+check("ref: missing path rejected",
+      not result.ok
+      and result.error["field"] == "ref_images[0].path"
+      and result.error["error"] == "missing_field")
+
+result = validate_machine_request(base_payload(
+    ref_images=[{"path": 123, "mode": "both"}]))
+check("ref: non-str path rejected",
+      not result.ok
+      and result.error["field"] == "ref_images[0].path"
+      and "int" in result.error["reason"])
+
+result = validate_machine_request(base_payload(
+    ref_images=[{"path": "/x", "mode": 7}]))
+check("ref: non-str mode rejected",
+      not result.ok and result.error["field"] == "ref_images[0].mode")
+
+result = validate_machine_request(base_payload(ref_images=["not-a-dict"]))
+check("ref: non-dict entry rejected",
+      not result.ok
+      and result.error["field"] == "ref_images[0]"
+      and "dict" in result.error["reason"])
+
+# Count cap re-checked on the wire (decision 6f) — a non-CLI caller cannot
+# exceed 8 references.
+result = validate_machine_request(base_payload(
+    ref_images=[{"path": f"/out/{i}.png", "mode": "both"} for i in range(9)]))
+check("ref: 9 references rejected (count cap 6f)",
+      not result.ok
+      and result.error["field"] == "ref_images"
+      and result.error["error"] == "invalid_value")
+result = validate_machine_request(base_payload(
+    ref_images=[{"path": f"/out/{i}.png", "mode": "both"} for i in range(8)]))
+check("ref: exactly 8 references accepted (boundary)", result.ok)
+
+# ──────────────────────────────────────────────────────────────────────
 print("\n== N18: cross-call-site fixture grid (validator-only in step 1) ==")
 
 # Steps 3 and 4 of the slice extend this grid to also assert the server and

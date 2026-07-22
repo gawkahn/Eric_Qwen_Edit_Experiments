@@ -1553,6 +1553,31 @@ def _run_qwen_edit_refs(
     return Image.fromarray(arr), out_h, out_w, ref_provenance
 
 
+def _resolve_ref_family_support(
+    ref_images: List[Dict[str, str]], model_family: str, ref_drop_strict: bool,
+) -> Tuple[bool, Optional[str]]:
+    """Decide how a family handles reference images (ADR-035 decision 2 / Finding 4).
+
+    Returns ``(is_qwen_edit, drop_warning)``. ``drop_warning`` is a loud message
+    to BOTH record in ``edit_warnings`` (so it rides the wire metadata and is
+    visible to a delegated interactive client — invariant N1) and print, when a
+    non-qwen-edit family is handed references on the lenient path.
+
+    Raises ``ValueError`` when references are handed to an unsupported family
+    under STRICT mode — machine clients and scripted CLI runs — because a silent
+    keyframe drop in an unattended chain is the exact failure Finding 4 prevents.
+    Extracted as a predicate so both branches are unit-testable without a GPU."""
+    is_qwen_edit = bool(ref_images) and model_family == "qwen-edit"
+    if not ref_images or is_qwen_edit:
+        return is_qwen_edit, None
+    msg = (f"--ref-image not supported for model family {model_family!r} "
+           f"(only qwen-edit has a reference-image edit path).")
+    if ref_drop_strict:
+        raise ValueError(
+            msg + " Refusing rather than silently dropping the reference(s).")
+    return False, msg + " Generated without references."
+
+
 def generate(
     model_path: str,
     prompt: str,
@@ -1607,6 +1632,7 @@ def generate(
     output_format: Optional[OutputFormat] = None,
     ref_images: Optional[List[Dict[str, str]]] = None,
     ref_dims_explicit: bool = False,
+    ref_drop_strict: bool = False,
 ) -> Dict[str, Any]:
     """Generate a single image and save it.
 
@@ -1745,18 +1771,29 @@ def generate(
     # without the references (warn-don't-block; Vision failure semantics). The
     # references are consumed only on the qwen-edit branch at the call site below.
     ref_images = ref_images or []
-    is_qwen_edit = bool(ref_images) and model_family == "qwen-edit"
-    if ref_images and not is_qwen_edit:
-        print(f"[comfyless] WARNING: --ref-image ignored — model family "
-              f"{model_family!r} has no reference-image edit path (only "
-              f"qwen-edit); generating without references.", file=sys.stderr)
     # Recorded-in-metadata provenance for a truthful edit sidecar (code review
     # 2026-07-21): the sampler qwen-edit actually ran (its own flow_heun loop,
     # not --sampler, whose namespace differs), any ignored-knob warnings, and the
     # per-reference path/mode/sha256. Defaults leave text2img runs untouched.
+    # Initialised BEFORE the family-support check so a lenient drop can record
+    # its warning here (edit_warnings rides the wire metadata — see below).
     recorded_sampler = sampler
     edit_warnings: List[str] = []
     ref_provenance: List[Dict[str, Any]] = []
+    # Decision 2 / Finding 4: a reference handed to a family with no edit path is
+    # a HARD failure under STRICT mode (machine clients / scripted CLI — raised
+    # here BEFORE any generation so the daemon returns cleanly and unlinks its
+    # reservation) and a LOUD warn-and-proceed under lenient mode (interactive).
+    # The lenient warning goes into edit_warnings (not just stderr): on a
+    # delegated run stderr is the daemon's log, invisible to the client, so the
+    # message must ride the wire metadata to be surfaced client-side (invariant
+    # N1, the nag/lora pattern) — otherwise the interactive user gets a silent
+    # drop, which is exactly what the "loud warn-and-proceed" promise forbids.
+    is_qwen_edit, _ref_drop_warn = _resolve_ref_family_support(
+        ref_images, model_family, ref_drop_strict)
+    if _ref_drop_warn:
+        edit_warnings.append(_ref_drop_warn)
+        print(f"[comfyless] WARNING: {_ref_drop_warn}", file=sys.stderr)
 
     # ── Load LoRAs ────────────────────────────────────────────────────
     lora_outcomes: List[Dict[str, Any]] = []
@@ -2337,6 +2374,15 @@ def _parse_args() -> argparse.Namespace:
                    help="[--serve] Directory where the server saves generated images")
     p.add_argument("--model-base", type=str, default=None, metavar="DIR",
                    help="[--serve] Root that all model and LoRA paths must be within")
+    p.add_argument("--ref-root", action="append", default=[], metavar="DIR",
+                   help="Reference-image root (ADR-035 6a; repeatable). As a "
+                        "--serve spawn flag it ADDS to the daemon's "
+                        "ref_image_roots (= --output-dir ∪ these), the disjoint "
+                        "allowlist wire ref_images paths are contained to. As a "
+                        "client flag it lets a typed --ref-image inside one of "
+                        "these roots delegate to a running daemon; a reference "
+                        "outside all roots runs in-process (row-1 user "
+                        "authority). A root of '/' or $HOME warns loudly.")
     return p.parse_args()
 
 
@@ -2560,6 +2606,9 @@ def _run_serve_mode(args: argparse.Namespace) -> int:
             model_base=args.model_base,
             device=args.device,
             precision=args.precision,
+            # ADR-035 6a: --ref-root spawn additions to ref_image_roots
+            # (= --output-dir ∪ these). Validated + breadth-warned in run_server.
+            ref_roots=tuple(args.ref_root),
         )
         return 0
     except (FileNotFoundError, PermissionError) as e:
@@ -2657,6 +2706,7 @@ def _build_server_request(
     loras: list,
     *,
     savepath_override: Optional[str] = None,
+    ref_dims_explicit: bool = False,
 ) -> Dict[str, Any]:
     """Build the daemon wire request for one generation (pure; no I/O).
 
@@ -2727,6 +2777,23 @@ def _build_server_request(
         "nag_alpha":           p.get("nag_alpha", 0.25),
         "nag_end":             p.get("nag_end", 1.0),
     }
+    # ADR-035 slice 4: reference-image edit over the wire. Paths absolutized so
+    # the daemon's _check_ref_paths (realpath containment) and decode see them
+    # absolute. Re-validating the specs is idempotent (main() already did, and
+    # this touches no GPU / decodes nothing). Omitted entirely when empty so a
+    # plain text2img request is byte-identical to before this slice.
+    _ref_specs = _validate_ref_image_specs(getattr(args, "ref_image", None) or [])
+    if _ref_specs:
+        req["ref_images"] = [{"path": _abspath(s["path"]), "mode": s["mode"]}
+                             for s in _ref_specs]
+        req["ref_dims_explicit"] = ref_dims_explicit
+        # Drop strictness (decision 2 / Finding 4): the daemon defaults to strict
+        # on absence, so only send the lenient value from an INTERACTIVE TTY.
+        # A scripted/piped CLI invocation omits it and inherits fail-closed —
+        # nobody stumbles into a silent keyframe drop from a pipe. None-guarded
+        # so a detached stdin fails toward strict (matches the in-process gate).
+        if sys.stdin is not None and sys.stdin.isatty():
+            req["ref_drop_strict"] = False
     # ADR-034 output format. Raw CLI values (name + 0.0-1.0 fraction); the
     # daemon resolves the OutputFormat and owns the on-disk extension. Omitted
     # when None (like rebalance_weights) so the canonical str/float validator
@@ -2744,17 +2811,60 @@ def _build_server_request(
     return req
 
 
+def _cli_ref_image_roots(args: argparse.Namespace) -> tuple:
+    """The CLI's view of `ref_image_roots` for the delegation decision (ADR-035
+    6a / decision 7 Finding 2).
+
+    ONLY `--ref-root` values, realpath'd — deliberately a SUBSET of the daemon's
+    `ref_image_roots` (= `--output-dir` ∪ `--ref-root`). `--model-base` is
+    excluded on purpose: it is a WEIGHT root, disjoint from the daemon's ref
+    roots (6a), so a ref under it would delegate and then be REFUSED by the
+    daemon's `_check_ref_paths` — a wrong refusal of a legitimately typed path
+    whenever a daemon is up (the row-1-vs-row-3 conflict Finding 2 forbids). By
+    keeping this a subset, a typed ref outside `--ref-root` runs in-process with
+    row-1 user authority; it is never silently dropped and never wrongly refused.
+    The daemon cannot honor its own `--output-dir` as a CLI-known root (the CLI
+    does not learn the daemon's output dir when delegating); erring narrow is
+    safe. Slice 5's cold-path resolver widens this for replay."""
+    return tuple(os.path.realpath(r)
+                 for r in (getattr(args, "ref_root", None) or []))
+
+
+def _path_within_any(path: str, roots: tuple) -> bool:
+    """realpath containment of `path` within ANY root (mirrors server._within,
+    kept local to avoid the server import cycle)."""
+    r = os.path.realpath(path)
+    for b in roots:
+        rb = os.path.realpath(b)
+        if r == rb or r.startswith(rb + os.sep):
+            return True
+    return False
+
+
 def _should_delegate_to_server(args: argparse.Namespace,
                                using_default_output: bool) -> bool:
-    """Whether a run may be handed to the daemon (ADR-035 slice 3).
+    """Whether a run may be handed to the daemon (ADR-035 slice 4).
 
     Delegation happens on --savepath or the default output sentinel, and is
-    skipped on an explicit --output (the server owns path resolution). A
-    --ref-image run ALSO never delegates: the daemon cannot honor references
-    until slice 4, so delegating would silently generate WITHOUT them — the
-    exact silent-drop the Vision names. Extracted as a predicate so this
-    one-token guard is unit-testable (the regression mode is a silent ref drop)."""
-    return (bool(args.savepath) or using_default_output) and not args.ref_image
+    skipped on an explicit --output (the server owns path resolution).
+
+    A --ref-image run delegates ONLY when EVERY typed reference resolves inside a
+    CLI-known ref_image_root (--ref-root only; see _cli_ref_image_roots — a subset
+    of the daemon's ref roots so a delegated ref is never wrongly refused).
+    A reference outside those roots runs in-process, where a typed path carries
+    row-1 user authority with no containment gate (decision 7 Finding 2) — the
+    daemon's row-3 containment would otherwise refuse a legitimately typed path
+    the moment a daemon happens to be up. Erring toward in-process is always safe
+    and never a silent drop. Without --ref-root, a ref run has no in-root refs and
+    stays in-process exactly as slice 3 (purely additive)."""
+    if not (bool(args.savepath) or using_default_output):
+        return False
+    if args.ref_image:
+        roots = _cli_ref_image_roots(args)
+        for spec in _validate_ref_image_specs(args.ref_image):
+            if not _path_within_any(spec["path"], roots):
+                return False
+    return True
 
 
 def _delegate_to_server(
@@ -2764,6 +2874,7 @@ def _delegate_to_server(
     *,
     iterate_batch_id: Optional[str] = None,
     savepath_override: Optional[str] = None,
+    ref_dims_explicit: bool = False,
 ) -> Optional[int]:
     """Try to send this generation request to the running server.
 
@@ -2780,7 +2891,8 @@ def _delegate_to_server(
         return None
 
     req = _build_server_request(args, p, loras,
-                                savepath_override=savepath_override)
+                                savepath_override=savepath_override,
+                                ref_dims_explicit=ref_dims_explicit)
 
     # Per-layer weights: omit when unset so the daemon's _KIND_LIST validator
     # never sees a null (it defaults to the node preset server-side).
@@ -2820,6 +2932,14 @@ def _delegate_to_server(
         # stderr never reaches here (ADR-028; invariant N1).
         for _w in metadata.get("schedule_warnings") or []:
             print(f"[comfyless] WARNING: --schedule ignored — {_w}", file=sys.stderr)
+        # ADR-035 slice 4: edit-path notices (a reference dropped for an
+        # unsupported family under lenient mode; a --sampler ignored by the
+        # qwen-edit loop) happened in the daemon's process — its stderr never
+        # reaches the client. Surface them from the wire metadata so the
+        # interactive user actually sees the loud warn the ADR promises
+        # (invariant N1; mirrors nag/schedule above).
+        for _w in metadata.get("edit_warnings") or []:
+            print(f"[comfyless] WARNING: {_w}", file=sys.stderr)
         # Daemon already carries lora_warnings in the wire metadata — surface
         # them loudly client-side (ADR-015 2026-07-06).
         return _report_lora_outcome(metadata)
@@ -3489,6 +3609,11 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                 args, p_cur, loras_cur,
                 iterate_batch_id=iterate_batch_id,
                 savepath_override=wire_savepath,
+                # ADR-035 slice 4: same dims-explicit signal the in-process
+                # path uses (below) — user set BOTH width and height via
+                # --width/--height, --override, or --params (explicit_keys).
+                ref_dims_explicit=("width" in explicit_keys
+                                   and "height" in explicit_keys),
             )
             if delegate_rc is not None:
                 return delegate_rc
@@ -3577,6 +3702,16 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                 ref_images=_validate_ref_image_specs(args.ref_image),
                 ref_dims_explicit=("width" in explicit_keys
                                    and "height" in explicit_keys),
+                # Drop strictness (decision 2 / Finding 4) must match the wire:
+                # an interactive TTY is lenient (loud warn-and-proceed on an
+                # unsupported family), a scripted/piped run is strict (hard fail).
+                # Without this the in-process fallback was UNCONDITIONALLY lenient,
+                # so the same scripted command silently dropped refs when no daemon
+                # was up and hard-failed when one was — strictness must not depend
+                # on daemon availability (security review MEDIUM). None-guarded so
+                # a detached stdin fails toward strict.
+                ref_drop_strict=not (sys.stdin is not None
+                                     and sys.stdin.isatty()),
             )
             if iterate_batch_id:
                 metadata["iterate_batch_id"] = iterate_batch_id

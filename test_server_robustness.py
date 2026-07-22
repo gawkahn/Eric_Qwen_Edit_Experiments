@@ -726,6 +726,20 @@ check("nag params do NOT change the cache key (per-request safe)",
 check("nag params do NOT change the cache key under quant either",
       _K(dict(_r0, quant="fp8", nag_scale=5.0), "bf16", "cuda") == _k_fp8)
 
+# ADR-035 decision 3 pin: reference-image presence NEVER changes the pipeline
+# cache key. Pipeline class is selected once at load (detect_pipeline_class); a
+# reference must not swap class or trigger a from_pipe upgrade on the cached
+# pipeline. Same model → same class → same key, ref or no ref — so the daemon
+# serves the same cached qwen-edit pipeline across ref and non-ref requests.
+check("ref_images do NOT change the cache key (decision 3 pin)",
+      _K(dict(_r0, ref_images=[{"path": "/out/kf.png", "mode": "both"}]),
+         "bf16", "cuda") == _k_none)
+check("ref_images/ref_dims_explicit/ref_drop_strict do NOT change the key under quant",
+      _K(dict(_r0, quant="fp8",
+              ref_images=[{"path": "/out/kf.png", "mode": "vl"}],
+              ref_dims_explicit=True, ref_drop_strict=False),
+         "bf16", "cuda") == _k_fp8)
+
 # Daemon forwards the quadruple to generate(); omitted -> dormant defaults.
 _load_captured_n: dict = {}
 
@@ -1076,6 +1090,112 @@ with _tempfile.TemporaryDirectory() as _mb, \
               "FileNotFoundError",
               _raised is not None and "--transformer-path" in _raised)
 
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n== ADR-035 slice 4: ref_images wire hardening ==")
+# ──────────────────────────────────────────────────────────────────────
+# Wire-boundary validation (shape delegated to the canonical validator via
+# _validate_request), NUL defense (6e), and containment against the DISJOINT
+# ref_image_roots set (6a). Uses the REAL srv functions.
+
+_rr_base = {"type": "generate", "model": "/m", "prompt": "p"}
+
+# NUL defense (6e) — mirrors the loras[i].path NUL test. A NUL must be caught
+# here so it never reaches os.path.realpath in _check_ref_paths (accept-loop
+# kill). The entry is otherwise well-formed so it clears canonical shape first.
+_err = srv._validate_request(
+    dict(_rr_base, ref_images=[{"path": "/out/a\x00b.png", "mode": "both"}]))
+check("ref_images NUL path rejected by _validate_request (6e)",
+      _err is not None and "ref_images[0].path" in _err, f"err={_err!r}")
+
+# Shape/mode/count rejections flow through the canonical validator (surfaced as
+# a ValidationError string by _validate_request, no raise).
+_err = srv._validate_request(
+    dict(_rr_base, ref_images=[{"path": "/out/a.png", "mode": "evil"}]))
+check("ref_images bad mode rejected at wire (no KeyError)",
+      _err is not None and "mode" in _err, f"err={_err!r}")
+_err = srv._validate_request(
+    dict(_rr_base, ref_images=[{"path": "/out/a.png", "mode": "both"} for _ in range(9)]))
+check("ref_images >8 rejected at wire (count cap 6f)",
+      _err is not None and "ref_images" in _err, f"err={_err!r}")
+_err = srv._validate_request(
+    dict(_rr_base, ref_images=[{"path": "/out/a.png", "mode": "both"}]))
+check("well-formed ref_images entry passes _validate_request",
+      _err is None, f"err={_err!r}")
+
+# Containment (6a) — ref_image_roots is DISJOINT from the weight roots. A ref
+# inside an output/ref root passes; a ref only inside a WEIGHT root is refused.
+with _tempfile.TemporaryDirectory() as _outdir, \
+     _tempfile.TemporaryDirectory() as _refextra, \
+     _tempfile.TemporaryDirectory() as _weightonly:
+    _kf = _mk18(_os.path.join(_outdir, "kf.png"))
+    _kf2 = _mk18(_os.path.join(_refextra, "sub", "kf2.png"))
+    _wf = _mk18(_os.path.join(_weightonly, "in_weights.png"))
+    _ref_roots = (_outdir, _refextra)
+
+    check("ref containment: no ref_images → None",
+          srv._check_ref_paths({"model": "/m"}, _ref_roots) is None)
+    check("ref containment: ref under output root accepted",
+          srv._check_ref_paths(
+              {"ref_images": [{"path": _kf, "mode": "both"}]}, _ref_roots) is None)
+    check("ref containment: ref under a --ref-root accepted",
+          srv._check_ref_paths(
+              {"ref_images": [{"path": _kf2, "mode": "vl"}]}, _ref_roots) is None)
+    _err = srv._check_ref_paths(
+        {"ref_images": [{"path": _wf, "mode": "both"}]}, _ref_roots)
+    check("ref containment: ref only in a WEIGHT root refused (roots disjoint)",
+          _err is not None and "outside the ref-image roots" in _err, f"err={_err!r}")
+    _err = srv._check_ref_paths(
+        {"ref_images": [{"path": "rel/kf.png", "mode": "both"}]}, _ref_roots)
+    check("ref containment: relative ref path rejected",
+          _err is not None and "must be absolute" in _err, f"err={_err!r}")
+    # Empty ref roots = fail-closed (no tree readable).
+    _err = srv._check_ref_paths(
+        {"ref_images": [{"path": _kf, "mode": "both"}]}, ())
+    check("ref containment: empty ref_roots refuses everything (fail-closed)",
+          _err is not None, f"err={_err!r}")
+
+    # _resolve_ref_roots: output_dir is always a ref root; a valid --ref-root is
+    # appended; a non-dir --ref-root fails closed; NUL rejected; a broad root
+    # ('/', $HOME, a mount root) emits a loud breadth warning and PROCEEDS.
+    _roots = srv._resolve_ref_roots(_outdir, (_refextra,))
+    check("ref roots: output_dir is always included",
+          _outdir in _roots)
+    check("ref roots: a valid --ref-root is appended (realpath'd)",
+          _os.path.realpath(_refextra) in _roots)
+    _raised = None
+    try:
+        srv._resolve_ref_roots(_outdir, ("/nonexistent-adr035-ref-xyzzy",))
+    except FileNotFoundError as e:
+        _raised = str(e)
+    check("ref roots: missing --ref-root → FileNotFoundError (fail-closed)",
+          _raised is not None and "--ref-root" in _raised, f"raised={_raised!r}")
+    _raised = None
+    try:
+        srv._resolve_ref_roots(_outdir, ("a\x00b",))
+    except FileNotFoundError as e:
+        _raised = str(e)
+    check("ref roots: NUL in --ref-root → FileNotFoundError",
+          _raised is not None and "NUL" in _raised, f"raised={_raised!r}")
+
+    # Breadth warning: capture _log output and assert it fires for '/' (a real,
+    # broad, existing dir) and does NOT for a narrow keyframe dir.
+    import io as _io
+    _orig_log = srv._log
+    _cap = _io.StringIO()
+    srv._log = lambda m: _cap.write(m + "\n")
+    try:
+        srv._resolve_ref_roots(_outdir, ("/",))
+        _warned_broad = "extremely broad" in _cap.getvalue()
+        _cap2 = _io.StringIO()
+        srv._log = lambda m: _cap2.write(m + "\n")
+        srv._resolve_ref_roots(_outdir, (_refextra,))
+        _warned_narrow = "extremely broad" in _cap2.getvalue()
+    finally:
+        srv._log = _orig_log
+    check("ref roots: '/' emits the breadth warning and proceeds", _warned_broad)
+    check("ref roots: a narrow keyframe dir emits NO breadth warning",
+          not _warned_narrow)
 
 # ──────────────────────────────────────────────────────────────────────
 # Client-side recv-failure contract (2026-07-17): a daemon that ACCEPTS a
