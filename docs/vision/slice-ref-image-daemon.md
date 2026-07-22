@@ -64,21 +64,27 @@ made to block the accept loop.
   `_request_cache_key` is byte-identical with and without `ref_images`, in the
   style of the NAG pins. Ref presence must never swap pipeline class or trigger a
   `from_pipe` upgrade; the key already ignores `ref_images` — the test pins it.
-- **H. Delegation seam (decision 7, Finding 2)** — `_should_delegate_to_server`
-  loses its `and not args.ref_image` blanket skip. A `--ref-image` run now
-  delegates **iff every typed reference resolves inside a CLI-known
-  `ref_image_root`** (`--ref-root` only — a SUBSET of the daemon's ref roots;
-  `--model-base` is a weight root, disjoint from the daemon's ref roots (6a), so
-  a ref under it would delegate and then be wrongly refused by the daemon — the
-  row-1-vs-row-3 conflict Finding 2 forbids). A reference outside `--ref-root`
-  runs in-process, where row-1 user authority applies with no containment gate.
-  Erring toward in-process is always safe. Without `--ref-root`, ref runs stay
-  in-process exactly as slice 3 — the change is purely additive.
-- **I. `--ref-root DIR` CLI flag** — repeatable; a daemon spawn flag (adds to
-  `ref_image_roots`) and a client flag (widens which typed refs may delegate).
-  A `--ref-root` of `/`, a mount root, or `$HOME` prints a loud breadth warning
-  and proceeds (warn-don't-block — operator-typed, not attacker-reachable;
-  re-review Finding 6). Each configured ref root is logged at startup.
+- **H. Delegation seam (decision 7, Finding 2 — revised in slice 4b).**
+  `_should_delegate_to_server` loses its `and not args.ref_image` blanket skip. A
+  `--ref-image` run delegates on the **same rule as any run** (savepath /
+  default-output, skip explicit `--output`); the **daemon is the authoritative
+  containment gate**. A reference outside the daemon's `ref_image_roots`
+  (`--output-dir` ∪ `--ref-root`) comes back as a distinct **`RefPathError`**, on
+  which `_delegate_to_server` **falls back to in-process** (row-1 user authority)
+  with a loud warning. Keyed on the error *type*, never a message substring, so a
+  model-path `PathError` still hard-fails. **No client-side ref-root gate** — the
+  CLI cannot know the daemon's `--output-dir`, and a client `--ref-root` would
+  only work when it matched the daemon's config (removed as a client flag; it
+  stays a `--serve` spawn flag). *(The original slice-4 text — delegate iff every
+  typed ref is inside a CLI `--ref-root` — is superseded; it made keyframes in the
+  output tree run in-process and required a redundant client flag.)*
+- **I. `--ref-root DIR` — a `--serve` spawn flag only** (repeatable; revised in
+  4b). Adds to the daemon's `ref_image_roots` (= `--output-dir` ∪ these). **Not a
+  client flag** — the daemon is the authoritative gate and a client `--ref-root`
+  would only work when it matched the daemon's config (see §H). A `--ref-root` of
+  `/`, a mount root, or `$HOME` prints a loud breadth warning and proceeds
+  (warn-don't-block — operator-typed, not attacker-reachable; re-review Finding
+  6). Each configured ref root is logged at startup.
 
 ## Decisions inherited from ADR-035 (settled, not re-opened here)
 
@@ -103,7 +109,7 @@ made to block the accept loop.
 - **A malformed `ref_images` wire entry is rejected at the boundary, never
   crashes the accept loop.** Not-a-dict, missing/`non-str` `path`, missing/bad
   `mode`, > 8 entries, and a NUL in a path each return a structured
-  `ValidationError`/`PathError` and the daemon keeps serving. No `isinstance`
+  `ValidationError` and the daemon keeps serving. No `isinstance`
   predicate is added to `server._validate_request` (N19 invariant) — shape
   validity is the canonical validator's job (B); `server` owns only NUL (C) and
   containment (D).
@@ -111,7 +117,8 @@ made to block the accept loop.
   `_REF_MODE_FLAGS` lookup can never `KeyError`.
 - **Every wire-supplied reference path is `_within` `ref_image_roots`** (D), which
   is disjoint from and never merged with the weight-root allowlist. A path outside
-  is a `PathError`, logged server-side (prompt redacted) before the reply.
+  is a `RefPathError` (distinct wire type, 4b), logged server-side (prompt
+  redacted) before the reply, on which the client falls back to in-process.
 - **A FIFO / device / directory / symlink-to-non-regular passed as a reference is
   rejected before any blocking read** (A) — `open()` never hangs the daemon.
 - **The daemon decodes through `comfyless/ref_image.py` only** — same single
@@ -125,9 +132,10 @@ made to block the accept loop.
   an interactive one** (F) — the wire strictness field defaults to strict on
   absence; the video worker and scripts get fail-the-segment, not a silent
   keyframe drift.
-- **Without `--ref-root`, a `--ref-image` run behaves exactly as slice 3**
-  (in-process) — H is additive; every existing `test_ref_edit` delegation case
-  still resolves to in-process for the default (rootless) shape.
+- **A `--ref-image` run delegates on the same rule as any run** (slice 4b); a
+  reference the daemon refuses (`RefPathError`) falls back to in-process with a
+  loud warning, never a silent drop and never a hard failure. A model-path
+  `PathError` still hard-fails (fallback is keyed on the distinct error type).
 - **A non-ref `generate` request — wire or in-process — is byte-for-byte
   unchanged.** Existing `test_server_robustness` / `test_mcp_server` /
   `test_params_schema` stay green.
@@ -136,7 +144,8 @@ made to block the accept loop.
 ## Failure semantics
 
 Fail-closed at every new boundary: wire-shape violation → `ValidationError`;
-containment violation → `PathError` (server-logged, prompt redacted);
+ref-containment violation → `RefPathError` (server-logged, prompt redacted;
+client falls back to in-process); model-path violation → `PathError`;
 non-regular-file / cap / format / decode violation → `RefImageError` surfaced as
 an `InferenceError` naming path + reason, never file bytes; family-mismatch drop
 → hard `InferenceError` for machine clients (strict default), loud warn-and-
@@ -160,7 +169,7 @@ debt). No new dependency.
 - `ref_images` entry `mode` = `"evil"` / missing `mode` → `ValidationError`, no `KeyError`.
 - 9 `ref_images` entries on the wire → rejected, cap named.
 - NUL in `ref_images[i].path` → rejected (mirrors the `loras[i].path` NUL test), accept loop survives.
-- Ref path outside `ref_image_roots` → `PathError`; a path inside `--output-dir` and one inside a `--ref-root` both pass; a weight-root-only path is refused (roots disjoint).
+- Ref path outside `ref_image_roots` → `RefPathError`; a path inside `--output-dir` and one inside a `--ref-root` both pass; a weight-root-only path is refused (roots disjoint). Client turns `RefPathError` into an in-process fallback; a model-path `PathError` stays a hard error.
 - FIFO path (`os.mkfifo`) and directory path as a reference → `RefImageError`, no hang.
 - `_request_cache_key(req)` == `_request_cache_key(req + ref_images)` (decision 3 pin).
 - Drop strictness: non-qwen-edit family + refs with strict (absent field) → hard error; with lenient field → warn-proceed. (Predicate-level; full family routing is a live-GPU concern.)

@@ -450,7 +450,13 @@ def _handle_connection(
     if err:
         redacted = {k: v for k, v in req.items() if k != "prompt"}
         _log(f"RefPathError: {err} req={redacted!r}")
-        _send_safe(conn, {"status": "error", "error_type": "PathError", "error": err})
+        # DISTINCT error_type from the model-path PathError above: a reference
+        # outside the daemon's ref_image_roots is a recoverable condition the
+        # interactive client turns into an in-process fallback (ADR-035 slice 4b),
+        # whereas a model-path PathError is a hard misconfiguration. Keying the
+        # fallback on this type — not a substring of the message — keeps the two
+        # apart so a real weight-root violation never silently retries in-process.
+        _send_safe(conn, {"status": "error", "error_type": "RefPathError", "error": err})
         return True
 
     # ── Generation (wired in Step 3) ─────────────────────────────────────

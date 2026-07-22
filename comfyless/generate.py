@@ -2375,14 +2375,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--model-base", type=str, default=None, metavar="DIR",
                    help="[--serve] Root that all model and LoRA paths must be within")
     p.add_argument("--ref-root", action="append", default=[], metavar="DIR",
-                   help="Reference-image root (ADR-035 6a; repeatable). As a "
-                        "--serve spawn flag it ADDS to the daemon's "
-                        "ref_image_roots (= --output-dir ∪ these), the disjoint "
-                        "allowlist wire ref_images paths are contained to. As a "
-                        "client flag it lets a typed --ref-image inside one of "
-                        "these roots delegate to a running daemon; a reference "
-                        "outside all roots runs in-process (row-1 user "
-                        "authority). A root of '/' or $HOME warns loudly.")
+                   help="[--serve] Reference-image root (ADR-035 6a; repeatable). "
+                        "ADDS to the daemon's ref_image_roots (= --output-dir ∪ "
+                        "these) — the disjoint allowlist that wire --ref-image "
+                        "paths are contained to. Not a client flag: the daemon is "
+                        "the authoritative gate, and a --ref-image outside its "
+                        "roots falls back to in-process with a warning. A root of "
+                        "'/', a mount root, or $HOME warns loudly.")
     return p.parse_args()
 
 
@@ -2811,60 +2810,24 @@ def _build_server_request(
     return req
 
 
-def _cli_ref_image_roots(args: argparse.Namespace) -> tuple:
-    """The CLI's view of `ref_image_roots` for the delegation decision (ADR-035
-    6a / decision 7 Finding 2).
-
-    ONLY `--ref-root` values, realpath'd — deliberately a SUBSET of the daemon's
-    `ref_image_roots` (= `--output-dir` ∪ `--ref-root`). `--model-base` is
-    excluded on purpose: it is a WEIGHT root, disjoint from the daemon's ref
-    roots (6a), so a ref under it would delegate and then be REFUSED by the
-    daemon's `_check_ref_paths` — a wrong refusal of a legitimately typed path
-    whenever a daemon is up (the row-1-vs-row-3 conflict Finding 2 forbids). By
-    keeping this a subset, a typed ref outside `--ref-root` runs in-process with
-    row-1 user authority; it is never silently dropped and never wrongly refused.
-    The daemon cannot honor its own `--output-dir` as a CLI-known root (the CLI
-    does not learn the daemon's output dir when delegating); erring narrow is
-    safe. Slice 5's cold-path resolver widens this for replay."""
-    return tuple(os.path.realpath(r)
-                 for r in (getattr(args, "ref_root", None) or []))
-
-
-def _path_within_any(path: str, roots: tuple) -> bool:
-    """realpath containment of `path` within ANY root (mirrors server._within,
-    kept local to avoid the server import cycle)."""
-    r = os.path.realpath(path)
-    for b in roots:
-        rb = os.path.realpath(b)
-        if r == rb or r.startswith(rb + os.sep):
-            return True
-    return False
-
-
 def _should_delegate_to_server(args: argparse.Namespace,
                                using_default_output: bool) -> bool:
-    """Whether a run may be handed to the daemon (ADR-035 slice 4).
+    """Whether a run may be handed to the daemon (ADR-035 slice 4b).
 
     Delegation happens on --savepath or the default output sentinel, and is
     skipped on an explicit --output (the server owns path resolution).
 
-    A --ref-image run delegates ONLY when EVERY typed reference resolves inside a
-    CLI-known ref_image_root (--ref-root only; see _cli_ref_image_roots — a subset
-    of the daemon's ref roots so a delegated ref is never wrongly refused).
-    A reference outside those roots runs in-process, where a typed path carries
-    row-1 user authority with no containment gate (decision 7 Finding 2) — the
-    daemon's row-3 containment would otherwise refuse a legitimately typed path
-    the moment a daemon happens to be up. Erring toward in-process is always safe
-    and never a silent drop. Without --ref-root, a ref run has no in-root refs and
-    stays in-process exactly as slice 3 (purely additive)."""
-    if not (bool(args.savepath) or using_default_output):
-        return False
-    if args.ref_image:
-        roots = _cli_ref_image_roots(args)
-        for spec in _validate_ref_image_specs(args.ref_image):
-            if not _path_within_any(spec["path"], roots):
-                return False
-    return True
+    A --ref-image run delegates like any other: the DAEMON is the authoritative
+    gate for reference containment (`_check_ref_paths` vs its ref_image_roots =
+    --output-dir ∪ --ref-root). If a typed reference is outside those roots the
+    daemon returns a RefPathError and `_delegate_to_server` falls back to
+    in-process with a loud warning (decision 7 Finding 2, revised 4b). There is
+    NO client-side ref-root gate: the CLI cannot know the daemon's --output-dir,
+    and a client-side --ref-root would only work when it matched the daemon's
+    config — extra flag, no value, and misleading. The daemon's default
+    output-dir ref root means a ref anywhere in the output tree delegates with no
+    flags at all."""
+    return bool(args.savepath) or using_default_output
 
 
 def _delegate_to_server(
@@ -2943,6 +2906,24 @@ def _delegate_to_server(
         # Daemon already carries lora_warnings in the wire metadata — surface
         # them loudly client-side (ADR-015 2026-07-06).
         return _report_lora_outcome(metadata)
+
+    # ADR-035 slice 4b: a reference outside the daemon's configured
+    # ref_image_roots (--output-dir ∪ --ref-root) comes back as RefPathError.
+    # This is recoverable — fall back to in-process generation (return None so
+    # main() runs it locally with row-1 user authority), with a loud warning
+    # naming the reason. Keyed on the DISTINCT error_type, never a message
+    # substring, so a real model-path PathError below still hard-fails and never
+    # silently retries a weight-root violation in-process.
+    if resp.get("error_type") == "RefPathError":
+        print(f"[comfyless] WARNING: the daemon refused a --ref-image path as "
+              f"outside its configured reference-image roots (--output-dir ∪ "
+              f"--ref-root) — running in-process instead. To use the daemon for "
+              f"this reference, start it with --ref-root covering the image's "
+              f"directory (the output dir is already a ref root). Note: the "
+              f"daemon still holds its pipeline's GPU memory, so this in-process "
+              f"run shares the device — --unload the daemon if it OOMs. Reason: "
+              f"{resp.get('error', 'unknown')}", file=sys.stderr)
+        return None
 
     err = resp.get("error", "unknown error")
     print(f"Error (server): {err}", file=sys.stderr)
@@ -3595,9 +3576,10 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
         # docs/security/review-slice-DQ-daemon-quant-2026-07-03.md).
         # ADR-034 slice 2: output_format/quality ride the wire request and the
         # daemon owns the extension, so jpeg delegates like any other request.
-        # ADR-035 slice 3: a --ref-image run forces the in-process path (the
-        # daemon can't honor references until slice 4 — delegating would silently
-        # drop them). See _should_delegate_to_server for the full predicate.
+        # ADR-035 slice 4b: a --ref-image run delegates like any run — the daemon
+        # is the authoritative ref-containment gate; a reference it refuses comes
+        # back as RefPathError and _delegate_to_server falls back to in-process
+        # with a warning (no client-side ref-root gate).
         if _should_delegate_to_server(args, using_default_output):
             # Pre-expand iteration tokens client-side so the daemon receives a
             # template it can finish resolving (%seed%, %model%, etc.) without

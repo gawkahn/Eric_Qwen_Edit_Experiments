@@ -149,57 +149,95 @@ check("MODE ref → vl_flags=F, ref_flags=T",
       _captured["vl_flags"] == [False] and _captured["ref_flags"] == [True])
 check("negative_prompt forwarded when set", _captured["neg"] == "ugly")
 
-# ── Delegation seam (ADR-035 slice 4, decision 7 Finding 2) ──────────────────
-# A --ref-image run delegates ONLY when every typed reference resolves inside a
-# CLI-known ref_image_root (--ref-root ∪ --model-base). Outside all roots → the
-# run stays in-process (row-1 user authority, never a silent drop). Without
-# --ref-root a ref run is unchanged from slice 3 (in-process).
+# ── Delegation seam (ADR-035 slice 4b, decision 7 Finding 2 revised) ─────────
+# A --ref-image run delegates like ANY run — the DAEMON is the authoritative gate
+# for reference containment. There is no client-side ref-root gate: a ref outside
+# the daemon's ref_image_roots comes back as RefPathError and _delegate_to_server
+# falls back to in-process (tested below). So the predicate only depends on
+# savepath / default-output / explicit --output — identical for ref and non-ref.
 from types import SimpleNamespace
 
 
-def _args(*, savepath=None, ref_image=(), ref_root=(), model_base=None):
-    return SimpleNamespace(savepath=savepath, ref_image=list(ref_image),
-                           ref_root=list(ref_root), model_base=model_base)
+def _args(*, savepath=None, ref_image=()):
+    return SimpleNamespace(savepath=savepath, ref_image=list(ref_image))
 
 
-# Non-ref shapes unchanged.
 check("delegate: savepath + no ref → True",
       cg._should_delegate_to_server(_args(savepath="out/%seed%.png"), False) is True)
 check("delegate: default-output + no ref → True",
       cg._should_delegate_to_server(_args(), True) is True)
 check("delegate: explicit --output + no ref → False",
       cg._should_delegate_to_server(_args(), False) is False)
+# Ref runs delegate on the SAME rule now (no ref-root gate) — the daemon decides.
+check("delegate: savepath + REF → True (daemon is the gate, 4b)",
+      cg._should_delegate_to_server(
+          _args(savepath="out/%seed%.png", ref_image=["kf.png:both"]), False) is True)
+check("delegate: default-output + REF → True (4b)",
+      cg._should_delegate_to_server(_args(ref_image=["kf.png"]), True) is True)
+check("delegate: explicit --output + REF → False (server owns path)",
+      cg._should_delegate_to_server(_args(ref_image=["kf.png"]), False) is False)
 
-# Ref shapes: roots-aware. Use a real dir so realpath containment is exercised.
-with tempfile.TemporaryDirectory() as _rroot:
-    _in_root = os.path.join(_rroot, "kf.png")
-    Path(_in_root).write_bytes(b"stub")  # existence not required, but realistic
-    _outside = os.path.join(tempfile.gettempdir(), "elsewhere_ref_xyz.png")
+# ── RefPathError auto-fallback (slice 4b) ────────────────────────────────────
+# When the daemon refuses a ref as outside its roots, the client must FALL BACK
+# to in-process (return None), not hard-fail — and ONLY for RefPathError, never
+# for a model-path PathError (which stays a hard error, rc 1).
+import io as _io
+import contextlib as _ctxlib
 
-    check("delegate: REF, no --ref-root → False (slice-3 parity, in-process)",
-          cg._should_delegate_to_server(
-              _args(savepath="out/%seed%.png", ref_image=[f"{_in_root}:both"]),
-              False) is False)
-    check("delegate: REF inside --ref-root → True",
-          cg._should_delegate_to_server(
-              _args(savepath="out/%seed%.png", ref_image=[f"{_in_root}:both"],
-                    ref_root=[_rroot]), False) is True)
-    # --model-base is a WEIGHT root, NOT a daemon ref root (6a) — a ref under it
-    # must NOT delegate (the daemon would refuse it), so it runs in-process.
-    check("delegate: REF inside --model-base only → False (weight root ≠ ref root)",
-          cg._should_delegate_to_server(
-              _args(ref_image=[_in_root], model_base=_rroot), True) is False)
-    check("delegate: REF outside all roots → False (row-1 in-process)",
-          cg._should_delegate_to_server(
-              _args(ref_image=[_outside], ref_root=[_rroot]), True) is False)
-    check("delegate: one REF in-root + one out-of-root → False (ALL must pass)",
-          cg._should_delegate_to_server(
-              _args(savepath="out/%seed%.png",
-                    ref_image=[f"{_in_root}:both", _outside],
-                    ref_root=[_rroot]), False) is False)
-    check("delegate: REF in-root but explicit --output → False (server owns path)",
-          cg._should_delegate_to_server(
-              _args(ref_image=[_in_root], ref_root=[_rroot]), False) is False)
+
+class _FakeSock:
+    def exists(self):
+        return True
+
+
+def _deleg_args():
+    return SimpleNamespace(
+        device="cuda", precision="bf16", offload_vae=False,
+        attention_slicing=False, sequential_offload=False, vae_tiling="auto",
+        savepath="out/%seed%.png", quant=None, quant_skip=None, quant_only=None,
+        output_format=None, quality=None, rebalance=False, rebalance_mult=4.0,
+        rebalance_weights=None, ref_image=["/somewhere/kf.png:both"])
+
+
+import comfyless.server as _srvmod
+_orig_socket_path = _srvmod.socket_path
+_orig_send = cg._send_server_command
+try:
+    _srvmod.socket_path = lambda device="cuda": _FakeSock()
+
+    cg._send_server_command = lambda req, device="cuda": {
+        "status": "error", "error_type": "RefPathError",
+        "error": "ref_images[0].path outside the ref-image roots: '/somewhere/kf.png'"}
+    _buf = _io.StringIO()
+    with _ctxlib.redirect_stderr(_buf):
+        _rc = cg._delegate_to_server(_deleg_args(), {"model": "/m", "prompt": "p"}, [])
+    check("fallback: RefPathError → returns None (run in-process)", _rc is None)
+    check("fallback: RefPathError prints a loud reason on stderr",
+          "reference-image roots" in _buf.getvalue()
+          and "in-process" in _buf.getvalue())
+
+    # A model-path PathError is NOT recoverable — hard error, rc 1, no fallback.
+    cg._send_server_command = lambda req, device="cuda": {
+        "status": "error", "error_type": "PathError",
+        "error": "model path outside the allowed roots: '/evil'"}
+    _buf2 = _io.StringIO()
+    with _ctxlib.redirect_stderr(_buf2):
+        _rc2 = cg._delegate_to_server(_deleg_args(), {"model": "/m", "prompt": "p"}, [])
+    check("fallback: model-path PathError → rc 1 (hard error, NOT in-process)",
+          _rc2 == 1)
+
+    # An error response with NO error_type (e.g. a synthetic ClientRecvError or a
+    # legacy daemon) must fail closed to rc 1 — never a fallback on an unknown error.
+    cg._send_server_command = lambda req, device="cuda": {
+        "status": "error", "error": "something unexpected"}
+    _buf3 = _io.StringIO()
+    with _ctxlib.redirect_stderr(_buf3):
+        _rc3 = cg._delegate_to_server(_deleg_args(), {"model": "/m", "prompt": "p"}, [])
+    check("fallback: error with no error_type → rc 1 (fail-closed default)",
+          _rc3 == 1)
+finally:
+    _srvmod.socket_path = _orig_socket_path
+    cg._send_server_command = _orig_send
 
 # ── Drop strictness predicate (ADR-035 slice 4, decision 2 / Finding 4) ──────
 # A reference handed to a family with no edit path: STRICT (machine/scripted) →

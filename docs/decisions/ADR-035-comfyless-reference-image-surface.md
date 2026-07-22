@@ -544,6 +544,31 @@ convention, and Qwen-Image-Edit-2511 is the *Plus* multi-reference variant where
 
 ## Changelog
 
+- 2026-07-21 — **Slice 4b — delegation seam revised to daemon-authoritative +
+  in-process fallback (Finding 2 re-resolution).** Live testing of slice 4
+  showed the client-side `--ref-root` gate was the wrong ergonomics: the CLI
+  cannot know the daemon's `--output-dir` (a default ref root), so a keyframe in
+  the output tree — the common case — silently ran in-process instead of
+  delegating, and a client `--ref-root` only "worked" when it happened to match
+  the daemon's config (extra flag, no value, misleading). Revised resolution of
+  decision 7 Finding 2: **there is no client-side ref-root gate.** A
+  `--ref-image` run delegates on the same rule as any run (savepath /
+  default-output, skip explicit `--output`); the **daemon is the authoritative
+  containment gate**. A reference outside the daemon's `ref_image_roots`
+  (`--output-dir` ∪ `--ref-root`) returns a **distinct `RefPathError`** wire
+  type, on which `_delegate_to_server` **falls back to in-process** (row-1 user
+  authority) with a loud warning naming the reason. The fallback keys on the
+  error *type*, never a message substring, so a model-path `PathError` still
+  hard-fails and never silently retries a weight-root violation in-process. This
+  preserves both guarantees Finding 2 required (a legitimately typed path is
+  never wrongly refused; a wire path is always contained) without the client
+  needing to know the daemon's roots. `--ref-root` remains a `--serve` spawn
+  flag only (removed as a client flag; `_cli_ref_image_roots` /
+  `_path_within_any` deleted). Tests: `test_ref_edit` delegation cases rewritten
+  (ref runs delegate on the same rule; RefPathError→None fallback and
+  PathError→rc1 hard-fail both pinned). `code-reviewer` + `security-auditor`
+  (Fable) on the diff. Does not change the daemon-side containment, decode, caps,
+  or cache-key invariant landed in slice 4.
 - 2026-07-21 — **Slice 4 landed (daemon reference-image path).** The persistent
   daemon (ADR-020) now honors `--ref-image`, so a qwen-edit run reuses a resident
   pipeline instead of the slice-3 forced in-process path. New/changed:
