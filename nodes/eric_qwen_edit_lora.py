@@ -879,6 +879,73 @@ def _rename_lora_down_up(state_dict: dict) -> dict:
     return renamed
 
 
+def _bake_lora_alpha_scales(state_dict: dict, log_prefix: str = "[LoRA]") -> dict:
+    """Fold each LoRA module's ``alpha/rank`` scale into its weights and drop the
+    ``.alpha`` keys, matching diffusers' ``_convert_non_diffusers_qwen_lora_to_diffusers``
+    ``get_alpha_scales`` numerics exactly (scale split across down/up, product
+    preserved).
+
+    WHY (root cause of the "over-strength LoRA → noise" bug): diffusers' pipeline
+    loader bakes alpha ONLY when it sees the kohya ``lora_down``/``lora_up``
+    layout. If we hand it ``lora_A``/``lora_B`` + orphan ``.alpha`` (which is what
+    ``_rename_lora_down_up`` used to produce before the pipeline load), the
+    converter takes its "already in diffusers format" branch, copies the weights
+    **unscaled**, and **discards** the ``.alpha`` keys — silently dropping the
+    ``alpha/rank`` scale. On a LoRA with ``alpha != rank`` that applies the LoRA
+    far too strong (e.g. rank 64 / alpha 16 → 4×) across every module → garbage.
+
+    Baking here, BEFORE any rename/load, makes every downstream path (pipeline
+    "already-diffusers" branch, direct PEFT injection, direct merge) apply the
+    correct magnitude, because they all then see no ``.alpha`` and default to
+    scale 1.0 on pre-scaled weights. Handles ``lora_down``/``lora_up`` OR
+    ``lora_A``/``lora_B`` naming. A dict with no ``.alpha`` keys (already-diffusers
+    LoRAs) is returned unchanged, and ``alpha == rank`` bakes to a numeric no-op —
+    so neither case regresses.
+    """
+    alpha_keys = [k for k in state_dict if k.endswith(".alpha")]
+    if not alpha_keys:
+        return state_dict
+    out = dict(state_dict)
+    baked = 0
+    for ak in alpha_keys:
+        base = ak[:-len(".alpha")]  # module path minus the .alpha suffix
+        down_k = next((f"{base}.{s}" for s in ("lora_down.weight", "lora_A.weight")
+                       if f"{base}.{s}" in out), None)
+        up_k = next((f"{base}.{s}" for s in ("lora_up.weight", "lora_B.weight")
+                     if f"{base}.{s}" in out), None)
+        if down_k is None or up_k is None:
+            continue  # orphan alpha with no paired weights — leave it be
+        down = out[down_k]
+        rank = down.shape[0]
+        if rank <= 0:
+            continue
+        # Corrupt-file guards (code review): a multi-element .alpha would raise
+        # in .item(); a non-positive alpha would spin the balancing loop below
+        # (diffusers itself hangs on negative alpha). Skip such keys — leave them
+        # in place, unscaled — rather than crash or hang the whole load.
+        if out[ak].numel() != 1:
+            continue
+        alpha = out[ak].item()
+        if alpha <= 0:
+            continue
+        scale = alpha / rank
+        # diffusers get_alpha_scales: balance the scale across down/up so neither
+        # tensor gets an extreme multiplier; the PRODUCT stays alpha/rank exactly.
+        scale_down, scale_up = scale, 1.0
+        while scale_down * 2 < scale_up:
+            scale_down *= 2
+            scale_up /= 2
+        out[down_k] = down * scale_down
+        out[up_k] = out[up_k] * scale_up
+        del out[ak]
+        baked += 1
+    if baked:
+        print(f"{log_prefix} Baked alpha/rank scale into {baked} LoRA modules "
+              f"(matches the diffusers converter; prevents the alpha-drop "
+              f"over-strength that reads as noise)")
+    return out
+
+
 def _load_lora_adapter(pipe, state_dict: dict, adapter_name: str,
                        log_prefix: str = "[LoRA]",
                        weight: float = 1.0) -> bool:
@@ -897,6 +964,10 @@ def _load_lora_adapter(pipe, state_dict: dict, adapter_name: str,
     Returns True if at least one module was patched (see _load_lokr_adapter
     docstring for return-value semantics).
     """
+    # Bake alpha/rank into the weights + drop .alpha keys BEFORE renaming, so the
+    # diffusers pipeline load (which drops orphan .alpha on lora_A/lora_B dicts)
+    # can't lose the scale. See _bake_lora_alpha_scales for the full rationale.
+    state_dict = _bake_lora_alpha_scales(state_dict, log_prefix)
     # Normalise lora_down/lora_up → lora_A/lora_B
     state_dict = _rename_lora_down_up(state_dict)
 
@@ -967,8 +1038,18 @@ def _load_lora_adapter_peft(pipe, state_dict: dict, adapter_name: str,
     if r_val is None:
         r_val = 64  # common default
 
+    # Only honour an .alpha whose module actually has a paired lora_A tensor.
+    # After _bake_lora_alpha_scales (the caller pre-bakes) there are normally no
+    # .alpha keys left; an ORPHAN .alpha — one whose weights were dropped, e.g.
+    # by _normalize_keys on a partially-matching file — must NOT be picked up as
+    # the GLOBAL lora_alpha, or it would double-scale the already-baked weights
+    # (code review). A module with real (non-baked) alpha is still honoured for
+    # any caller that reaches here without pre-baking.
     for key, val in state_dict.items():
         if key.endswith(".alpha") and val.numel() == 1:
+            base = key[:-len(".alpha")]
+            if f"{base}.lora_A.weight" not in state_dict:
+                continue  # orphan alpha — no paired weights; ignore it
             alpha_val = val.item()
             break
     if alpha_val is None:
