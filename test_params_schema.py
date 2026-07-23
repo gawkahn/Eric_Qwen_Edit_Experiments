@@ -1370,14 +1370,26 @@ with _tf.TemporaryDirectory() as _d:
 
 check("empty --ref-image list is a clean no-op", g._validate_ref_image_specs([]) == [])
 
-# Schema recognition + fail-closed deferral.
+# Schema recognition + replay trust (ADR-035 slice 5).
 check("ref_images is a recognized schema key (list, default [])",
       _SCHEMA.get("ref_images") == (list, []))
-check("ref_images is replay-dropped until slice 5 (fail-closed)",
-      "ref_images" in g._SKIP_SIDECAR_KEYS)
+check("ref_images is NOT replay-skipped (slice 5: replays via the decision-7 "
+      "trust gate)", "ref_images" not in g._SKIP_SIDECAR_KEYS)
+# The sidecar loader must therefore let the key through for the gate to judge.
+with tempfile.TemporaryDirectory() as _d5:
+    _sc5 = _os.path.join(_d5, "run.json")
+    with open(_sc5, "w") as _f5:
+        json.dump({"prompt": "p", "ref_images":
+                   [{"path": "/a/kf.png", "mode": "both", "sha256": "0" * 64,
+                     "applied": True}]}, _f5)
+    _p5 = g._load_sidecar(_sc5)
+    check("_load_sidecar carries ref_images through to the gate",
+          isinstance(_p5.get("ref_images"), list) and len(_p5["ref_images"]) == 1)
 
 # Wire inertness — FUNCTIONAL, not a source grep (review Finding 1): a params
-# dict carrying ref_images must NOT produce a wire request that carries it.
+# dict carrying ref_images must NOT produce a wire request that carries it —
+# still true in slice 5: the gate pops the key from `p` and re-injects
+# survivors through args.ref_image; `p` itself never feeds the wire.
 import argparse as _ap  # noqa: E402
 _stub_ns = _ap.Namespace(
     precision="bf16", device="cuda:0", offload_vae=False, attention_slicing=False,

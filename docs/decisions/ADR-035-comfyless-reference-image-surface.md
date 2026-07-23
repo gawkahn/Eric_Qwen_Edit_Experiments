@@ -544,6 +544,58 @@ convention, and Qwen-Image-Edit-2511 is the *Plus* multi-reference variant where
 
 ## Changelog
 
+- 2026-07-22 — **Slice 5 landed (replay trust, decision 7 row 2).** `ref_images`
+  removed from `_SKIP_SIDECAR_KEYS`: a `--params` sidecar / comfyless PNG chunk
+  now REPLAYS its recorded references — but only through the new
+  `_gate_file_derived_refs` in `_run_cli_mode`, which implements the
+  file-derived trust class: loud per-path echo naming path+mode; **outside-roots
+  → the run is refused** (exit 2) with the retype-at-CLI escape hatch;
+  missing file → loud warning, never relocated; recorded-SHA-256 vs on-disk
+  mismatch → louder warning (warn-don't-block); malformed structure / bad MODE /
+  NUL / over-cap → hard error, never a default. **Gate ordering is load-bearing:
+  containment is checked before any file I/O on the path** — the gate never
+  performs the attacker-directed read it exists to refuse (the hash check runs
+  only on in-roots files, via the new decode-free `ref_image.hash_ref_file`,
+  which shares the bounded single read + S_ISREG guard with
+  `load_ref_image_capped`). Replay roots per Finding 1: output dir ∪
+  `--ref-root` ∪ weight roots (parent dirs of the run's resolved path-shaped
+  weight params; HF repo ids and nonexistent paths contribute nothing).
+  Survivors re-enter through the TYPED channel (`args.ref_image` as
+  `PATH:MODE`, exact round-trip), so delegation, the daemon's row-3
+  containment, dims logic, and execution all flow through the one existing
+  channel — `p` never carries `ref_images` to `generate()` or the wire
+  (slice-1 wire-inertness pin still holds). The pop→gate→inject seam is
+  `_apply_replay_ref_trust`, extracted for direct unit testing.
+  **Replay roots come ONLY from operator-supplied sources** (`security-auditor`
+  CRITICAL-1, folded pre-commit): the explicit `--output` dir, `--ref-root`,
+  and CLI-**typed** weight paths (`args.model/…`, row-1 authority) — NEVER the
+  sidecar's own `model`/`*_path` values. Finding 1's original "resolved weight
+  roots" wording admitted attacker-craftable paths on the cold in-process path
+  (which has no `_check_paths` gate, decision 7), letting a crafted sidecar name
+  a secret's directory as "model" and self-authorize a co-located ref — the
+  exact read-any-file primitive this gate exists to close. The default
+  `--output` sentinel (`/tmp/comfyless.png`) is also excluded (LOW-1: /tmp is
+  world-writable). Refused paths are echoed via `repr()` (MEDIUM-1: an
+  attacker-controlled path cannot drive terminal escapes at the "verify" prompt). A typed `--ref-image` REPLACES
+  file-derived refs entirely with a notice (Finding 8, typed-replaces-
+  file-derived; never merged). The recorded `applied` flag is provenance-only —
+  family routing re-decides on replay. Deliberately still closed: the
+  Eric-Diffusion-Save `parameters` chunk drops `ref_images` PERMANENTLY (node
+  chunks carry no verifiable comfyless provenance — mirror of its `loras`
+  precedent, now with a warning); `--json` and MCP never consume
+  `ref_images` from params. Refine seed entry (row 2's third channel):
+  `build_config_from_seed` now ECHOES each seed ref path with the F4
+  outside-roots flag and DROPS them from the working config with a notice —
+  refine has no ref execution path, and carrying them would be silently-inert
+  config a future slice could execute ungated; replay belongs to
+  `generate --params`. `--override ref_images=...` cannot bypass: `p`-carried
+  refs are popped and gated regardless of layer. Tests: `test_ref_edit.py`
+  65→92 (gate happy/warn paths, outside-roots refusal, **no-read-on-refusal
+  negative**, structure fail-closed set, colon-path round-trip, replay-roots
+  composition), `test_params_schema.py` (skip-set pin flipped + sidecar
+  carry-through; wire-inertness pin unchanged and still green),
+  `test_refine.py` (seed ref echo+drop incl. malformed-entry no-crash),
+  `test_ref_image.py` refactor-neutral. Full battery 29/29 suites.
 - 2026-07-21 — **Slice 4b — delegation seam revised to daemon-authoritative +
   in-process fallback (Finding 2 re-resolution).** Live testing of slice 4
   showed the client-side `--ref-root` gate was the wrong ergonomics: the CLI

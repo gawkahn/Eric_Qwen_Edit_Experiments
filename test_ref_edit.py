@@ -396,6 +396,205 @@ _wire_noref = cg._build_server_request(
 check("wire: no --ref-image → no ref_images key",
       "ref_images" not in _wire_noref and "ref_dims_explicit" not in _wire_noref)
 
+# ── Replay trust gate (ADR-035 slice 5, decision 7) ──────────────────────────
+# File-derived ref paths (a --params sidecar / PNG chunk) are honored only
+# through _gate_file_derived_refs: loud echo, outside-roots REFUSAL,
+# missing-file / sha-mismatch warnings, and — load-bearing — no file I/O on a
+# path that fails containment.
+import contextlib as _ctx
+import io as _io
+
+import comfyless.ref_image as cri
+from comfyless.ref_image import RefImageError, hash_ref_file, load_ref_image_capped
+
+_troot = tempfile.mkdtemp()
+_rroot = os.path.join(_troot, "outdir")
+os.makedirs(_rroot)
+_kf = os.path.join(_rroot, "kf.png")
+Image.new("RGB", (16, 16), (1, 2, 3)).save(_kf)
+
+# hash_ref_file: the gate's no-decode hash primitive.
+_sha = hash_ref_file(_kf)
+check("hash_ref_file matches load_ref_image_capped's sha256",
+      _sha == load_ref_image_capped(_kf).sha256)
+try:
+    hash_ref_file(_kf, max_bytes=4)
+    _hr = False
+except RefImageError:
+    _hr = True
+check("hash_ref_file enforces the byte cap", _hr)
+try:
+    hash_ref_file(os.path.join(_troot, "nope.png"))
+    _hr2 = False
+except RefImageError:
+    _hr2 = True
+check("hash_ref_file raises on a missing file", _hr2)
+
+
+def _gate(entries, roots, src="--params test.json"):
+    """Run the gate capturing stderr → (specs|None, stderr, error|None)."""
+    err = _io.StringIO()
+    with _ctx.redirect_stderr(err):
+        try:
+            out = cg._gate_file_derived_refs(entries, roots, src)
+        except ValueError as e:
+            return None, err.getvalue(), str(e)
+    return out, err.getvalue(), None
+
+
+_specs, _err, _exc = _gate(
+    [{"path": _kf, "mode": "vl", "sha256": _sha, "applied": True}], (_rroot,))
+check("gate: in-roots entry passes with absolutized spec",
+      _exc is None and _specs == [{"path": _kf, "mode": "vl"}], detail=str(_exc))
+check("gate: echo names the path and mode", _kf in _err and "(vl)" in _err)
+check("gate: matching sha → no mismatch flag", "MISMATCH" not in _err)
+
+_specs2, _err2, _exc2 = _gate(
+    [{"path": _kf, "mode": "both", "sha256": "0" * 64}], (_rroot,))
+check("gate: sha mismatch warns LOUDLY but passes (warn-don't-block)",
+      _exc2 is None and len(_specs2) == 1 and "SHA-256 MISMATCH" in _err2)
+
+_gone = os.path.join(_rroot, "gone.png")
+_specs3, _err3, _exc3 = _gate([{"path": _gone, "mode": "ref"}], (_rroot,))
+check("gate: missing file warns (replay never relocates) but passes",
+      _exc3 is None and len(_specs3) == 1 and "MISSING" in _err3
+      and "never relocates" in _err3)
+
+_out_png = os.path.join(_troot, "outside.png")
+Image.new("RGB", (8, 8)).save(_out_png)
+_specs4, _err4, _exc4 = _gate(
+    [{"path": _out_png, "mode": "both", "sha256": _sha}], (_rroot,))
+check("gate: outside-roots path REFUSED with the retype escape hatch",
+      _specs4 is None and _exc4 is not None and "--ref-image" in _exc4)
+check("gate: refusal echo flags the offender", "REFUSED" in _err4)
+
+# NEGATIVE (the gate's core security property): a refused path is never read —
+# the gate must not itself perform the attacker-directed read it refuses.
+_read_trap = {"hit": False}
+_orig_hash = cri.hash_ref_file
+
+
+def _trap(path, *a, **k):
+    _read_trap["hit"] = True
+    return _orig_hash(path, *a, **k)
+
+
+cri.hash_ref_file = _trap
+try:
+    _gate([{"path": _out_png, "mode": "both", "sha256": _sha}], (_rroot,))
+finally:
+    cri.hash_ref_file = _orig_hash
+check("gate: NO file read on a refused path", _read_trap["hit"] is False)
+
+# Malformed structure → hard error, never a default (fail-closed, Finding 4).
+for _name, _bad in [
+    ("non-list ref_images", {"path": _kf}),
+    ("non-dict entry", ["x"]),
+    ("entry without a path", [{"mode": "both"}]),
+    ("NUL byte in path (6e)", [{"path": "/a\x00b.png", "mode": "both"}]),
+    ("unknown mode", [{"path": _kf, "mode": "wild"}]),
+    ("absent mode never defaults", [{"path": _kf}]),
+    ("count over the 6f cap", [{"path": _kf, "mode": "both"}] * 9),
+]:
+    _s, _e, _x = _gate(_bad, (_rroot,))
+    check(f"gate: {_name} → hard error", _s is None and _x is not None)
+
+_specs5, _, _exc5 = _gate([{"path": _kf, "mode": "vl", "applied": False}], (_rroot,))
+check("gate: recorded applied=False is provenance-only (still replayed)",
+      _exc5 is None and len(_specs5) == 1)
+
+# Echo escapes control chars via repr() (security review MEDIUM-1): a refused
+# path carrying an ESC sequence must not reach the terminal raw.
+_esc = "/x/\x1b]0;pwned\x07evil.png"
+_, _err_esc, _ = _gate([{"path": _esc, "mode": "both"}], (_rroot,))
+check("gate: echo escapes control chars (no raw ESC on stderr)",
+      "\x1b" not in _err_esc and "\\x1b" in _err_esc)
+
+# ── _replay_ref_roots (decision 7 Finding 1, hardened per CRITICAL-1) ─────────
+# Roots come ONLY from operator sources: explicit --output dir, --ref-root, and
+# CLI-TYPED weight args — NEVER the untrusted sidecar's own params.
+_ra = _ap.Namespace(output=os.path.join(_rroot, "img.png"), ref_root=[_troot],
+                    model="owner/repo", transformer=_kf, vae="/does/not/exist",
+                    upscale_vae=None, te1=None, te2=None)
+_roots = cg._replay_ref_roots(_ra)
+check("roots: explicit --output dir included", os.path.realpath(_rroot) in _roots)
+check("roots: --ref-root included", os.path.realpath(_troot) in _roots)
+check("roots: existing CLI-typed weight dir included (deduped)",
+      _roots.count(os.path.realpath(_rroot)) == 1)
+check("roots: HF repo id (--model) contributes no cwd-relative root",
+      all("owner" not in r for r in _roots))
+check("roots: nonexistent CLI weight path contributes nothing",
+      all(not r.startswith("/does") for r in _roots))
+
+# CRITICAL-1 negative: the default --output sentinel does NOT make /tmp a root.
+_ra_def = _ap.Namespace(output="/tmp/comfyless.png", ref_root=[], model=None,
+                        transformer=None, vae=None, upscale_vae=None,
+                        te1=None, te2=None)
+check("roots: default /tmp output sentinel is NOT a root (LOW-1)",
+      cg._replay_ref_roots(_ra_def) == ())
+
+# ── The seam: _apply_replay_ref_trust (pop → gate → inject) ───────────────────
+# CRITICAL-1: a sidecar's OWN weight path must NOT authorize a co-located ref.
+# The gate reads roots from args only, so a sidecar naming a secret's directory
+# as "model" cannot self-authorize a ref beside it.
+_secret_dir = tempfile.mkdtemp()
+_secret = os.path.join(_secret_dir, "secret.png")  # stand-in for any readable file
+Image.new("RGB", (8, 8)).save(_secret)
+_read_after_refuse = {"hit": False}
+cri.hash_ref_file = lambda p, *a, **k: (_read_after_refuse.__setitem__("hit", True)
+                                        or _orig_hash(p, *a, **k))
+_p_attack = {"model": _secret_dir,  # sidecar tries to self-authorize its dir
+             "ref_images": [{"path": _secret, "mode": "both"}]}
+_args_attack = _ap.Namespace(ref_image=[], params="evil.json", output=None,
+                             ref_root=[], model=None, transformer=None, vae=None,
+                             upscale_vae=None, te1=None, te2=None)
+_err_at = _io.StringIO()
+with _ctx.redirect_stderr(_err_at):
+    _rc_at = cg._apply_replay_ref_trust(_args_attack, _p_attack)
+cri.hash_ref_file = _orig_hash
+check("seam: sidecar weight path CANNOT authorize a co-located ref (CRITICAL-1)",
+      _rc_at == 2)
+check("seam: refused sidecar ref triggers NO file read", _read_after_refuse["hit"] is False)
+check("seam: ref_images popped off p (never reaches generate/wire)",
+      "ref_images" not in _p_attack)
+
+# Happy seam: an in-roots sidecar ref is gated and re-injected as a typed spec.
+_args_ok = _ap.Namespace(ref_image=[], params="run.json", output=os.path.join(_rroot, "o.png"),
+                         ref_root=[], model=None, transformer=None, vae=None,
+                         upscale_vae=None, te1=None, te2=None)
+_p_ok = {"ref_images": [{"path": _kf, "mode": "vl", "sha256": _sha}]}
+with _ctx.redirect_stderr(_io.StringIO()):
+    _rc_ok = cg._apply_replay_ref_trust(_args_ok, _p_ok)
+check("seam: in-roots sidecar ref proceeds (rc None)", _rc_ok is None)
+check("seam: survivor re-injected through typed args.ref_image",
+      _args_ok.ref_image == [f"{_kf}:vl"] and "ref_images" not in _p_ok)
+
+# Typed --ref-image REPLACES file-derived (Finding 8) with a NOTE, gate never runs.
+_gate_ran = {"hit": False}
+_orig_gate = cg._gate_file_derived_refs
+cg._gate_file_derived_refs = lambda *a, **k: _gate_ran.__setitem__("hit", True) or []
+_args_typed = _ap.Namespace(ref_image=["typed.png:both"], params="run.json",
+                            output=None, ref_root=[], model=None, transformer=None,
+                            vae=None, upscale_vae=None, te1=None, te2=None)
+_p_typed = {"ref_images": [{"path": _kf, "mode": "vl"}]}
+_err_typed = _io.StringIO()
+with _ctx.redirect_stderr(_err_typed):
+    _rc_typed = cg._apply_replay_ref_trust(_args_typed, _p_typed)
+cg._gate_file_derived_refs = _orig_gate
+check("seam: typed --ref-image proceeds without running the gate",
+      _rc_typed is None and _gate_ran["hit"] is False)
+check("seam: typed-replaces-file-derived prints a NOTE (Finding 8)",
+      "replaces the ref_images recorded" in _err_typed.getvalue())
+check("seam: typed args.ref_image left untouched",
+      _args_typed.ref_image == ["typed.png:both"] and "ref_images" not in _p_typed)
+
+# No ref_images → clean no-op.
+_p_none = {"prompt": "p"}
+check("seam: no ref_images → None, p untouched",
+      cg._apply_replay_ref_trust(
+          _ap.Namespace(ref_image=[], params=None), _p_none) is None
+      and _p_none == {"prompt": "p"})
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

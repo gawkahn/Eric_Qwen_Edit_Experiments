@@ -65,21 +65,14 @@ class LoadedRefImage:
     size_bytes: int
 
 
-def load_ref_image_capped(
-    path: str,
-    max_bytes: int = REF_IMAGE_MAX_BYTES,
-    max_pixels: int = REF_IMAGE_MAX_PIXELS,
-    formats=REF_IMAGE_FORMATS,
-) -> LoadedRefImage:
-    """Ingest one reference image, fail-closed at the first violation.
+def _read_ref_bytes_capped(path: str, max_bytes: int) -> bytes:
+    """Bounded single read of a reference-image file (ADR-035 6d).
 
-    Order (ADR-035 6c/6d/6g): bounded single read → byte cap → SHA-256 over
-    those bytes → format-allowlisted lazy open → pixel cap on the header BEFORE
-    full decode → first-frame RGB decode. Raises `RefImageError` naming the
-    path and reason on any violation; never echoes file bytes. Containment is
-    the caller's concern, not this helper's (6b)."""
-    from PIL import Image
-
+    The read half of `load_ref_image_capped`, shared with `hash_ref_file` so
+    the replay-trust hash check (decision 7, slice 5) reuses the exact same
+    non-regular-file guard and byte cap instead of duplicating them. Raises
+    `RefImageError` naming the path and reason; never echoes file bytes (6g).
+    """
     # Non-regular-file guard (ADR-035 slice 4; closes slice-2 LOW-2). Open
     # NON-BLOCKING and reject anything that is not S_ISREG *before* reading a
     # byte. A FIFO / device / socket path would otherwise block open() or read()
@@ -114,6 +107,38 @@ def load_ref_image_capped(
     if len(data) > max_bytes:
         raise RefImageError(
             f"reference image {path!r} exceeds byte cap {max_bytes}")
+    return data
+
+
+def hash_ref_file(path: str, max_bytes: int = REF_IMAGE_MAX_BYTES) -> str:
+    """SHA-256 of a reference file's bytes WITHOUT decoding (ADR-035 slice 5).
+
+    The replay-trust gate (decision 7) compares a sidecar's recorded sha256
+    against the file on disk before generation. Decoding at the gate would be
+    wasted work (the run's single decode site does it again) and would decode
+    content the gate might still refuse — so this hashes only, through the
+    same bounded read and non-regular-file guard as `load_ref_image_capped`.
+    Callers MUST containment-check the path before calling (this reads the
+    file); raises `RefImageError` on any read violation."""
+    return hashlib.sha256(_read_ref_bytes_capped(path, max_bytes)).hexdigest()
+
+
+def load_ref_image_capped(
+    path: str,
+    max_bytes: int = REF_IMAGE_MAX_BYTES,
+    max_pixels: int = REF_IMAGE_MAX_PIXELS,
+    formats=REF_IMAGE_FORMATS,
+) -> LoadedRefImage:
+    """Ingest one reference image, fail-closed at the first violation.
+
+    Order (ADR-035 6c/6d/6g): bounded single read → byte cap → SHA-256 over
+    those bytes → format-allowlisted lazy open → pixel cap on the header BEFORE
+    full decode → first-frame RGB decode. Raises `RefImageError` naming the
+    path and reason on any violation; never echoes file bytes. Containment is
+    the caller's concern, not this helper's (6b)."""
+    from PIL import Image
+
+    data = _read_ref_bytes_capped(path, max_bytes)
 
     # Hash the exact bytes read (6d) — the same bytes decoded below.
     sha256 = hashlib.sha256(data).hexdigest()

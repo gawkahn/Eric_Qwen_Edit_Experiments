@@ -1747,3 +1747,18 @@ the next daemon-protocol slice, OR any report of a delegated ref run producing
 a text2img result. Fix: client checks a daemon `ping`-reply capability/version
 before including `ref_images`; until then, restart daemons on upgrade (add to
 the Comfyless manual's daemon-restart note).
+
+## 2026-07-22 — `ref_images` replay gate absent on the `--json` / MCP transports
+ADR-035 slice-5 `code-reviewer` (Fable) INFO. The decision-7 file-derived
+replay-trust gate (`_apply_replay_ref_trust` → `_gate_file_derived_refs`) lives
+only on the interactive CLI (`_run_cli_mode`). `_run_json_mode` and the MCP
+server are safe TODAY only because they never forward `ref_images` from params
+into `generate()` — they drop it by omission, not by a gate. Whoever later
+wires reference-image replay into the `--json` bridge or an MCP `edit`/`generate`
+tool inherits the row-2 obligation and MUST route file-derived paths through the
+same gate (outside-roots refusal + hash/moved warnings), NOT honor them as
+literal paths. Why not now: those transports have no ref-image feature yet;
+adding the gate pre-emptively would be dead code. Trigger: any commit that lets
+`ref_images` reach `generate()` from `--json` stdin or an MCP tool argument.
+Fix: call `_apply_replay_ref_trust` (or an MCP-appropriate equivalent with the
+server's `ref_image_roots`) before those paths reach the decode site.

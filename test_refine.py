@@ -1026,6 +1026,45 @@ raises("non-image seed rejected at entry (F5 gate wired in)",
            SimpleNamespace(seed_image=__file__, params=None, model=_s4model),
            _s4cat, _s4roots, log=_quiet))
 
+print("== ADR-035 slice 5: seed ref_images echoed (F4) + dropped ==")
+# gen._load_params no longer skips ref_images (replay trust landed), so the seed
+# chunk CAN carry them into extraction — refine must echo each (outside-roots
+# flagged) and drop them from base: it has no ref execution path, and carrying
+# them would be silently-inert config a future slice could execute ungated.
+_ref_png = _png_with(
+    {"prompt": "x", "model": _s4model,
+     "ref_images": [
+         {"path": "/outside/roots/kf1.png", "mode": "both",
+          "sha256": "ab" * 32, "applied": True},
+         {"path": os.path.join(_s4mb, "kf2.png"), "mode": "vl",
+          "sha256": "cd" * 32, "applied": False},
+     ]},
+    "seedrefs.png")
+_ref_echo = []
+_cfg_ref, _ = build_config_from_seed(
+    _seed_args(seed_image=_ref_png), _s4cat, _s4roots,
+    log=lambda m: _ref_echo.append(m))
+_ref_joined = "\n".join(_ref_echo)
+check("ref_images dropped from base (no silent execution channel)",
+      "ref_images" not in _cfg_ref.base)
+check("seed ref paths echoed", "/outside/roots/kf1.png" in _ref_joined
+      and os.path.join(_s4mb, "kf2.png") in _ref_joined)
+check("outside-roots seed ref is flagged",
+      any("kf1.png" in m and "OUTSIDE the allowed roots" in m for m in _ref_echo))
+check("in-roots seed ref is NOT flagged",
+      any("kf2.png" in m and "OUTSIDE" not in m for m in _ref_echo))
+check("drop notice names the generate --params replay path",
+      "NOT used by refine" in _ref_joined and "--params" in _ref_joined)
+# Malformed entries must not crash the echo (echo is best-effort; the DROP is
+# the guarantee).
+_refmal_png = _png_with(
+    {"prompt": "x", "model": _s4model,
+     "ref_images": ["notadict", {"mode": "both"}, {"path": 42}]}, "seedrefmal.png")
+_cfg_refmal, _ = build_config_from_seed(
+    _seed_args(seed_image=_refmal_png), _s4cat, _s4roots, log=_quiet)
+check("malformed seed ref_images still dropped without crashing",
+      "ref_images" not in _cfg_refmal.base)
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Judge-recipe layer (ADR-027 amendment) — rubric in a file, contract in code
 # ══════════════════════════════════════════════════════════════════════════════

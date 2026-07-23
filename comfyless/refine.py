@@ -1539,6 +1539,13 @@ def build_config_from_seed(args, catalog, roots,
     # is mangled by abspath — acceptable: refine is fail-closed on HF (no
     # download), so a repo id could not resolve anyway.
     base = {k: v for k, v in extracted.items() if k not in ("prompt", "loras")}
+    # ADR-035 slice 5 (decision 7, refine seed entry): the seed's recorded
+    # ref_images are FILE-DERIVED paths and refine has no reference-image
+    # execution path — carrying them in base would be silently-inert config a
+    # future slice could start executing without its trust gate. Drop them
+    # here, fail-closed, and echo each below so the human sees what the seed
+    # carried (the F4 echo extension the decision-7 table mandates).
+    seed_ref_images = base.pop("ref_images", None) or []
     base["model"] = (os.path.abspath(model)
                      if ("/" in model or os.sep in model) else model)
 
@@ -1565,6 +1572,25 @@ def build_config_from_seed(args, catalog, roots,
     for entry in (extracted.get("loras") or []):
         if isinstance(entry, dict) and (entry.get("path") or entry.get("name")):
             log(f"[refine]   lora path = {entry.get('path') or entry.get('name')}")
+    # ADR-035 slice 5: seed ref_images — echoed (with an outside-roots flag,
+    # same F4 mechanism) then DROPPED: refine has no reference-image execution
+    # path; replay them via `comfyless generate --params`, which runs the
+    # decision-7 trust gate. Path echoed via repr() so an attacker-controlled
+    # seed path cannot drive terminal escapes (security review MEDIUM-1); the
+    # flag says "dropped", not "loads on the cold path" — these never load here.
+    for entry in seed_ref_images:
+        if isinstance(entry, dict) and isinstance(entry.get("path"), str):
+            _p = entry["path"]
+            try:
+                _in = any(_within(_p, r) for r in roots_t)
+            except Exception:  # noqa: BLE001 — a malformed path must not abort the echo
+                _in = False
+            _flag = "" if _in else "  ** OUTSIDE the allowed roots (dropped) **"
+            log(f"[refine]   ref image = {_p!r}{_flag}")
+    if seed_ref_images:
+        log("[refine]   NOTE: seed reference images are NOT used by refine "
+            "(no ref execution in the loop) — dropped. Replay them with "
+            "`comfyless generate --params` instead.")
     for n in (*skip_notices, *lora_notices):
         log(f"[refine]   {n}")
 

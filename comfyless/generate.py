@@ -127,15 +127,13 @@ _SKIP_SIDECAR_KEYS = {"timestamp", "elapsed_seconds", "contract_version",
                       # ADR-034: output format/quality are an OUTPUT concern,
                       # recorded as provenance on jpeg runs but never a replay
                       # param — re-pass --output-format/--quality to replay.
-                      "output_format", "quality",
-                      # ADR-035: ref_images is a recognized schema key, but its
-                      # replay TRUST treatment (decision 7: F4 echo + outside-roots
-                      # refusal) lands in slice 5. Until then the replay channel is
-                      # held closed here — a --params sidecar's ref_images is
-                      # dropped, so only a typed --ref-image (row-1 authority) can
-                      # introduce a reference. Slice 5 removes this and adds the
-                      # trust treatment.
-                      "ref_images"}
+                      "output_format", "quality"}
+# ADR-035 slice 5: ref_images is deliberately NOT in _SKIP_SIDECAR_KEYS —
+# recorded references replay, but ONLY through the decision-7 file-derived
+# trust gate (_gate_file_derived_refs in _run_cli_mode): loud per-path echo,
+# outside-roots REFUSAL, moved-file / hash-mismatch warnings. The key never
+# reaches generate() or the wire from `p` — the gate pops it and re-injects
+# survivors through the typed --ref-image channel.
 
 
 def _type_name(t) -> str:
@@ -229,16 +227,18 @@ def _extract_eric_save_params(params_json: str, path: str) -> dict:
         data["model"] = data.pop("model_path")
 
     had_loras = bool(data.get("loras"))
+    had_refs = bool(data.get("ref_images"))
 
     # Validator drops node-internal fields (node_type, model_name, sampler_s2,
     # sampler_s3, model_path, etc.) as "unknown keys".  loras is a schema key
     # but Eric Diffusion Save stores it in an unreplayable format — warn and
     # drop before validation so the user relies on --lora explicitly.
     #
-    # ref_images (ADR-035) is likewise a schema key, but this chunk path bypasses
-    # _SKIP_SIDECAR_KEYS — so drop it here too, mirroring _load_sidecar's replay
-    # suppression, until the slice-5 replay-trust treatment lands. Without this a
-    # crafted 'parameters' chunk would plant an unvalidated ref_images path.
+    # ref_images (ADR-035) drops here PERMANENTLY (slice 5 kept this closed):
+    # a node-written 'parameters' chunk is not comfyless provenance — its ref
+    # entries carry no recorded sha256 to verify and no comfyless MODE contract
+    # — so like loras it is unreplayable from this chunk. Retyping --ref-image
+    # at the CLI is the decision-7 row-1 escape hatch; a warning below says so.
     for _drop in ("loras", "ref_images"):
         if _drop in data:
             data = {k: v for k, v in data.items() if k != _drop}
@@ -252,6 +252,14 @@ def _extract_eric_save_params(params_json: str, path: str) -> dict:
             "WARNING: LoRAs were active when this image was saved but will NOT be "
             "replayed.\n"
             "  Use --lora path:weight to re-apply them.",
+            file=sys.stderr,
+        )
+    if had_refs:
+        print(
+            "WARNING: reference images were recorded in this chunk but will NOT "
+            "be replayed\n"
+            "  (node-chunk refs carry no verifiable comfyless provenance). "
+            "Use --ref-image PATH[:MODE] to re-apply them.",
             file=sys.stderr,
         )
 
@@ -2202,10 +2210,12 @@ def generate(
     if nag_warnings:
         metadata["nag_warnings"] = nag_warnings
     # ADR-035 slice 3: record reference provenance (path/mode/sha256) so an edit
-    # sidecar is truthful and distinguishable from a text2img one. RECORDING only
-    # — a --params replay still drops ref_images via _SKIP_SIDECAR_KEYS (the
-    # replay-trust treatment is slice 5). edit_warnings carries the ignored
-    # --sampler notice across the daemon/MCP boundary (invariant N1 pattern).
+    # sidecar is truthful and distinguishable from a text2img one. Slice 5 makes
+    # this recording REPLAYABLE — a --params replay of this sidecar re-honors
+    # ref_images through the decision-7 file-derived trust gate
+    # (_apply_replay_ref_trust), NOT silently: outside-roots refusal + hash/moved
+    # warnings. edit_warnings carries the ignored --sampler notice across the
+    # daemon/MCP boundary (invariant N1 pattern).
     if ref_provenance:
         metadata["ref_images"] = ref_provenance
     if edit_warnings:
@@ -2492,10 +2502,13 @@ def _parse_args() -> argparse.Namespace:
                    help="[--serve] Reference-image root (ADR-035 6a; repeatable). "
                         "ADDS to the daemon's ref_image_roots (= --output-dir ∪ "
                         "these) — the disjoint allowlist that wire --ref-image "
-                        "paths are contained to. Not a client flag: the daemon is "
-                        "the authoritative gate, and a --ref-image outside its "
-                        "roots falls back to in-process with a warning. A root of "
-                        "'/', a mount root, or $HOME warns loudly.")
+                        "paths are contained to. Not a client gate for typed "
+                        "--ref-image: the daemon is the authoritative gate, and a "
+                        "--ref-image outside its roots falls back to in-process "
+                        "with a warning. A root of '/', a mount root, or $HOME "
+                        "warns loudly. On a --params replay it is ALSO an extra "
+                        "replay ref root (decision 7: file-derived ref paths are "
+                        "refused outside output-dir ∪ --ref-root ∪ weight roots).")
     return p.parse_args()
 
 
@@ -2566,6 +2579,175 @@ def _validate_ref_image_specs(specs: List[str]) -> List[Dict[str, str]]:
                 f"part of the filename, append an explicit mode: '{spec}:both'.")
         out.append(entry)
     return out
+
+
+def _replay_ref_roots(args: argparse.Namespace) -> Tuple[str, ...]:
+    """Roots a FILE-DERIVED reference path may resolve into (ADR-035 decision 7
+    / re-review Finding 1). Composed ONLY from OPERATOR-supplied sources, never
+    from the untrusted sidecar's own params (security review 2026-07-22
+    CRITICAL-1): the explicit `--output` dir, `--ref-root` values, and any
+    weight path TYPED ON THE CLI (`args.model/…` — row-1 authority). A recorded
+    keyframe normally lives in the output tree; anything else is re-typed via
+    `--ref-image` per decision 7's escape hatch.
+
+    Two exclusions are load-bearing, not conveniences dropped:
+    - The default `--output` sentinel (`/tmp/comfyless.png`) is EXCLUDED — /tmp
+      is world-writable, so admitting it would let a co-tenant plant the
+      referenced bytes (LOW-1). No `--output` → no output root; use `--ref-root`.
+    - A sidecar-supplied `model`/`vae_path`/`transformer_path`/… is NOT a root.
+      On the cold in-process path there is no `_check_paths` gate (decision 7),
+      so a crafted sidecar could otherwise name any existing file's parent as a
+      trusted root and self-authorize a co-located ref (the read-any-file
+      primitive this gate exists to close). Only CLI-TYPED weight paths, which
+      carry row-1 operator authority, contribute."""
+    roots: List[str] = []
+    out = getattr(args, "output", None)
+    # Literal sentinel matches `using_default_output` (generate.py) — an
+    # unspecified --output is not an operator-chosen root.
+    if isinstance(out, str) and out and out != "/tmp/comfyless.png":
+        roots.append(os.path.dirname(os.path.realpath(out)))
+    for r in getattr(args, "ref_root", None) or []:
+        roots.append(os.path.realpath(r))
+    # CLI-typed weight paths only — read from `args`, NEVER from the merged
+    # params dict. On a plain `--params` replay these are unset (the model comes
+    # from the sidecar); the one case they cover is a keyframe stored beside a
+    # CLI-typed `--model`/component. The argparse attrs (not canonical keys):
+    # model, transformer, vae, upscale_vae, te1, te2.
+    for attr in ("model", "transformer", "vae", "upscale_vae", "te1", "te2"):
+        val = getattr(args, attr, None)
+        # Path-shaped only: an HF repo id ("owner/repo") must not smuggle a
+        # cwd-relative root in; a nonexistent path contributes nothing.
+        if isinstance(val, str) and val and not _is_hf_repo_id(val) \
+                and os.path.exists(val):
+            roots.append(os.path.dirname(os.path.realpath(val)))
+    return tuple(dict.fromkeys(roots))
+
+
+def _apply_replay_ref_trust(args: argparse.Namespace, p: dict) -> Optional[int]:
+    """Pop file-derived `ref_images` off `p` and apply the decision-7 row-2
+    trust gate, re-injecting survivors through the typed `args.ref_image`
+    channel. Returns an exit code to abort with (2 on an outside-roots refusal)
+    or None to proceed. Extracted from `_run_cli_mode` so the pop → gate →
+    inject seam is unit-testable (code review 2026-07-22, SHOULD-4).
+
+    `p.pop` is UNCONDITIONAL: the key must never reach `generate()` or the wire
+    from `p` (slice-1 wire-inertness). A typed `--ref-image` REPLACES the
+    file-derived refs entirely with a NOTE (Finding 8, never merged)."""
+    file_refs = p.pop("ref_images", None)
+    if not file_refs:
+        return None
+    if args.ref_image:
+        print("[comfyless] NOTE: --ref-image was typed on the command line — "
+              "it replaces the ref_images recorded in --params "
+              "(typed user authority, ADR-035 decision 7).", file=sys.stderr)
+        return None
+    src = f"--params {args.params}" if getattr(args, "params", None) else "--override"
+    try:
+        gated = _gate_file_derived_refs(file_refs, _replay_ref_roots(args), src)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    # Re-inject through the typed channel. "PATH:MODE" round-trips exactly:
+    # _parse_ref_image splits on the LAST colon and the gate guarantees MODE is
+    # valid, so a colon-bearing path is unambiguous.
+    args.ref_image = [f"{s['path']}:{s['mode']}" for s in gated]
+    return None
+
+
+def _gate_file_derived_refs(entries, roots: Tuple[str, ...],
+                            source: str) -> List[Dict[str, str]]:
+    """Decision-7 row-2 trust gate for FILE-DERIVED reference paths (ADR-035
+    slice 5): a --params sidecar / PNG chunk / --override is attacker-craftable
+    metadata, so its ref_images are only honored after a loud per-path echo
+    with an outside-roots check. Outside-roots → the whole run is REFUSED
+    (ValueError) with the retype-at-CLI escape hatch; a missing file and a
+    SHA-256 mismatch are loud warnings (warn-don't-block — replay never
+    relocates and never silently proceeds past changed content).
+
+    Ordering is load-bearing: the containment refusal happens BEFORE any file
+    I/O on the path — the gate must never itself perform the attacker-directed
+    read it exists to refuse. Per path: echo → refuse-outside-roots →
+    existence check (metadata only) → bounded hash check (in-roots files only).
+
+    Structure is validated fail-closed (wire precedent, Finding 4): a
+    malformed entry or an absent/unknown MODE is a hard error, never a
+    default. The recorded `applied` flag is provenance-only and ignored —
+    family routing re-decides on the replay run. Returns absolutized
+    {"path", "mode"} specs for the survivors."""
+    from comfyless.ref_image import RefImageError, hash_ref_file
+    from comfyless.server import _within as _server_within
+
+    if not isinstance(entries, list):
+        raise ValueError(
+            f"{source}: ref_images must be a list, got {type(entries).__name__}")
+    if len(entries) > _MAX_REF_IMAGES:
+        raise ValueError(
+            f"{source}: {len(entries)} references exceeds the per-request cap "
+            f"of {_MAX_REF_IMAGES} (ADR-035 decision 6f)")
+    print(f"[comfyless] replaying reference images from {source} — file-derived "
+          f"paths from an UNTRUSTED metadata channel (ADR-035 decision 7); "
+          f"verify each before trusting:", file=sys.stderr)
+    specs: List[Dict[str, str]] = []
+    offenders: List[str] = []
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{source}: ref_images[{i}] is not an object")
+        path = entry.get("path")
+        mode = entry.get("mode")
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError(f"{source}: ref_images[{i}] has no usable path")
+        if "\x00" in path:  # decision 6e
+            raise ValueError(f"{source}: ref_images[{i}].path contains a NUL byte")
+        if mode not in _REF_MODES:
+            raise ValueError(
+                f"{source}: ref_images[{i}].mode {mode!r} is invalid (expected "
+                f"one of {', '.join(_REF_MODES)}); refusing rather than "
+                f"defaulting — MODE changes what the model conditions on.")
+        abs_path = os.path.abspath(path)
+        try:
+            inside = any(_server_within(abs_path, r) for r in roots)
+        except OSError:  # a malformed path fails toward refusal, never a crash
+            inside = False
+        # Echo the path via repr() so attacker-controlled bytes in a
+        # file-derived path cannot drive terminal escape sequences into the
+        # operator's terminal at the very "verify each" prompt (security review
+        # MEDIUM-1). repr quotes and backslash-escapes control chars; NUL is
+        # already refused above (6e).
+        if not inside:
+            offenders.append(abs_path)
+            print(f"[comfyless]   ref[{i}] = {abs_path!r} ({mode})"
+                  f"  ** OUTSIDE the replay ref roots — REFUSED **",
+                  file=sys.stderr)
+            continue  # containment failed — no file I/O below
+        flags = ""
+        if not os.path.isfile(abs_path):
+            flags = ("  ** MISSING — the recorded reference no longer exists; "
+                     "decode will fail. If it moved, re-specify it with "
+                     "--ref-image (replay never relocates) **")
+        else:
+            rec_sha = entry.get("sha256")
+            if isinstance(rec_sha, str) and rec_sha:
+                try:
+                    actual = hash_ref_file(abs_path)
+                except RefImageError as e:
+                    flags = f"  ** hash check failed: {e} **"
+                else:
+                    if actual != rec_sha.lower():
+                        flags = ("  ** SHA-256 MISMATCH — file content differs "
+                                 "from the recorded reference; the replayed "
+                                 "conditioning will NOT match the original run **")
+        print(f"[comfyless]   ref[{i}] = {abs_path!r} ({mode}){flags}",
+              file=sys.stderr)
+        specs.append({"path": abs_path, "mode": mode})
+    if offenders:
+        raise ValueError(
+            f"{source}: {len(offenders)} reference path(s) refused — outside "
+            f"every replay ref root (--output dir ∪ --ref-root ∪ CLI-typed "
+            f"weight dirs): {', '.join(repr(o) for o in offenders)}. "
+            f"File-derived ref paths are refused there (ADR-035 decision 7); to "
+            f"assert user authority re-specify each on the command line: "
+            f"--ref-image PATH[:MODE].")
+    return specs
 
 
 def _run_json_mode() -> int:
@@ -3557,6 +3739,18 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                 f"Verify the repo is what you expect before proceeding.",
                 file=sys.stderr,
             )
+
+    # ── ADR-035 slice 5: replay trust for reference images (decision 7) ──
+    # A --params sidecar / PNG chunk / --override may carry FILE-DERIVED refs
+    # (trust-table row 2). The seam is extracted into _apply_replay_ref_trust:
+    # it pops ref_images off `p` unconditionally (never reaching generate() or
+    # the wire from `p`), applies the outside-roots refusal gate, and re-injects
+    # survivors through the typed --ref-image channel every downstream site
+    # already consumes. Runs BEFORE _plan_iterations so a refusal precedes the
+    # iteration-count confirm and any GPU touch.
+    _ref_rc = _apply_replay_ref_trust(args, p)
+    if _ref_rc is not None:
+        return _ref_rc
 
     base_loras = [_parse_lora_arg(s) for s in args.lora] if args.lora else p.get("loras", [])
 
