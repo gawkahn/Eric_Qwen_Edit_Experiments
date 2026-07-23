@@ -79,10 +79,11 @@ The loop keeps a per-run, in-memory list of per-iteration records:
   extension** (see Security findings below) rather than avoided, because
   structural-only excerpts (length deltas, token counts) carry almost no
   "reconsider that change" signal. Mitigations, binding on slice A:
-  the serialized block labels every excerpt `"planner-proposed prompt
-  (untrusted)"`; only the OPERATOR's original target prompt is ever quoted
-  unlabeled; total planner-authored characters across the block are budgeted
-  at `HISTORY_PLANNER_TEXT_BUDGET` (8 KiB), truncating oldest excerpts first.
+  the serialized block labels every excerpt `"planner-proposed (untrusted)"`
+  (the implemented label — field `prompt_provenance`; slice-A review NIT-1);
+  only the OPERATOR's original target prompt is ever quoted unlabeled; total
+  planner-authored characters across the block are budgeted at
+  `HISTORY_PLANNER_TEXT_BUDGET` (8 KiB), truncating oldest excerpts first.
 - **Judge-error iterations contribute `{iteration, judge_error: true}` and
   structural flags ONLY** (Finding 9, LOW) — never `str(e)`:
   `_post_judge` error text embeds the endpoint URL and up to 300 chars of
@@ -285,6 +286,20 @@ Findings 1–8 before code; Findings 1–13 disposed as follows — 1↦D1, 2↦
   >10-iteration until-score runs (D3) are the cheap first probe.
 
 ## Changelog
+
+- 2026-07-23 — **Slice A (trajectory core, t2i) implemented.** D1 history
+  layer, D2 snapshot/lineage, D3 until-score + judge-error abort, D6 rubric
+  guidance. Implementation reviews (both Fable, no fallback): code-reviewer
+  APPROVED (SHOULD-1 → `LoopOutcome.aborted` + exit 3; SHOULD-2 →
+  `_resolve_max_iterations` seam; NITs folded incl. `apply_overrides`
+  deepcopy); security-auditor LOW-only, folded —
+  `docs/security/review-adr-037-sliceA-implementation-2026-07-23.md`.
+  D1 label aligned to the implemented `"planner-proposed (untrusted)"`
+  (NIT-1). INFO items accepted: `current_prompt` stays outside the F8-P
+  budget (bounded by OVERRIDE_PROMPT_MAX_CHARS); seed-derived target prompts
+  label "operator" per the F4 trust decision; `--pass-threshold` unvalidated
+  (operator footgun, warn-don't-block); `lora_ops_applied` means "resolved
+  and submitted." test_refine 206→313; battery 29/29; pyright at baseline.
 
 - 2026-07-23 — Proposed. Security-auditor (Fable, no model fallback) design
   review completed same day: no CRITICAL; Findings 1–8 folded textually into
