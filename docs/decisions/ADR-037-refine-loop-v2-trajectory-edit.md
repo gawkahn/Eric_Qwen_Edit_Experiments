@@ -1,6 +1,6 @@
 # ADR-037 — Refinement loop v2: trajectory-aware hill-climb + edit-mode refinement
 
-Status:   proposed
+Status:   accepted (Grant, 2026-07-23)
 Date:     2026-07-23
 Vision:   docs/vision/slice-v5-keyframe-authoring-refine-v2.md
 Relates:  ADR-027 (refinement loop v1 — superseded-in-part on acceptance),
