@@ -1,7 +1,24 @@
 # Security Review — ADR-035 Slice 5 (reference-image replay trust)
 
-**AI-Disclosure:** Claude (Fable) authored this review as the `security-auditor`
-subagent; findings folded by Claude (Fable) in the main session; Grant reviewed.
+**AI-Disclosure:** authored by the `security-auditor` subagent (spawned pinned
+to `claude-fable-5`) and folded by Claude (Fable) in the main session; Grant
+reviewed. **Model-fallback note (recorded 2026-07-23):** the auditor did NOT
+run entirely on Fable. Its transcript
+(`tasks/ad1f31f72a8c30166.output`) contains a literal harness fallback record —
+`{"type":"fallback","from":{"model":"claude-fable-5"},"to":{"model":"claude-opus-4-8"}}`
+(requestId `req_011CdJ6nFWxbd2QsVGccPpqP`) — that fired ONCE at the transition
+from the evidence-gathering phase to the first analysis turn (immediately after
+grepping the `_within` containment helper). Fable performed only the read-in
+(diff, ADR decision-7 text, ref validators, `_within`); **every finding below,
+including CRITICAL-1, was authored by `claude-opus-4-8` post-fallback.** No
+`stop_reason`/refusal is recorded, so the cause is not proven from the
+transcript, but the most plausible reading is Fable's dual-use safety layer
+declining the offensive-security synthesis turn and the harness falling back to
+Opus 4.8. This matters for the §5A review bar: the model that actually authored
+the security truth was Opus 4.8, not the pinned Fable (per this environment,
+Fable is Mythos-tier, above Opus 4.8 — i.e. a silent downgrade at the
+truth-authoring turns). The companion `code-reviewer` run
+(`tasks/a3290aff851ebca45.output`) ran fully on Fable, no fallback.
 
 **Date:** 2026-07-22
 **Slice:** ADR-035 slice 5 — replay trust for `ref_images` (decision 7, row 2).
