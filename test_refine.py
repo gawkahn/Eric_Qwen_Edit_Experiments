@@ -623,6 +623,10 @@ _reqdef = _gen._build_server_request(_ns, {"model": "/m", "prompt": "p"}, [],
                                      savepath_override="/out/c")
 check("default (png) wire request omits output_format (no AttributeError)",
       "output_format" not in _reqdef and "quality" not in _reqdef)
+# ADR-037 slice B (NIT-1): a ref-less refine namespace must keep the t2i wire
+# request byte-identical — no ref_images key ever appears.
+check("t2i wire request carries NO ref_images key",
+      "ref_images" not in _reqdef and "ref_drop_strict" not in _reqdef)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Slice 3 — refine_loop controller (monkeypatched generation + judge)
@@ -1143,11 +1147,15 @@ _dt2, _ot2, _fgt2, _fj_sent = _run_loop(
 check("a selected judge_system_prompt reaches the judge unchanged",
       _fj_sent.system_prompts_seen == [_SENTINEL_SP])
 
-# CLI wiring: --judge-recipe defaults to generic.
+# CLI wiring: --judge-recipe parser default is the None sentinel since ADR-037
+# slice B — main() resolves it per mode (generic for t2i, edit-generic for
+# edit) and an explicit value always wins. The resolution itself is pinned in
+# the slice-B block below.
 _jr_args = refine._build_arg_parser().parse_args(
     ["--prompt", "x", "--model", "m", "--output-dir", "o", "--model-base", "mb",
      "--judge-backend", "j"])
-check("--judge-recipe defaults to 'generic'", _jr_args.judge_recipe == "generic")
+check("--judge-recipe parser default is the None sentinel",
+      _jr_args.judge_recipe is None)
 
 # ── Family-defaults overlay on the fresh-CLI entry (ADR-009, 2026-07-18) ─────
 # The bug: refine's argparse defaults (28/3.5) were baked into base
@@ -1609,6 +1617,341 @@ _generic = refine.load_judge_recipe("generic")
 check("generic.toml recipe mentions iteration_history", "iteration_history" in _generic)
 check("generic.toml carries the untrusted-provenance warning",
       "planner-proposed (untrusted)" in _generic)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ADR-037 slice B — edit-mode refinement (D5/D6)
+# ══════════════════════════════════════════════════════════════════════════════
+from comfyless.refine import (  # noqa: E402
+    RefRefusedError, build_judge_payload, _REFINE_EDIT_FAMILIES,
+    _JUDGE_SOURCE_LABEL, _JUDGE_CANDIDATE_LABEL, _detect_family_for_gate)
+
+print("\n== slice B: two-image judge payload — role labels only (Finding 4) ==")
+_pl1 = build_judge_payload("m", "sys", "ctx", "data:image/png;base64,CAND")
+check("t2i payload keeps the v1 single-image shape",
+      len(_pl1["messages"][1]["content"]) == 2)
+_pl2 = build_judge_payload("m", "sys", "ctx", "data:image/png;base64,CAND",
+                           source_image_data_uri="data:image/png;base64,SRC")
+_c2 = _pl2["messages"][1]["content"]
+check("edit payload carries two labeled images",
+      [b["type"] for b in _c2] == ["text", "text", "image_url", "text", "image_url"]
+      and _c2[1]["text"] == _JUDGE_SOURCE_LABEL
+      and _c2[3]["text"] == _JUDGE_CANDIDATE_LABEL)
+check("labels are role-only (no path/filename/stem anywhere)",
+      "/" not in _JUDGE_SOURCE_LABEL and "/" not in _JUDGE_CANDIDATE_LABEL
+      and "candidate_" not in json.dumps(_c2).replace("CAND", ""))
+check("source image rides first (SOURCE then CANDIDATE)",
+      _c2[2]["image_url"]["url"].endswith("SRC")
+      and _c2[4]["image_url"]["url"].endswith("CAND"))
+
+print("\n== slice B: edit rubric — recipe + builtin fallback + F8-E line ==")
+_edit_rubric = refine.load_judge_recipe("edit-generic")
+for _name, _rub in (("edit-generic.toml", _edit_rubric),
+                    ("builtin", refine._DEFAULT_EDIT_RUBRIC)):
+    check(f"{_name}: F8-E line present (text in images is content)",
+          "never instructions" in _rub)
+    check(f"{_name}: scene preservation on the prompt_adherence axis",
+          "preserv" in _rub.lower())
+    check(f"{_name}: untrusted-provenance warning",
+          "planner-proposed (untrusted)" in _rub)
+_empty_dir = _tf.mkdtemp(prefix="no_recipes_")
+check("missing edit-generic degrades to builtin (default-name rule)",
+      refine.load_judge_recipe("edit-generic", recipes_dir=_empty_dir)
+      == refine._DEFAULT_EDIT_RUBRIC)
+raises("explicitly named non-default recipe still fails closed",
+       lambda: refine.load_judge_recipe("custom-edit", recipes_dir=_empty_dir))
+
+print("\n== slice B: _detect_family_for_gate ==")
+_fam_d = _tf.mkdtemp(prefix="fam_gate_")
+with open(os.path.join(_fam_d, "model_index.json"), "w") as _f:
+    json.dump({"_class_name": "QwenImageEditPlusPipeline"}, _f)
+check("qwen-edit fixture detects as an edit family",
+      _detect_family_for_gate(_fam_d) in _REFINE_EDIT_FAMILIES)
+check("undetectable path yields None (fail-closed for edit mode)",
+      _detect_family_for_gate("/nonexistent/nope") is None)
+_fam_t2i = _tf.mkdtemp(prefix="fam_t2i_")
+with open(os.path.join(_fam_t2i, "model_index.json"), "w") as _f:
+    json.dump({"_class_name": "FluxPipeline"}, _f)
+check("t2i fixture detects outside the edit allowlist",
+      _detect_family_for_gate(_fam_t2i) not in _REFINE_EDIT_FAMILIES)
+
+print("\n== slice B: entry-contract gates (main-level, pre-catalog) ==")
+
+
+def _main_stderr(argv):
+    err = _io.StringIO()
+    with _ctx.redirect_stderr(err):
+        rc = refine.main(argv)
+    return rc, err.getvalue()
+
+
+_seed_png = os.path.join(_tf.mkdtemp(prefix="edit_seed_"), "seed.png")
+_PILImage.new("RGB", (8, 8), (1, 2, 3)).save(_seed_png)
+_rc, _e = _main_stderr(["--output-dir", "o", "--model-base", "m",
+                        "--judge-backend", "j"])
+check("neither --prompt nor --seed-image → refused with message",
+      _rc == 2 and "one of --prompt / --seed-image" in _e)
+_rc, _e = _main_stderr(["--prompt", "edit it", "--seed-image", _seed_png,
+                        "--output-dir", "o", "--model-base", "m",
+                        "--judge-backend", "j"])
+check("edit intent without --model → refused (Finding 5)",
+      _rc == 2 and "REQUIRED in edit mode" in _e)
+_rc, _e = _main_stderr(["--prompt", "edit it", "--seed-image", _seed_png,
+                        "--model", _fam_d, "--params", "x.json",
+                        "--output-dir", "o", "--model-base", "m",
+                        "--judge-backend", "j"])
+check("edit mode refuses --params (seed is pixels-only)",
+      _rc == 2 and "pixels-only" in _e)
+_rc, _e = _main_stderr(["--prompt", "edit it", "--seed-image", _seed_png,
+                        "--model", _fam_t2i, "--output-dir", "o",
+                        "--model-base", "m", "--judge-backend", "j"])
+check("edit intent on a t2i-family model → refused",
+      _rc == 2 and "edit mode requires an edit-family model" in _e)
+_rc, _e = _main_stderr(["--prompt", "edit it", "--seed-image", _seed_png,
+                        "--model", "/nonexistent/nope", "--output-dir", "o",
+                        "--model-base", "m", "--judge-backend", "j"])
+check("undetectable family under edit intent → refused (fail-closed)",
+      _rc == 2 and "edit mode requires an edit-family model" in _e)
+_rc, _e = _main_stderr(["--prompt", "edit it", "--seed-image", _seed_png,
+                        "--model", _fam_d, "--output-dir", "o",
+                        "--model-base", "/nonexistent/mb",
+                        "--judge-backend", "j"])
+check("edit gate PASSES on a qwen-edit model (later failure is catalog, "
+      "not the gate)",
+      _rc == 2 and "edit mode requires" not in _e and "REQUIRED" not in _e)
+
+print("\n== slice B: t2i inverse gate — edit-family model refused under t2i ==")
+# Full main() plumbing: a real (empty) model-base, a registry TOML with a
+# pre-set model (no autodetect GET), the qwen-edit fixture as --model.
+_mb_dir = _tf.mkdtemp(prefix="mb_")
+_reg = os.path.join(_tf.mkdtemp(prefix="reg_"), "enhancers.toml")
+with open(_reg, "w") as _f:
+    _f.write('[judge]\ntype = "openai-endpoint"\n'
+             'url = "http://127.0.0.1:1"\nmodel = "m"\n')
+_rc, _e = _main_stderr(["--prompt", "a scene", "--model", _fam_d,
+                        "--output-dir", _tf.mkdtemp(prefix="out_"),
+                        "--model-base", _mb_dir, "--judge-backend", "judge",
+                        "--judge-config", _reg])
+check("t2i entry with an edit-family model → refused pre-GPU",
+      _rc == 2 and "t2i refinement cannot drive it" in _e)
+
+print("\n== slice B: loop — refs threaded, lineage, acceptance, latch ==")
+
+
+class _FakeGenE(_FakeGen):
+    """Records ref_images + force_in_process per call; optionally refuses the
+    daemon path once (raises RefRefusedError while force_in_process=False)."""
+    def __init__(self, seed=123, refuse_daemon=False):
+        super().__init__(seed=seed)
+        self.refs_seen = []
+        self.forced_seen = []
+        self.refuse_daemon = refuse_daemon
+
+    def __call__(self, cfg, *, ref_images=None, force_in_process=False, **kw):
+        if self.refuse_daemon and not force_in_process:
+            raise RefRefusedError("outside ref roots")
+        self.refs_seen.append([dict(s) for s in (ref_images or [])])
+        self.forced_seen.append(force_in_process)
+        return super().__call__(cfg, **kw)
+
+
+class _FakeJudgeE(_FakeJudge):
+    def __init__(self, script):
+        super().__init__(script)
+        self.histories_seen = []
+        self.sources_seen = []
+
+    def __call__(self, image, target_prompt, cfg, backend_cfg, planner_loras, **kw):
+        self.histories_seen.append(kw.get("history"))
+        self.sources_seen.append(kw.get("source_image"))
+        return super().__call__(image, target_prompt, cfg, backend_cfg,
+                                planner_loras, **kw)
+
+
+def _run_loop_e(script, *, edit_source, refuse_daemon=False, **kw):
+    d = _tf.mkdtemp(prefix="refine_edit_test_")
+    fg = _FakeGenE(refuse_daemon=refuse_daemon)
+    fj = _FakeJudgeE(script)
+    _rg, _jc = refine.run_generation, refine.judge_candidate
+    refine.run_generation, refine.judge_candidate = fg, fj
+    msgs = []
+    try:
+        cfg = WorkingConfig(prompt="p", loras=[], base={"seed": -1})
+        out = refine.refine_loop(
+            cfg, target_prompt="p", catalog={}, roots=(), conn=None,
+            backend_cfg={"url": "http://x", "model": "m"}, output_dir=d,
+            device="cuda", pass_threshold=8, edit_source=edit_source,
+            log=msgs.append, **kw)
+    finally:
+        refine.run_generation, refine.judge_candidate = _rg, _jc
+    return d, out, fg, fj, msgs
+
+
+# iter0 edits the SEED; promoted iter0 → iter1 edits candidate_00; iter1
+# regresses → iter2 STILL edits candidate_00 (best's image, never the reject).
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    [_mkverdict_ov(6, 6, None), _mkverdict_ov(4, 4, None), _mkverdict_ov(5, 5, None)],
+    edit_source=_seed_png, max_iterations=3, patience=0)
+check("iter0 ref is the operator seed",
+      _fg.refs_seen[0] == [{"path": _seed_png, "mode": "both"}])
+check("promoted candidate becomes the next edit source",
+      _fg.refs_seen[1][0]["path"].endswith("candidate_00.png"))
+check("rejected candidate NEVER promoted to edit source (D5)",
+      _fg.refs_seen[2][0]["path"].endswith("candidate_00.png"))
+check("judge received a source image every edit iteration",
+      all(s is not None for s in _fj.sources_seen))
+check("history records carry accepted in edit mode",
+      _fj.histories_seen[2][0].get("accepted") is True
+      and _fj.histories_seen[2][1].get("accepted") is False)
+
+# t2i runs: no refs, no source image, no accepted key — slice-A shape intact.
+_d, _o2, _fg2, _fjh2 = _run_loop_h(
+    [_mkverdict_ov(5, 5, None), _mkverdict_ov(6, 6, None)],
+    max_iterations=2, patience=0)
+check("t2i history records have NO accepted key",
+      all("accepted" not in r for r in (_fjh2.histories_seen[1] or [])))
+
+print("\n== slice B: daemon ref refusal latches the whole run in-process ==")
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    [_mkverdict_ov(5, 5, None)], edit_source=_seed_png,
+    refuse_daemon=True, max_iterations=3, patience=0)
+check("run completes despite the refusal", _o.iterations == 3)
+check("refusal notice is loud and printed ONCE",
+      sum(1 for m in _m if "refused the edit-source ref" in m) == 1)
+check("every successful generation ran in-process after the latch",
+      _fg.forced_seen == [True, True, True])
+check("refs still threaded on the in-process path",
+      len(_fg.refs_seen) == 3 and all(r for r in _fg.refs_seen))
+
+print("\n== slice B fold: wire RefPathError keying (LOW-4/SHOULD-2) ==")
+# The REAL run_generation's trust-boundary discriminator: error_type ==
+# "RefPathError" recovers (RefRefusedError); anything else — including an
+# error MESSAGE that merely mentions RefPathError — stays FATAL, so a weight
+# -root violation can never silently retry in-process.
+
+
+def _drive_daemon_error(error_type, error_text):
+    _osock, _osend = _rg_srv.socket_path, _rg_gen._send_server_command
+    _rg_srv.socket_path = lambda dev: _FakeSock(True)
+    _rg_gen._send_server_command = lambda req, dev: {
+        "status": "error", "error_type": error_type, "error": error_text}
+    try:
+        cfg = WorkingConfig(prompt="p", loras=[], base={"seed": 1, "model": "/m"})
+        refine.run_generation(cfg, device="cuda",
+                              output_dir=_tf.mkdtemp(prefix="wk_"),
+                              stem="c00",
+                              ref_images=[{"path": "/x.png", "mode": "both"}],
+                              log=lambda *_a: None)
+    finally:
+        _rg_srv.socket_path, _rg_gen._send_server_command = _osock, _osend
+
+
+try:
+    _drive_daemon_error("RefPathError", "outside roots")
+except RefRefusedError:
+    check("wire RefPathError error_type → RefRefusedError (recoverable)", True)
+except Exception as _e:  # noqa: BLE001
+    check("wire RefPathError error_type → RefRefusedError (recoverable)", False,
+          detail=f"raised {type(_e).__name__}")
+else:
+    check("wire RefPathError error_type → RefRefusedError (recoverable)", False,
+          detail="did not raise")
+try:
+    _drive_daemon_error("PathError", "text that mentions RefPathError")
+except RefRefusedError:
+    check("non-Ref error_type stays FATAL even if the MESSAGE says "
+          "RefPathError", False, detail="recovered on message substring")
+except RefineError:
+    check("non-Ref error_type stays FATAL even if the MESSAGE says "
+          "RefPathError", True)
+
+print("\n== slice B fold: daemon refusal text never enters history ==")
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    [_mkverdict_ov(5, 5, None), _mkverdict_ov(6, 6, None)],
+    edit_source=_seed_png, refuse_daemon=True, max_iterations=2, patience=0)
+check("daemon refusal string absent from ALL judge-bound history",
+      all("outside ref roots" not in json.dumps(h)
+          for h in _fj.histories_seen if h))
+
+print("\n== slice B fold: empty edit instruction refused (NIT-4) ==")
+_rc, _e = _main_stderr(["--prompt", "  ", "--seed-image", _seed_png,
+                        "--model", _fam_d, "--output-dir", "o",
+                        "--model-base", "m", "--judge-backend", "j"])
+check("blank --prompt with --seed-image → refused as empty edit instruction",
+      _rc == 2 and "non-empty --prompt" in _e)
+
+print("\n== slice B fold: pixels-only sentinel (LOW-5) + dims note (SHOULD-3) ==")
+# A seed carrying an embedded comfyless chunk with sentinel params: edit mode
+# must never read it — the config and target prompt are CLI-built only.
+_chunk_seed = os.path.join(_tf.mkdtemp(prefix="chunk_seed_"), "seed.png")
+_pi = PngInfo()
+_pi.add_text("comfyless", json.dumps({
+    "model": "/SENTINEL_MODEL/path", "prompt": "SENTINEL_PROMPT",
+    "steps": 777, "loras": [{"path": "/SENTINEL_LORA.safetensors",
+                             "weight": 2.0}]}))
+_PILImage.new("RGB", (8, 8), (4, 5, 6)).save(_chunk_seed, pnginfo=_pi)
+_loop_capture = {}
+_orig_loop = refine.refine_loop
+
+
+def _stub_loop(cfg, **kw):
+    _loop_capture["cfg"] = cfg
+    _loop_capture["target_prompt"] = kw.get("target_prompt")
+    _loop_capture["edit_source"] = kw.get("edit_source")
+    return refine.LoopOutcome(winner_path=os.path.join(
+        kw.get("output_dir", "."), "w.png"), passed=True, iterations=1,
+        best_composite=8.0)
+
+
+refine.refine_loop = _stub_loop
+_out_io = _io.StringIO()
+try:
+    with _ctx.redirect_stdout(_out_io):
+        _rc = refine.main(["--prompt", "make it night", "--seed-image",
+                           _chunk_seed, "--model", _fam_d, "--width", "512",
+                           "--output-dir", _tf.mkdtemp(prefix="eout_"),
+                           "--model-base", _mb_dir, "--judge-backend", "judge",
+                           "--judge-config", _reg])
+finally:
+    refine.refine_loop = _orig_loop
+_cfg_blob = json.dumps({"prompt": _loop_capture["cfg"].prompt,
+                        "loras": [(s.name, s.abs_path, s.weight)
+                                  for s in _loop_capture["cfg"].loras],
+                        "base": _loop_capture["cfg"].base}, default=str)
+check("edit entry ran to the (stubbed) loop", _rc == 0)
+check("seed's embedded params NEVER reach the edit config (LOW-5)",
+      "SENTINEL" not in _cfg_blob
+      and _loop_capture["target_prompt"] == "make it night")
+check("edit_source is the seed path, config model is the CLI model",
+      _loop_capture["edit_source"] == os.path.abspath(_chunk_seed)
+      and _loop_capture["cfg"].base.get("model") not in
+      ("/SENTINEL_MODEL/path",))
+check("--width in edit mode notes dims-from-source (SHOULD-3)",
+      "dims from the source" in _out_io.getvalue())
+
+print("\n== slice B: judge payload path-leak negative (Finding 4) ==")
+_probe_img = _PILImage.new("RGB", (4, 4), (9, 9, 9))
+_probe_cfg = WorkingConfig(prompt="p", loras=[], base={})
+_captured = {}
+_orig_post = refine._post_judge
+
+
+def _capture_post(endpoint, payload, key="", timeout=0):
+    _captured["payload"] = payload
+    return json.dumps({"scores": {"prompt_adherence": 5, "aesthetics": 5},
+                       "critique": {}, "verdict": "revise", "overrides": {}})
+
+
+refine._post_judge = _capture_post
+try:
+    refine.judge_candidate(_probe_img, "t", _probe_cfg,
+                           {"url": "http://x", "model": "m"}, [],
+                           source_image=_probe_img)
+finally:
+    refine._post_judge = _orig_post
+_pj = json.dumps(_captured["payload"])
+check("edit judge wire payload carries no path-shaped strings",
+      _seed_png not in _pj and "candidate_" not in _pj and "/tmp/" not in _pj
+      and _JUDGE_SOURCE_LABEL in _pj)
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 print(f"\n{passed} passed, {failed} failed")

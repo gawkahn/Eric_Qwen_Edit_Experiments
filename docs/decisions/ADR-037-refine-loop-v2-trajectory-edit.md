@@ -287,6 +287,28 @@ Findings 1–8 before code; Findings 1–13 disposed as follows — 1↦D1, 2↦
 
 ## Changelog
 
+- 2026-07-23 — **Slice B (edit-mode refinement) implemented.** D5 entry
+  contract, family gate (qwen-edit), loop-owned edit-source lineage,
+  two-image role-labeled judging, edit rubric (D6). **D5's "loop-entry
+  preflight" sentence is superseded:** the client cannot know the daemon's
+  ref roots (ADR-035 4b — a client-side check is structurally impossible),
+  so Finding 2 is realized as **first-refusal latching** keyed on wire
+  `error_type == "RefPathError"` (never a message substring): ONE loud
+  notice naming the `--ref-root` fix, then in-process for the rest of the
+  run — possibly latched MID-RUN when the seed lies inside daemon roots but
+  the run's output dir does not (iteration 0 may complete on the daemon;
+  daemon→in-process param parity is covered by slice-3 LOW-7). The three
+  prohibited workarounds (wire trust field, daemon exemption, root merging)
+  remain absent. Implementation reviews (both Fable, no fallback):
+  code-reviewer APPROVED, security-auditor LOW-only — all folded
+  (`ref_drop_strict=True` forced on ref-bearing wire requests +
+  `edit_warnings` surfaced; repr on daemon error echoes; judge-source
+  re-open through the capped loader; wire-keying + pixels-only sentinel
+  tests; presence-based entry semantics + empty-instruction refusal;
+  dims-from-source note). `docs/security/review-adr-037-sliceB-`
+  `implementation-2026-07-23.md`. test_refine 313→355; battery 29/29;
+  pyright at baseline.
+
 - 2026-07-23 — **Slice A (trajectory core, t2i) implemented.** D1 history
   layer, D2 snapshot/lineage, D3 until-score + judge-error abort, D6 rubric
   guidance. Implementation reviews (both Fable, no fallback): code-reviewer
