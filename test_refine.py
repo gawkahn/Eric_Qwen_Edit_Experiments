@@ -1850,6 +1850,13 @@ check("rejected candidate NEVER promoted to edit source (D5)",
       _fg.refs_seen[2][0]["path"].endswith("candidate_00.png"))
 check("judge received a source image every edit iteration",
       all(s is not None for s in _fj.sources_seen))
+# D5 amendment (2026-07-24): the judge's comparison image is ALWAYS the
+# operator's ORIGINAL seed (8x8 fixture), never the drifting accepted
+# candidate (_FakeGenE writes 4x4) — cumulative drift must stay visible
+# against a fixed reference even after promotions advance the edit source.
+check("judge source is the ORIGINAL seed every iteration (anchor, D5 amend)",
+      all(s.size == (8, 8) for s in _fj.sources_seen),
+      detail=str([s.size for s in _fj.sources_seen]))
 check("history records carry accepted in edit mode",
       _fj.histories_seen[2][0].get("accepted") is True
       and _fj.histories_seen[2][1].get("accepted") is False)
@@ -1866,6 +1873,9 @@ _d, _o, _fg, _fj, _m = _run_loop_e(
 check("tie advances the edit source to the newer candidate (D2 amendment)",
       _fg.refs_seen[2][0]["path"].endswith("candidate_01.png"),
       detail=str(_fg.refs_seen))
+check("judge anchor stays the ORIGINAL even under tie-advanced sources",
+      all(s.size == (8, 8) for s in _fj.sources_seen),
+      detail=str([s.size for s in _fj.sources_seen]))
 _rec1 = _fj.histories_seen[2][1]
 check("tied edit iteration history: improved=False, is_best=True, accepted=True",
       _rec1.get("improved") is False and _rec1.get("is_best") is True

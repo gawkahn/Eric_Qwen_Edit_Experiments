@@ -287,6 +287,48 @@ Findings 1–8 before code; Findings 1–13 disposed as follows — 1↦D1, 2↦
 
 ## Changelog
 
+- 2026-07-24 (later) — **D5 amendment: judge anchor = ORIGINAL seed.** Live
+  stress run (impossible target, 100-iteration tie chain) showed cumulative
+  drift the judge structurally could not see: subject getting younger/
+  blonder, jeans splotchy — yet 9.6 every iteration. Root cause: the judge's
+  SOURCE image was `current_source` (the currently-accepted candidate), so
+  preservation was only ever checked STEPWISE — each candidate vs its
+  immediate parent — and tie-promotion advanced the anchor itself
+  (boiling-frog ratchet; the D2-amendment MEDIUM materializing benignly).
+  Change: the judge's comparison image is now the OPERATOR'S ORIGINAL
+  `edit_source` for the whole run; generation lineage still builds
+  forward on best's image (D2/D5 unchanged). Drift now scores as an
+  unrequested change against a fixed reference → strict decline → revert
+  to best; the deferred tie-streak cap stays in reserve pending a rerun of
+  the stress test. Role label updated to "SOURCE (original, pre-edit)" in
+  the code-owned constant, the fallback rubric, and edit-generic.toml
+  (preservation step now names cumulative drift explicitly). Test pin:
+  every judged iteration's source image is the 8×8 seed fixture, not a
+  4×4 candidate — asserted in both the promotion and tie-chain scenarios.
+  **Review fold (both Fable, no fallback, same day):** code-reviewer
+  SHOULD — the anchor was pinned to a PATH (re-opened per iteration),
+  which reintroduced silent anchor drift via mid-run file swap plus a
+  fatal window on mid-run delete; FIXED by loading the anchor ONCE at
+  loop entry (bytes pinned; the slice-B LOW-3 re-open rationale died with
+  the constant anchor; fatal-on-absent moves to entry, memory bounded by
+  SEED_IMAGE_MAX_PIXELS). NITs folded: fallback rubric got the
+  cumulative-drift language + corrected CANDIDATE description (it had
+  received only the label swap) and its "shipped verbatim" header claim
+  corrected; refine_loop docstring now names the anchor/lineage split
+  (and its stale "strict improvement" phrasing updated to the D2 >=
+  rule); current_source comment disambiguated from edit_source.
+  security-auditor: LOW×2, INFO×2, no blockers — Q3 verdict: every path
+  by which a candidate advances now requires a verdict produced with the
+  original anchor in context. Accepted residuals recorded: (a) F8-E
+  surface quantitatively widened — adversarial text in the seed now gets
+  N full-fidelity judge exposures per run instead of one; bounded by
+  F1/F2/F6/F7 structural guards; the soft rubric line stops being
+  sufficient the day refine is exposed to agent/remote callers (that
+  trigger = harden before wiring); (b) the mitigation is behavioral —
+  a constant-parity judge can still tie-promote drifted lineage to the
+  cap (the D2 MEDIUM residual; tie-streak cap remains the reserve).
+  Review: `docs/security/review-adr-037-d5-anchor-2026-07-24.md`.
+
 - 2026-07-24 — **D2 amendment (tie-promotion + no-op seed resample)**, from
   the first edit-mode live smokes (Grant). Two coupled lineage changes:
   (1) **Ties promote the NEWER candidate** — promotion is now composite
