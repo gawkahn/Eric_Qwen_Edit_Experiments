@@ -841,13 +841,19 @@ check("the parse failure is recorded in the candidate's verdict.json",
 check("winners/ directory is empty after an all-failure run",
       os.listdir(os.path.join(_d, "winners")) == [])
 
-print("\n== slice 3: refine_loop — seed pinned after iteration 0 ==")
+print("\n== slice 3: refine_loop — seed pinned after iter 0; no-op resamples ==")
 _d, _o, _fg, _fj = _run_loop([_mkverdict(5, 5)], max_iter=3, patience=99, seed=777)
-# iter 0 runs with the CLI seed (-1); every later iter must reuse the pinned seed
-# from iter 0's metadata (777) so the hill-climb varies only prompt/LoRA.
+# iter 0 runs with the CLI seed (-1) and pins iter 0's metadata seed (777).
+# These verdicts carry NO overrides, so every subsequent config is a no-op vs
+# its lineage source: the D2 amendment (2026-07-24) resamples the seed by a
+# MONOTONIC loop-level counter (source seed + Nth-no-op) so the loop explores
+# instead of regenerating the identical image. All-tie chain: iter1 = 777+1,
+# iter2 = 778+2 (the tie promoted iter1's bumped config as the new source).
+# (An iteration whose planner DID change the config keeps the pinned seed —
+# covered by the D2-amendment block below.)
 check("iteration 0 uses the initial seed", _fg.seeds_seen[0] == -1)
-check("iterations 1+ reuse the pinned seed",
-      _fg.seeds_seen[1:] == [777, 777], detail=str(_fg.seeds_seen))
+check("no-op iterations resample via the monotonic counter",
+      _fg.seeds_seen[1:] == [778, 780], detail=str(_fg.seeds_seen))
 
 print("\n== slice 3: refine_loop — no-pass run finalizes top composite ==")
 _d, _o, _fg, _fj = _run_loop(
@@ -1428,12 +1434,57 @@ check("iter2 re-derived from BEST's config after regression (D2)",
 check("winner remains iter0", _o.winner_path is not None
       and os.path.basename(_o.winner_path) == "candidate_00.png")
 
-# Tie also reverts (D2: strict improvement only): iter1 ties iter0 exactly.
+# D2 amendment (2026-07-24): a TIE promotes the NEWER candidate — equal scores
+# can hide sub-score-resolution improvements worth building on. iter1 (prompt
+# "B") ties iter0 → iter1 becomes best; iter2 derives from iter1's config,
+# and the winner is the tied NEWER candidate. Only a strict decline reverts
+# (pinned by the regression block above).
 _d, _o, _fg, _fj = _run_loop_p(
     [_mkverdict_ov(6, 6, "B"), _mkverdict_ov(6, 6, None), _mkverdict_ov(5, 5, None)],
     max_iterations=3, patience=0)
-check("tie is not promoted: iter2 derives from best (iter0)",
-      _fg.prompts_seen[2] == "p", detail=str(_fg.prompts_seen))
+check("tie promotes the newer candidate: iter2 derives from iter1 (\"B\")",
+      _fg.prompts_seen[2] == "B", detail=str(_fg.prompts_seen))
+check("winner is the tied NEWER candidate (iter1)",
+      _o.winner_path is not None
+      and os.path.basename(_o.winner_path) == "candidate_01.png")
+
+# D2 amendment: an iteration whose planner DID change the config keeps the
+# pinned seed (attribution preserved); a no-op iteration resamples.
+_d, _o, _fg, _fj = _run_loop_p(
+    [_mkverdict_ov(5, 5, "B"), _mkverdict_ov(6, 6, None), _mkverdict_ov(6, 6, None)],
+    max_iterations=3, patience=0)
+check("changed-config iteration keeps the pinned seed; no-op resamples",
+      _fg.seeds_seen == [-1, 123, 124], detail=str(_fg.seeds_seen))
+
+# D2 amendment review fold (code review SHOULD, 2026-07-24): the resample
+# offset is a MONOTONIC counter, not source-seed+1 — after a DECLINE the
+# lineage source reverts to best's immutable snapshot (seed 123), and a
+# +1-per-no-op scheme would re-derive 124 on every decline cycle, silently
+# regenerating the identical image to the cap (the exact plateau the
+# amendment kills, surviving on the decline branch). Seeds must strictly
+# increase across no-op decline cycles.
+_d, _o, _fg, _fj = _run_loop_p(
+    [_mkverdict_ov(7, 7, None), _mkverdict_ov(5, 5, None)],
+    max_iterations=4, patience=0)
+check("no-op decline cycles get strictly increasing seeds",
+      _fg.seeds_seen == [-1, 124, 125, 126], detail=str(_fg.seeds_seen))
+
+# D2 amendment: the rubric-mandated plain-text preamble (DESCRIPTION /
+# VERIFICATION before the JSON) survives parse_verdict — and a stray '{' in
+# the preamble fails CLOSED (invalid outer slice), never mis-parses.
+_pre = ("DESCRIPTION\n- shirt untucked, hem over waistband\nVERIFICATION\n"
+        "R1: shirt tucked -> NOT MET - hem hangs over waistband\n"
+        "PRESERVATION: identity kept\n")
+_vj = ('{"scores": {"prompt_adherence": 5, "aesthetics": 8}, "critique": {}, '
+       '"verdict": "revise", "overrides": {}}')
+_v = refine.parse_verdict(_pre + _vj)
+check("preamble-shaped judge response parses (scores survive)",
+      _v.prompt_adherence == 5 and _v.aesthetics == 8)
+try:
+    refine.parse_verdict(_pre.replace("R1:", "R1: { ") + _vj)
+    check("stray '{' in preamble fails closed", False)
+except refine.RefineError:
+    check("stray '{' in preamble fails closed", True)
 
 print("\n== ADR-037 D1: judge receives bounded history; exactly one is_best ==")
 
@@ -1802,6 +1853,23 @@ check("judge received a source image every edit iteration",
 check("history records carry accepted in edit mode",
       _fj.histories_seen[2][0].get("accepted") is True
       and _fj.histories_seen[2][1].get("accepted") is False)
+
+# D2 amendment (2026-07-24): a TIE advances the edit source to the NEWER
+# candidate's image — image lineage follows config lineage on ties. Pinned so
+# a future refactor gating current_source on `improved` (strict) instead of
+# `promoted` forks image lineage from config lineage and fails here. The tied
+# iteration's history record carries the divergent flag combination
+# improved=False / is_best=True / accepted=True.
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    [_mkverdict_ov(6, 6, None), _mkverdict_ov(6, 6, None), _mkverdict_ov(5, 5, None)],
+    edit_source=_seed_png, max_iterations=3, patience=0)
+check("tie advances the edit source to the newer candidate (D2 amendment)",
+      _fg.refs_seen[2][0]["path"].endswith("candidate_01.png"),
+      detail=str(_fg.refs_seen))
+_rec1 = _fj.histories_seen[2][1]
+check("tied edit iteration history: improved=False, is_best=True, accepted=True",
+      _rec1.get("improved") is False and _rec1.get("is_best") is True
+      and _rec1.get("accepted") is True, detail=str(_rec1))
 
 # t2i runs: no refs, no source image, no accepted key — slice-A shape intact.
 _d, _o2, _fg2, _fjh2 = _run_loop_h(

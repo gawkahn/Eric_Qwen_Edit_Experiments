@@ -287,6 +287,66 @@ Findings 1–8 before code; Findings 1–13 disposed as follows — 1↦D1, 2↦
 
 ## Changelog
 
+- 2026-07-24 — **D2 amendment (tie-promotion + no-op seed resample)**, from
+  the first edit-mode live smokes (Grant). Two coupled lineage changes:
+  (1) **Ties promote the NEWER candidate** — promotion is now composite
+  `>=` best, not strict `>`. Rationale: equal scores hide sub-score-
+  resolution improvements worth building on; reverting to the older equal
+  candidate discards them. A strict DECLINE still reverts the climb to
+  best (unchanged). `no_improve`/patience still counts ties as
+  non-improvement (strict-improvement semantics), so tie-promotion cannot
+  defeat the early stop. In edit mode the accepted source advances to the
+  tied candidate's image (image lineage follows config lineage,
+  unchanged rule). History `improved` flag = strict improvement;
+  `is_best` = promotion.
+  (2) **No-op seed resample** — observed failure: judge scored 10/9 with
+  zero unmet requirements → planner had nothing to aim a rewrite at →
+  empty/absent overrides → next config identical to its lineage source →
+  with the seed pinned (slice A), the loop regenerated the byte-identical
+  image to the 100-iteration cap. Fix: after `apply_overrides`, if the
+  derived config equals its lineage `source_cfg` (prompt + LoRA set/
+  weights + base), bump the pinned seed by +1 with a loud log line so the
+  next iteration explores a new sample instead of reprinting. Seed
+  attribution semantics are preserved: iterations where the planner DID
+  change something keep the pinned seed, so score deltas remain
+  attributable to the change. Guarded to int seeds >= 0 (an unpinned -1
+  is already random). Not a planner-authority change (D4 untouched);
+  `apply_overrides`' deep-copied base makes the in-place bump alias-safe
+  w.r.t. best's snapshot. Test pins updated: seed-pinning pin becomes the
+  no-op-resample pin; "tie is not promoted" flips to "tie promotes the
+  newer candidate."
+  **Same-day D6 note:** `judge_recipes/edit-generic.toml` was rewritten in
+  the same slice (DECOMPOSE-THEN-VERIFY: neutral DESCRIPTION pass →
+  per-requirement VERIFICATION citing description lines → mechanically
+  bounded score, emitted as a plain-text preamble before the strict JSON —
+  `_extract_json_block` tolerates brace-free leading prose). Motivation:
+  the judge scored 9/9 on a candidate failing 3 of 6 edit instructions
+  (checklist-echo sycophancy); pre-flighted live 10/pass → 6/revise.
+  Known residual: instruction text in context can still contaminate the
+  description (a two-call blind-describe judge is backlogged).
+  **Review fold (both Fable, no fallback, 2026-07-24):**
+  code-reviewer's SHOULD (borderline-CRITICAL): the +1-per-no-op bump was
+  NOT monotonic across decline cycles (a decline reverts to best's
+  immutable snapshot seed, re-deriving the same bumped seed forever — the
+  plateau surviving on the decline branch); fixed with a monotonic
+  loop-level no-op counter (`seed = source_seed + Nth_noop`), pinned by a
+  strictly-increasing-seeds decline-cycle test. Second SHOULD: edit-mode
+  tie lineage (source advances on tie; history improved=False/is_best=True/
+  accepted=True) now pinned. security-auditor MEDIUM **accepted as
+  documented risk**: tie-promotion lowers the F8-E propagation bar from
+  strict-win to parity, and with DEFAULT_PATIENCE=0 the only bound on a
+  constant-parity tie chain is --max-iterations — the winner shifts from
+  earliest-peak to last-tied (most-drifted). Deferred mitigation option:
+  a tie-streak cap (revert to best after N consecutive non-improving
+  promotions). LOW: the rubric preamble + JSON can crowd
+  DEFAULT_JUDGE_MAX_TOKENS=1024 — truncation fails closed but burns
+  iterations; raise backend-cfg `max_tokens` if truncation appears (noted
+  in the recipe header). INFO folds: bool excluded from the seed guard;
+  preamble-parse positive + stray-brace negative tests added; contract
+  "STRICT JSON and nothing else" vs preamble tension left standing (parse-
+  safe; verify preamble emission in live smokes). Reviews:
+  `docs/security/review-adr-037-d2-amendment-2026-07-24.md`.
+
 - 2026-07-23 — **Slice B (edit-mode refinement) implemented.** D5 entry
   contract, family gate (qwen-edit), loop-owned edit-source lineage,
   two-image role-labeled judging, edit rubric (D6). **D5's "loop-entry

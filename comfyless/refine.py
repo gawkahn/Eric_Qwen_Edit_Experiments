@@ -1411,6 +1411,7 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
     edit = edit_source is not None
     current_source = edit_source
     in_process_latch = False  # ONE daemon ref refusal latches the whole run
+    noop_resamples = 0  # monotonic no-op counter (D2 amendment, review fold)
 
     for i in range(max_iterations):
         iters_run = i + 1
@@ -1527,10 +1528,23 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
             passed = True
             break
 
-        # Unified lineage rule (ADR-037 D2): promotion iff STRICT composite
-        # improvement; ties count as non-improvement and revert to best.
-        promoted = best is None or comp > best.composite
+        # Unified lineage rule (ADR-037 D2, amended 2026-07-24): promotion on
+        # composite >= best — a TIE promotes the NEWER candidate (equal scores
+        # can hide sub-score-resolution improvements worth building on); only
+        # a strict DECLINE reverts the climb to best. Patience (when enabled;
+        # DEFAULT_PATIENCE=0 disables it) still counts ties as non-improvement.
+        # On a default run the only bound on a tie chain is --max-iterations —
+        # a constant-parity judge promotes every iteration, so cumulative
+        # unrequested drift can compound to the cap (security review MEDIUM,
+        # 2026-07-24; accepted with the cap as the bound, tie-streak limit
+        # deferred).
+        improved = best is None or comp > best.composite
+        promoted = best is None or comp >= best.composite
         if promoted:
+            if not improved and best is not None:
+                log(f"[refine] iter {i}: composite {comp:.2f} ties best "
+                    f"(iter {best.index}) — promoting the newer candidate "
+                    f"(ADR-037 D2 amendment)")
             best = cand
             # By-value snapshot of the config that PRODUCED this candidate —
             # taken now, before apply_overrides re-binds cfg, and immune to the
@@ -1546,6 +1560,7 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 # their exact {iteration, judge_error} shape (Finding 9 / NIT-3).
                 if "is_best" in rec:
                     rec["is_best"] = False
+        if improved:
             no_improve = 0
         else:
             no_improve += 1
@@ -1578,12 +1593,42 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
         cfg = apply_overrides(source_cfg, verdict, resolved_ops, apply_notices)
         for n in apply_notices:
             log(f"[refine] iter {i}: {n}")
+        # No-op escape (ADR-037 D2 amendment 2026-07-24): if the planner's
+        # overrides left the derived config identical to its lineage source
+        # (prompt + LoRA set/weights + base), the next t2i generation would
+        # reproduce that source's image byte-for-byte — the seed is pinned
+        # after iter 0 — and the run freezes on a plateau (observed live:
+        # 10/9 verdicts → nothing to fix → empty overrides → 100 identical
+        # images). Resample so the next iteration explores a new sample.
+        # The offset is a MONOTONIC loop-level counter, not +1: after a
+        # decline, source_cfg is best's immutable snapshot, so a source-seed-
+        # relative +1 would re-derive the SAME seed on every no-op decline
+        # cycle and the plateau would survive on that branch (code review
+        # SHOULD, 2026-07-24). Iterations where the planner DID change
+        # something keep the pinned seed, preserving score-delta attribution
+        # (in edit mode a promotion also advances the source image, so a
+        # no-op resample there varies sample + source together — exploration
+        # over strict attribution, accepted). apply_overrides deep-copies
+        # base, so this in-place bump cannot alias best's snapshot. bool is
+        # excluded from the seed guard to match _coerce_score/_parse_lora_op.
+        if (cfg.prompt == source_cfg.prompt
+                and [(s.name, s.weight) for s in cfg.loras]
+                == [(s.name, s.weight) for s in source_cfg.loras]
+                and cfg.base == source_cfg.base):
+            _seed = cfg.base.get("seed")
+            if (isinstance(_seed, int) and not isinstance(_seed, bool)
+                    and _seed >= 0):
+                noop_resamples += 1
+                cfg.base["seed"] = _seed + noop_resamples
+                log(f"[refine] iter {i}: planner proposed no effective change "
+                    f"— resampling seed {_seed} -> {_seed + noop_resamples} "
+                    f"(an unchanged config would re-sample nothing new)")
         # History record for this iteration (ADR-037 D1): the prompt that
         # produced the candidate + the RESOLVED ops applied in response.
         history.append(history_record(
             iteration=i, verdict=verdict, composite=comp, prompt=prev_prompt,
             target_prompt=target_prompt, applied_ops=resolved_ops,
-            improved=promoted, is_best=promoted,
+            improved=improved, is_best=promoted,
             accepted=(promoted if edit else None)))
 
     if best is None:
