@@ -648,6 +648,7 @@ _OFFER_STOPWORDS = frozenset("""
     could should very more most much many some also just like unto while
     where when what which whose
     image images picture pictures frame framed background full
+    candidate source instruction requirement requirements verdict
 """.split())
 
 #: Families whose LoRAs are cross-loadable enough to co-offer (the qwen edit
@@ -676,13 +677,25 @@ def _offer_keywords(prompt_text: str, max_terms: int = 8) -> List[str]:
     return out
 
 
-def search_loras(conn, prompt_text: str, *, family: Optional[str] = None,
+def search_loras(conn, prompt_text: str, *, critique_text: str = "",
+                 family: Optional[str] = None,
                  limit: int = 5) -> List[dict]:
     """Keyword-merged LoRA offers via the ADR-022 FTS (fixed 2026-07-25: the
     old form phrase-quoted the ENTIRE target prompt as one FTS term and
     returned zero rows on any real prompt — the planner never received a
     single offer across every refine run to date). Tokenize the prompt into
     content keywords, search each, round-robin-merge by rank, dedupe by name.
+
+    `critique_text` (same day, Grant): quality/fix-it LoRAs match words that
+    describe the FLAW, not the scene — "realism"/"skin texture" live in the
+    judge's critique, never in a content prompt (live evidence: the prompt's
+    own keywords surfaced anatomy LoRAs on token noise while
+    qwen-studio-realism sat unmatched). The previous iteration's critique is
+    prepended, so its keywords take the front of the cap and offers chase
+    what the judge just complained about. No topical filtering by design:
+    body/NSFW LoRAs often genuinely improve skin texture and realism — the
+    judge decides relevance, ranking just surfaces candidates (Grant,
+    2026-07-25).
 
     Family filter is SOFT: entries tagged with a DIFFERENT family are dropped
     (a flux LoRA offered on a qwen run is pure noise), NULL-family entries
@@ -694,8 +707,9 @@ def search_loras(conn, prompt_text: str, *, family: Optional[str] = None,
     from comfyless import catalog_db
     allowed = (set(_OFFER_FAMILY_COMPAT.get(family, (family,)))
                if family else None)
+    query_text = f"{critique_text or ''} {prompt_text or ''}"
     per_kw: List[List[dict]] = []
-    for kw in _offer_keywords(prompt_text):
+    for kw in _offer_keywords(query_text, max_terms=10):
         rows = catalog_db.search(conn, kw, kind="lora", limit=limit)
         per_kw.append([_safe_lora_view(r) for r in rows])
     out: List[dict] = []
@@ -1526,6 +1540,12 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
     # BOTH escape triggers (planner no-op, stagnation) so resampled seeds
     # stay unique across mixed trigger sequences.
     seed_resamples = 0
+    # Previous iteration's critique text, fed into the next offer search so
+    # quality/fix-it LoRAs surface on flaw words the prompt never contains
+    # (2026-07-25, Grant). Validated F7 output (string-typed critique values
+    # only) used as READ-ONLY FTS keyword material — quoted per term at the
+    # DB layer; it never enters any authority channel.
+    prev_critique_text = ""
     # D5 amendment (2026-07-24, review fold): the judge's comparison anchor is
     # loaded ONCE at entry — pinned to the original's BYTES, not its path. The
     # slice-B LOW-3 re-open-per-iteration rationale applied when the judged
@@ -1594,6 +1614,7 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
         if conn is not None:
             try:
                 search_offers = search_loras(conn, target_prompt,
+                                             critique_text=prev_critique_text,
                                              family=offer_family)
             except Exception as e:  # noqa: BLE001 — FTS on arbitrary text can raise
                 log(f"[refine] iter {i}: catalog search skipped ({e})")
@@ -1641,6 +1662,16 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 break
             continue
         consecutive_judge_errors = 0
+        # Feed THIS verdict's critique into the NEXT iteration's offer search
+        # (flaw words live here, not in the prompt). String values only —
+        # parse_verdict's F7 allowlist guarantees the shape.
+        # [:2000] (security review INFO): F7 caps override_prompt but not
+        # critique values — a misbehaving endpoint could deliver ~8 MiB of
+        # critique (HTTP read cap) and re.findall would materialize the full
+        # match list over it. 2000 chars ≫ any real critique.
+        prev_critique_text = " ".join(
+            v for v in (verdict.critique or {}).values()
+            if isinstance(v, str))[:2000]
 
         comp = composite_score(verdict.prompt_adherence, verdict.aesthetics,
                                w_pa, w_aes)

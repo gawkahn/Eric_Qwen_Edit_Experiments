@@ -312,6 +312,23 @@ Findings 1–8 before code; Findings 1–13 disposed as follows — 1↦D1, 2↦
   Optimization research memo (pairwise duels, sideways caps, anchor
   duels) saved to the vault: `Refine_Optimization_Research_2026-07-25.md`
   — algorithm changes await Grant's read (his direction 2026-07-25).
+  **Same-day addendum — critique-driven offers.** Live iteration-25
+  evidence: prompt-derived keywords surface SUBJECT LoRAs (anatomy hits
+  on "body") while the quality LoRAs the run needed (realism/portrait
+  enhancers) match FLAW words that live only in the judge's critique.
+  `search_loras` now takes `critique_text` — the PREVIOUS iteration's
+  validated critique (F7 string values only), PREPENDED so its keywords
+  own the front of a raised 10-term cap; offers chase what the judge
+  just complained about. Read-only FTS keyword material, quoted per
+  term at the DB layer — no authority channel. NO topical filtering by
+  design (Grant: body/NSFW LoRAs often genuinely improve skin texture
+  and realism; the judge decides relevance). Enhance-based prompt
+  rewording evaluated and NOT wired: the judge already produces full
+  in-band rewrites; a second LLM hop is the fallback only if in-band
+  rewording proves too timid (deferred). F8-P budget left at 8192 —
+  elision keeps score/flag stubs (anti-cycling intact); the raise
+  trigger is the planner re-proposing a specific pre-horizon failed
+  edit.
 
 - 2026-07-24 (night) — **D2 amendment addendum: stagnation seed escape
   (`--explore-after N`).** Live gap in the no-op resample: it fires only

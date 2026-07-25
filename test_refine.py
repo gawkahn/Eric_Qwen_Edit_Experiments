@@ -1657,8 +1657,68 @@ try:
           refine.search_loras(object(), "the image of a") == [])
     check("offers: keywords that all miss -> empty offers",
           refine.search_loras(object(), "zebra unicorns") == [])
+    # Critique-driven offers (2026-07-25, Grant): flaw words from the judge's
+    # critique are PREPENDED, so they own the front of the keyword cap and
+    # their rank-1 hits merge ahead of prompt-derived hits.
+    _FAKE_OFFER_ROWS["realism"] = [{"id": 9, "name": "RealFix", "kind": "lora",
+                                    "model_family": None,
+                                    "abs_path": "/secret/r"}]
+    _offers = refine.search_loras(
+        object(), "Barefoot realism, the image",
+        critique_text="not photorealistic, needs realism and skin texture")
+    check("offers: critique keywords outrank prompt keywords",
+          [o["name"] for o in _offers][0] == "RealFix"
+          and any(o["name"] == "A" for o in _offers),
+          detail=str(_offers))
+    # Cap pin (code review): search_loras runs at a 10-term cap, not the
+    # 8-term _offer_keywords default. Eight filler critique words occupy
+    # slots 1-8; the prompt's barefoot/realism land at 9-10 and produce all
+    # three offers — under a cap of 8 this returns [] and the check fails.
+    _offers = refine.search_loras(
+        object(), "Barefoot realism, the image",
+        critique_text="grainy blurry mushy janky wonky splotchy muddy noisy")
+    check("offers: 10-term cap admits prompt keywords behind 8 critique words",
+          [o["name"] for o in _offers] == ["A", "RealFix", "FluxThing"]
+          and "/secret" not in str(_offers),
+          detail=str(_offers))
 finally:
     _cdb.search = _real_search
+
+# Loop threading: iteration 2's offer search receives iteration 1's critique.
+_seen_critiques: list = []
+_real_sl = refine.search_loras
+
+
+def _spy_search_loras(conn, prompt_text, *, critique_text="", family=None,
+                      limit=5):
+    _seen_critiques.append(critique_text)
+    return []
+
+
+refine.search_loras = _spy_search_loras
+try:
+    _d3 = _tf.mkdtemp(prefix="refine_critique_test_")
+    fg, fj = _FakeGenP(), _FakeJudge(
+        [Verdict(5, 5, "revise", {"aesthetics": "too illustration-like"},
+                 "B", []),
+         Verdict(5, 5, "revise", {}, None, [])])
+    _rg, _jc = refine.run_generation, refine.judge_candidate
+    refine.run_generation, refine.judge_candidate = fg, fj
+    try:
+        refine.refine_loop(
+            WorkingConfig(prompt="p", loras=[], base={"seed": -1}),
+            target_prompt="p", catalog={}, roots=(), conn=object(),
+            backend_cfg={"url": "http://x", "model": "m"}, output_dir=_d3,
+            device="cuda", pass_threshold=8, max_iterations=2, patience=0,
+            log=lambda *_a: None)
+    finally:
+        refine.run_generation, refine.judge_candidate = _rg, _jc
+finally:
+    refine.search_loras = _real_sl
+check("iter-1 offer search has no critique yet; iter-2 gets iter-1's critique",
+      len(_seen_critiques) == 2 and _seen_critiques[0] == ""
+      and "illustration-like" in _seen_critiques[1],
+      detail=str(_seen_critiques))
 # Rubric-text pins (code review SHOULD): the plateau-reword paragraph and
 # the offers-provenance line must survive future recipe edits, in the
 # shipped TOMLs and the import-safe fallbacks alike.
