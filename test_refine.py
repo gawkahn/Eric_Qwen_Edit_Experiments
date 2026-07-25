@@ -1606,6 +1606,92 @@ check("composite target absent from persisted verdict records",
       == ["composite", "critique", "iteration", "notices",
           "proposed_overrides", "scores", "verdict", "weights"])
 
+print("\n== parity slice 2: shared wire-warning surfacer ==")
+# Before this slice refine read ONLY edit_warnings, so a planner-added LoRA
+# that silently failed to apply was invisible to operator, loop, and judge.
+_md_all = {
+    "nag_warnings": ["nag skipped on this family"],
+    "schedule_warnings": ["karras ignored"],
+    "edit_warnings": ["ref dropped"],
+    "lora_warnings": ["LoRA not applied (0 modules): /p/some.safetensors"],
+}
+_lines: list = []
+_n = _rg_gen.surface_wire_warnings(_md_all, _lines.append)
+check("surfacer emits all four channels", len(_lines) == 4, detail=str(_lines))
+check("surfacer returns the LoRA-failure count", _n == 1)
+check("surfacer labels each channel", _lines[0].startswith("NAG — ")
+      and _lines[1].startswith("--schedule ignored — ")
+      and _lines[2] == "ref dropped"
+      and _lines[3].startswith("LoRA — "), detail=str(_lines))
+_lines2: list = []
+_n2 = _rg_gen.surface_wire_warnings(_md_all, _lines2.append, include_lora=False)
+check("include_lora=False suppresses LoRA lines but still counts",
+      len(_lines2) == 3 and _n2 == 1)
+_empty: list = []
+check("surfacer tolerates None / empty metadata (returns 0, emits nothing)",
+      _rg_gen.surface_wire_warnings(None, _empty.append) == 0
+      and _rg_gen.surface_wire_warnings({}, _empty.append) == 0
+      and _empty == [], detail=str(_empty))
+# Hardening folds (security review LOW): control chars stripped, per-channel
+# cap with an explicit suppression line.
+_ctrl: list = []
+_rg_gen.surface_wire_warnings(
+    {"edit_warnings": ["clean\x1b[2Jwiped\x07"]}, _ctrl.append)
+check("surfacer strips control characters from daemon strings",
+      _ctrl == ["clean[2Jwiped"], detail=str(_ctrl))
+_flood: list = []
+_n_flood = _rg_gen.surface_wire_warnings(
+    {"edit_warnings": [f"w{i}" for i in range(50)]}, _flood.append)
+check("surfacer caps per-channel emission and says how many it dropped",
+      len(_flood) == 21 and _flood[-1] == "... 30 more edit_warnings suppressed",
+      detail=str(_flood[-2:]))
+check("surfacer truncates an over-long warning line",
+      len(_rg_gen._sanitize_wire_warning("x" * 5000)) == 500)
+
+
+def _drive_rg_warnings(md, *, daemon: bool):
+    """Drive the REAL run_generation with a metadata payload carrying every
+    warning channel, on the daemon or the cold path; return its log lines."""
+    d = _tf.mkdtemp(prefix="refine_warn_test_")
+    logs: list = []
+    cfg = WorkingConfig(prompt="p", loras=[], base={"seed": 1, "model": "/tmp/m"})
+    _osock, _ogen, _osend = (_rg_srv.socket_path, _rg_gen.generate,
+                             _rg_gen._send_server_command)
+    try:
+        if daemon:
+            _rg_srv.socket_path = lambda dev: _FakeSock(True)
+            dout = os.path.join(d, "daemon_out")
+
+            def _send(req, dev, _dout=dout, _md=md):
+                os.makedirs(_dout, exist_ok=True)
+                op = os.path.join(_dout, "srv.png")
+                _PILImage.new("RGB", (4, 4)).save(op)
+                return {"status": "ok", "output_path": op, "metadata": _md}
+            _rg_gen._send_server_command = _send
+        else:
+            _rg_srv.socket_path = lambda dev: _FakeSock(False)
+
+            def _fakegen(_md=md, **kw):
+                _PILImage.new("RGB", (4, 4)).save(kw["output_path"])
+                return _md
+            _rg_gen.generate = _fakegen
+        refine.run_generation(cfg, device="cpu", output_dir=d,
+                              stem="candidate_00", log=logs.append)
+    finally:
+        (_rg_srv.socket_path, _rg_gen.generate,
+         _rg_gen._send_server_command) = _osock, _ogen, _osend
+    return logs
+
+
+for _path_name, _is_daemon in (("daemon", True), ("cold", False)):
+    _lg = _drive_rg_warnings(dict(_md_all, seed=1), daemon=_is_daemon)
+    _blob = " | ".join(_lg)
+    check(f"{_path_name} path surfaces the LoRA failure (the silent hole)",
+          "LoRA not applied" in _blob, detail=_blob)
+    check(f"{_path_name} path surfaces nag + schedule + edit too",
+          "nag skipped" in _blob and "karras ignored" in _blob
+          and "ref dropped" in _blob, detail=_blob)
+
 print("\n== keyword LoRA offers (2026-07-25): tokenize + merge + soft family ==")
 # Root cause fixed here: the old search_loras phrase-quoted the ENTIRE target
 # prompt as one FTS term -> 0 rows on any real prompt -> the planner never

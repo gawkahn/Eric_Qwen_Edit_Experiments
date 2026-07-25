@@ -287,6 +287,45 @@ Findings 1–8 before code; Findings 1–13 disposed as follows — 1↦D1, 2↦
 
 ## Changelog
 
+- 2026-07-25 (parity slice 2) — **Shared wire-warning surfacer.** From the
+  refine↔generate parity audit (matrix: vault
+  `Refine_Generate_Parity_Audit_2026-07-25.md`, Grant's call to run the
+  audit before the UX slices). refine surfaced ONLY `edit_warnings` from
+  daemon metadata while generate surfaced nag/schedule/edit/lora — so a
+  planner-added LoRA that silently failed to apply was invisible to the
+  operator, the loop, and the judge, and the score moved for
+  unattributable reasons. Acutely relevant since the planner started
+  actually proposing LoRAs (first live proposal same day, iteration 20).
+  New `generate.surface_wire_warnings(metadata, emit, *,
+  include_lora=True) -> int` over a `_WIRE_WARNING_CHANNELS` table;
+  generate's `_delegate_to_server` replaces three inline loops
+  (`include_lora=False` — `_report_lora_outcome` renders its own banner,
+  emission byte-identical); refine's `run_generation` calls it on BOTH
+  the daemon and cold branches. **Scope: the OPERATOR half only** — no
+  caller consumes the returned count, so loop/judge accounting is
+  unchanged and the planner can still re-propose a LoRA its own prior
+  iteration failed to apply (TECH_DEBT 2026-07-25, own slice: it changes
+  decision-making on a Red Zone file and interacts with `--pin-lora` and
+  the v3 gate). **Review folds (both Fable, no fallback):**
+  security-auditor Q1 PASS — traced every consumer and confirmed the
+  path-bearing `lora_warnings` strings reach the operator log ONLY
+  (`log = print`); the judge payload reads none of `GenOutcome.metadata`
+  and `_assert_no_paths` coverage is unaffected. Its two LOWs folded at
+  the new choke point: control-character stripping (a divergent
+  same-UID daemon could embed ANSI/OSC in a warning line) and a
+  per-channel cap of 20 items × 500 chars with an explicit
+  "N more suppressed" line (attention-DoS: ~1 MiB of warning text per
+  response × 100 iterations would bury the score/PASS lines). Its INFO
+  taken: the four wire-warning keys joined `_FORBIDDEN_CONTEXT_KEYS`, so
+  a future slice that accidentally passed daemon metadata into a judge
+  payload trips the structural backstop instead of relying on
+  by-construction discipline. code-reviewer APPROVED after catching a
+  self-inflicted weakening: my replacement `test_nag.py` N1 pin matched
+  the surfacer's DEF line, so deleting the CLI call site would have left
+  it green — re-pinned on the stderr emit literal. Cold-path duplicate
+  emission (stderr at origin + loop log) judged acceptable: different
+  sinks, the loop log is the operator's record.
+
 - 2026-07-25 — **Keyword LoRA offers + plateau-reword rubric.** Live
   finding: the planner NEVER received a LoRA offer in any refine run to
   date — `search_loras` phrase-quoted the ENTIRE target prompt as one FTS

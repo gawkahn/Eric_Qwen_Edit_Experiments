@@ -40,7 +40,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -1343,6 +1343,77 @@ def lora_failure_warnings(outcomes: List[Dict[str, Any]]) -> List[str]:
 # still written (ADR-015 2026-07-06). Distinct from 1/2 (hard errors) so
 # scripts can special-case it; the --iterate sweep treats it as NON-FATAL.
 _LORA_SOFT_FAIL_RC = 3
+
+
+#: Daemon-carried warning channels, as (metadata key, line prefix) pairs.
+#: The daemon's stderr is a log the operator never watches (invariant N1), so
+#: every notice raised in ITS process rides back in the wire metadata and MUST
+#: be emitted by whoever received it. Order is stable for test pinning.
+_WIRE_WARNING_CHANNELS = (
+    ("nag_warnings", "NAG — "),
+    ("schedule_warnings", "--schedule ignored — "),
+    ("edit_warnings", ""),
+    ("lora_warnings", "LoRA — "),
+)
+
+
+#: Per-channel emission caps (security review LOW, 2026-07-25). A divergent
+#: daemon can pack ~1 MiB of warning text per response (server._MAX_FRAME_BYTES)
+#: and refine runs up to 100 iterations — without a cap that buries the score
+#: and PASS/ABORT lines the loop's usability depends on (attention-DoS).
+_WIRE_WARNING_MAX_ITEMS = 20
+_WIRE_WARNING_MAX_CHARS = 500
+
+
+def _sanitize_wire_warning(text: Any) -> str:
+    """Strip control characters from a daemon-supplied warning line and cap its
+    length (security review LOW, 2026-07-25).
+
+    These strings are produced in the DAEMON's process and printed straight to
+    the operator's terminal. A compromised/divergent daemon could embed ANSI/OSC
+    sequences (cursor control, screen clear, window-title or clipboard writes on
+    permissive terminals). Same-UID peer per ADR-001, so this is
+    defense-in-depth, not a privilege boundary — but the shared surfacer is the
+    single choke point that finally makes it a one-line fix for all callers.
+    """
+    s = str(text)[:_WIRE_WARNING_MAX_CHARS]
+    return "".join(c for c in s if c.isprintable() or c == " ")
+
+
+def surface_wire_warnings(metadata: Optional[Dict[str, Any]],
+                          emit: Callable[[str], None],
+                          *, include_lora: bool = True) -> int:
+    """Emit every daemon-carried warning channel through `emit`; return the
+    LoRA-failure count (parity audit slice 2, 2026-07-25).
+
+    Shared by the CLI's `_delegate_to_server` and refine's `run_generation`,
+    which previously surfaced DIFFERENT subsets: refine read only
+    `edit_warnings`, so a LoRA the planner added that silently failed to apply
+    was invisible to the operator, the loop, AND the judge — the score moved
+    for unattributable reasons. One list, both callers. NOTE this closes the
+    OPERATOR half only: no caller yet consumes the returned count, so the
+    planner can still re-propose a LoRA its own prior iteration failed to
+    apply (loop/judge accounting is the declared follow-up — TECH_DEBT
+    2026-07-25).
+
+    `emit` takes one preformatted line (the CLI writes stderr; refine writes
+    its log). `include_lora=False` suppresses the LoRA lines for callers that
+    render their own banner (the CLI's `_report_lora_outcome`) — the count is
+    still returned either way. Works on in-process metadata too: both paths
+    populate the same keys.
+    """
+    md = metadata or {}
+    lora_count = len(md.get("lora_warnings") or [])
+    for key, prefix in _WIRE_WARNING_CHANNELS:
+        if key == "lora_warnings" and not include_lora:
+            continue
+        items = md.get(key) or []
+        for w in items[:_WIRE_WARNING_MAX_ITEMS]:
+            emit(f"{prefix}{_sanitize_wire_warning(w)}")
+        if len(items) > _WIRE_WARNING_MAX_ITEMS:
+            emit(f"{prefix}... {len(items) - _WIRE_WARNING_MAX_ITEMS} more "
+                 f"{key} suppressed")
+    return lora_count
 
 
 def _report_lora_outcome(metadata: Dict[str, Any]) -> int:
@@ -3205,26 +3276,16 @@ def _delegate_to_server(
             print(f"[comfyless] Metadata: {sidecar_path}")
         print(f"\nDone. seed={metadata.get('seed', '?')}, "
               f"time={metadata.get('elapsed_seconds', '?')}s")
-        # NAG skips/oddities happened in the DAEMON's process — its stderr
-        # is a log the user never watches. Surface them client-side from the
-        # wire metadata (invariant N1; mirrors lora_warnings below).
-        for _w in metadata.get("nag_warnings") or []:
-            print(f"[comfyless] WARNING: NAG — {_w}", file=sys.stderr)
-        # A --schedule that the daemon warn-and-ignored (wrong family/scheduler)
-        # is likewise surfaced client-side from the wire metadata — the daemon's
-        # stderr never reaches here (ADR-028; invariant N1).
-        for _w in metadata.get("schedule_warnings") or []:
-            print(f"[comfyless] WARNING: --schedule ignored — {_w}", file=sys.stderr)
-        # ADR-035 slice 4: edit-path notices (a reference dropped for an
-        # unsupported family under lenient mode; a --sampler ignored by the
-        # qwen-edit loop) happened in the daemon's process — its stderr never
-        # reaches the client. Surface them from the wire metadata so the
-        # interactive user actually sees the loud warn the ADR promises
-        # (invariant N1; mirrors nag/schedule above).
-        for _w in metadata.get("edit_warnings") or []:
-            print(f"[comfyless] WARNING: {_w}", file=sys.stderr)
-        # Daemon already carries lora_warnings in the wire metadata — surface
-        # them loudly client-side (ADR-015 2026-07-06).
+        # Every notice raised in the DAEMON's process rides back in the wire
+        # metadata — its stderr is a log the user never watches (invariant N1;
+        # NAG, ADR-028 --schedule, ADR-035 slice-4 edit notices). One shared
+        # surfacer, also used by refine (parity audit slice 2). LoRA lines are
+        # suppressed here because _report_lora_outcome renders them in its own
+        # banner immediately below (ADR-015 2026-07-06).
+        surface_wire_warnings(
+            metadata,
+            lambda line: print(f"[comfyless] WARNING: {line}", file=sys.stderr),
+            include_lora=False)
         return _report_lora_outcome(metadata)
 
     # ADR-035 slice 4b: a reference outside the daemon's configured

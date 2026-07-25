@@ -408,8 +408,19 @@ check("CFG-interplay rule lives in the gate table (client-visible skip)",
       "cfg_owns and cfg_scale > 0" in _gen_src)
 check("NAG skips ride metadata as nag_warnings (N1 boundary channel)",
       'metadata["nag_warnings"] = nag_warnings' in _gen_src)
+# Parity slice 2 (2026-07-25): the per-channel `metadata.get("nag_warnings")`
+# loop moved into the shared `surface_wire_warnings` channel table, which both
+# the CLI daemon path and refine's loop call — so N1 loudness now crosses BOTH
+# client boundaries. Pin the table entry + the call site (behavioral coverage
+# of the surfacer itself lives in test_refine.py's parity-slice-2 block).
 check("daemon client surfaces wire nag_warnings on stderr",
-      'metadata.get("nag_warnings")' in _gen_src)
+      '("nag_warnings", ' in _gen_src
+      # The CALL, not just the def: bare `"surface_wire_warnings(" in src`
+      # matches the definition line, so deleting the call from
+      # _delegate_to_server would leave this green while the daemon client
+      # goes silent (code review, 2026-07-25). Pin the stderr emit literal.
+      and 'lambda line: print(f"[comfyless] WARNING: {line}", file=sys.stderr)'
+      in _gen_src)
 _mcp_src = Path("comfyless/mcp_server.py").read_text()
 check("MCP surfaces nag_warnings as agent notices",
       "WARNING: NAG" in _mcp_src

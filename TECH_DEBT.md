@@ -1777,3 +1777,19 @@ OR the next history-shape slice. Fix: a boolean `seed_resampled` field in
 `history_record` (loop-owned state, not filesystem drift — slice-2
 forward-constraint permits it), plus rubric line telling the judge scores on
 such iterations reflect a new sample, not the edit.
+
+## 2026-07-25 — refine loop does not ACT on failed LoRA applications
+Parity-audit slice 2 `code-reviewer` (Fable) NIT. `surface_wire_warnings`
+returns the LoRA-failure count and refine now logs the warnings, but no
+caller consumes the count: the loop's accounting (history record, verdict,
+promotion) is unchanged, so the planner can re-propose a LoRA that its own
+prior iteration failed to apply, and a score delta caused by a MISSING
+adapter is attributable only by a human reading the log. Why not now:
+feeding failure state into the planner's context or the promotion rule
+changes decision-making on a Red Zone file and belongs in its own slice with
+its own review (it also interacts with the pending `--pin-lora` work and the
+v3 promotion gate). Trigger: observing the planner re-propose a failed LoRA,
+OR the next refine loop-accounting slice. Fix: carry the count into the
+history record (a `lora_failed: true` flag is path-free and F8-P-safe) and
+add a rubric line telling the planner that a flagged iteration's scores do
+not reflect the proposed LoRA.

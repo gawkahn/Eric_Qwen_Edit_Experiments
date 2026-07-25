@@ -127,7 +127,16 @@ MAX_ITERATIONS_SANITY_CAP = 100
 _REFINE_EDIT_FAMILIES = ("qwen-edit",)
 
 #: Load-plane path keys that must NEVER appear in a planner-visible payload (F3).
-_FORBIDDEN_CONTEXT_KEYS = ("abs_path", "path", "root", "relative_path")
+#: The wire-warning channels join the list (security review INFO, 2026-07-25):
+#: `lora_warnings` strings EMBED LoRA PATHS (operator-facing only per ADR-015
+#: MEDIUM-1), and `_assert_no_paths` gates KEYS, so without them a future slice
+#: that passed daemon metadata into a judge payload would sail through the
+#: structural backstop. Path-freedom for those strings is by construction today
+#: (audit-verified: the surfacer's only sink is the operator log) — this makes
+#: an accidental future inclusion trip loudly instead.
+_FORBIDDEN_CONTEXT_KEYS = ("abs_path", "path", "root", "relative_path",
+                           "lora_warnings", "nag_warnings",
+                           "schedule_warnings", "edit_warnings")
 
 
 class RefineError(Exception):
@@ -1369,12 +1378,16 @@ def run_generation(cfg: WorkingConfig, *, device: str, output_dir: str,
                     f"honestly as {os.path.basename(move_target)}.")
             if os.path.abspath(out_path) != os.path.abspath(move_target):
                 shutil.move(out_path, move_target)
-            # Surface daemon-side edit warnings (invariant N1 parity with
-            # _delegate_to_server; slice-B review LOW-2) — they happened in
-            # the daemon's process and its stderr never reaches this client.
-            for _w in (resp.get("metadata") or {}).get("edit_warnings") or []:
-                log(f"[refine] WARNING (daemon): {_w}")
-            return GenOutcome(image_path=move_target, metadata=resp.get("metadata", {}))
+            # Surface EVERY daemon-side warning channel (invariant N1 parity
+            # with _delegate_to_server via the shared surfacer — parity audit
+            # slice 2, 2026-07-25). This path previously read only
+            # edit_warnings, so a planner-added LoRA that silently failed to
+            # apply was invisible to the operator, the loop, and the judge:
+            # the score moved for unattributable reasons.
+            _md = resp.get("metadata") or {}
+            gen.surface_wire_warnings(
+                _md, lambda line: log(f"[refine] WARNING (daemon): {line}"))
+            return GenOutcome(image_path=move_target, metadata=_md)
         # resp is None: socket present but the connection failed. Say so — running
         # in-process now risks a VRAM collision with the resident daemon (code
         # review slice-3, LOW-5a).
@@ -1433,6 +1446,11 @@ def run_generation(cfg: WorkingConfig, *, device: str, output_dir: str,
         # path already carries the matching extension). None → png, unchanged.
         output_format=output_format,
     )
+    # Cold path carries the same warning keys as the wire result — surface it
+    # identically (parity audit slice 2). generate() prints its own notices to
+    # stderr in-process, but the loop's log is what the operator reads.
+    gen.surface_wire_warnings(
+        metadata, lambda line: log(f"[refine] WARNING: {line}"))
     return GenOutcome(image_path=canonical, metadata=metadata)
 
 
