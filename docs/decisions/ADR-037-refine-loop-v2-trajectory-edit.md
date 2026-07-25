@@ -287,6 +287,32 @@ Findings 1–8 before code; Findings 1–13 disposed as follows — 1↦D1, 2↦
 
 ## Changelog
 
+- 2026-07-25 — **Keyword LoRA offers + plateau-reword rubric.** Live
+  finding: the planner NEVER received a LoRA offer in any refine run to
+  date — `search_loras` phrase-quoted the ENTIRE target prompt as one FTS
+  term (0 rows on any real prompt; verified against the live DB where
+  single keywords surface exactly the applicable entries, e.g.
+  qwen-studio-realism). Fix: `_offer_keywords` tokenizes the prompt
+  (stopword-stripped content words, capped 8), per-keyword FTS,
+  round-robin rank merge, dedupe; family filter is SOFT — entries tagged
+  a DIFFERENT family are dropped, NULL-family entries stay proposable
+  (catalog tagging is partial, 498/789 untagged; wrong proposals fail
+  loudly at load per ADR-015) — with qwen-edit/qwen-image as one compat
+  group. `offer_family` derives from the operator-typed model — or, in t2i
+  seed mode, the seed-sidecar model (the F4 user-authority channel, loudly
+  echoed) — never from LLM output (audit-verified: no planner-writable
+  channel reaches `base["model"]`). F3 unchanged:
+  offers still project through `_safe_lora_view`. Companion D6 rubric
+  change (both recipes): NEVER return empty overrides while short of the
+  gate — reword/reorder the instruction (same requirements, different
+  emphasis) and/or use the offered LoRAs by catalog name. Interaction
+  note: this makes planner no-ops rare, so seed exploration shifts to the
+  stagnation escape (intended — config exploration beats reprints; the
+  research memo's seed-batch design will supersede this territory).
+  Optimization research memo (pairwise duels, sideways caps, anchor
+  duels) saved to the vault: `Refine_Optimization_Research_2026-07-25.md`
+  — algorithm changes await Grant's read (his direction 2026-07-25).
+
 - 2026-07-24 (night) — **D2 amendment addendum: stagnation seed escape
   (`--explore-after N`).** Live gap in the no-op resample: it fires only
   when the planner proposes NOTHING. Observed run: iter 1 hit 8.6 (best);

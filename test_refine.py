@@ -1606,6 +1606,74 @@ check("composite target absent from persisted verdict records",
       == ["composite", "critique", "iteration", "notices",
           "proposed_overrides", "scores", "verdict", "weights"])
 
+print("\n== keyword LoRA offers (2026-07-25): tokenize + merge + soft family ==")
+# Root cause fixed here: the old search_loras phrase-quoted the ENTIRE target
+# prompt as one FTS term -> 0 rows on any real prompt -> the planner never
+# received a single offer across every refine run to date.
+check("_offer_keywords: stopwords/short words stripped, order kept, deduped",
+      refine._offer_keywords(
+          "Full body, the image of a barefoot man, barefoot realism")
+      == ["body", "barefoot", "realism"])
+check("_offer_keywords: cap respected",
+      len(refine._offer_keywords(
+          "alpha bravo charlie delta echo foxtrot golfing hotels india "
+          "juliet kilos")) == 8)
+_FAKE_OFFER_ROWS = {
+    "barefoot": [{"id": 1, "name": "A", "kind": "lora",
+                  "model_family": "qwen-image", "abs_path": "/secret/a"},
+                 {"id": 2, "name": "FluxThing", "kind": "lora",
+                  "model_family": "flux", "abs_path": "/secret/f"}],
+    "realism": [{"id": 3, "name": "B", "kind": "lora",
+                 "model_family": None, "abs_path": "/secret/b"},
+                {"id": 1, "name": "A", "kind": "lora",
+                 "model_family": "qwen-image", "abs_path": "/secret/a"}],
+}
+
+
+def _fake_cat_search(conn, term, *, kind=None, family=None, limit=20,
+                     include_excluded=False):
+    return list(_FAKE_OFFER_ROWS.get(term, []))
+
+
+from comfyless import catalog_db as _cdb  # noqa: E402
+_real_search = _cdb.search
+_cdb.search = _fake_cat_search
+try:
+    _offers = refine.search_loras(object(), "Barefoot realism, the image",
+                                  family="qwen-edit")
+    check("offers: rank-merged, deduped, different-family dropped, "
+          "NULL-family kept",
+          [o["name"] for o in _offers] == ["A", "B"],
+          detail=str(_offers))
+    check("offers: qwen-edit accepts qwen-image-tagged entries (compat group)",
+          any(o.get("model_family") == "qwen-image" for o in _offers))
+    check("offers: paths never survive the safe view (F3)",
+          all("abs_path" not in o and "/secret" not in str(o)
+              for o in _offers))
+    _offers = refine.search_loras(object(), "Barefoot realism, the image")
+    check("offers: no family -> cross-family entries pass through",
+          [o["name"] for o in _offers] == ["A", "B", "FluxThing"])
+    check("offers: all-stopword prompt -> no keywords -> no offers",
+          refine.search_loras(object(), "the image of a") == [])
+    check("offers: keywords that all miss -> empty offers",
+          refine.search_loras(object(), "zebra unicorns") == [])
+finally:
+    _cdb.search = _real_search
+# Rubric-text pins (code review SHOULD): the plateau-reword paragraph and
+# the offers-provenance line must survive future recipe edits, in the
+# shipped TOMLs and the import-safe fallbacks alike.
+for _rname in ("generic", "edit-generic"):
+    _rtext = refine.load_judge_recipe(_rname)
+    check(f"{_rname} rubric: plateau-reword guidance present",
+          "NEVER return empty overrides" in _rtext)
+    check(f"{_rname} rubric: offers provenance label present",
+          "CATALOG METADATA" in _rtext)
+check("fallback rubrics carry the same guidance (parity)",
+      "NEVER return empty overrides" in refine._DEFAULT_JUDGE_RUBRIC
+      and "NEVER return empty overrides" in refine._DEFAULT_EDIT_RUBRIC
+      and "CATALOG METADATA" in refine._DEFAULT_JUDGE_RUBRIC
+      and "CATALOG METADATA" in refine._DEFAULT_EDIT_RUBRIC)
+
 print("\n== ADR-009 CFG-knob aliasing: --cfg suppresses true_cfg default ==")
 # Parity with generate._apply_family_defaults (2026-07-24): an explicit
 # --cfg (non-None cfg_scale in base) must suppress the family-default
