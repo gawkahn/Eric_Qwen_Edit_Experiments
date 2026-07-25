@@ -662,6 +662,58 @@ check("overlay: mixed — explicit true_cfg_scale preserved at 6.0",
 check("overlay: mixed — non-explicit steps still gets family value 50",
       _p["steps"] == 50)
 
+# 6. CFG-knob aliasing (ADR-009 changelog 2026-07-24): --cfg and --true-cfg
+# are one knob — build_call_kwargs routes an explicit cfg_scale onto
+# true_cfg_scale for non-guidance-embeds families, but ONLY when
+# true_cfg_scale is None. A family default filling true_cfg_scale therefore
+# silently defeats the operator's explicit --cfg (live: --cfg 1 on
+# qwen-edit + Lightning ran true-CFG 4.0). Explicit or iterated cfg_scale
+# must suppress the true_cfg_scale family default; unrelated keys still fill.
+_p = {"model": _paths["qwen-image"], "cfg_scale": 1.0,
+      "true_cfg_scale": None, "steps": 28}
+_, _err6 = _capture_stderr(g._apply_family_defaults, _p, {"cfg_scale"}, set())
+check("overlay: explicit cfg_scale suppresses true_cfg_scale family default",
+      _p["true_cfg_scale"] is None)
+check("overlay: suppression still fills unrelated keys (steps=50)",
+      _p["steps"] == 50)
+check("overlay: suppression is loud",
+      "suppressed by explicit/iterated --cfg" in _err6)
+_p = {"model": _paths["qwen-image"], "cfg_scale": None,
+      "true_cfg_scale": None, "steps": 28}
+_capture_stderr(g._apply_family_defaults, _p, set(), {"cfg_scale"})
+check("overlay: iterated cfg axis also suppresses true_cfg default",
+      _p["true_cfg_scale"] is None)
+# Value-aware guard (security review LOW): a sidecar "cfg_scale": null puts
+# the key in explicit_keys with a None value — suppression must NOT fire
+# (the family default keeps masking the degenerate pair).
+_p = {"model": _paths["qwen-image"], "cfg_scale": None,
+      "true_cfg_scale": None, "steps": 28}
+_capture_stderr(g._apply_family_defaults, _p, {"cfg_scale"}, set())
+check("overlay: explicit-but-None cfg_scale does NOT suppress the default",
+      _p["true_cfg_scale"] == 4.0)
+# End-to-end routing pin (code review SHOULD): the exact junction that
+# caused the incident — after suppression leaves true_cfg_scale None, the
+# qwen router must map the explicit cfg onto true CFG. A future falsy-check
+# regression (`if true_cfg_scale:`) fails here.
+_kw = g._build_call_kwargs(
+    object(), "qwen-image", False, "a cat", "",
+    1024, 1024, 8, 1.0, None, 512, None,
+)
+check("qwen routing: explicit cfg 1.0 + suppressed default -> true_cfg 1.0",
+      _kw.get("true_cfg_scale") == 1.0)
+_kw = g._build_call_kwargs(
+    object(), "qwen-image", False, "a cat", "",
+    1024, 1024, 8, 1.0, 6.0, 512, None,
+)
+check("qwen routing: explicit --true-cfg 6.0 outranks --cfg 1.0",
+      _kw.get("true_cfg_scale") == 6.0)
+# Structural guard (code review NIT): the one-directional suppression is
+# only safe while no family declares BOTH knobs — force a deliberate
+# decision if one ever does.
+check("no FAMILY_DEFAULTS entry sets both cfg_scale and true_cfg_scale",
+      all(not ({"cfg_scale", "true_cfg_scale"} <= set(v))
+          for v in FAMILY_DEFAULTS.values()))
+
 # ── distilled-schedule warning on --transformer override (2026-07-10) ────
 # Family resolves from the BASE model path (ADR-009 name-hint); --transformer
 # is never inspected. So a base-weights override against a *-Turbo directory

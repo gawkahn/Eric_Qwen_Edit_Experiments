@@ -1908,11 +1908,26 @@ def _overlay_family_defaults(base: dict,
         # not an object (index.get on a list/str) — degrade like the rest.
         pass
     applied: Dict[str, Any] = {}
+    # CFG-knob aliasing (ADR-009 changelog 2026-07-24, parity with
+    # generate._apply_family_defaults): an explicit --cfg suppresses a
+    # family-default true_cfg_scale — the two flags are one knob, and the
+    # router prefers a non-None true_cfg_scale, so the default would defeat
+    # the operator's explicit --cfg. One-directional (see generate.py).
+    _cfg_knob_explicit = base.get("cfg_scale") is not None
     if family:
         for key, value in FAMILY_DEFAULTS.get(family, {}).items():
             # Only keys refine's CLI exposes (present in base) participate;
             # family entries like hunyuan's refiner_steps have no refine flag
             # and must not ride into the daemon request unrequested.
+            # base.get() guard: with BOTH knobs explicit (--cfg + --true-cfg)
+            # the explicit --true-cfg stands and no default was in play — do
+            # not log a misleading suppression (code review NIT).
+            if (key == "true_cfg_scale" and _cfg_knob_explicit
+                    and base.get("true_cfg_scale") is None):
+                log(f"[refine] family default true_cfg_scale={value!r} "
+                    f"suppressed by explicit --cfg (one CFG knob — --cfg "
+                    f"routes to true CFG on this family)")
+                continue
             if key in base and base[key] is None:
                 base[key] = value
                 applied[key] = value

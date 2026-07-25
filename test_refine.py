@@ -1606,6 +1606,30 @@ check("composite target absent from persisted verdict records",
       == ["composite", "critique", "iteration", "notices",
           "proposed_overrides", "scores", "verdict", "weights"])
 
+print("\n== ADR-009 CFG-knob aliasing: --cfg suppresses true_cfg default ==")
+# Parity with generate._apply_family_defaults (2026-07-24): an explicit
+# --cfg (non-None cfg_scale in base) must suppress the family-default
+# true_cfg_scale, or the router prefers the default and the explicit --cfg
+# is silently ignored (the qwen-edit + Lightning true-CFG-4.0 burn).
+_famdir = _tf.mkdtemp(prefix="refine_fam_alias_")
+with open(os.path.join(_famdir, "model_index.json"), "w") as _fh:
+    _fh.write('{"_class_name": "QwenImagePipeline"}')
+_fbase = {"model": _famdir, "cfg_scale": 1.0, "true_cfg_scale": None,
+          "steps": None}
+_fmsgs: list = []
+refine._overlay_family_defaults(_fbase, log=_fmsgs.append)
+check("refine overlay: explicit --cfg suppresses true_cfg_scale default",
+      _fbase["true_cfg_scale"] is None)
+check("refine overlay: unrelated family key still fills (steps=50)",
+      _fbase["steps"] == 50)
+check("refine overlay: suppression is loud",
+      any("suppressed by explicit --cfg" in m for m in _fmsgs))
+_fbase = {"model": _famdir, "cfg_scale": None, "true_cfg_scale": None,
+          "steps": None}
+refine._overlay_family_defaults(_fbase, log=lambda *_a: None)
+check("refine overlay: no explicit --cfg -> true_cfg default still applies",
+      _fbase["true_cfg_scale"] == 4.0)
+
 _pre = ("DESCRIPTION\n- shirt untucked, hem over waistband\nVERIFICATION\n"
         "R1: shirt tucked -> NOT MET - hem hangs over waistband\n"
         "PRESERVATION: identity kept\n")

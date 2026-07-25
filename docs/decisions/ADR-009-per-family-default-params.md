@@ -180,6 +180,43 @@ them. The dict is therefore designed for one-edit changes:
 
 ## Changelog
 
+- **2026-07-24** — **CFG-knob aliasing fix** (both appliers:
+  `generate._apply_family_defaults` + `refine._overlay_family_defaults`).
+  `--cfg` and `--true-cfg` are two spellings of one knob:
+  `build_call_kwargs` routes an explicit `cfg_scale` onto
+  `true_cfg_scale` for non-guidance-embeds families, but only when
+  `true_cfg_scale` is None — so a family default filling
+  `true_cfg_scale` (qwen-image/qwen-edit: 4.0) silently DEFEATED an
+  operator's explicit `--cfg` (observed live: `--cfg 1` on qwen-edit +
+  a Lightning 8-step LoRA ran double-pass true-CFG 4.0 — CFG burn on a
+  distilled setup, plausibly the artifact source in the first edit-mode
+  refine smokes). The precedence ladder is unchanged; the fix extends
+  "explicit" across the alias pair one-directionally: an explicit or
+  iterated `cfg_scale` suppresses the `true_cfg_scale` family default
+  (loud log line), while an explicit `true_cfg_scale` does NOT suppress
+  a `cfg_scale` default (krea-class families default `cfg_scale`;
+  `true_cfg` is inert there, so symmetric suppression would only break
+  their defaults). Pinned in test_params_schema (explicit + iterated) and
+  test_refine (parity + defaults-still-apply negative).
+  **Review fold (both Fable, no fallback, same day):** code-reviewer
+  APPROVED after verifying all five consumer paths (CLI in-process,
+  daemon delegation — server.py applies no family defaults, --iterate,
+  MCP, refine entries; seed-image entry never calls the overlay).
+  Folds: end-to-end qwen routing pin at the incident junction
+  (cfg 1.0 + suppressed default → true_cfg 1.0; explicit --true-cfg
+  outranks), no-both-knobs FAMILY_DEFAULTS structural guard, refine
+  suppression log silenced when --true-cfg is also explicit, log
+  wording "explicit/iterated". security-auditor LOW folded: the
+  generate-side explicit test is now value-aware (a replayed sidecar
+  `"cfg_scale": null` no longer suppresses — the family default keeps
+  masking the degenerate pair); INFO verdicts: MCP gains no authority
+  it lacked (it could already set true_cfg_scale directly, and the
+  machine boundary rejects null cfg_scale), refine's seed path cannot
+  reach the suppression, logs injection-clean. Bonus fix noted by the
+  reviewer: `--iterate cfg_scale` sweeps on qwen families were
+  previously inert (every iteration ran true-CFG 4.0) — now they work.
+  Review: `docs/security/review-adr-009-cfg-aliasing-2026-07-24.md`.
+
 - **2026-04-25** — proposed and accepted (this document).
 - **2026-04-25** — clarification (reviewer fold-in): the family overlay
   applies to BOTH the in-process path and the daemon delegation path
