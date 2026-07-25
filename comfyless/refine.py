@@ -1597,6 +1597,10 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                                              family=offer_family)
             except Exception as e:  # noqa: BLE001 — FTS on arbitrary text can raise
                 log(f"[refine] iter {i}: catalog search skipped ({e})")
+        # Operator ergonomics (2026-07-25, Grant): emit the CANONICAL saved
+        # path like `generate` does — the daemon's own log line shows its
+        # pre-move re-rooted path, which is misleading and not paste-able.
+        log(f"[refine] iter {i}: candidate saved: {outcome.image_path}")
         img = Image.open(outcome.image_path).convert("RGB")
         # Edit mode: the judge compares SOURCE vs CANDIDATE (role labels only,
         # D5/Finding 4) — scene preservation is unscoreable from the candidate
