@@ -1370,6 +1370,7 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 conn, backend_cfg: dict, output_dir: str, device: str,
                 precision: str = "bf16",
                 pass_threshold: int = DEFAULT_PASS_THRESHOLD,
+                until_composite: Optional[float] = None,
                 max_iterations: int = DEFAULT_MAX_ITERATIONS,
                 patience: int = DEFAULT_PATIENCE,
                 w_pa: float = DEFAULT_W_PA, w_aes: float = DEFAULT_W_AES,
@@ -1390,7 +1391,9 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
     a dead endpoint must not burn blind generations to the cap). patience <= 0
     disables the no-improvement early stop (the default since 2026-07-18).
     Winner = the passing candidate, or the top-composite candidate if none
-    passed.
+    passed. Pass gate: both axes >= pass_threshold, or — when
+    `until_composite` is set (ADR-037 D3 amendment) — weighted composite >=
+    that float target INSTEAD (pass_threshold ignored).
 
     EDIT MODE (ADR-037 D5): `edit_source` (an operator-typed image path) makes
     every iteration an edit of the current source — the operator's seed at
@@ -1548,8 +1551,21 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
         log(f"[refine] iter {i}: prompt_adherence={verdict.prompt_adherence} "
             f"aesthetics={verdict.aesthetics} composite={comp:.2f}")
 
-        if verdict_passes(verdict, pass_threshold):
-            log(f"[refine] iter {i}: PASS — both axes >= {pass_threshold}, stopping")
+        # Pass gate (ADR-037 D3 amendment): a float composite target REPLACES
+        # the both-axes gate when set. Epsilon-tolerant compare — composites
+        # are float sums (0.6*10 + 0.4*9 can sit a ULP under 9.6). The judge's
+        # advisory verdict string stays non-authoritative either way (F8).
+        if until_composite is not None:
+            gate = comp >= until_composite - 1e-9
+            if gate:
+                log(f"[refine] iter {i}: PASS — composite {comp:.2f} >= "
+                    f"{until_composite:g}, stopping")
+        else:
+            gate = verdict_passes(verdict, pass_threshold)
+            if gate:
+                log(f"[refine] iter {i}: PASS — both axes >= "
+                    f"{pass_threshold}, stopping")
+        if gate:
             best = cand
             passed = True
             break
@@ -1748,18 +1764,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    metavar="SEC", help="Per-call judge HTTP timeout")
     # Loop controls.
     p.add_argument("--pass-threshold", type=int, default=DEFAULT_PASS_THRESHOLD,
-                   help="Pass when BOTH axes >= this (default 8)")
+                   help="Pass when BOTH axes >= this (default 8; ignored when "
+                        "--until-score is given a SCORE value — the composite "
+                        "gate replaces it)")
     p.add_argument("--max-iterations", type=int, default=None,
                    help=f"Hard cap on generations (default "
                         f"{DEFAULT_MAX_ITERATIONS}; with --until-score the "
                         f"default rises to the sanity cap "
                         f"{MAX_ITERATIONS_SANITY_CAP}; ceiling "
                         f"{MAX_ITERATIONS_SANITY_CAP} either way)")
-    p.add_argument("--until-score", action="store_true",
-                   help="Run until BOTH axes >= --pass-threshold, however many "
+    p.add_argument("--until-score", nargs="?", const=True, default=False,
+                   metavar="SCORE",
+                   help="Run until the pass gate holds, however many "
                         "iterations that takes, bounded by --max-iterations if "
                         f"given, else the sanity cap "
-                        f"({MAX_ITERATIONS_SANITY_CAP}) (ADR-037 D3)")
+                        f"({MAX_ITERATIONS_SANITY_CAP}). Bare flag: gate = "
+                        "BOTH axes >= --pass-threshold (unchanged). With a "
+                        "SCORE value (float, 1-10, e.g. 9.6): gate = weighted "
+                        "COMPOSITE >= SCORE and --pass-threshold is ignored "
+                        "(ADR-037 D3 amendment)")
     p.add_argument("--patience", type=int, default=DEFAULT_PATIENCE,
                    help="Early-stop after N iters with no composite gain; "
                         "0 disables — run until pass or --max-iterations "
@@ -2079,6 +2102,45 @@ def build_config_from_seed(args, catalog, roots,
     return WorkingConfig(prompt=prompt, loras=slots, base=base), prompt
 
 
+def _parse_until_score(value) -> Optional[float]:
+    """--until-score's optional composite target (ADR-037 D3 amendment).
+    False (absent) / True (bare flag) → None: the both-axes gate applies.
+    A string (the argparse nargs='?' value) → validated float target:
+    finite, 1.0-10.0. Raises RefineError on anything else — same operator-
+    error discipline as _resolve_max_iterations."""
+    if value is False or value is True:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        raise RefineError(
+            f"--until-score: invalid score {value!r} (want a number 1-10)")
+    if not math.isfinite(f) or not (1.0 <= f <= 10.0):
+        raise RefineError(
+            f"--until-score: score must be a finite number between 1 and 10, "
+            f"got {value!r}")
+    return f
+
+
+def _nearest_reachable_composite(target: float, w_pa: float,
+                                 w_aes: float) -> Optional[float]:
+    """Smallest composite achievable with INTEGER axis scores (1-10 each)
+    that is >= target — a 10x10 grid scan — or None when NO lattice point
+    reaches the target (non-default weights can cap the max composite below
+    it, e.g. weights .5/.3 max out at 8.0). Integer axes make the reachable
+    composite set a lattice; a target inside a gap (9.8 at weights .6/.4,
+    where the lattice jumps 9.6 → 10.0) silently demands the next lattice
+    point and an unreachable target silently demands the iteration cap —
+    main() names both in warn-don't-block notes (code review SHOULD,
+    2026-07-24: the unreachable case must not be the one silent branch)."""
+    vals = sorted({composite_score(a, b, w_pa, w_aes)
+                   for a in range(1, 11) for b in range(1, 11)})
+    for v in vals:
+        if v >= target - 1e-9:
+            return v
+    return None
+
+
 def _resolve_max_iterations(max_iterations_arg: Optional[int],
                             until_score: bool) -> int:
     """Effective iteration cap (ADR-037 D3): an explicit --max-iterations wins
@@ -2148,13 +2210,45 @@ def main(argv: Optional[List[str]] = None) -> int:
                   f"--prompt / --seed-image.", file=sys.stderr)
             return 2
 
+    # Composite weights are operator CLI floats that — since the D3 amendment
+    # — control loop TERMINATION, not just ranking (security review LOW,
+    # 2026-07-24): a NaN weight makes every gate compare False (cap ride) and
+    # scrambles the lattice note. Finite-check them up front; range stays
+    # operator-domain (warn-don't-block).
+    for _wname, _wval in (("--w-prompt-adherence", args.w_prompt_adherence),
+                          ("--w-aesthetics", args.w_aesthetics)):
+        if not math.isfinite(_wval):
+            print(f"[refine] {_wname} must be a finite number, got {_wval!r}",
+                  file=sys.stderr)
+            return 2
     try:
+        until_composite = _parse_until_score(args.until_score)
         max_iterations = _resolve_max_iterations(args.max_iterations,
-                                                 args.until_score)
+                                                 bool(args.until_score))
     except RefineError as e:
         print(f"[refine] {e}", file=sys.stderr)
         return 2
-    if args.until_score:
+    if until_composite is not None:
+        log(f"[refine] until-score mode: running until composite >= "
+            f"{until_composite:g} (--pass-threshold ignored), capped at "
+            f"{max_iterations} iterations")
+        _nearest = _nearest_reachable_composite(
+            until_composite, args.w_prompt_adherence, args.w_aesthetics)
+        if _nearest is None:
+            _max_comp = composite_score(10, 10, args.w_prompt_adherence,
+                                        args.w_aesthetics)
+            log(f"[refine] WARNING: target {until_composite:g} is UNREACHABLE "
+                f"at weights ({args.w_prompt_adherence:g}/"
+                f"{args.w_aesthetics:g}) — the maximum possible composite is "
+                f"{_max_comp:g}; the run will ride to the iteration cap "
+                f"({max_iterations})")
+        elif _nearest > until_composite + 1e-9:
+            log(f"[refine] note: axis scores are integers, so composites form "
+                f"a lattice — at weights ({args.w_prompt_adherence:g}/"
+                f"{args.w_aesthetics:g}) the nearest reachable composite >= "
+                f"{until_composite:g} is {_nearest:g}; the run effectively "
+                f"requires that")
+    elif args.until_score:
         log(f"[refine] until-score mode: running until both axes >= "
             f"{args.pass_threshold}, capped at {max_iterations} iterations")
 
@@ -2292,7 +2386,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             cfg, target_prompt=target_prompt, catalog=catalog, roots=roots,
             conn=conn, backend_cfg=backend_cfg, output_dir=args.output_dir,
             device=args.device, precision=args.precision,
-            pass_threshold=args.pass_threshold, max_iterations=max_iterations,
+            pass_threshold=args.pass_threshold,
+            until_composite=until_composite, max_iterations=max_iterations,
             patience=args.patience, w_pa=args.w_prompt_adherence,
             w_aes=args.w_aesthetics, judge_timeout=args.judge_timeout,
             judge_system_prompt=judge_system_prompt, output_format=out_fmt,

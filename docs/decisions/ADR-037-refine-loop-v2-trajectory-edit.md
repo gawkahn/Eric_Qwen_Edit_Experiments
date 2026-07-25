@@ -287,6 +287,42 @@ Findings 1–8 before code; Findings 1–13 disposed as follows — 1↦D1, 2↦
 
 ## Changelog
 
+- 2026-07-24 (evening) — **D3 amendment: `--until-score [SCORE]` float
+  composite gate.** From the impossible-target stress test: axis scores are
+  integers, so `--pass-threshold` is an int by design and a "very good but
+  not perfect" target (Grant wanted 9.8, then 9.6) was inexpressible — a
+  threshold-10 until-score run rides to the cap by rubric construction
+  (aesthetics 10 = "exceptional craft"). Semantics: bare `--until-score`
+  is UNCHANGED (both axes >= --pass-threshold); `--until-score SCORE`
+  (float, 1-10, finite) REPLACES the gate with weighted COMPOSITE >=
+  SCORE (epsilon-tolerant compare — composites are float sums, 0.6*10+
+  0.4*9 may sit a ULP under 9.6). --pass-threshold is ignored in valued
+  mode (help text says so). Cap rules unchanged (valued mode raises the
+  default cap to the sanity cap exactly like bare mode). Warn-don't-block
+  lattice note: integer axes make the reachable composite set a lattice —
+  when the target sits in a gap (9.8 at weights .6/.4 → nearest reachable
+  10.0), a loud note names the composite the run effectively requires.
+  The judge's advisory "pass" string stays non-authoritative (F8,
+  unchanged).
+  **Review fold (both Fable, no fallback, same day):** code-reviewer
+  SHOULD + security-auditor LOW (independent, same finding): an
+  UNREACHABLE target (non-default weights capping the max composite below
+  it, e.g. weights .5/.3 with target 9) silently skipped the lattice note
+  and rode to the cap — FIXED: `_nearest_reachable_composite` returns
+  None on unreachable and main() emits a loud UNREACHABLE warning naming
+  the max possible composite. Security LOW: composite weights are
+  unvalidated CLI floats that now control TERMINATION (NaN weights = every
+  compare False = silent cap ride) — FIXED: finite-check on both `--w-*`
+  flags at entry, exit 2 (range stays operator-domain per
+  warn-don't-block). NITs/INFO folded: cap-raise pinned against
+  `bool("9.6")` coercion tidy-ups; verdict-record key-set pin proves the
+  target never persists (operator-side only — auditor verified it reaches
+  neither judge context nor sidecars). Auditor Q1 verdict: no expansion
+  of judge termination authority — the composite is a deterministic
+  monotone map of the same two F6-coerced ints. Vault Comfyless_Manual
+  updated for the new flag semantics. Review:
+  `docs/security/review-adr-037-d3-until-score-2026-07-24.md`.
+
 - 2026-07-24 (later) — **D5 amendment: judge anchor = ORIGINAL seed.** Live
   stress run (impossible target, 100-iteration tie chain) showed cumulative
   drift the judge structurally could not see: subject getting younger/

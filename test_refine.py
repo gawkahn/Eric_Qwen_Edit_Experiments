@@ -1472,6 +1472,77 @@ check("no-op decline cycles get strictly increasing seeds",
 # D2 amendment: the rubric-mandated plain-text preamble (DESCRIPTION /
 # VERIFICATION before the JSON) survives parse_verdict — and a stray '{' in
 # the preamble fails CLOSED (invalid outer slice), never mis-parses.
+print("\n== ADR-037 D3 amendment: --until-score optional float composite gate ==")
+_pu = refine._build_arg_parser()
+_pu_req = ["--output-dir", "o", "--model-base", "m", "--judge-backend", "j"]
+check("bare --until-score parses as True",
+      _pu.parse_args(["--until-score"] + _pu_req).until_score is True)
+check("valued --until-score parses as the raw string",
+      _pu.parse_args(["--until-score", "9.8"] + _pu_req).until_score == "9.8")
+check("absent --until-score parses as False",
+      _pu.parse_args(_pu_req).until_score is False)
+check("_parse_until_score: False/True (off / bare mode) -> None",
+      refine._parse_until_score(False) is None
+      and refine._parse_until_score(True) is None)
+check("_parse_until_score: '9.8' -> 9.8", refine._parse_until_score("9.8") == 9.8)
+check("_parse_until_score: integer-looking '9' -> 9.0",
+      refine._parse_until_score("9") == 9.0)
+for _bad in ("abc", "nan", "inf", "0.5", "11"):
+    try:
+        refine._parse_until_score(_bad)
+        check(f"_parse_until_score rejects {_bad!r}", False)
+    except refine.RefineError:
+        check(f"_parse_until_score rejects {_bad!r}", True)
+# Lattice helper: integer axes make composites a lattice; 9.8 at .6/.4 sits in
+# the 9.6 -> 10.0 gap, 9.5 rounds up to 9.6, and 9.6 is reachable exactly.
+check("nearest reachable composite above 9.8 (.6/.4) is 10.0",
+      refine._nearest_reachable_composite(9.8, 0.6, 0.4) == 10.0)
+_n95 = refine._nearest_reachable_composite(9.5, 0.6, 0.4)
+check("nearest reachable composite above 9.5 (.6/.4) is 9.6",
+      _n95 is not None and abs(_n95 - 9.6) < 1e-9)
+_n96 = refine._nearest_reachable_composite(9.6, 0.6, 0.4)
+check("9.6 itself is reachable (epsilon-tolerant)",
+      _n96 is not None and abs(_n96 - 9.6) < 1e-9)
+# Unreachable target (code review SHOULD): non-default weights can cap the
+# max composite below the target — helper must signal None (main() emits a
+# loud UNREACHABLE warning), never silently return the max.
+check("unreachable target -> None (weights .5/.3 max at 8.0, target 9)",
+      refine._nearest_reachable_composite(9.0, 0.5, 0.3) is None)
+# Valued mode raises the default cap exactly like bare mode: main() coerces
+# the three-state args.until_score with bool(), and a non-empty string is
+# truthy — pinned so a "tidy-up" to `is True` can't silently keep the
+# 10-iteration default under --until-score 9.6.
+check("valued until-score raises the default cap (bool coercion)",
+      refine._resolve_max_iterations(None, bool("9.6"))
+      == refine.MAX_ITERATIONS_SANITY_CAP)
+# Loop gate: composite target REPLACES the both-axes gate. (10,9) at .6/.4 is
+# composite 9.6 — under the default both-axes threshold 8 it would stop at
+# iter 0 either way, so the 9.7 case proves the REPLACEMENT: both axes >= 8
+# holds yet the run does NOT stop, because only the composite gate applies.
+_d, _o, _fg, _fj = _run_loop_p([_mkverdict_ov(10, 9, None)],
+                               max_iterations=3, patience=0,
+                               until_composite=9.6)
+check("composite gate passes at exactly 9.6 (float-epsilon safe)",
+      _o.passed is True and _o.iterations == 1)
+_d, _o, _fg, _fj = _run_loop_p([_mkverdict_ov(10, 9, None)],
+                               max_iterations=2, patience=0,
+                               until_composite=9.7)
+check("composite 9.6 does NOT pass a 9.7 target (both-axes gate is replaced)",
+      _o.passed is False and _o.iterations == 2
+      and _o.best_composite is not None
+      and abs(_o.best_composite - 9.6) < 1e-9)
+# Security review INFO (2026-07-24): the composite target is OPERATOR-side
+# only — it must never enter persisted verdict records (nor judge context,
+# pinned upstream by the record key allowlist). Uses the 9.7-target run's
+# on-disk record.
+with open(os.path.join(_d, "candidates", "candidate_00.verdict.json")) as _fh:
+    _vr_raw = _fh.read()
+check("composite target absent from persisted verdict records",
+      "until" not in _vr_raw
+      and sorted(json.loads(_vr_raw).keys())
+      == ["composite", "critique", "iteration", "notices",
+          "proposed_overrides", "scores", "verdict", "weights"])
+
 _pre = ("DESCRIPTION\n- shirt untucked, hem over waistband\nVERIFICATION\n"
         "R1: shirt tucked -> NOT MET - hem hangs over waistband\n"
         "PRESERVATION: identity kept\n")
