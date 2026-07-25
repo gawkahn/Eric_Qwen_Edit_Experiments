@@ -287,6 +287,46 @@ Findings 1–8 before code; Findings 1–13 disposed as follows — 1↦D1, 2↦
 
 ## Changelog
 
+- 2026-07-24 (night) — **D2 amendment addendum: stagnation seed escape
+  (`--explore-after N`).** Live gap in the no-op resample: it fires only
+  when the planner proposes NOTHING. Observed run: iter 1 hit 8.6 (best);
+  every later iteration declined, reverted to best's config, and the
+  planner kept rewriting the prompt against seed-tied background
+  artifacts prompting cannot remove — config differed every time, so the
+  seed stayed pinned to best's and 12 straight iterations reprinted the
+  same flaw. Fix: when `no_improve >= --explore-after` (default 2; 0
+  disables), the derived config's seed is resampled via the SAME
+  monotonic counter as the no-op escape (uniqueness preserved), on every
+  further non-improving iteration, resetting on strict improvement. The
+  no-op branch takes precedence (no double-bump). Counter renamed
+  `noop_resamples` → `seed_resamples` (two triggers, one lattice).
+  Interaction note: a positive `--patience` <= `--explore-after` stops
+  the run before the escape fires (help text says so). Not a planner
+  authority change — the planner still cannot touch base params; the
+  escape is code-triggered off the loop's own improvement accounting.
+  **Review fold (both Fable, no fallback, same day):** security-auditor
+  all-INFO + one LOW (mixed no-op/stagnation counter-uniqueness pin —
+  added: strictly-increasing-seeds test across interleaved triggers);
+  Q1 verdict: no authority expansion — the judge could already trigger
+  resamples at will via empty overrides, the seed value is code-computed
+  and appears in no judge-visible surface, and resamples are bounded by
+  the iteration cap. Acceptance-record accuracy note (auditor INFO): the
+  escape extends the accepted tie-chain drift residual to the SEED
+  dimension — a constant-parity judge now compounds prompt drift, source
+  advancement (edit mode), and noise-sample drift simultaneously, under
+  the same --max-iterations bound and the same acceptance rationale.
+  code-reviewer (Fable): mechanism verified sound (monotonicity proof
+  across mixed/tie sequences); folds — stale attribution comments
+  conditionalized, tie-chain skip-value + patience-stops-first +
+  mixed-trigger uniqueness pins added, docstring names the escape.
+  **Accepted attribution deferral:** a stagnation-resampled iteration
+  changes prompt AND seed but the planner's D1 history carries no
+  `seed_resampled` flag — the planner may mis-attribute the next score
+  delta to its prompt edit. Deferred (TECH_DEBT 2026-07-24): a history
+  field touches the F8-P surface and warrants its own pass; escapes only
+  fire on already-stagnant runs.
+  Review: `docs/security/review-adr-037-stagnation-escape-2026-07-24.md`.
+
 - 2026-07-24 (evening) — **D3 amendment: `--until-score [SCORE]` float
   composite gate.** From the impossible-target stress test: axis scores are
   integers, so `--pass-threshold` is an int by design and a "very good but

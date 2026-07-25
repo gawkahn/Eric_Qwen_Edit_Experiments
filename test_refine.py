@@ -850,7 +850,7 @@ _d, _o, _fg, _fj = _run_loop([_mkverdict(5, 5)], max_iter=3, patience=99, seed=7
 # instead of regenerating the identical image. All-tie chain: iter1 = 777+1,
 # iter2 = 778+2 (the tie promoted iter1's bumped config as the new source).
 # (An iteration whose planner DID change the config keeps the pinned seed —
-# covered by the D2-amendment block below.)
+# below the stagnation threshold; covered by the D2-amendment block below.)
 check("iteration 0 uses the initial seed", _fg.seeds_seen[0] == -1)
 check("no-op iterations resample via the monotonic counter",
       _fg.seeds_seen[1:] == [778, 780], detail=str(_fg.seeds_seen))
@@ -1449,7 +1449,8 @@ check("winner is the tied NEWER candidate (iter1)",
       and os.path.basename(_o.winner_path) == "candidate_01.png")
 
 # D2 amendment: an iteration whose planner DID change the config keeps the
-# pinned seed (attribution preserved); a no-op iteration resamples.
+# pinned seed (attribution preserved — below the stagnation threshold); a
+# no-op iteration resamples.
 _d, _o, _fg, _fj = _run_loop_p(
     [_mkverdict_ov(5, 5, "B"), _mkverdict_ov(6, 6, None), _mkverdict_ov(6, 6, None)],
     max_iterations=3, patience=0)
@@ -1531,6 +1532,68 @@ check("composite 9.6 does NOT pass a 9.7 target (both-axes gate is replaced)",
       _o.passed is False and _o.iterations == 2
       and _o.best_composite is not None
       and abs(_o.best_composite - 9.6) < 1e-9)
+print("\n== ADR-037 D2 addendum: stagnation seed escape (--explore-after) ==")
+# A planner that CHANGES the prompt every iteration never triggers the no-op
+# escape, so a seed-tied flaw reprints forever at best's pinned seed (live
+# failure: 12 straight declines, one seed). Once no_improve reaches the
+# threshold (default 2), every further non-improving derivation explores a
+# fresh seed via the shared monotonic counter.
+check("DEFAULT_EXPLORE_AFTER is 2", refine.DEFAULT_EXPLORE_AFTER == 2)
+# iter0 improves (best, prompt "B"); iters 1+ decline with a DIFFERENT
+# rewrite each time (no no-op anywhere). no_improve: 1 after iter1, 2 after
+# iter2 -> iter3's derivation resamples (123+1), iter4's resamples (123+2).
+_d, _o, _fg, _fj = _run_loop_p(
+    [_mkverdict_ov(7, 7, "B"), _mkverdict_ov(5, 5, "C"),
+     _mkverdict_ov(5, 5, "D"), _mkverdict_ov(5, 5, "E"),
+     _mkverdict_ov(5, 5, "F")],
+    max_iterations=5, patience=0)
+check("stagnation escape: pinned until threshold, then fresh seeds",
+      _fg.seeds_seen == [-1, 123, 123, 124, 125],
+      detail=str(_fg.seeds_seen))
+check("prompts kept changing (no no-op ever fired)",
+      _fg.prompts_seen == ["p", "B", "C", "D", "E"],
+      detail=str(_fg.prompts_seen))
+_d, _o, _fg, _fj = _run_loop_p(
+    [_mkverdict_ov(7, 7, "B"), _mkverdict_ov(5, 5, "C"),
+     _mkverdict_ov(5, 5, "D"), _mkverdict_ov(5, 5, "E")],
+    max_iterations=4, patience=0, explore_after=0)
+check("--explore-after 0 disables the stagnation escape",
+      _fg.seeds_seen == [-1, 123, 123, 123], detail=str(_fg.seeds_seen))
+# Security review LOW (2026-07-24): the SHARED monotonic counter is the
+# uniqueness guarantee across MIXED trigger sequences — no-op (empty-override
+# decline reverts exactly to best -> no-op branch) interleaved with
+# stagnation (changed-prompt decline past threshold). Seeds must be strictly
+# increasing with no repeats; a split counter or elif->if regression fails
+# here. Trace: iter1 no-op (124), iter2 stagnation (125), iter3 no-op (126).
+_d, _o, _fg, _fj = _run_loop_p(
+    [_mkverdict_ov(7, 7, "B"), _mkverdict_ov(5, 5, None),
+     _mkverdict_ov(5, 5, "C"), _mkverdict_ov(5, 5, None),
+     _mkverdict_ov(5, 5, None)],
+    max_iterations=5, patience=0)
+check("mixed no-op + stagnation triggers: strictly increasing unique seeds",
+      _fg.seeds_seen == [-1, 123, 124, 125, 126],
+      detail=str(_fg.seeds_seen))
+# Tie-chain stagnation (code review SHOULD): ties promote, so the source
+# carries the previously-bumped seed and assigned seeds SKIP values — the
+# interesting uniqueness case (123 -> 124 via counter1, then 124+2=126).
+_d, _o, _fg, _fj = _run_loop_p(
+    [_mkverdict_ov(6, 6, "B"), _mkverdict_ov(6, 6, "C"),
+     _mkverdict_ov(6, 6, "D"), _mkverdict_ov(6, 6, "E"),
+     _mkverdict_ov(6, 6, "F")],
+    max_iterations=5, patience=0)
+check("tie-chain stagnation: skip-value seeds stay unique",
+      _fg.seeds_seen == [-1, 123, 123, 124, 126],
+      detail=str(_fg.seeds_seen))
+# Help-text claim (code review SHOULD): a positive --patience <= the
+# threshold stops the run BEFORE the escape ever fires.
+_d, _o, _fg, _fj = _run_loop_p(
+    [_mkverdict_ov(7, 7, "B"), _mkverdict_ov(5, 5, "C"),
+     _mkverdict_ov(5, 5, "D")],
+    max_iterations=5, patience=2)
+check("patience <= explore-after stops before any stagnation resample",
+      _o.iterations == 3 and _fg.seeds_seen == [-1, 123, 123],
+      detail=str(_fg.seeds_seen))
+
 # Security review INFO (2026-07-24): the composite target is OPERATOR-side
 # only — it must never enter persisted verdict records (nor judge context,
 # pinned upstream by the record key allowlist). Uses the 9.7-target run's

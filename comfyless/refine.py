@@ -87,6 +87,13 @@ DEFAULT_MAX_ITERATIONS = 10
 #: models an iteration is cheap, and --max-iterations is the authoritative
 #: spend bound. Pass --patience N to opt back into the early stop.
 DEFAULT_PATIENCE = 0
+#: Stagnation seed escape (ADR-037 D2 amendment addendum): after this many
+#: consecutive non-improving iterations, every further non-improving
+#: derivation gets a resampled seed even when the planner DID change the
+#: config — a planner rewriting prompts against a seed-tied flaw never
+#: triggers the no-op escape and reprints the flaw to the cap (observed
+#: live 2026-07-24). 0 disables (--explore-after).
+DEFAULT_EXPLORE_AFTER = 2
 #: Judge runs at temperature 0 for low-variance / reproducible scoring.
 DEFAULT_JUDGE_TEMPERATURE = 0.0
 #: Hard output cap on the judge/planner call (backend-cfg `max_tokens`
@@ -1371,6 +1378,7 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 precision: str = "bf16",
                 pass_threshold: int = DEFAULT_PASS_THRESHOLD,
                 until_composite: Optional[float] = None,
+                explore_after: int = DEFAULT_EXPLORE_AFTER,
                 max_iterations: int = DEFAULT_MAX_ITERATIONS,
                 patience: int = DEFAULT_PATIENCE,
                 w_pa: float = DEFAULT_W_PA, w_aes: float = DEFAULT_W_AES,
@@ -1390,6 +1398,10 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
     JUDGE_ERROR_ABORT_AFTER CONSECUTIVE unusable verdicts abort loudly (D3 —
     a dead endpoint must not burn blind generations to the cap). patience <= 0
     disables the no-improvement early stop (the default since 2026-07-18).
+    `explore_after` (D2 addendum): after that many consecutive non-improving
+    iterations, every further non-improving derivation resamples the seed via
+    the shared monotonic counter — even when the planner changed the prompt —
+    so a seed-tied flaw cannot be reprinted to the cap; <= 0 disables.
     Winner = the passing candidate, or the top-composite candidate if none
     passed. Pass gate: both axes >= pass_threshold, or — when
     `until_composite` is set (ADR-037 D3 amendment) — weighted composite >=
@@ -1429,7 +1441,10 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
     edit = edit_source is not None
     current_source = edit_source
     in_process_latch = False  # ONE daemon ref refusal latches the whole run
-    noop_resamples = 0  # monotonic no-op counter (D2 amendment, review fold)
+    # Monotonic seed-resample counter (D2 amendment + addendum): shared by
+    # BOTH escape triggers (planner no-op, stagnation) so resampled seeds
+    # stay unique across mixed trigger sequences.
+    seed_resamples = 0
     # D5 amendment (2026-07-24, review fold): the judge's comparison anchor is
     # loaded ONCE at entry — pinned to the original's BYTES, not its path. The
     # slice-B LOW-3 re-open-per-iteration rationale applied when the judged
@@ -1647,24 +1662,44 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
         # relative +1 would re-derive the SAME seed on every no-op decline
         # cycle and the plateau would survive on that branch (code review
         # SHOULD, 2026-07-24). Iterations where the planner DID change
-        # something keep the pinned seed, preserving score-delta attribution
+        # something keep the pinned seed — UNTIL the stagnation escape below
+        # overrides this past --explore-after — preserving score-delta
+        # attribution
         # (in edit mode a promotion also advances the source image, so a
         # no-op resample there varies sample + source together — exploration
         # over strict attribution, accepted). apply_overrides deep-copies
         # base, so this in-place bump cannot alias best's snapshot. bool is
         # excluded from the seed guard to match _coerce_score/_parse_lora_op.
+        _seed = cfg.base.get("seed")
+        if not (isinstance(_seed, int) and not isinstance(_seed, bool)
+                and _seed >= 0):
+            _seed = None  # unpinned/-1/absent/bool: no resample either branch
         if (cfg.prompt == source_cfg.prompt
                 and [(s.name, s.weight) for s in cfg.loras]
                 == [(s.name, s.weight) for s in source_cfg.loras]
                 and cfg.base == source_cfg.base):
-            _seed = cfg.base.get("seed")
-            if (isinstance(_seed, int) and not isinstance(_seed, bool)
-                    and _seed >= 0):
-                noop_resamples += 1
-                cfg.base["seed"] = _seed + noop_resamples
+            if _seed is not None:
+                seed_resamples += 1
+                cfg.base["seed"] = _seed + seed_resamples
                 log(f"[refine] iter {i}: planner proposed no effective change "
-                    f"— resampling seed {_seed} -> {_seed + noop_resamples} "
+                    f"— resampling seed {_seed} -> {_seed + seed_resamples} "
                     f"(an unchanged config would re-sample nothing new)")
+        # Stagnation escape (D2 amendment addendum, 2026-07-24): a planner
+        # that keeps CHANGING the prompt against a seed-tied flaw never
+        # triggers the no-op branch above, so the seed stays pinned to best's
+        # while every rewrite reprints the flaw (observed live: 12 straight
+        # declines at one seed). Once no_improve reaches the threshold, every
+        # further non-improving derivation explores a fresh seed; strict
+        # improvement resets the counter upstream. elif: the no-op branch
+        # already resampled — never double-bump one iteration.
+        elif (explore_after > 0 and no_improve >= explore_after
+                and _seed is not None):
+            seed_resamples += 1
+            cfg.base["seed"] = _seed + seed_resamples
+            log(f"[refine] iter {i}: {no_improve} iterations without "
+                f"improvement — resampling seed {_seed} -> "
+                f"{_seed + seed_resamples} to explore (stagnation escape; "
+                f"--explore-after 0 disables)")
         # History record for this iteration (ADR-037 D1): the prompt that
         # produced the candidate + the RESOLVED ops applied in response.
         history.append(history_record(
@@ -1787,6 +1822,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Early-stop after N iters with no composite gain; "
                         "0 disables — run until pass or --max-iterations "
                         "(default 0)")
+    p.add_argument("--explore-after", type=int, default=DEFAULT_EXPLORE_AFTER,
+                   help=f"After N consecutive non-improving iterations, "
+                        f"resample the seed on every further non-improving "
+                        f"one (stagnation escape — a prompt rewrite can't fix "
+                        f"a seed-tied flaw). 0 disables. Default "
+                        f"{DEFAULT_EXPLORE_AFTER}. Note: a positive "
+                        f"--patience <= this stops the run before the escape "
+                        f"fires")
     p.add_argument("--w-prompt-adherence", type=float, default=DEFAULT_W_PA,
                    help="Composite weight for prompt-adherence (default 0.6)")
     p.add_argument("--w-aesthetics", type=float, default=DEFAULT_W_AES,
@@ -2388,7 +2431,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             device=args.device, precision=args.precision,
             pass_threshold=args.pass_threshold,
             until_composite=until_composite, max_iterations=max_iterations,
-            patience=args.patience, w_pa=args.w_prompt_adherence,
+            patience=args.patience, explore_after=args.explore_after,
+            w_pa=args.w_prompt_adherence,
             w_aes=args.w_aesthetics, judge_timeout=args.judge_timeout,
             judge_system_prompt=judge_system_prompt, output_format=out_fmt,
             edit_source=edit_source, log=log)

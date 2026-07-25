@@ -1762,3 +1762,18 @@ adding the gate pre-emptively would be dead code. Trigger: any commit that lets
 `ref_images` reach `generate()` from `--json` stdin or an MCP tool argument.
 Fix: call `_apply_replay_ref_trust` (or an MCP-appropriate equivalent with the
 server's `ref_image_roots`) before those paths reach the decode site.
+
+## 2026-07-24 — stagnation-resampled iterations are invisible to the planner's trajectory context
+ADR-037 D2-addendum `code-reviewer` (Fable) SHOULD, accepted as documented
+deferral. A stagnation escape changes prompt AND seed in one iteration, but
+`history_record` carries no `seed_resampled` flag, so the D1 trajectory
+context attributes the next score delta entirely to the prompt edit — the
+planner can learn a false lesson ("that rewrite worked/failed") on every
+escape iteration. Why not now: adding a field to judge-bound history touches
+the F8-P surface and warrants its own review pass; the escape only fires on
+already-stagnant runs where attribution value is low. Trigger: planner
+visibly re-proposing/reverting edits it "learned" from resampled iterations,
+OR the next history-shape slice. Fix: a boolean `seed_resampled` field in
+`history_record` (loop-owned state, not filesystem drift — slice-2
+forward-constraint permits it), plus rubric line telling the judge scores on
+such iterations reflect a new sample, not the edit.
