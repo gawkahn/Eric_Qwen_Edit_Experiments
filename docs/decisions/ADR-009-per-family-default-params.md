@@ -180,6 +180,30 @@ them. The dict is therefore designed for one-edit changes:
 
 ## Changelog
 
+- **2026-07-25** — **One shared applier (parity-audit slice 1).** The overlay
+  existed in two implementations — `generate._apply_family_defaults`
+  (explicit_keys/iterated_axes bookkeeping, because it materializes every
+  schema key) and `refine._overlay_family_defaults` (None-sentinel
+  bookkeeping) — so the 2026-07-24 CFG-aliasing fix above had to be made
+  TWICE with different predicates. The fill loop and the CFG rule now live
+  once in `family_defaults.apply_family_defaults(params, *, family,
+  is_pinned, has_value, is_eligible, log, prefix)`; both callers are thin
+  adapters answering three questions about a key: pinned (never overwrite),
+  has_value (a USABLE operator value — distinct from pinned, which is what
+  makes an explicit sidecar `null` still get masked by the family default),
+  and eligible (participates for this caller: generate = in COMFYLESS_SCHEMA,
+  refine = exposed by its CLI). The one-directional CFG rule is unchanged and
+  now unforgeable-by-drift. Behavior verified identical on both sides
+  (predicate-by-predicate); the applied-keys log line is now sorted rather
+  than insertion-ordered. **Forward note:** no FAMILY_DEFAULTS entry sets
+  `schedule` today, so refine's new `--schedule` port inherits nothing from
+  the overlay — if a family later adds one, refine will start honoring it;
+  that is intended parity, recorded here so it is a decision rather than a
+  surprise. Likewise, if a future slice ever calls the shared applier with a
+  SIDECAR-derived `base`, that call site inherits F4 review (today
+  `build_config_from_seed` does not call the overlay at all).
+  Reviews: `docs/security/review-parity-slice1-shared-defaults-2026-07-25.md`.
+
 - **2026-07-24** — **CFG-knob aliasing fix** (both appliers:
   `generate._apply_family_defaults` + `refine._overlay_family_defaults`).
   `--cfg` and `--true-cfg` are two spellings of one knob:

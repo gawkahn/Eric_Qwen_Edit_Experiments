@@ -194,3 +194,73 @@ FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
 #: silently inherits one of these schedules from the base model's path.
 #: Keep in sync with the table above.
 DISTILLED_FAMILIES = frozenset({"krea-turbo", "zimage-turbo", "flux2klein"})
+
+
+# ── Shared overlay core (parity-audit slice 1, 2026-07-25) ───────────────────
+# Both consumers previously carried their own copy of the fill loop: generate's
+# `_apply_family_defaults` (explicit_keys/iterated_axes bookkeeping, because it
+# materializes every schema key up front) and refine's `_overlay_family_defaults`
+# (None-sentinel bookkeeping, because it keeps unset keys as None). The values
+# were always shared via FAMILY_DEFAULTS; the LOGIC was not — so the 2026-07-24
+# CFG-knob aliasing bug had to be found and fixed twice, with subtly different
+# predicates each time (ADR-009 changelog). This is the one seam: callers supply
+# how THEY know a key is spoken for; the rule itself lives here once.
+
+def apply_family_defaults(
+    params: dict,
+    *,
+    family: "str | None",
+    is_pinned,
+    has_value,
+    is_eligible,
+    log,
+    prefix: str = "",
+) -> dict:
+    """Fill `params` in place from FAMILY_DEFAULTS[family]; return what was applied.
+
+    Callers differ only in how they answer three questions about a key:
+
+    * `is_pinned(key)`   — the operator has spoken for it; never overwrite.
+    * `has_value(key)`   — there is a USABLE operator value for it (distinct
+      from pinned: a replayed sidecar carrying an explicit ``null`` is pinned
+      but has no value — see the CFG rule below).
+    * `is_eligible(key)` — this key participates at all for this caller
+      (generate: in COMFYLESS_SCHEMA; refine: exposed by its CLI, i.e. present
+      in the config dict — family entries like hunyuan's ``refiner_steps``
+      have no refine flag and must not ride into a daemon request unrequested).
+
+    CFG-knob aliasing (ADR-009 changelog 2026-07-24): ``--cfg`` and
+    ``--true-cfg`` are two spellings of ONE knob — `build_call_kwargs` maps an
+    explicit ``cfg_scale`` onto ``true_cfg_scale`` for families without
+    guidance embeds, but ONLY when ``true_cfg_scale`` is None. So a family
+    default for ``true_cfg_scale`` must never outrank an operator's explicit
+    ``--cfg``: it fills the very slot whose non-None value makes the router
+    ignore that ``--cfg`` (observed live: ``--cfg 1`` on qwen-edit + a Lightning
+    LoRA silently ran double-pass true-CFG 4.0 on a distilled setup). The test
+    is `has_value`, not `is_pinned`: a sidecar ``"cfg_scale": null`` is pinned
+    yet unusable, and the family default should keep masking that case rather
+    than leaving both knobs empty. One-directional by design — an explicit
+    ``true_cfg_scale`` does NOT suppress a ``cfg_scale`` family default
+    (krea-class families default ``cfg_scale`` and ``true_cfg`` is inert there,
+    so symmetric suppression would only break their defaults); it needs no
+    special case because `is_pinned("true_cfg_scale")` already skips the key.
+    """
+    fam_defaults = FAMILY_DEFAULTS.get(family or "", {})
+    if not fam_defaults:
+        return {}
+    applied: dict = {}
+    cfg_knob_has_value = has_value("cfg_scale")
+    for key, value in fam_defaults.items():
+        if not is_eligible(key) or is_pinned(key):
+            continue
+        if key == "true_cfg_scale" and cfg_knob_has_value:
+            log(f"{prefix}family default true_cfg_scale={value!r} suppressed "
+                f"by explicit/iterated --cfg (one CFG knob — --cfg routes to "
+                f"true CFG on this family)")
+            continue
+        params[key] = value
+        applied[key] = value
+    if applied:
+        kv = ", ".join(f"{k}={v!r}" for k, v in sorted(applied.items()))
+        log(f"{prefix}family={family} defaults applied: {kv}")
+    return applied

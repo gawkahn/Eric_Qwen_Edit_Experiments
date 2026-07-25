@@ -45,7 +45,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from comfyless.family_defaults import FAMILY_DEFAULTS
+from comfyless.family_defaults import (FAMILY_DEFAULTS,
+                                        apply_family_defaults)
 from comfyless.output_format import _EXT_TO_NAME, OutputFormat, resolve_output_format
 
 # ── Bounds (security review F5/F6) ───────────────────────────────────────────
@@ -1986,6 +1987,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--height", type=int, default=None,
                    help="image height (default: model-family default, else 1024)")
     p.add_argument("--sampler", default="default")
+    # Parity port (audit 2026-07-25): the CLI-args path had NO --schedule, so
+    # every fresh-prompt run took the "linear" backstop — a family-neutral
+    # quality knob with zero loop semantics the loop could not reach. NOTE
+    # seed-image replays already carried the sidecar's recorded schedule
+    # (build_config_from_seed → run_generation/_build_server_request both
+    # read it from the params dict), so only fresh entry was schedule-blind
+    # (code review 2026-07-25). Choices gated like generate's (ADR-028);
+    # warn-and-ignored server-side for non-flow-match schedulers, and those
+    # warnings now surface (slice 2).
+    # Local import: refine only pays generate's (heavy) module import at CLI
+    # startup, which a real run pays anyway — it is NOT avoided, just moved
+    # off module load, and --help now pays it too (code review NIT).
+    from comfyless.generate import SCHEDULE_NAMES
+    p.add_argument("--schedule", choices=SCHEDULE_NAMES, default=None,
+                   help="Sigma-spacing schedule (ADR-028): linear (uniform), "
+                        "balanced (Karras p=3), karras (Karras p=7), beta57, "
+                        "bong_tangent. Fixed across the run — the planner "
+                        "never touches it. Default: model-family default, "
+                        "else linear")
     p.add_argument("--max-seq-len", type=int, default=512)
     p.add_argument("--quant", default="none")
     p.add_argument("--device", default="cuda")
@@ -2007,7 +2027,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 #: family cannot be detected — or has no FAMILY_DEFAULTS entry — generates
 #: exactly as before. true_cfg_scale is deliberately absent: None is meaningful
 #: to generate() ("no true-CFG"), so only a family entry (qwen-*) may set it.
-_GEN_KEY_FALLBACKS = {"steps": 28, "cfg_scale": 3.5, "width": 1024, "height": 1024}
+_GEN_KEY_FALLBACKS = {"steps": 28, "cfg_scale": 3.5, "width": 1024,
+                      "height": 1024, "schedule": "linear"}
 
 
 def _overlay_family_defaults(base: dict,
@@ -2042,33 +2063,26 @@ def _overlay_family_defaults(base: dict,
         # AttributeError: model_index.json whose top level is valid JSON but
         # not an object (index.get on a list/str) — degrade like the rest.
         pass
-    applied: Dict[str, Any] = {}
-    # CFG-knob aliasing (ADR-009 changelog 2026-07-24, parity with
-    # generate._apply_family_defaults): an explicit --cfg suppresses a
-    # family-default true_cfg_scale — the two flags are one knob, and the
-    # router prefers a non-None true_cfg_scale, so the default would defeat
-    # the operator's explicit --cfg. One-directional (see generate.py).
-    _cfg_knob_explicit = base.get("cfg_scale") is not None
-    if family:
-        for key, value in FAMILY_DEFAULTS.get(family, {}).items():
-            # Only keys refine's CLI exposes (present in base) participate;
-            # family entries like hunyuan's refiner_steps have no refine flag
-            # and must not ride into the daemon request unrequested.
-            # base.get() guard: with BOTH knobs explicit (--cfg + --true-cfg)
-            # the explicit --true-cfg stands and no default was in play — do
-            # not log a misleading suppression (code review NIT).
-            if (key == "true_cfg_scale" and _cfg_knob_explicit
-                    and base.get("true_cfg_scale") is None):
-                log(f"[refine] family default true_cfg_scale={value!r} "
-                    f"suppressed by explicit --cfg (one CFG knob — --cfg "
-                    f"routes to true CFG on this family)")
-                continue
-            if key in base and base[key] is None:
-                base[key] = value
-                applied[key] = value
-    if applied:
-        kv = ", ".join(f"{k}={v!r}" for k, v in sorted(applied.items()))
-        log(f"[refine] family={family} defaults applied: {kv}")
+    # Shared overlay core (parity-audit slice 1, 2026-07-25) — the fill loop
+    # and the CFG-knob aliasing rule now live in
+    # family_defaults.apply_family_defaults, so they cannot drift from
+    # generate's copy again (the aliasing bug shipped twice; ADR-009).
+    #
+    # refine's None sentinel answers all three predicates: a key is PINNED and
+    # HAS A VALUE iff it is present and non-None (there is no
+    # explicit-but-null case here — argparse either supplied a value or left
+    # the sentinel), and it is ELIGIBLE iff refine's CLI exposes it at all
+    # (present in `base`) — family entries like hunyuan's refiner_steps have
+    # no refine flag and must not ride into a daemon request unrequested.
+    apply_family_defaults(
+        base,
+        family=family,
+        is_pinned=lambda k: base.get(k) is not None,
+        has_value=lambda k: base.get(k) is not None,
+        is_eligible=lambda k: k in base,
+        log=log,
+        prefix="[refine] ",
+    )
     for key, value in _GEN_KEY_FALLBACKS.items():
         if base.get(key) is None:
             base[key] = value
@@ -2092,6 +2106,10 @@ def build_config_from_args(args, catalog, roots,
         "width": args.width,
         "height": args.height,
         "sampler": args.sampler,
+        # Parity port (2026-07-25): None here means "unset", so the family
+        # overlay may fill it and _GEN_KEY_FALLBACKS backstops to "linear" —
+        # the value refine used to hardcode on every generation.
+        "schedule": args.schedule,
         "max_sequence_length": args.max_seq_len,
         "quant": args.quant,
     }

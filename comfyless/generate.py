@@ -64,7 +64,8 @@ from nodes.eric_diffusion_utils import (
 from nodes.eric_diffusion_samplers import sampler_choices, swap_sampler
 from nodes.eric_qwen_edit_lora import load_lora_with_key_fix
 
-from comfyless.family_defaults import DISTILLED_FAMILIES, FAMILY_DEFAULTS
+from comfyless.family_defaults import (DISTILLED_FAMILIES, FAMILY_DEFAULTS,
+                                        apply_family_defaults)
 
 CONTRACT_VERSION = 1
 SAMPLER_NAMES = sampler_choices()
@@ -640,42 +641,28 @@ def _apply_family_defaults(
     fam_defaults = FAMILY_DEFAULTS.get(family, {})
     if not fam_defaults:
         return
-    applied: Dict[str, Any] = {}
     prefix = f"[comfyless] iter {idx}: " if idx is not None else "[comfyless] "
-    # CFG-knob aliasing (ADR-009 changelog 2026-07-24): --cfg and --true-cfg
-    # are two spellings of ONE knob — build_call_kwargs maps an explicit
-    # cfg_scale onto true_cfg_scale for families without guidance embeds. A
-    # family default for true_cfg_scale must therefore never outrank an
-    # operator's explicit cfg_scale: it fills the very slot whose non-None
-    # value makes the router IGNORE the explicit --cfg (observed live:
-    # --cfg 1 on qwen-edit + a Lightning LoRA silently ran true-CFG 4.0,
-    # double-pass CFG burn on a distilled setup). One-directional by design:
-    # an explicit true_cfg_scale does NOT suppress a cfg_scale family
-    # default (krea-class families default cfg_scale; true_cfg is inert
-    # there, so symmetric suppression would only break their defaults).
-    # Value-aware, not presence-based (security review LOW, 2026-07-24): a
-    # replayed sidecar carrying "cfg_scale": null would otherwise suppress
-    # the default AND leave both knobs None — the family default should keep
-    # masking that case. Iterated-axis presence is safe as-is (every element
-    # is shape-validated by _plan_iterations, so never None).
-    _cfg_knob_explicit = (("cfg_scale" in explicit_keys
-                           and p_cur.get("cfg_scale") is not None)
-                          or "cfg_scale" in iterated_axes)
-    for key, value in fam_defaults.items():
-        if key in explicit_keys or key in iterated_axes:
-            continue
-        if key not in COMFYLESS_SCHEMA:
-            continue
-        if key == "true_cfg_scale" and _cfg_knob_explicit:
-            _log(f"{prefix}family default true_cfg_scale={value!r} suppressed "
-                 f"by explicit/iterated --cfg (one CFG knob — --cfg routes "
-                 f"to true CFG on this family)")
-            continue
-        p_cur[key] = value
-        applied[key] = value
-    if applied:
-        kv = ", ".join(f"{k}={v!r}" for k, v in applied.items())
-        _log(f"{prefix}family={family} defaults applied: {kv}")
+    # Shared overlay core (parity-audit slice 1) — the fill loop and the
+    # CFG-knob aliasing rule live in family_defaults.apply_family_defaults so
+    # they cannot drift from refine's copy again (the aliasing bug shipped
+    # twice; ADR-009 changelog 2026-07-24 / 2026-07-25).
+    #
+    # `is_pinned` is presence-based: an explicit key is spoken for even when
+    # its value is null. `has_value` is value-aware for exactly the CFG rule
+    # (a sidecar "cfg_scale": null is pinned but unusable, so the family
+    # default must keep masking it); iterated axes always carry real values —
+    # every element is shape-validated by _plan_iterations.
+    applied = apply_family_defaults(
+        p_cur,
+        family=family,
+        is_pinned=lambda k: k in explicit_keys or k in iterated_axes,
+        has_value=lambda k: (k in iterated_axes
+                             or (k in explicit_keys
+                                 and p_cur.get(k) is not None)),
+        is_eligible=lambda k: k in COMFYLESS_SCHEMA,
+        log=_log,
+        prefix=prefix,
+    )
 
     # Family is resolved from the BASE model path (ADR-009 name-hint), never
     # from --transformer. A few-step distilled schedule applied to override

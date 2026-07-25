@@ -1606,6 +1606,99 @@ check("composite target absent from persisted verdict records",
       == ["composite", "critique", "iteration", "notices",
           "proposed_overrides", "scores", "verdict", "weights"])
 
+print("\n== parity slice 1: shared family-defaults applier + --schedule port ==")
+# The overlay core now lives in family_defaults; both callers are adapters, so
+# the CFG-aliasing rule can't drift between them again (it shipped twice).
+from comfyless import family_defaults as _fd  # noqa: E402
+check("shared applier is the single source (refine delegates to it)",
+      "apply_family_defaults(" in
+      open(os.path.join(os.path.dirname(os.path.abspath(refine.__file__)),
+                        "refine.py")).read()
+      and hasattr(_fd, "apply_family_defaults"))
+# Predicate contract: pinned skips, eligible gates participation, and the
+# has_value/is_pinned split is what makes an explicit-null cfg still masked.
+_p_shared = {"cfg_scale": None, "true_cfg_scale": None, "steps": None}
+_msgs_shared: list = []
+_applied = _fd.apply_family_defaults(
+    _p_shared, family="qwen-image",
+    is_pinned=lambda k: _p_shared.get(k) is not None,
+    has_value=lambda k: _p_shared.get(k) is not None,
+    is_eligible=lambda k: k in _p_shared,
+    log=_msgs_shared.append)
+check("shared applier fills unpinned eligible keys",
+      _applied == {"true_cfg_scale": 4.0, "steps": 50}, detail=str(_applied))
+_p_pin = {"cfg_scale": 1.0, "true_cfg_scale": None, "steps": None}
+_msgs_pin: list = []
+_fd.apply_family_defaults(
+    _p_pin, family="qwen-image",
+    is_pinned=lambda k: _p_pin.get(k) is not None,
+    has_value=lambda k: _p_pin.get(k) is not None,
+    is_eligible=lambda k: k in _p_pin,
+    log=_msgs_pin.append)
+check("shared applier: has_value('cfg_scale') suppresses the true_cfg default",
+      _p_pin["true_cfg_scale"] is None and _p_pin["steps"] == 50
+      and any("suppressed by explicit/iterated --cfg" in m for m in _msgs_pin))
+_p_null = {"cfg_scale": None, "true_cfg_scale": None}
+_fd.apply_family_defaults(
+    _p_null, family="qwen-image",
+    is_pinned=lambda k: k == "cfg_scale",      # pinned (sidecar said null)…
+    has_value=lambda k: False,                 # …but carries no usable value
+    is_eligible=lambda k: k in _p_null,
+    log=lambda *_a: None)
+check("shared applier: pinned-but-null cfg does NOT suppress (masking holds)",
+      _p_null["true_cfg_scale"] == 4.0)
+# Both-knobs invariant (code review SHOULD): with --cfg AND --true-cfg both
+# supplied, the operator's true_cfg stands and NO suppression line is logged.
+# This is enforced purely by statement order (pinned-check before the CFG
+# branch) inside the shared applier — a future "pre-filter" reordering would
+# log a false suppression, or worse discard the operator's --true-cfg.
+_p_both = {"cfg_scale": 1.0, "true_cfg_scale": 6.0, "steps": None}
+_msgs_both: list = []
+_applied_both = _fd.apply_family_defaults(
+    _p_both, family="qwen-image",
+    is_pinned=lambda k: _p_both.get(k) is not None,
+    has_value=lambda k: _p_both.get(k) is not None,
+    is_eligible=lambda k: k in _p_both,
+    log=_msgs_both.append)
+check("shared applier: both CFG knobs pinned -> true_cfg kept, no suppression log",
+      _p_both["true_cfg_scale"] == 6.0
+      and "true_cfg_scale" not in _applied_both
+      and not any("suppressed" in m for m in _msgs_both),
+      detail=str(_msgs_both))
+check("shared applier: unknown family is a no-op",
+      _fd.apply_family_defaults({}, family=None, is_pinned=lambda k: False,
+                                has_value=lambda k: False,
+                                is_eligible=lambda k: True,
+                                log=lambda *_a: None) == {})
+# --schedule port: refine hardcoded "linear" on every generation before this.
+_ps = refine._build_arg_parser()
+_ps_req = ["--output-dir", "o", "--model-base", "m", "--judge-backend", "j"]
+check("refine exposes --schedule with generate's choices",
+      _ps.parse_args(["--schedule", "karras"] + _ps_req).schedule == "karras"
+      and _ps.parse_args(_ps_req).schedule is None)
+check("--schedule backstops to linear when unset (prior hardcoded value)",
+      refine._GEN_KEY_FALLBACKS["schedule"] == "linear")
+# End-to-end port pin (code review NIT): a regression that dropped
+# "schedule": args.schedule from the base dict would otherwise pass the whole
+# suite. Drive the real build_config_from_args against the qwen fixture and
+# confirm the value survives the overlay into to_generate_params(), which is
+# exactly what _build_server_request and the cold call read.
+_sched_dir = _tf.mkdtemp(prefix="refine_sched_fam_")
+with open(os.path.join(_sched_dir, "model_index.json"), "w") as _fh:
+    _fh.write('{"_class_name": "QwenImagePipeline"}')
+_sched_args = _ps.parse_args(
+    ["--prompt", "p", "--model", _sched_dir, "--schedule", "karras"] + _ps_req)
+_sched_cfg = refine.build_config_from_args(_sched_args, {}, (),
+                                           log=lambda *_a: None)
+check("--schedule survives build_config_from_args into generate params",
+      _sched_cfg.base["schedule"] == "karras"
+      and _sched_cfg.to_generate_params()["schedule"] == "karras")
+_sched_cfg2 = refine.build_config_from_args(
+    _ps.parse_args(["--prompt", "p", "--model", _sched_dir] + _ps_req),
+    {}, (), log=lambda *_a: None)
+check("unset --schedule lands as linear end-to-end",
+      _sched_cfg2.to_generate_params()["schedule"] == "linear")
+
 print("\n== parity slice 2: shared wire-warning surfacer ==")
 # Before this slice refine read ONLY edit_warnings, so a planner-added LoRA
 # that silently failed to apply was invisible to operator, loop, and judge.
@@ -1837,7 +1930,9 @@ check("refine overlay: explicit --cfg suppresses true_cfg_scale default",
 check("refine overlay: unrelated family key still fills (steps=50)",
       _fbase["steps"] == 50)
 check("refine overlay: suppression is loud",
-      any("suppressed by explicit --cfg" in m for m in _fmsgs))
+      # Wording is now the SHARED one (parity slice 1) — both callers emit
+      # family_defaults.apply_family_defaults' single message.
+      any("suppressed by explicit/iterated --cfg" in m for m in _fmsgs))
 _fbase = {"model": _famdir, "cfg_scale": None, "true_cfg_scale": None,
           "steps": None}
 refine._overlay_family_defaults(_fbase, log=lambda *_a: None)

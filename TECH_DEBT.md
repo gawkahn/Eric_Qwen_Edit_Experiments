@@ -1793,3 +1793,21 @@ OR the next refine loop-accounting slice. Fix: carry the count into the
 history record (a `lora_failed: true` flag is path-free and F8-P-safe) and
 add a rubric line telling the planner that a flagged iteration's scores do
 not reflect the proposed LoRA.
+
+## 2026-07-25 — `schedule` has no value allowlist at the machine boundary
+Parity-slice-1 `security-auditor` (Fable) LOW. Pre-existing, surfaced because
+the slice widens the population of schedule-carrying wire requests (refine now
+always sends one). `params_validation` types `schedule` as `_KIND_STR` with no
+value check, so a `--json`/MCP/sidecar-supplied name outside `SCHEDULE_NAMES`
+passes the boundary, `_sigma_schedule_gate` treats it as non-linear,
+`build_sigma_schedule` silently shapes it as linear — and the
+"[comfyless] sigma schedule: {name} (flow-match...)" log line plus the sidecar
+then RECORD a schedule that did not run. Integrity misreport, not an exploit;
+no dispatch or eval on the string. The CLI is unaffected (argparse
+choices-gated on both generate and refine). Why not now: it belongs with the
+machine-boundary validator, not this refactor, and the fix has two shapes
+worth choosing between deliberately. Trigger: next params-validation slice, OR
+any report of a sidecar recording a schedule that didn't run. Fix: either add
+`schedule` to the dtype-style value-allowlist mechanism in
+`params_validation.py`, or have `build_sigma_schedule` return the EFFECTIVE
+name so the log and sidecar say "linear (fallback from <name>)".
