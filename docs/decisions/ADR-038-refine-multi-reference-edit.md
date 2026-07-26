@@ -1,6 +1,6 @@
 # ADR-038 — Multi-reference refinement (operator-pinned refs + identity judging)
 
-Status:   proposed
+Status:   accepted
 AI-Disclosure: Claude (Fable 5) authored; Grant reviewed.
 
 ## Context
@@ -324,4 +324,9 @@ guarantees are structural and a refactor could quietly undo them:
   the planner-authority deferral now cites its standing control (ADR-035
   decision 7 / Finding 8), and the slice plan names its negative tests.
   Review: `docs/security/review-adr-038-design-2026-07-25.md`.
-  **Awaiting Grant's acceptance before implementation.**
+
+- 2026-07-25 — **ACCEPTED by Grant.** Implementation may proceed. Grant also
+  set the follow-on order: the v3 promotion gate (memo B1-B5) comes
+  IMMEDIATELY after this slice, ahead of the daemon progress-bar work
+  ("eye-candy, not substantive") — which makes the duel-payload forward
+  constraint above live rather than hypothetical.
