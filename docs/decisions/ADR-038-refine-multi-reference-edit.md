@@ -261,6 +261,27 @@ REPLACING. There is nothing in the anchor to match against.
   structurally cannot reach them today.
 - **Multi-ref for t2i mode.** References are an edit-family concept; t2i
   entry is unchanged.
+
+- **The v3 promotion gate (research memo B1-B5) is NOT in this ADR** — and
+  the boundary is worth stating precisely, because the two look adjacent.
+  ADR-038 stays inside the existing scoring model: identity match becomes a
+  third ABSOLUTE criterion alongside adherence and preservation. B1 changes
+  the PROMOTION GATE itself, replacing score-vs-score with a swap-paired
+  head-to-head duel — which matters exactly where absolute scoring saturates
+  (the observed 9.6 tie chains), because the elements that break a tie are
+  the ones the scalar has already flattened (Grant, 2026-07-25).
+
+  **Forward constraint for whoever writes the v3 ADR:** a duel in a
+  multi-ref run should compare candidates WITH the identity reference
+  present — "which of these two better matches this face?" is a far sharper
+  question than either candidate's absolute identity score, and it is the
+  natural place this ADR's work pays off. That payload is
+  reference + candidate A + candidate B (+ optionally the anchor), which
+  collides with D3's judge-image budget: the current `--limit-mm-per-prompt`
+  of 4 admits ref + 2 candidates + anchor exactly, with nothing spare. The
+  v3 ADR must therefore re-disposition D3's cap arithmetic rather than
+  inherit it, and decide whether a duel drops the anchor (preservation is
+  already scored elsewhere) or the endpoint's cap is raised.
 - **Raising the vLLM image cap beyond 4.** Operator-side infra; D3's cap
   tracks whatever the endpoint is configured for.
 
