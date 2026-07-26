@@ -269,6 +269,14 @@ which is exactly why its direction had to be fixed.
 intent done in a statistically meaningful way). The no-op resample stays: it
 addresses a different failure (the planner proposing nothing at all).
 
+**Amended 2026-07-26 (Grant's ruling, option (b) — see Changelog).** The
+subsumption is now scoped rather than absolute: `--explore-after` schedules a
+seed BATCH where duels exist (edit mode), which is what "subsumed" wanted; the
+single-seed resample survives where a batch cannot run — t2i, and edit runs
+with duels off. D1 is why the wording needed amending: ties keeping the
+incumbent made "nothing promotes at all" the common plateau shape, which D3's
+non-improving-PROMOTIONS trigger never sees.
+
 ## Alternatives Rejected
 
 **Keep absolute scoring, make the rubric more discriminating.** Already tried
@@ -381,3 +389,34 @@ and `--until-score` gates read the absolute composite only.
   design truest to D3's intent, and its own slice; (c) delete the escape as
   written and accept the gap. Until then, an accepted ADR and Red Zone code
   disagree, with the conservative option in the code.
+- 2026-07-26 — **RESOLVED: Grant ruled (b).** The batch trigger now fires on
+  EITHER `--sideways-cap` consecutive non-improving promotions or
+  `--explore-after` consecutive iterations with nothing promoted; in edit mode
+  that retires the ADR-037 single-seed resample, which survives for t2i and for
+  edit runs with duels off (a batch needs duels, so it does not exist there).
+  Supersession section amended above. `plateau_streak` is tracked separately
+  from `no_improve` so scheduling a batch cannot blind `--patience`.
+- 2026-07-26 — **Slice 4 implemented (D4 + D6); D5 deliberately NOT
+  implemented.** Review:
+  `docs/security/review-adr-039-slice4-anchor-duel-2026-07-26.md`.
+  **Two HIGHs found and fixed, both in D4 — the control slice 2 escalated to
+  load-bearing.** (1) The trigger was `promotions % anchor_duel_every == 0`, so
+  the check designed for the regime where promotions have STOPPED was keyed to
+  promotions: an entrenched incumbent freezes the counter and the duel either
+  never fires again (4 chances in 5 at the default) or fires every iteration.
+  Now latched, and due on either N promotions or N iterations since the last
+  check. (2) The anchor file used a FIXED name, so two runs sharing an
+  `--output-dir` overwrote it with probability 1 — and a revert then edited
+  forward, and published, a foreign run's image. Now created O_EXCL with a
+  run-unique name. Also fixed: anchor-duel voids were being erased by the
+  per-iteration error reset, leaving D4 permanently void without ever aborting.
+  **D5 (annealed tie-advance) is not implemented and this is deliberate:** its
+  own bounds disable tie-advance in edit mode, and duels are edit-only in this
+  implementation, so its entire live domain is t2i duels — which this ADR
+  defers. Revisit trigger: t2i duels landing.
+  **Named residual (unchanged by this slice):** the anchor duel is the same
+  judge on the same channel, and the incumbent's pixels ride every anchor call.
+  D4 converts the residual from "undetectable drift" to "entrenchment requires
+  continuously re-winning against a fixed reference" — it catches ordinary
+  drift, which is what motivated it, but does not close pixel injection. The
+  pass gate also exits before D4 runs.

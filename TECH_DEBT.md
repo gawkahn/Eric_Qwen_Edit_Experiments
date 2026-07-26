@@ -1841,3 +1841,29 @@ wants one deliberate slice with its own §10A commit. Trigger: the next Red Zone
 review in any project, or the ADR-039 slice-3 review. Fix: add `Bash(git diff*)`
 / `Bash(git status*)` to the reviewer agents' tool lists, or have the parent
 session write the diff to a file and hand the reviewer that path.
+
+## 2026-07-26 — catalog truncates trained INSTRUCTION templates to 64 chars
+Found while diagnosing why the refine loop never proposed the face-swap LoRAs
+(Grant, 2026-07-26). `sanitize_trigger_words` caps each entry at
+`TRIGGER_WORD_CAP` (64 B), which is right for trigger WORDS ("ohwx man",
+"pixel art") but wrong for the edit-tool LoRAs whose civitai `trainedWords` is
+a full instruction TEMPLATE. `bfs_head_v5_2511_merged_version_rank_16_fp16`
+ships a ~380-char template ("head_swap: start with Picture 1 as the base
+image, keeping its lighting, environment, and background. remove the head from
+Picture 1 completely and replace it with the head from Picture 2, strictly
+preserving the hair, eye color, nose structure of Picture 2. copy the direction
+of the eye, head rotation, micro expressions from Picture 1 ...") and the
+catalog stores `"head_swap: start with Picture 1 as the base image, keeping its
+l"`. The planner sees that fragment, so even when the LoRA IS offered it cannot
+reproduce the phrasing the LoRA was trained on — which is plausibly why the
+2026-07-25 face-swap runs got nothing out of this class of LoRA. Note the
+template is also, verbatim, the "name the specific features instead of
+'maintain identity'" strategy in the Backlog idea of the same date.
+Why not now: raising the cap is a catalog-plane change (schema value, sanitizer
+bound, FTS content size, and the planner-visible payload budget all move
+together), and it wants a deliberate decision about how much third-party text
+may enter LLM context — the offers are third-party-sourced metadata, an F8-P
+adjacent surface. Trigger: the face-swap end-to-end test, or the next catalog
+slice. Fix: a separate longer cap for template-shaped trained words (e.g.
+`TRIGGER_TEMPLATE_CAP` ~512 B, one per entry), or a dedicated
+`instruction_template` description column that the planner sees whole.

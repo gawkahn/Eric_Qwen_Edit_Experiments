@@ -39,6 +39,7 @@ import re
 import shutil
 import sqlite3
 import sys
+import tempfile
 import tomllib
 import urllib.error
 import urllib.request
@@ -91,8 +92,10 @@ DEFAULT_MAX_ITERATIONS = 10
 #: models an iteration is cheap, and --max-iterations is the authoritative
 #: spend bound. Pass --patience N to opt back into the early stop.
 DEFAULT_PATIENCE = 0
-#: Stagnation seed escape (ADR-037 D2 amendment addendum): after this many
-#: consecutive iterations with nothing promoted, every further non-promoting
+#: Plateau trigger: after this many consecutive iterations with nothing
+#: promoted, change the move type. In edit mode that means a D3 seed batch
+#: (Grant's ruling 2026-07-26); in t2i, where duels and therefore batches do
+#: not exist, every further non-promoting
 #: derivation gets a resampled seed even when the planner DID change the
 #: config — a planner rewriting prompts against a seed-tied flaw never
 #: triggers the no-op escape and reprints the flaw to the cap (observed
@@ -137,6 +140,25 @@ DEFAULT_SIDEWAYS_CAP = 3
 #: scale. Minimum 2 — a one-arm "batch" is the per-iteration resample D3
 #: replaces.
 DEFAULT_SEED_BATCH = 3
+
+#: Promotions between anchor duels (ADR-039 D4): every N-th promotion, current
+#: best is duelled against the run's EARLIEST promoted best. If the old one
+#: wins, the chain has drifted and the run reverts to it. This is the KL-anchor
+#: idea from the reward-hacking literature translated to a judge-only check —
+#: the direct structural answer to the observed photo-to-illustration walk, and
+#: (slice-2 security review) the only compensating control for the accepted
+#: pixel-injection residual once best's composite passes 10 - duel_band, where
+#: no challenger can promote without the incumbent's duel consent. 0 disables.
+DEFAULT_ANCHOR_DUEL_EVERY = 5
+
+#: Iterations before the D6 planner hint says anything: below this a promotion
+#: rate is noise, not a signal.
+_HINT_MIN_ITERATIONS = 5
+
+#: Promotion rate under which the planner is nudged toward smaller edits. The
+#: (1+1)-ES 1/5th rule is the ANALOGY, not a controller — prompt space has no
+#: step-size metric, so this is advisory text and nothing else (D6).
+_HINT_LOW_RATE = 0.2
 
 #: Composite distance from best within which the promotion gate is decided by a
 #: swap-paired DUEL rather than by the scalar (ADR-039 D1). The absolute scale
@@ -885,6 +907,11 @@ class LoopOutcome:
     #: that --max-iterations bounds. Automation auditing spend must read this
     #: one (slice-3 review, LOW).
     generations: int = 0
+    #: How many times a D4 anchor duel rewound the chain. A reverted run is
+    #: otherwise indistinguishable from one that never improved — same
+    #: passed/aborted/exhausted, same composite — while N iterations of work
+    #: were discarded (slice-4 review, INFO).
+    reverts: int = 0
 
 
 def composite_score(prompt_adherence: int, aesthetics: int,
@@ -1269,10 +1296,35 @@ def prepare_history_for_context(records: List[dict],
     return out
 
 
+#: Code-owned D6 hint strings. The planner never authors these and they carry
+#: no authority — they are guidance text in the same class as the rubric.
+_HINT_SMALLER = (
+    "Recent iterations have rarely improved. Prefer SMALL, single-clause "
+    "changes now — one requirement reworded, or one LoRA weight moved by about "
+    "0.1 — so the next score difference is attributable.")
+_HINT_BOLDER = (
+    "Recent iterations have been landing. Bolder rewrites are worth trying — "
+    "restructure the instruction rather than adjusting one clause.")
+
+
+def edit_magnitude_hint(promotions: int, iterations: int) -> Optional[str]:
+    """ADR-039 D6: an ADVISORY line for the planner, derived from how often its
+    changes have been promoted. Deliberately NOT a controller — the (1+1)-ES
+    1/5th-rule mapping is qualitative because prompt space has no step-size
+    metric, so this returns text the planner may ignore, never a parameter.
+
+    Silent below `_HINT_MIN_ITERATIONS`: a rate over 2-3 samples is noise."""
+    if iterations < _HINT_MIN_ITERATIONS:
+        return None
+    return (_HINT_SMALLER if promotions / iterations < _HINT_LOW_RATE
+            else _HINT_BOLDER)
+
+
 def build_judge_user_text(target_prompt: str, cfg: WorkingConfig,
                           planner_loras: List[dict],
                           search_offers: Optional[List[dict]] = None,
-                          history: Optional[List[dict]] = None) -> str:
+                          history: Optional[List[dict]] = None,
+                          planner_hint: Optional[str] = None) -> str:
     """Assemble the judge/planner user message (F3: NO abs_path ever). The active
     LoRAs are rendered as name+weight (paths dropped); `planner_loras`/`search_offers`
     are already path-stripped upstream; `history` must come through
@@ -1288,6 +1340,10 @@ def build_judge_user_text(target_prompt: str, cfg: WorkingConfig,
         payload["catalog_search_offers"] = search_offers
     if history:
         payload["iteration_history"] = history
+    if planner_hint:
+        # D6: code-owned advisory text (see edit_magnitude_hint). Never
+        # planner-authored, so it adds nothing to the F8-P surface.
+        payload["edit_magnitude_hint"] = planner_hint
     _assert_no_paths(payload)
     return ("Evaluate the attached image against the target prompt and suggest "
             "fixes.\nContext (JSON):\n" + json.dumps(payload, indent=2,
@@ -1343,6 +1399,7 @@ def judge_candidate(image, target_prompt: str, cfg: WorkingConfig, backend_cfg: 
                     planner_loras: List[dict], *,
                     search_offers: Optional[List[dict]] = None,
                     history: Optional[List[dict]] = None,
+                    planner_hint: Optional[str] = None,
                     source_image=None,
                     ref_images_judge: Optional[List[Any]] = None,
                     system_prompt: str = JUDGE_SYSTEM_PROMPT,
@@ -1359,7 +1416,8 @@ def judge_candidate(image, target_prompt: str, cfg: WorkingConfig, backend_cfg: 
                   if source_image is not None else None)
     user_text = build_judge_user_text(target_prompt, cfg, planner_loras,
                                       search_offers=search_offers,
-                                      history=history)
+                                      history=history,
+                                      planner_hint=planner_hint)
     payload = build_judge_payload(model, system_prompt, user_text, data_uri,
                                   temperature=temperature, max_tokens=max_tokens,
                                   source_image_data_uri=source_uri,
@@ -2008,6 +2066,7 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 duel_system_prompt: str = DUEL_SYSTEM_PROMPT,
                 sideways_cap: int = DEFAULT_SIDEWAYS_CAP,
                 seed_batch: int = DEFAULT_SEED_BATCH,
+                anchor_duel_every: int = DEFAULT_ANCHOR_DUEL_EVERY,
                 output_format: Optional[OutputFormat] = None,
                 edit_source: Optional[str] = None,
                 log: Callable[[str], None] = print) -> LoopOutcome:
@@ -2049,6 +2108,17 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
     first promoted candidate. `duel_band <= 0` disables duels. t2i duels are
     ADR-039-deferred: in t2i the strict-composite rule applies and a positive
     band logs one notice.
+
+    PLATEAU + DRIFT (ADR-039 D3/D4). Two plateau triggers schedule a seed batch
+    — `sideways_cap` consecutive non-improving promotions, or `explore_after`
+    iterations with nothing promoted — and a batch generates `seed_batch` arms
+    at best's config varying only the seed, picking a winner by
+    single-elimination duels with an earliest-arm tie-break. A batch winner that
+    cannot beat best ends the run as `exhausted`. Separately, every
+    `anchor_duel_every` promotions, best is duelled against the run's FIRST best
+    (pinned by value at first promotion); if the old one wins, the chain has
+    drifted and the run reverts to the pinned config and image, marking the
+    intervening mutations as failed.
 
     EDIT MODE (ADR-037 D5): `edit_source` (an operator-typed image path) makes
     every iteration an edit of the current source — the operator's seed at
@@ -2092,7 +2162,37 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
     # than iterating the planner again on a plateau it cannot see.
     gens_used = 0
     sideways_streak = 0
+    # Non-promoting iterations since the last promotion OR the last scheduled
+    # batch. Distinct from `no_improve`, which must keep counting for --patience
+    # even when a batch has just answered the same plateau.
+    plateau_streak = 0
     pending_batch = False
+    # D4 anchor state, pinned BY VALUE at the FIRST promotion: decoded bytes
+    # copied into a loop-owned file, the judge-resolution image held in memory,
+    # and a config snapshot. The anchor duel and any revert consume ONLY these —
+    # never a candidates/ re-read, never a sidecar reconstruction. ADR-038's
+    # accepted residual is that two concurrent runs sharing an --output-dir
+    # cross-overwrite candidates/ on colliding stems, so a path-based anchor
+    # could compare against a FOREIGN run's image and revert this chain to a
+    # config whose image never existed here.
+    anchor_cand: Optional[Candidate] = None
+    anchor_cfg: Optional[WorkingConfig] = None
+    anchor_img = None
+    anchor_path: Optional[str] = None
+    promotions = 0
+    reverts = 0
+    # D4 scheduling state. The trigger must NOT be `promotions % N == 0`
+    # (security review HIGH): an entrenched incumbent — injected or merely
+    # drifted — stops promoting, so a modulo on `promotions` either never lands
+    # again (4 chances in 5 at the default N) or, if it froze exactly on a
+    # multiple, lands EVERY iteration at 2 judge calls a time. Both directions
+    # fail in precisely the regime D4 exists for: the one where promotions have
+    # stopped. Track the last check instead, and let EITHER promotions or plain
+    # iterations since that check arm it, so the drift check stays periodic even
+    # when nothing is promoting.
+    anchor_checked_at = 0
+    iters_since_anchor = 0
+    planner_hint: Optional[str] = None
     # Edit mode (ADR-037 D5): current_source — the GENERATION input — is
     # LOOP-OWNED: the operator's seed at iteration 0, then best's image (a
     # candidates/ file this loop wrote), advancing on every promotion (a TIE
@@ -2319,12 +2419,20 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                     # keys (Finding 9 / F8-P).
                     history.append(history_error_record(i))
                     no_improve += 1
+                    # Abort BEFORE patience, matching the scoring-error path:
+                    # an iteration that trips both must report aborted=True on
+                    # either route, since automation branches on that flag
+                    # (code review LOW).
                     if consecutive_judge_errors >= JUDGE_ERROR_ABORT_AFTER:
                         log(f"[refine] ABORT: {JUDGE_ERROR_ABORT_AFTER} "
                             f"consecutive unusable judge calls. Candidates so "
                             f"far are kept.")
                         aborted = True
                     if aborted:
+                        break
+                    if patience > 0 and no_improve >= patience:
+                        log(f"[refine] nothing promoted for {patience} iters "
+                            f"— stopping")
                         break
                     continue
         if not batch_iteration:
@@ -2372,6 +2480,7 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                                       planner_loras, search_offers=search_offers,
                                       history=(prepare_history_for_context(history, log)
                                                if history else None),
+                                      planner_hint=planner_hint,
                                       source_image=source_img,
                                       ref_images_judge=_judge_ref_images,
                                       system_prompt=judge_system_prompt,
@@ -2526,8 +2635,6 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 f"Candidates so far are kept.")
             aborted = True
             break
-        if judge_calls_ok:
-            consecutive_judge_errors = 0
         # D3: a batch winner that cannot beat best has exhausted the config —
         # the plateau survived the one axis the planner cannot reason about.
         # Stop rather than spending the remaining budget on more rewording.
@@ -2568,6 +2675,47 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 # their exact {iteration, judge_error} shape (Finding 9 / NIT-3).
                 if "is_best" in rec:
                     rec["is_best"] = False
+            promotions += 1
+            if anchor_cand is None and anchor_duel_every > 0:
+                # D4: pin the run's FIRST best BY VALUE — bytes copied into a
+                # loop-owned file (same discipline as ADR-038's pin_static_refs),
+                # the judge-resolution image, and a config snapshot. The
+                # Candidate we keep points at the COPY, so even the final winner
+                # copy after a revert never reads candidates/.
+                _anchor_dir = os.path.join(output_dir, "anchor")
+                os.makedirs(_anchor_dir, exist_ok=True)
+                # RUN-UNIQUE name, created O_EXCL (security review HIGH): a
+                # fixed `first_best.<ext>` collides with probability 1 between
+                # two runs sharing an --output-dir — not the narrow same-stem
+                # window of ADR-038's accepted residual but a certainty — and a
+                # revert consumes this path for BOTH the edit source and the
+                # published winner. A foreign run's image would then be edited
+                # forward and published as this run's winner: exactly the
+                # "config whose image never existed here" outcome the by-value
+                # pin exists to prevent, with the blast radius of a whole run.
+                # (The read side is the loop's pre-existing candidates/ window,
+                # the same one `Image.open(outcome.image_path)` already has —
+                # ADR-038's accepted residual, not something D4 widens.)
+                _a_fd, _a_path = tempfile.mkstemp(
+                    prefix="first_best_", dir=_anchor_dir,
+                    suffix=os.path.splitext(cand.image_path)[1])
+                os.close(_a_fd)
+                shutil.copy2(cand.image_path, _a_path)
+                anchor_path = _a_path
+                anchor_img = best_duel_img
+                anchor_cfg = snapshot_config(cfg)
+                anchor_cand = Candidate(index=cand.index,
+                                        image_path=_a_path,
+                                        metadata=cand.metadata,
+                                        verdict=cand.verdict,
+                                        composite=cand.composite)
+                anchor_checked_at = promotions   # the pin IS a check: an
+                # --anchor-duel-every 1 run would otherwise duel the anchor
+                # against its own copy on the spot (code review LOW).
+                iters_since_anchor = 0
+                log(f"[refine] iter {i}: anchor pinned — best of iteration "
+                    f"{cand.index} is held by value for anchor duels every "
+                    f"{anchor_duel_every} promotions (ADR-039 D4)")
         # Progress = PROMOTION, not a composite tick (ADR-039 D1). Under the
         # duel gate a challenger can score higher and still lose the duel; if
         # that reset the counter, the stagnation escape and --patience would
@@ -2579,29 +2727,139 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
         else:
             no_improve += 1
 
-        # D3 sideways cap. A promotion that did not strictly improve the
-        # composite is a SIDEWAYS move — under D1 it is a duel win at
-        # equal-or-lower score, which is real information but not progress.
-        # Unbounded sideways moves are the classic local-search failure, so
-        # cap the streak and change the MOVE TYPE instead of iterating the
-        # planner again. Non-promotions leave the streak alone: they are the
-        # other plateau shape, and the ADR-037 stagnation escape below still
-        # owns that one (see the note there — D3's "subsumed" reading does not
-        # survive D1's tie rule).
+        # D3 has TWO plateau triggers, because D1 gave the plateau two shapes
+        # (Grant's ruling 2026-07-26, ADR-039 Changelog option (b)):
+        #
+        #   * SIDEWAYS — a promotion that did not strictly improve the
+        #     composite; under D1 a duel win at equal-or-lower score. Real
+        #     information, but not progress. Capped by --sideways-cap.
+        #   * STALLED — nothing promotes at all, which is what a plateau looks
+        #     like once ties keep the incumbent. Counted by --explore-after.
+        #
+        # Both change the MOVE TYPE rather than iterating the planner again on
+        # an axis it cannot reason about. In EDIT mode --explore-after now
+        # schedules a seed BATCH (statistically meaningful selection) instead of
+        # the ADR-037 single resample it retires there; t2i keeps the single
+        # resample below, since the batch needs duels and duels are edit-only.
         if improved:
             sideways_streak = 0
         elif promoted:
             sideways_streak += 1
-        if (sideways_cap > 0 and duels_enabled and best_cfg is not None
-                and sideways_streak >= sideways_cap):
+        if promoted:
+            plateau_streak = 0
+        else:
+            plateau_streak += 1
+        _sideways_hit = sideways_cap > 0 and sideways_streak >= sideways_cap
+        _stalled_hit = explore_after > 0 and plateau_streak >= explore_after
+        if (duels_enabled and best_cfg is not None
+                and (_sideways_hit or _stalled_hit)):
             # Scheduled for the NEXT pass, where it replaces that pass's single
             # generation; the streak resets now so a void batch cannot
             # re-trigger immediately and spend the budget on batches.
             pending_batch = True
+            # BOTH counters reset: the batch answers either trigger, and a
+            # still-armed second trigger would re-schedule immediately.
             sideways_streak = 0
-            log(f"[refine] iter {i}: {sideways_cap} consecutive non-improving "
-                f"promotions — the planner is moving sideways on a plateau. "
-                f"Next pass is a seed batch instead (--sideways-cap 0 disables)")
+            plateau_streak = 0
+            _why = (f"{sideways_cap} consecutive non-improving promotions — "
+                    f"the planner is moving sideways on a plateau"
+                    if _sideways_hit else
+                    f"{explore_after} iterations with nothing promoted — the "
+                    f"planner has stalled")
+            log(f"[refine] iter {i}: {_why}. Next pass is a seed batch instead "
+                f"(--sideways-cap 0 / --explore-after 0 disable their "
+                f"triggers)")
+
+        # D4 anchor duel. Every `anchor_duel_every` promotions, ask whether the
+        # chain has drifted away from where it started: current best against the
+        # run's first best, swap-paired. Cost is 2 judge calls per m promotions
+        # and NO generations. A void duel changes nothing (D1) — it is charged
+        # and the run continues, because an unavailable anchor check must not
+        # invent a revert any more than it invents a promotion.
+        reverted = False
+        _anchor_due = (promotions - anchor_checked_at >= anchor_duel_every
+                       or iters_since_anchor >= anchor_duel_every)
+        if (anchor_duel_every > 0 and duels_enabled and anchor_cand is not None
+                and anchor_cfg is not None
+                and best is not None and anchor_cand is not best
+                and _anchor_due):
+            anchor_checked_at = promotions
+            iters_since_anchor = 0
+            log(f"[refine] iter {i}: {promotions} promotions — anchor duel "
+                f"against the run's first best (iteration {anchor_cand.index})")
+            try:
+                _anchor_duel = duel_candidates(
+                    best_duel_img, anchor_img, target_prompt, backend_cfg,
+                    ref_images_judge=_judge_ref_images,
+                    system_prompt=duel_system_prompt, timeout=judge_timeout,
+                    log=log)
+            except RefineError as e:
+                # judge_calls_ok=False as well as the charge (security review
+                # MEDIUM): the reset below must not erase this. Without it, a
+                # channel that scores fine but always fails ANCHOR duels — the
+                # pixel-text scenario this control exists for — keeps the run
+                # alive with D4 permanently void and never trips the abort.
+                judge_calls_ok = False
+                consecutive_judge_errors += getattr(e, "failed_calls", 0)
+                log(f"[refine] iter {i}: anchor duel unusable ({e}) — VOID: "
+                    f"no revert, the chain stands (ADR-039 D1)")
+                if consecutive_judge_errors >= JUDGE_ERROR_ABORT_AFTER:
+                    log(f"[refine] ABORT: {JUDGE_ERROR_ABORT_AFTER} "
+                        f"consecutive unusable judge calls. Candidates so far "
+                        f"are kept.")
+                    aborted = True
+                    break
+            else:
+                for n in _anchor_duel.notices:
+                    log(f"[refine] iter {i}: anchor duel notice: {n}")
+                if _anchor_duel.outcome == DUEL_B:
+                    # The first best wins: the chain drifted. Revert to the
+                    # PINNED values only.
+                    log(f"[refine] iter {i}: the run's FIRST best wins the "
+                        f"anchor duel — the chain has drifted. Reverting to "
+                        f"iteration {anchor_cand.index}'s pinned config and "
+                        f"image, and marking the mutations since as failed "
+                        f"(ADR-039 D4)")
+                    best = anchor_cand
+                    best_cfg = snapshot_config(anchor_cfg)
+                    best_duel_img = anchor_img
+                    if edit:
+                        current_source = anchor_path
+                    # History marking mutates only EXISTING boolean flags — no
+                    # new keys, no free text, so the F8-P judge-bound surface is
+                    # unchanged (D4).
+                    for rec in history:
+                        if "improved" not in rec:
+                            continue          # error records keep their shape
+                        _it = rec.get("iteration")
+                        if isinstance(_it, int) and _it > anchor_cand.index:
+                            rec["improved"] = False
+                            rec["is_best"] = False
+                        elif _it == anchor_cand.index:
+                            rec["is_best"] = True
+                    reverted = True
+                    reverts += 1
+                    sideways_streak = 0
+                    plateau_streak = 0
+                    # The promotion this iteration recorded has just been
+                    # overruled, so it is not progress for the early stop
+                    # either — `no_improve` was zeroed by the gate before the
+                    # anchor duel ran (code review LOW).
+                    no_improve += 1
+                else:
+                    log(f"[refine] iter {i}: current best holds the anchor duel "
+                        f"({_anchor_duel.outcome}) — no drift to correct")
+
+        # Counted at the END of the pass, so the iteration that PINS the anchor
+        # cannot immediately duel it against its own copy (code review LOW).
+        iters_since_anchor += 1
+
+        # The consecutive-error reset lands HERE, after every judge call this
+        # iteration could make — scoring, gate duel, and anchor duel alike. Any
+        # earlier and a failure from a later call is wiped by the next
+        # iteration's reset (security review MEDIUM).
+        if judge_calls_ok:
+            consecutive_judge_errors = 0
 
         if gens_used >= max_iterations:
             log(f"[refine] generation cap {max_iterations} reached — stopping")
@@ -2619,7 +2877,10 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
         resolved_ops, res_notices = resolve_lora_ops(catalog, roots, verdict.lora_ops)
         for n in res_notices:
             log(f"[refine] iter {i}: {n}")
-        source_cfg = cfg if promoted else best_cfg
+        # After a D4 revert the lineage source is the ANCHOR's snapshot, even
+        # though this iteration promoted — the promotion is what the anchor duel
+        # just overruled.
+        source_cfg = cfg if (promoted and not reverted) else best_cfg
         if source_cfg is None:  # unreachable: promotion always sets best_cfg
             source_cfg = cfg
         if not promoted and best is not None:  # best is always set here
@@ -2665,16 +2926,14 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 log(f"[refine] iter {i}: planner proposed no effective change "
                     f"— resampling seed {_seed} -> {_seed + seed_resamples} "
                     f"(an unchanged config would re-sample nothing new)")
-        # Stagnation escape (D2 amendment addendum, 2026-07-24). ADR-039 D3
-        # declares this SUBSUMED by the seed batch, and it is NOT — kept
-        # deliberately, flagged for Grant. The subsumption assumed the two
-        # triggers describe the same plateau, but D1 split them: the batch
-        # fires on non-improving PROMOTIONS, while ties now keep the incumbent,
-        # so under v3 the common plateau shape is "nothing promotes at all" —
-        # which the batch trigger never sees. Deleting this would leave the
-        # most likely v3 plateau with no seed exploration whatsoever. The two
-        # are complementary post-D1; if Grant prefers the literal reading, the
-        # deletion is one block and the ADR keeps its wording.
+        # Stagnation escape (D2 amendment addendum, 2026-07-24), RETIRED in
+        # edit mode by Grant's ruling of 2026-07-26 (ADR-039 Changelog option
+        # (b)): where duels exist, --explore-after schedules a seed BATCH
+        # instead — the same intent done in a statistically meaningful way,
+        # which is what D3's "subsumed" wanted. It survives here for the runs a
+        # batch cannot serve: t2i (duels are edit-only), and edit runs with
+        # duels switched off. Deleting it outright would leave those with no
+        # seed exploration at all.
         # A planner that keeps CHANGING the prompt against a seed-tied flaw never
         # triggers the no-op branch above, so the seed stays pinned to best's
         # while every rewrite reprints the flaw (observed live: 12 straight
@@ -2682,8 +2941,8 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
         # further non-promoting derivation explores a fresh seed; a PROMOTION
         # resets the counter upstream (ADR-039 D1). elif: the no-op branch
         # already resampled — never double-bump one iteration.
-        elif (explore_after > 0 and no_improve >= explore_after
-                and _seed is not None):
+        elif (explore_after > 0 and not duels_enabled
+                and no_improve >= explore_after and _seed is not None):
             seed_resamples += 1
             cfg.base["seed"] = _seed + seed_resamples
             log(f"[refine] iter {i}: {no_improve} iterations without a "
@@ -2692,18 +2951,29 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 f"--explore-after 0 disables)")
         # History record for this iteration (ADR-037 D1): the prompt that
         # produced the candidate + the RESOLVED ops applied in response.
+        # D6: recompute the advisory hint for the NEXT planner call from this
+        # run's promotion rate. Advisory only — it never gates anything.
+        planner_hint = edit_magnitude_hint(promotions, iters_run)
+        # A D4 revert overrules THIS iteration's promotion, and its record is
+        # written after the revert ran — so the flags must reflect the anchor
+        # duel's verdict, not the gate's. Without this the planner is told the
+        # mutation the anchor duel just rejected succeeded, and D4's "mark the
+        # intervening mutations as failed" would skip the one that mattered
+        # most: the one that triggered the check. Found by the slice-4 test.
+        _rec_improved = improved and not reverted
+        _rec_is_best = promoted and not reverted
         history.append(history_record(
             iteration=i, verdict=verdict, composite=comp, prompt=prev_prompt,
             target_prompt=target_prompt, applied_ops=resolved_ops,
-            improved=improved, is_best=promoted,
-            accepted=(promoted if edit else None)))
+            improved=_rec_improved, is_best=_rec_is_best,
+            accepted=(_rec_is_best if edit else None)))
 
     if best is None:
         log("[refine] no usable candidate produced — winners/ is empty")
         return LoopOutcome(winner_path=None, passed=False,
                            iterations=iters_run, best_composite=None,
                            aborted=aborted, exhausted=exhausted,
-                           generations=gens_used)
+                           generations=gens_used, reverts=reverts)
     win_dst = os.path.join(winners_dir, os.path.basename(best.image_path))
     shutil.copy2(best.image_path, win_dst)
     log(f"[refine] winner: {win_dst} (composite={best.composite:.2f}, "
@@ -2711,7 +2981,7 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
     return LoopOutcome(winner_path=win_dst, passed=passed,
                        iterations=iters_run, best_composite=best.composite,
                        aborted=aborted, exhausted=exhausted,
-                       generations=gens_used)
+                       generations=gens_used, reverts=reverts)
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -3006,9 +3276,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "--max-iterations (default 0)")
     p.add_argument("--explore-after", type=int, default=DEFAULT_EXPLORE_AFTER,
                    help=f"After N consecutive iterations with nothing "
-                        f"promoted, resample the seed on every further "
-                        f"one (stagnation escape — a prompt rewrite can't fix "
-                        f"a seed-tied flaw). 0 disables. Default "
+                        f"promoted, stop rewording and explore the seed — a "
+                        f"prompt rewrite cannot fix a seed-tied flaw. In EDIT "
+                        f"mode (duels on) this schedules a --seed-batch; in "
+                        f"t2i it resamples one seed per further non-promoting "
+                        f"iteration. 0 disables. Default "
                         f"{DEFAULT_EXPLORE_AFTER}. Note: a positive "
                         f"--patience <= this stops the run before the escape "
                         f"fires")
@@ -3038,6 +3310,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         f"tie-break (default {DEFAULT_SEED_BATCH}, minimum "
                         f"2). These generations count against "
                         f"--max-iterations")
+    p.add_argument("--anchor-duel-every", type=int,
+                   default=DEFAULT_ANCHOR_DUEL_EVERY, metavar="N",
+                   help=f"Every N promotions, duel current best against the "
+                        f"run's FIRST best; if the old one wins, the chain has "
+                        f"drifted and the run reverts to it (default "
+                        f"{DEFAULT_ANCHOR_DUEL_EVERY}; 0 disables). Costs 2 "
+                        f"judge calls per N promotions and no generations. "
+                        f"This is the drift check — leave it on")
     p.add_argument("--w-prompt-adherence", type=float, default=DEFAULT_W_PA,
                    help="Composite weight for prompt-adherence (default 0.6)")
     p.add_argument("--w-aesthetics", type=float, default=DEFAULT_W_AES,
@@ -3538,6 +3818,11 @@ def main(argv: Optional[List[str]] = None) -> int:
               f"the plateau escape), got {args.sideways_cap!r}",
               file=sys.stderr)
         return 2
+    if args.anchor_duel_every < 0:
+        print(f"[refine] --anchor-duel-every must be an integer >= 0 (0 "
+              f"disables the drift check), got {args.anchor_duel_every!r}",
+              file=sys.stderr)
+        return 2
     if args.seed_batch < 2:
         print(f"[refine] --seed-batch must be at least 2 — a one-arm batch is "
               f"the per-iteration resample it replaces, and a bracket needs "
@@ -3743,6 +4028,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             judge_system_prompt=judge_system_prompt,
             duel_band=args.duel_band, duel_system_prompt=duel_system_prompt,
             sideways_cap=args.sideways_cap, seed_batch=args.seed_batch,
+            anchor_duel_every=args.anchor_duel_every,
             output_format=out_fmt,
             edit_source=edit_source, static_refs=static_refs, log=log)
     except RefineError as e:

@@ -2419,8 +2419,10 @@ class _FakeJudgeE(_FakeJudge):
         self.histories_seen = []
         self.sources_seen = []
         self.judge_refs_seen = []
+        self.hints_seen = []
 
     def __call__(self, image, target_prompt, cfg, backend_cfg, planner_loras, **kw):
+        self.hints_seen.append(kw.get("planner_hint"))
         self.histories_seen.append(kw.get("history"))
         self.sources_seen.append(kw.get("source_image"))
         self.judge_refs_seen.append(kw.get("ref_images_judge"))
@@ -3200,9 +3202,14 @@ check("a +0.6 gain INSIDE the band is duelled, and a tie keeps the incumbent",
 
 print("\n== ADR-039 D1: a void duel promotes nothing and feeds the abort ==")
 _fd = _FakeDuel([refine.DuelError("endpoint down", failed_calls=1)])
+# Both D3 plateau triggers are OFF here so this pins the void-duel accounting
+# alone: with them on, a run where nothing promotes schedules a seed batch
+# (Grant's ruling 2026-07-26) and the call counts below would be measuring the
+# batch, not the gate. The batch's own void accounting is pinned in slice 3.
 _d, _o, _fg, _fj, _m = _run_loop_e(
     [_mkverdict_ov(6, 6, None)] * 6,
-    edit_source=_seed_png, max_iterations=6, patience=0, duel_band=1.0, duel=_fd)
+    edit_source=_seed_png, max_iterations=6, patience=0, duel_band=1.0,
+    sideways_cap=0, explore_after=0, duel=_fd)
 check("consecutive void duels abort the run (JUDGE_ERROR_ABORT_AFTER)",
       _o.aborted is True
       and _o.iterations == 1 + refine.JUDGE_ERROR_ABORT_AFTER,
@@ -3516,6 +3523,55 @@ _d, _o, _fg, _fj, _m = _run_loop_e(
 check("with duels off there are no sideways promotions to cap",
       _fd.calls == 0 and not any("seed batch" in m for m in _m))
 
+print("\n== ADR-039 D3 (Grant's ruling b): --explore-after schedules a BATCH "
+      "in edit mode, a single resample in t2i ==")
+# Nothing promotes (every gate duel ties), so the SIDEWAYS trigger never arms —
+# this is the plateau shape D1 created and D3's original trigger could not see.
+# In edit mode it must now schedule a batch.
+_fd = _FakeDuel([refine.DUEL_TIE, refine.DUEL_TIE, refine.DUEL_A,
+                 refine.DUEL_A])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    _sideways_script, edit_source=_seed_png, max_iterations=8, patience=0,
+    duel_band=1.0, sideways_cap=0, explore_after=2, seed_batch=2, duel=_fd)
+check("a stalled edit run schedules a seed batch, naming the stall trigger",
+      any("iterations with nothing promoted" in m and "seed batch" in m
+          for m in _m), detail=str([m for m in _m if "seed batch" in m]))
+check("the retired single-seed resample does NOT also fire in edit mode",
+      not any("stagnation escape" in m for m in _m))
+check("the batch really ran (arms drawn from the lattice)",
+      _fg.seeds_seen[3:5] == [124, 125], detail=str(_fg.seeds_seen))
+# t2i keeps the per-iteration resample: duels are edit-only, so there is no
+# batch to schedule and deleting the escape would leave t2i with none at all.
+_d, _o, _fg, _fj = _run_loop_p(
+    [_mkverdict_ov(7, 7, "B"), _mkverdict_ov(5, 5, "C"),
+     _mkverdict_ov(5, 5, "D"), _mkverdict_ov(5, 5, "E")],
+    max_iterations=4, patience=0)
+check("t2i still resamples one seed per stalled iteration",
+      _fg.seeds_seen == [-1, 123, 123, 124], detail=str(_fg.seeds_seen))
+# An edit run with duels OFF has no batch either — the escape must survive
+# there too, or that configuration loses seed exploration entirely.
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    [_mkverdict_ov(7, 7, "B"), _mkverdict_ov(5, 5, "C"),
+     _mkverdict_ov(5, 5, "D"), _mkverdict_ov(5, 5, "E")],
+    edit_source=_seed_png, max_iterations=4, patience=0, duel_band=0.0,
+    explore_after=2)
+check("an edit run with duels off keeps the single-seed escape",
+      any("stagnation escape" in m for m in _m),
+      detail=str([m for m in _m if "resampling" in m]))
+# Scheduling a batch resets the PLATEAU counter but must not blind --patience:
+# `no_improve` keeps counting, and a void batch pass evaluates the early stop
+# just like the scoring-error path does. (A batch whose winner legitimately
+# loses stops the run as exhausted before patience can matter — that path is
+# pinned above; this one is the void case, where the run carries on.)
+_fd = _FakeDuel([refine.DUEL_TIE, refine.DUEL_TIE,
+                 refine.DuelError("endpoint down", failed_calls=1)])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    _sideways_script, edit_source=_seed_png, max_iterations=9, patience=3,
+    duel_band=1.0, sideways_cap=0, explore_after=2, seed_batch=2, duel=_fd)
+check("no_improve survives a batch scheduling and still trips --patience",
+      any("nothing promoted for 3 iters" in m for m in _m),
+      detail=str([m for m in _m if "stopping" in m or "seed batch" in m]))
+
 print("\n== ADR-039 D3: --sideways-cap / --seed-batch validation ==")
 for _flag, _bad, _needle in (("--sideways-cap", "-1", "--sideways-cap must be"),
                              ("--seed-batch", "1", "--seed-batch must be at least 2"),
@@ -3528,6 +3584,191 @@ for _flag, _bad, _needle in (("--sideways-cap", "-1", "--sideways-cap must be"),
     check(f"{_flag} {_bad} is rejected by its own check, exit 2",
           _rc == 2 and _needle in _err.getvalue(),
           detail=f"rc={_rc} stderr={_err.getvalue()[:120]!r}")
+
+# ── ADR-039 slice 4: anchor duel (D4) + planner hint (D6) ────────────────────
+#
+# D4 is the compensating control the slice-2 review escalated: near the score
+# ceiling no challenger can promote without the incumbent's duel consent, so
+# without a periodic check against where the run STARTED, an entrenched
+# incumbent (drifted or injected) holds the chain indefinitely.
+
+print("\n== ADR-039 D4: the anchor duel reverts a drifted chain ==")
+# Every gate duel promotes, so promotions climb 1..N. With --anchor-duel-every 2
+# the anchor duel fires on promotion 2; the anchor (first best) wins it, so the
+# run must revert to the anchor's pinned config and image.
+_anchor_script = [_mkverdict_ov(6, 6, "B"), _mkverdict_ov(6, 6, "C"),
+                  _mkverdict_ov(6, 6, "D"), _mkverdict_ov(6, 6, "E")]
+# iter0 promotes (1), iter1 promotes (2) -> the anchor duel fires and the FIRST
+# best wins it -> revert. iter2 then generates from the ANCHOR and loses its
+# gate duel, so the run ends with the anchor as the winner.
+_fd = _FakeDuel([refine.DUEL_A, refine.DUEL_B, refine.DUEL_B])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    _anchor_script, edit_source=_seed_png, max_iterations=3, patience=0,
+    duel_band=1.0, sideways_cap=0, explore_after=0, anchor_duel_every=1,
+    duel=_fd)
+check("the anchor is pinned at the FIRST promotion, by value",
+      any("anchor pinned" in m for m in _m)
+      and len([f for f in os.listdir(os.path.join(_d, "anchor"))
+               if f.startswith("first_best_")]) == 1)
+check("an anchor win reverts the chain, loudly",
+      any("FIRST best wins the anchor duel" in m for m in _m),
+      detail=str([m for m in _m if "anchor" in m]))
+check("the revert restores the ANCHOR's image as the edit source — the pinned "
+      "copy, never a candidates/ path",
+      os.path.dirname(_fg.refs_seen[2][0]["path"]).endswith("anchor")
+      and os.path.basename(_fg.refs_seen[2][0]["path"]).startswith(
+          "first_best_"),
+      detail=str([r[0]["path"] for r in _fg.refs_seen]))
+# NOT the obvious prompt comparison: with an override present,
+# apply_overrides sets the prompt from the verdict either way, so it holds with
+# or without a revert (code review MEDIUM — the first version of this check was
+# vacuous). Discriminate with a verdict that overrides NOTHING on the reverting
+# iteration: the next generation then carries the ANCHOR's prompt ("p") if the
+# config was really restored, or the drifted "B" if only the image was.
+_fd2 = _FakeDuel([refine.DUEL_A, refine.DUEL_B, refine.DUEL_B])
+_d2, _o2b, _fg2, _fj2b, _m2 = _run_loop_e(
+    [_mkverdict_ov(6, 6, "B"), _mkverdict_ov(6, 6, None),
+     _mkverdict_ov(6, 6, None)],
+    edit_source=_seed_png, max_iterations=3, patience=0, duel_band=1.0,
+    sideways_cap=0, explore_after=0, anchor_duel_every=1, duel=_fd2)
+check("the revert restores the ANCHOR's CONFIG, not just its image",
+      _fg2.prompts_seen[1] == "B" and _fg2.prompts_seen[2] == "p",
+      detail=str(_fg2.prompts_seen))
+check("the winner after a revert is the pinned anchor copy, not a candidate",
+      _o.winner_path is not None
+      and os.path.basename(_o.winner_path).startswith("first_best_"),
+      detail=str(_o.winner_path))
+# The history the PLANNER saw on the post-revert iteration is the marked one.
+_marked = _fj.histories_seen[-1] or []
+check("intervening mutations are marked failed — existing flags ONLY",
+      all(set(r) <= {"iteration", "scores", "prompt_excerpt",
+                     "prompt_provenance", "lora_ops_applied", "improved",
+                     "is_best", "judge_error", "accepted"} for r in _marked)
+      and all(r.get("improved") is False and r.get("is_best") is False
+              for r in _marked if r.get("iteration", 0) > 0)
+      and any(r.get("is_best") is True for r in _marked
+              if r.get("iteration") == 0),
+      detail=json.dumps(_marked)[:220])
+
+print("\n== ADR-039 D4: the anchor holding, and the void case ==")
+_fd = _FakeDuel([refine.DUEL_A, refine.DUEL_A, refine.DUEL_A, refine.DUEL_A])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    _anchor_script, edit_source=_seed_png, max_iterations=4, patience=0,
+    duel_band=1.0, sideways_cap=0, explore_after=0, anchor_duel_every=1,
+    duel=_fd)
+check("current best holding the anchor duel changes nothing",
+      any("no drift to correct" in m for m in _m)
+      and not any("Reverting" in m for m in _m))
+# A void anchor duel must not invent a revert any more than it invents a
+# promotion — and it charges the same accounting.
+_fd = _FakeDuel([refine.DUEL_A,
+                 refine.DuelError("endpoint down", failed_calls=1),
+                 refine.DUEL_A, refine.DUEL_A])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    _anchor_script, edit_source=_seed_png, max_iterations=4, patience=0,
+    duel_band=1.0, sideways_cap=0, explore_after=0, anchor_duel_every=1,
+    duel=_fd)
+check("a void anchor duel is VOID: no revert, the chain stands",
+      any("anchor duel unusable" in m and "no revert" in m for m in _m)
+      and not any("Reverting" in m for m in _m))
+_fd = _FakeDuel([refine.DUEL_A])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    _anchor_script, edit_source=_seed_png, max_iterations=4, patience=0,
+    duel_band=1.0, sideways_cap=0, explore_after=0, anchor_duel_every=0,
+    duel=_fd)
+check("--anchor-duel-every 0 disables the drift check entirely",
+      not any("anchor" in m.lower() for m in _m)
+      and not os.path.isdir(os.path.join(_d, "anchor")))
+
+print("\n== ADR-039 D4: the check is periodic in iterations, not modulo ==")
+# The trigger must not key on `promotions % N` (both reviewers, HIGH): an
+# entrenched incumbent stops promoting, so a modulo either never lands again
+# (4 chances in 5 at the default) or lands EVERY iteration at 2 judge calls a
+# time. Nothing promotes after iter 0 here, so `promotions` freezes at 1.
+_fd = _FakeDuel([refine.DUEL_TIE])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    [_mkverdict_ov(6, 6, "B")] * 7, edit_source=_seed_png, max_iterations=7,
+    patience=0, duel_band=1.0, sideways_cap=0, explore_after=0,
+    anchor_duel_every=2, duel=_fd)
+_anchor_runs = sum(1 for m in _m if "anchor duel against" in m)
+check("a frozen promotion count still gets periodic anchor checks",
+      _anchor_runs >= 2, detail=f"anchor duels={_anchor_runs}")
+check("...but not one per iteration — the cadence stays bounded",
+      _anchor_runs <= 7 // 2 + 1, detail=f"anchor duels={_anchor_runs} over 7 iters")
+# --anchor-duel-every 1 must not duel the anchor against its own copy the
+# moment it is pinned.
+_fd = _FakeDuel([refine.DUEL_A])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    [_mkverdict_ov(6, 6, "B")], edit_source=_seed_png, max_iterations=1,
+    patience=0, duel_band=1.0, sideways_cap=0, explore_after=0,
+    anchor_duel_every=1, duel=_fd)
+check("the pin itself counts as a check — no self-duel at --anchor-duel-every 1",
+      not any("anchor duel against" in m for m in _m))
+
+print("\n== ADR-039 D4: an anchor-duel-only failure still reaches the abort ==")
+# The reset must sit AFTER every judge call the iteration makes. Scoring
+# succeeds every time here; only the anchor duel fails. If the reset ran before
+# it (as it first did), the counter would alternate 1/0 forever and the
+# load-bearing drift check would be permanently void with no abort.
+class _AnchorOnlyFailDuel(_FakeDuel):
+    def __call__(self, image_a, image_b, target_prompt, backend_cfg, **kw):
+        self.calls += 1
+        self.pairs.append((image_a, image_b))
+        raise refine.DuelError("endpoint down", failed_calls=1)
+
+
+_fd = _AnchorOnlyFailDuel([])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    [_mkverdict_ov(9, 6, "B"), _mkverdict_ov(8, 6, "C"),
+     _mkverdict_ov(7, 6, "D"), _mkverdict_ov(6, 6, "E"),
+     _mkverdict_ov(5, 6, "F")],
+    edit_source=_seed_png, max_iterations=5, patience=0, duel_band=0.5,
+    sideways_cap=0, explore_after=0, anchor_duel_every=1, duel=_fd)
+check("persistent anchor-duel voids accumulate and abort the run",
+      _o.aborted is True, detail=f"aborted={_o.aborted} iters={_o.iterations}")
+
+print("\n== ADR-039 D6: the planner hint is advisory and code-owned ==")
+check("no hint before the rate means anything",
+      refine.edit_magnitude_hint(0, 4) is None
+      and refine.edit_magnitude_hint(3, 0) is None)
+check("a low promotion rate asks for smaller edits",
+      refine.edit_magnitude_hint(0, 10) == refine._HINT_SMALLER
+      and refine.edit_magnitude_hint(1, 10) == refine._HINT_SMALLER)
+check("a healthy promotion rate allows bolder rewrites",
+      refine.edit_magnitude_hint(5, 10) == refine._HINT_BOLDER
+      and refine.edit_magnitude_hint(2, 5) == refine._HINT_BOLDER)
+_hint_text = refine.build_judge_user_text(
+    "t", WorkingConfig(prompt="p", loras=[], base={}), [],
+    planner_hint=refine._HINT_SMALLER)
+check("the hint rides the planner context as code-owned text",
+      "edit_magnitude_hint" in _hint_text and "single-clause" in _hint_text)
+check("no hint means no key at all — not an empty one",
+      "edit_magnitude_hint" not in refine.build_judge_user_text(
+          "t", WorkingConfig(prompt="p", loras=[], base={}), []))
+_fd = _FakeDuel([refine.DUEL_B])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    [_mkverdict_ov(6, 6, "B")] * 7, edit_source=_seed_png, max_iterations=7,
+    patience=0, duel_band=1.0, sideways_cap=0, explore_after=0,
+    anchor_duel_every=0, duel=_fd)
+# Only iteration 0 promotes, so the rate decays: at 5 iterations 1/5 == 0.2 is
+# not below the threshold (bolder), and by 6 it is (smaller). Both sides of the
+# boundary in one run.
+check("the loop stays silent until a promotion rate means something",
+      _fj.hints_seen[:5] == [None] * 5, detail=str(_fj.hints_seen[:6]))
+check("the hint tracks the decaying promotion rate across the threshold",
+      _fj.hints_seen[5] == refine._HINT_BOLDER
+      and _fj.hints_seen[6] == refine._HINT_SMALLER,
+      detail=str(_fj.hints_seen[5:]))
+
+print("\n== ADR-039 D4: --anchor-duel-every validation ==")
+_err = _io.StringIO()
+with _ctx.redirect_stderr(_err):
+    _rc = refine.main(["--prompt", "p", "--model", _band_dir, "--model-base",
+                       _band_dir, "--output-dir", _band_dir,
+                       "--judge-backend", "x", "--anchor-duel-every", "-1"])
+check("--anchor-duel-every -1 is rejected by its own check, exit 2",
+      _rc == 2 and "--anchor-duel-every must be" in _err.getvalue(),
+      detail=f"rc={_rc} stderr={_err.getvalue()[:120]!r}")
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 print(f"\n{passed} passed, {failed} failed")
