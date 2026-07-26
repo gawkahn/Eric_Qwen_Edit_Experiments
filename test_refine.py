@@ -2396,7 +2396,7 @@ check("t2i entry with an edit-family model → refused pre-GPU",
 print("\n== slice B: loop — refs threaded, lineage, acceptance, latch ==")
 
 
-class _FakeGenE(_FakeGen):
+class _FakeGenE(_FakeGenP):
     """Records ref_images + force_in_process per call; optionally refuses the
     daemon path once (raises RefRefusedError while force_in_process=False)."""
     def __init__(self, seed=123, refuse_daemon=False):
@@ -3322,6 +3322,212 @@ check("the band check precedes the judge-backend resolution",
       "--duel-band" in _err.getvalue()
       and "judge backend" not in _err.getvalue(),
       detail=_err.getvalue()[:160])
+
+# ── ADR-039 slice 3: sideways cap + seed batch ───────────────────────────────
+#
+# Named negatives this slice owes: the bracket's tie-break is the EARLIEST arm;
+# batch generations count against --max-iterations; a batch winner that cannot
+# beat best stops the run as exhausted; a void bracket duel promotes nothing and
+# charges the abort accounting; losing arms never reach judge-bound context.
+
+print("\n== ADR-039 D3: the sideways cap schedules a seed batch ==")
+# Every iteration ties best (6/6), so every gate lands in the band and the duel
+# decides. Scripted duel wins make those PROMOTIONS that do not improve — the
+# sideways moves D3 caps. Prompt overrides differ each iteration so the no-op
+# resample never fires and the seed arithmetic below stays legible.
+_sideways_script = [_mkverdict_ov(6, 6, "B"), _mkverdict_ov(6, 6, "C"),
+                    _mkverdict_ov(6, 6, "D"), _mkverdict_ov(6, 6, "E"),
+                    _mkverdict_ov(6, 6, "F")]
+_fd = _FakeDuel([refine.DUEL_A])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    _sideways_script, edit_source=_seed_png, max_iterations=8, patience=0,
+    duel_band=1.0, sideways_cap=2, seed_batch=2, duel=_fd)
+check("two sideways promotions schedule a batch, announced to the operator",
+      any("consecutive non-improving promotions" in m for m in _m))
+check("the batch spends its arms as generations (3 iters + 2 arms)",
+      len(_fg.seeds_seen) >= 5, detail=str(_fg.seeds_seen))
+check("batch arms vary ONLY the seed, from the monotonic lattice",
+      _fg.seeds_seen[3:5] == [124, 125], detail=str(_fg.seeds_seen))
+check("batch arms are generated at BEST's config, not the planner's next one",
+      _fg.prompts_seen[3] == _fg.prompts_seen[4] == _fg.prompts_seen[2],
+      detail=str(_fg.prompts_seen))
+check("each arm gets a load-plane sidecar",
+      all(os.path.isfile(os.path.join(_d, "candidates", f"candidate_0{n}.json"))
+          for n in (3, 4)))
+
+print("\n== ADR-039 D3: the bracket tie-break is the EARLIEST arm ==")
+# Gate duels promote (DUEL_A); the bracket duel ties. A tie must leave the
+# FIRST-generated arm standing — judge-independent, anti-drift, and independent
+# of arm ordering. Arm 0 is candidate_03, arm 1 is candidate_04.
+# The bracket match is identified structurally by its pixels: _FakeGen paints
+# candidate N with blue channel N, and a bracket duel is the only one whose
+# image_b is an ARM rather than the incumbent pin (arm 0 = candidate_03, arm 1 =
+# candidate_04). Duel script order: gate, gate, bracket, gate.
+_fd = _FakeDuel([refine.DUEL_A, refine.DUEL_A, refine.DUEL_TIE, refine.DUEL_A])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    _sideways_script, edit_source=_seed_png, max_iterations=8, patience=0,
+    duel_band=1.0, sideways_cap=2, seed_batch=2, duel=_fd)
+_bracket = [(a.getpixel((0, 0))[2], b.getpixel((0, 0))[2])
+            for a, b in _fd.pairs]
+check("the bracket match is arm 1 (A) against arm 0 (B) — challenger first",
+      (4, 3) in _bracket, detail=str(_bracket))
+check("a tied bracket leaves the EARLIEST arm standing (candidate_03)",
+      any("earlier arm stands" in m for m in _m)
+      and os.path.isfile(os.path.join(_d, "candidates",
+                                      "candidate_03.verdict.json"))
+      and not os.path.isfile(os.path.join(_d, "candidates",
+                                          "candidate_04.verdict.json")),
+      detail=str([f for f in sorted(os.listdir(os.path.join(_d, "candidates")))
+                  if f.endswith(".verdict.json")]))
+_hist_blob = json.dumps(_fj.histories_seen[-1] or [])
+check("losing arms never reach judge-bound history",
+      "candidate_04" not in _hist_blob and "arm" not in _hist_blob.lower(),
+      detail=_hist_blob[:160])
+
+print("\n== ADR-039 D3: bracket champion continuity across matches ==")
+# Every other batch test uses 2 arms, so the fold's champion handoff runs only
+# once and an implementation that always duelled against arm 0 would pass
+# (code review LOW). Three arms, arm 1 winning its match: the SECOND match must
+# then be arm 2 (blue 5) against the NEW champion arm 1 (blue 4), not arm 0.
+_fd = _FakeDuel([refine.DUEL_A, refine.DUEL_A,          # gate duels, iters 1-2
+                 refine.DUEL_A, refine.DUEL_TIE,        # bracket: arm1 wins, arm2 ties
+                 refine.DUEL_A])                        # champion's gate duel
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    _sideways_script, edit_source=_seed_png, max_iterations=9, patience=0,
+    duel_band=1.0, sideways_cap=2, seed_batch=3, duel=_fd)
+_pairs = [(a.getpixel((0, 0))[2], b.getpixel((0, 0))[2]) for a, b in _fd.pairs]
+check("the second bracket match duels arm 2 against the NEW champion arm 1",
+      [p for p in _pairs if p in ((4, 3), (5, 4), (5, 3))] == [(4, 3), (5, 4)],
+      detail=str(_pairs))
+check("a tie in the second match leaves the standing champion (arm 1)",
+      os.path.isfile(os.path.join(_d, "candidates",
+                                  "candidate_04.verdict.json")),
+      detail=str(sorted(f for f in os.listdir(os.path.join(_d, "candidates"))
+                        if f.endswith(".verdict.json"))))
+
+print("\n== ADR-039 D3: a batch winner that cannot beat best = EXHAUSTED ==")
+# Gate duels promote until the batch, then the batch winner loses its gate
+# duel: the config is spent, and the run stops rather than rewording on.
+_fd = _FakeDuel([refine.DUEL_A, refine.DUEL_A, refine.DUEL_A, refine.DUEL_B])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    _sideways_script, edit_source=_seed_png, max_iterations=8, patience=0,
+    duel_band=1.0, sideways_cap=2, seed_batch=2, duel=_fd)
+check("an exhausted config stops the run with the flag set",
+      _o.exhausted is True and _o.aborted is False,
+      detail=f"exhausted={_o.exhausted} aborted={_o.aborted}")
+check("exhaustion stops EARLY — budget is left unspent",
+      len(_fg.seeds_seen) < 8, detail=str(len(_fg.seeds_seen)))
+check("the operator is told the config is exhausted, not that it failed",
+      any("EXHAUSTED" in m for m in _m))
+check("the winner is still finalized on an exhausted run",
+      _o.winner_path is not None and os.path.isfile(_o.winner_path))
+
+print("\n== ADR-039 D3: a void bracket duel promotes nothing and charges ==")
+_fd = _FakeDuel([refine.DUEL_A, refine.DUEL_A,
+                 refine.DuelError("endpoint down", failed_calls=1)])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    _sideways_script, edit_source=_seed_png, max_iterations=9, patience=0,
+    duel_band=1.0, sideways_cap=2, seed_batch=2, duel=_fd)
+check("a void bracket duel is announced as VOID, promoting nothing",
+      any("seed-batch duel unusable" in m and "VOID" in m for m in _m))
+check("a void batch keeps the history's iteration numbering continuous",
+      [r.get("iteration") for r in (_fj.histories_seen[-1] or [])]
+      == list(range(len(_fj.histories_seen[-1] or []))),
+      detail=str([r.get("iteration")
+                  for r in (_fj.histories_seen[-1] or [])]))
+check("a void batch does not stop the run outright",
+      _o.exhausted is False)
+check("void batch duels feed the same abort accounting",
+      _o.aborted is True, detail=f"aborted={_o.aborted} iters={_o.iterations}")
+
+print("\n== ADR-039 D3: a VOID gate duel is NOT exhaustion (the untested seam) ==")
+# The bracket completes, then the CHAMPION's gate duel raises. That is "the
+# duel did not complete", never "the winner cannot beat best" — reading it as
+# exhaustion would hand automation a terminal "this config is done" with
+# aborted=False on one transient endpoint failure (both reviewers, HIGH/MEDIUM).
+_fd = _FakeDuel([refine.DUEL_A, refine.DUEL_A,      # gate duels, iters 1-2
+                 refine.DUEL_A,                     # bracket match
+                 refine.DuelError("endpoint down", failed_calls=1),
+                 refine.DUEL_A])                    # the run carries on
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    _sideways_script, edit_source=_seed_png, max_iterations=8, patience=0,
+    duel_band=1.0, sideways_cap=2, seed_batch=2, duel=_fd)
+check("a void gate duel on a batch pass does NOT report exhaustion",
+      _o.exhausted is False, detail=f"exhausted={_o.exhausted}")
+check("it is treated as an ordinary void: best kept, run continues",
+      len(_fg.seeds_seen) > 5 and _o.aborted is False,
+      detail=f"gens={len(_fg.seeds_seen)} aborted={_o.aborted}")
+check("the operator sees VOID, never the EXHAUSTED claim",
+      any("VOID" in m for m in _m)
+      and not any("EXHAUSTED" in m for m in _m))
+
+print("\n== ADR-039 D3: batch arms inherit the run's ref wiring ==")
+_fd = _FakeDuel([refine.DUEL_A])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    _sideways_script, edit_source=_seed_png, max_iterations=8, patience=0,
+    duel_band=1.0, sideways_cap=2, seed_batch=2, duel=_fd)
+check("arms edit the CURRENT source, exactly like an ordinary iteration",
+      _fg.refs_seen[3][0]["path"].endswith("candidate_02.png")
+      and _fg.refs_seen[4][0]["path"].endswith("candidate_02.png"),
+      detail=str([r[0]["path"] for r in _fg.refs_seen]))
+# The daemon ref-refusal latch is shared through _generate_one: a refusal on
+# iteration 0 must keep every later generation — arms included — in-process.
+_fd = _FakeDuel([refine.DUEL_A])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    _sideways_script, edit_source=_seed_png, refuse_daemon=True,
+    max_iterations=6, patience=0, duel_band=1.0, sideways_cap=2, seed_batch=2,
+    duel=_fd)
+check("a latched run keeps its batch arms in-process too",
+      all(_fg.forced_seen[1:]) and sum(1 for m in _m
+                                       if "daemon refused" in m) == 1,
+      detail=str(_fg.forced_seen))
+
+print("\n== ADR-039 D3: batch generations count against --max-iterations ==")
+# Budget 4: iters 0-2 spend three, leaving one — too few for a bracket, so the
+# batch is skipped loudly rather than silently degrading to a single resample.
+_fd = _FakeDuel([refine.DUEL_A])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    _sideways_script, edit_source=_seed_png, max_iterations=4, patience=0,
+    duel_band=1.0, sideways_cap=2, seed_batch=3, duel=_fd)
+check("a batch that cannot fit the remaining budget is skipped, and says so",
+      any("seed batch skipped" in m for m in _m))
+check("the generation cap is never exceeded by a batch",
+      len(_fg.seeds_seen) <= 4, detail=str(_fg.seeds_seen))
+# Budget 5 with 2-arm batches: 3 iterations + 2 arms lands exactly on the cap.
+_fd = _FakeDuel([refine.DUEL_A])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    _sideways_script, edit_source=_seed_png, max_iterations=5, patience=0,
+    duel_band=1.0, sideways_cap=2, seed_batch=2, duel=_fd)
+check("a batch may spend the budget down to exactly the cap",
+      len(_fg.seeds_seen) == 5 and any("generation cap" in m for m in _m),
+      detail=str(_fg.seeds_seen))
+
+print("\n== ADR-039 D3: the escape needs duels, and 0 disables it ==")
+_fd = _FakeDuel([refine.DUEL_A])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    _sideways_script, edit_source=_seed_png, max_iterations=6, patience=0,
+    duel_band=1.0, sideways_cap=0, seed_batch=2, duel=_fd)
+check("--sideways-cap 0 never schedules a batch",
+      not any("seed batch" in m for m in _m) and len(_fg.seeds_seen) == 6)
+_fd = _FakeDuel([refine.DUEL_A])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    _sideways_script, edit_source=_seed_png, max_iterations=6, patience=0,
+    duel_band=0.0, sideways_cap=1, seed_batch=2, duel=_fd)
+check("with duels off there are no sideways promotions to cap",
+      _fd.calls == 0 and not any("seed batch" in m for m in _m))
+
+print("\n== ADR-039 D3: --sideways-cap / --seed-batch validation ==")
+for _flag, _bad, _needle in (("--sideways-cap", "-1", "--sideways-cap must be"),
+                             ("--seed-batch", "1", "--seed-batch must be at least 2"),
+                             ("--seed-batch", "0", "--seed-batch must be at least 2")):
+    _err = _io.StringIO()
+    with _ctx.redirect_stderr(_err):
+        _rc = refine.main(["--prompt", "p", "--model", _band_dir,
+                           "--model-base", _band_dir, "--output-dir",
+                           _band_dir, "--judge-backend", "x", _flag, _bad])
+    check(f"{_flag} {_bad} is rejected by its own check, exit 2",
+          _rc == 2 and _needle in _err.getvalue(),
+          detail=f"rc={_rc} stderr={_err.getvalue()[:120]!r}")
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 print(f"\n{passed} passed, {failed} failed")

@@ -124,6 +124,20 @@ JUDGE_ERROR_ABORT_AFTER = 3
 #: Hard ceiling on --max-iterations, and the bound --until-score runs to when
 #: --max-iterations is not explicitly given (D3).
 MAX_ITERATIONS_SANITY_CAP = 100
+#: Consecutive non-improving PROMOTIONS after which the loop stops iterating the
+#: planner and changes the MOVE TYPE instead (ADR-039 D3). Unbounded sideways
+#: moves on a plateau are a known local-search failure; the fix is a cap plus a
+#: typed escape, not more of the same move. 0 disables the escape.
+DEFAULT_SIDEWAYS_CAP = 3
+
+#: Arms in a D3 seed batch: N candidates at FIXED config varying only the seed,
+#: the batch winner picked by swap-paired duels. This attacks the plateau on the
+#: axis the planner cannot reason about (noise) in a batch where selection is
+#: statistically meaningful, instead of one seed at a time judged on a saturated
+#: scale. Minimum 2 — a one-arm "batch" is the per-iteration resample D3
+#: replaces.
+DEFAULT_SEED_BATCH = 3
+
 #: Composite distance from best within which the promotion gate is decided by a
 #: swap-paired DUEL rather than by the scalar (ADR-039 D1). The absolute scale
 #: saturates — a 100-iteration run produced a chain of exact 9.6 ties whose
@@ -860,6 +874,17 @@ class LoopOutcome:
     #: orchestrator) must be able to tell an aborted run from a completed one
     #: (slice-A review SHOULD-1).
     aborted: bool = False
+    #: True when the run stopped because a D3 seed batch's winner could not
+    #: beat best: the config is exhausted, and more rewording would only spend
+    #: budget. Distinct from `aborted` (a broken judge) and from a plain cap
+    #: stop (budget ran out with the search still live) — automation should
+    #: read it as "this config is done", not as a failure.
+    exhausted: bool = False
+    #: GENERATIONS spent. Distinct from `iterations` since ADR-039 D3: a seed
+    #: batch spends several generations in ONE loop pass, and it is generations
+    #: that --max-iterations bounds. Automation auditing spend must read this
+    #: one (slice-3 review, LOW).
+    generations: int = 0
 
 
 def composite_score(prompt_adherence: int, aesthetics: int,
@@ -1981,6 +2006,8 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 judge_system_prompt: str = JUDGE_SYSTEM_PROMPT,
                 duel_band: float = DEFAULT_DUEL_BAND,
                 duel_system_prompt: str = DUEL_SYSTEM_PROMPT,
+                sideways_cap: int = DEFAULT_SIDEWAYS_CAP,
+                seed_batch: int = DEFAULT_SEED_BATCH,
                 output_format: Optional[OutputFormat] = None,
                 edit_source: Optional[str] = None,
                 log: Callable[[str], None] = print) -> LoopOutcome:
@@ -2053,9 +2080,19 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
     history: List[dict] = []                  # per-iteration records (ADR-037 D1)
     passed = False
     aborted = False
+    exhausted = False
     no_improve = 0
     iters_run = 0
     consecutive_judge_errors = 0
+    # D3 plateau escape state. `gens_used` is the authoritative spend counter —
+    # a seed batch spends several generations in ONE loop pass, and the ADR
+    # requires those to count against --max-iterations. `sideways_streak`
+    # counts consecutive PROMOTIONS that did not strictly improve the
+    # composite; hitting the cap schedules a batch for the next pass rather
+    # than iterating the planner again on a plateau it cannot see.
+    gens_used = 0
+    sideways_streak = 0
+    pending_batch = False
     # Edit mode (ADR-037 D5): current_source — the GENERATION input — is
     # LOOP-OWNED: the operator's seed at iteration 0, then best's image (a
     # candidates/ file this loop wrote), advancing on every promotion (a TIE
@@ -2104,8 +2141,12 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
             f"best are decided by swap-paired duel; ties keep the incumbent "
             f"(ADR-039 D1)")
 
-    for i in range(max_iterations):
-        iters_run = i + 1
+    def _generate_one(gen_cfg: WorkingConfig, stem_name: str) -> GenOutcome:
+        """One generation with this run's ref wiring and the ONE-TIME daemon
+        ref-refusal latch. Shared by the per-iteration path and the D3 seed
+        batch, so the ref ordering, the latch, and the refusal notice cannot
+        drift apart between them."""
+        nonlocal in_process_latch
         gen_kwargs: dict = {}
         if edit:
             gen_kwargs = {
@@ -2125,10 +2166,11 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
             # re-attempt churn (slice-B review INFO-7).
             gen_kwargs = {"force_in_process": True}
         try:
-            outcome = run_generation(cfg, device=device, output_dir=candidates_dir,
-                                     stem=f"candidate_{i:02d}", precision=precision,
-                                     output_format=output_format, log=log,
-                                     **gen_kwargs)
+            return run_generation(gen_cfg, device=device,
+                                  output_dir=candidates_dir,
+                                  stem=stem_name, precision=precision,
+                                  output_format=output_format, log=log,
+                                  **gen_kwargs)
         except RefRefusedError as e:
             # Decided ONCE, loudly, then in-process for the REST of the run
             # (ADR-037 D5 / ADR-035 4b — the daemon is the authoritative ref
@@ -2152,12 +2194,142 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 f"--unload it if this run OOMs.")
             in_process_latch = True
             gen_kwargs["force_in_process"] = True
-            outcome = run_generation(cfg, device=device,
-                                     output_dir=candidates_dir,
-                                     stem=f"candidate_{i:02d}",
-                                     precision=precision,
-                                     output_format=output_format, log=log,
-                                     **gen_kwargs)
+            return run_generation(gen_cfg, device=device,
+                                  output_dir=candidates_dir,
+                                  stem=stem_name, precision=precision,
+                                  output_format=output_format, log=log,
+                                  **gen_kwargs)
+
+    def _run_seed_batch(arms: int, base_cfg: WorkingConfig,
+                        iter_idx: int) -> Tuple[WorkingConfig, GenOutcome, Any]:
+        """The D3 typed plateau escape: generate `arms` candidates at FIXED
+        config varying ONLY the seed, then pick the winner by single-elimination
+        swap-paired duels in generation order.
+
+        The tie-break is DETERMINISTIC and judge-independent: the
+        EARLIEST-generated arm wins a tie, which is the anti-drift direction.
+        Implemented by passing the challenger as A and the reigning arm as B —
+        a tie or a loss leaves the earlier arm standing. Note what this does
+        NOT claim (slice-3 review): a single-elimination ladder under a
+        non-transitive judge is not order-INDEPENDENT, only deterministic; the
+        ADR concedes the same point when it cites the memo's Condorcet
+        warning.
+
+        Seeds come from the SAME monotonic `seed_resamples` lattice the no-op
+        resample uses, or uniqueness across mixed triggers breaks. An unpinned
+        seed needs no lattice: every generation already samples fresh.
+
+        A void duel inside the bracket follows D1 — it raises, the batch
+        promotes nothing, and the caller charges the abort accounting. Losing
+        arms are operator artifacts only: they get no verdict, no score, and NO
+        history record, so the batch adds nothing to the judge-bound context."""
+        nonlocal seed_resamples, gens_used
+        base_seed = base_cfg.base.get("seed")
+        if not (isinstance(base_seed, int) and not isinstance(base_seed, bool)
+                and base_seed >= 0):
+            base_seed = None
+        entries: List[Tuple[WorkingConfig, GenOutcome, Any]] = []
+        for k in range(arms):
+            arm_cfg = snapshot_config(base_cfg)
+            if base_seed is not None:
+                seed_resamples += 1
+                arm_cfg.base["seed"] = base_seed + seed_resamples
+            arm_out = _generate_one(arm_cfg, f"candidate_{gens_used:02d}")
+            gens_used += 1
+            _write_json(os.path.splitext(arm_out.image_path)[0] + ".json",
+                        arm_out.metadata)
+            log(f"[refine] iter {iter_idx}: batch arm {k + 1}/{arms} "
+                f"(seed {arm_cfg.base.get('seed')}): {arm_out.image_path}")
+            entries.append((arm_cfg, arm_out,
+                            downscale_for_judge(
+                                Image.open(arm_out.image_path).convert("RGB"))))
+        # Only DUEL failures are void (slice-3 review, MEDIUM). A generation
+        # failure inside an arm must keep the loop's fatal discipline — every
+        # iteration would fail identically — instead of being logged as a judge
+        # problem and charged to the judge's accounting, so the arm loop above
+        # deliberately sits OUTSIDE this guard and its errors propagate.
+        champion = entries[0]
+        for k, challenger in enumerate(entries[1:], start=1):
+            try:
+                duel = duel_candidates(challenger[2], champion[2], target_prompt,
+                                       backend_cfg,
+                                       ref_images_judge=_judge_ref_images,
+                                       system_prompt=duel_system_prompt,
+                                       timeout=judge_timeout, log=log)
+            except DuelError:
+                raise
+            except RefineError as e:
+                # A non-judge failure from the duel path (backend config) is
+                # still void, but charges nothing — same split as the gate.
+                raise DuelError(f"batch bracket duel: {e}",
+                                failed_calls=0) from e
+            for n in duel.notices:
+                log(f"[refine] iter {iter_idx}: batch duel notice: {n}")
+            if duel.outcome == DUEL_A:
+                champion = challenger
+                log(f"[refine] iter {iter_idx}: batch arm {k + 1} wins its match")
+            else:
+                log(f"[refine] iter {iter_idx}: batch arm {k + 1} does not beat "
+                    f"the standing arm ({duel.outcome}) — the earlier arm "
+                    f"stands (deterministic tie-break, D3)")
+        return champion
+
+    for i in range(max_iterations):
+        iters_run = i + 1
+        # The authoritative spend bound is GENERATIONS, not loop passes: a D3
+        # seed batch spends `arms` of them in one pass, and the ADR requires
+        # batch generations to count against --max-iterations (a free escape
+        # would let repeated batches multiply total GPU work past the cap).
+        if gens_used >= max_iterations:
+            log(f"[refine] generation cap {max_iterations} reached — stopping")
+            iters_run = i
+            break
+        batch_iteration = False
+        if pending_batch and best_cfg is not None:
+            pending_batch = False
+            arms = min(seed_batch, max_iterations - gens_used)
+            if arms < 2:
+                log(f"[refine] iter {i}: seed batch skipped — {arms} generation"
+                    f"(s) left in the budget, a batch needs at least 2")
+            else:
+                batch_iteration = True
+                _trunc = ("" if arms == seed_batch else
+                          f" (truncated from --seed-batch {seed_batch} by the "
+                          f"remaining generation budget)")
+                log(f"[refine] iter {i}: plateau — running a {arms}-arm seed "
+                    f"batch at best's config, varying only the seed "
+                    f"(D3){_trunc}")
+                try:
+                    cfg, outcome, _champ_img = _run_seed_batch(arms, best_cfg, i)
+                except DuelError as e:
+                    # DuelError ONLY (slice-3 review, MEDIUM): a generation
+                    # failure from an arm keeps the loop's fatal discipline and
+                    # propagates. _run_seed_batch converts every duel-plane
+                    # failure into a DuelError, so this catch is exact.
+
+                    charged = getattr(e, "failed_calls", 0)
+                    consecutive_judge_errors += charged
+                    log(f"[refine] iter {i}: seed-batch duel unusable ({e}) — "
+                        f"VOID: the batch promotes nothing (ADR-039 D1/D3)")
+                    # Parity with the scoring-judge error path (slice-3 review,
+                    # LOW): a pass that spent arms' worth of generations must
+                    # not leave a hole in the history's iteration numbering, and
+                    # must advance the patience/stagnation counters. The record
+                    # is the structural flags-only one — no error text, no duel
+                    # keys (Finding 9 / F8-P).
+                    history.append(history_error_record(i))
+                    no_improve += 1
+                    if consecutive_judge_errors >= JUDGE_ERROR_ABORT_AFTER:
+                        log(f"[refine] ABORT: {JUDGE_ERROR_ABORT_AFTER} "
+                            f"consecutive unusable judge calls. Candidates so "
+                            f"far are kept.")
+                        aborted = True
+                    if aborted:
+                        break
+                    continue
+        if not batch_iteration:
+            outcome = _generate_one(cfg, f"candidate_{gens_used:02d}")
+            gens_used += 1
         stem = os.path.splitext(outcome.image_path)[0]
         # Load-plane sidecar (carries paths — the human's --params replay artifact,
         # NOT planner-facing; distinct from the path-free *.verdict.json below).
@@ -2356,6 +2528,26 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
             break
         if judge_calls_ok:
             consecutive_judge_errors = 0
+        # D3: a batch winner that cannot beat best has exhausted the config —
+        # the plateau survived the one axis the planner cannot reason about.
+        # Stop rather than spending the remaining budget on more rewording.
+        # `not duel_failed` is load-bearing (slice-3 review, HIGH): a VOID gate
+        # duel sets promoted=False without deciding anything, and reading that
+        # as exhaustion would hand automation a terminal "this config is done"
+        # — with aborted=False — on the strength of one transient endpoint
+        # failure, or of pixel text that makes the judge emit unparsable duel
+        # output. D3's contract is "the batch winner CANNOT BEAT best", which a
+        # duel that never completed has not established. A void here falls
+        # through to the ordinary not-promoted path: charged, best kept, run
+        # continues — identical to a void inside the bracket.
+        if batch_iteration and not promoted and not duel_failed:
+            log(f"[refine] iter {i}: the seed batch's winner did not beat best "
+                f"(iter {best.index if best else '-'}) — this config is "
+                f"EXHAUSTED: varying the seed at fixed config cannot improve "
+                f"on it, and rewording has already plateaued. Stopping with "
+                f"the current best (ADR-039 D3).")
+            exhausted = True
+            break
         if promoted:
             best = cand
             # Pin the new incumbent's image BY VALUE for future duels, at judge
@@ -2387,8 +2579,32 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
         else:
             no_improve += 1
 
-        if i == max_iterations - 1:
-            log(f"[refine] iteration cap {max_iterations} reached — stopping")
+        # D3 sideways cap. A promotion that did not strictly improve the
+        # composite is a SIDEWAYS move — under D1 it is a duel win at
+        # equal-or-lower score, which is real information but not progress.
+        # Unbounded sideways moves are the classic local-search failure, so
+        # cap the streak and change the MOVE TYPE instead of iterating the
+        # planner again. Non-promotions leave the streak alone: they are the
+        # other plateau shape, and the ADR-037 stagnation escape below still
+        # owns that one (see the note there — D3's "subsumed" reading does not
+        # survive D1's tie rule).
+        if improved:
+            sideways_streak = 0
+        elif promoted:
+            sideways_streak += 1
+        if (sideways_cap > 0 and duels_enabled and best_cfg is not None
+                and sideways_streak >= sideways_cap):
+            # Scheduled for the NEXT pass, where it replaces that pass's single
+            # generation; the streak resets now so a void batch cannot
+            # re-trigger immediately and spend the budget on batches.
+            pending_batch = True
+            sideways_streak = 0
+            log(f"[refine] iter {i}: {sideways_cap} consecutive non-improving "
+                f"promotions — the planner is moving sideways on a plateau. "
+                f"Next pass is a seed batch instead (--sideways-cap 0 disables)")
+
+        if gens_used >= max_iterations:
+            log(f"[refine] generation cap {max_iterations} reached — stopping")
             break
         if patience > 0 and no_improve >= patience:
             log(f"[refine] nothing promoted for {patience} iters — stopping")
@@ -2449,8 +2665,17 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 log(f"[refine] iter {i}: planner proposed no effective change "
                     f"— resampling seed {_seed} -> {_seed + seed_resamples} "
                     f"(an unchanged config would re-sample nothing new)")
-        # Stagnation escape (D2 amendment addendum, 2026-07-24): a planner
-        # that keeps CHANGING the prompt against a seed-tied flaw never
+        # Stagnation escape (D2 amendment addendum, 2026-07-24). ADR-039 D3
+        # declares this SUBSUMED by the seed batch, and it is NOT — kept
+        # deliberately, flagged for Grant. The subsumption assumed the two
+        # triggers describe the same plateau, but D1 split them: the batch
+        # fires on non-improving PROMOTIONS, while ties now keep the incumbent,
+        # so under v3 the common plateau shape is "nothing promotes at all" —
+        # which the batch trigger never sees. Deleting this would leave the
+        # most likely v3 plateau with no seed exploration whatsoever. The two
+        # are complementary post-D1; if Grant prefers the literal reading, the
+        # deletion is one block and the ADR keeps its wording.
+        # A planner that keeps CHANGING the prompt against a seed-tied flaw never
         # triggers the no-op branch above, so the seed stays pinned to best's
         # while every rewrite reprints the flaw (observed live: 12 straight
         # declines at one seed). Once no_improve reaches the threshold, every
@@ -2477,13 +2702,16 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
         log("[refine] no usable candidate produced — winners/ is empty")
         return LoopOutcome(winner_path=None, passed=False,
                            iterations=iters_run, best_composite=None,
-                           aborted=aborted)
+                           aborted=aborted, exhausted=exhausted,
+                           generations=gens_used)
     win_dst = os.path.join(winners_dir, os.path.basename(best.image_path))
     shutil.copy2(best.image_path, win_dst)
-    log(f"[refine] winner: {win_dst} (composite={best.composite:.2f}, passed={passed})")
+    log(f"[refine] winner: {win_dst} (composite={best.composite:.2f}, "
+        f"passed={passed}, generations={gens_used})")
     return LoopOutcome(winner_path=win_dst, passed=passed,
                        iterations=iters_run, best_composite=best.composite,
-                       aborted=aborted)
+                       aborted=aborted, exhausted=exhausted,
+                       generations=gens_used)
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -2794,6 +3022,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         f"and leaves the strict-composite rule. Edit mode "
                         f"only — t2i duels are ADR-039-deferred. Costs 2 extra "
                         f"judge calls per banded iteration")
+    p.add_argument("--sideways-cap", type=int, default=DEFAULT_SIDEWAYS_CAP,
+                   metavar="N",
+                   help=f"After N consecutive promotions that did NOT improve "
+                        f"the composite (duel wins at equal-or-lower score), "
+                        f"change the move type: run a seed batch instead of "
+                        f"iterating the planner (default "
+                        f"{DEFAULT_SIDEWAYS_CAP}; 0 disables). Requires "
+                        f"duels, so edit mode only")
+    p.add_argument("--seed-batch", type=int, default=DEFAULT_SEED_BATCH,
+                   metavar="N",
+                   help=f"Arms in a plateau seed batch: N candidates at "
+                        f"best's config varying only the seed, winner picked "
+                        f"by single-elimination duels with an earliest-arm "
+                        f"tie-break (default {DEFAULT_SEED_BATCH}, minimum "
+                        f"2). These generations count against "
+                        f"--max-iterations")
     p.add_argument("--w-prompt-adherence", type=float, default=DEFAULT_W_PA,
                    help="Composite weight for prompt-adherence (default 0.6)")
     p.add_argument("--w-aesthetics", type=float, default=DEFAULT_W_AES,
@@ -3289,6 +3533,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[refine] --duel-band must be a finite number >= 0, got "
               f"{args.duel_band!r} (0 disables duels)", file=sys.stderr)
         return 2
+    if args.sideways_cap < 0:
+        print(f"[refine] --sideways-cap must be an integer >= 0 (0 disables "
+              f"the plateau escape), got {args.sideways_cap!r}",
+              file=sys.stderr)
+        return 2
+    if args.seed_batch < 2:
+        print(f"[refine] --seed-batch must be at least 2 — a one-arm batch is "
+              f"the per-iteration resample it replaces, and a bracket needs "
+              f"two arms to compare (got {args.seed_batch!r}). Use "
+              f"--sideways-cap 0 to turn the escape off.", file=sys.stderr)
+        return 2
     try:
         until_composite = _parse_until_score(args.until_score)
         max_iterations = _resolve_max_iterations(args.max_iterations,
@@ -3487,6 +3742,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             w_aes=args.w_aesthetics, judge_timeout=args.judge_timeout,
             judge_system_prompt=judge_system_prompt,
             duel_band=args.duel_band, duel_system_prompt=duel_system_prompt,
+            sideways_cap=args.sideways_cap, seed_batch=args.seed_batch,
             output_format=out_fmt,
             edit_source=edit_source, static_refs=static_refs, log=log)
     except RefineError as e:
@@ -3511,7 +3767,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
     print(f"\nDone. winner={result.winner_path} passed={result.passed} "
           f"iterations={result.iterations} "
-          f"best_composite={result.best_composite:.2f}")
+          f"generations={result.generations} "
+          f"best_composite={result.best_composite:.2f}"
+          # A completed search that ran out of config, not out of budget
+          # (ADR-039 D3). Reported on the success line, not as a failure code:
+          # the winner is final and the run did what it was asked to.
+          f"{' exhausted=True' if result.exhausted else ''}")
     return 0
 
 

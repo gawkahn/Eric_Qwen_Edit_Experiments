@@ -358,3 +358,26 @@ and `--until-score` gates read the absolute composite only.
   Two further accepted residuals, bounded by `--max-iterations`: sideways
   duel-win chains are unbounded until D3's cap (slice 3), and a charged-0 void
   withholds the error-counter reset without incrementing it.
+- 2026-07-26 — **Slice 3 implemented** (sideways cap → seed batch → duel
+  bracket with earliest-arm tie-break; `exhausted` stop; `gens_used` as the
+  authoritative `--max-iterations` bound). Reviews:
+  `docs/security/review-adr-039-slice3-seed-batch-2026-07-26.md` — one HIGH
+  found and fixed: a VOID gate duel on a batch pass was reported as
+  `exhausted`, handing automation a terminal "this config is done" (with
+  `aborted=False`) on one transient endpoint failure. D3's contract is "cannot
+  BEAT best"; a duel that never completed establishes nothing. Fix
+  mutation-verified.
+- 2026-07-26 — **OPEN, awaiting Grant: the D3 subsumption wording.** This ADR
+  says the ADR-037 stagnation escape (`--explore-after`) is SUBSUMED by the
+  seed batch. Slice 3 KEPT it, deliberately, and both reviewers judged that
+  correct: D1's tie-keeps-incumbent rule made the common plateau "nothing
+  promotes at all", which the batch's non-improving-PROMOTIONS trigger never
+  sees, and the two counters are provably disjoint. Additionally the batch
+  requires duels, so it does not exist in t2i at all — deleting the escape
+  would leave t2i with no plateau escape whatsoever. Three ways to close this,
+  Grant's call: (a) amend the Supersession to say the escape is retained as
+  complementary; (b) broaden the batch trigger to also fire on `no_improve` in
+  edit mode, retiring `--explore-after` there and keeping it for t2i — the
+  design truest to D3's intent, and its own slice; (c) delete the escape as
+  written and accept the gap. Until then, an accepted ADR and Red Zone code
+  disagree, with the conservative option in the code.
