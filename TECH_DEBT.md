@@ -1811,3 +1811,33 @@ any report of a sidecar recording a schedule that didn't run. Fix: either add
 `schedule` to the dtype-style value-allowlist mechanism in
 `params_validation.py`, or have `build_sigma_schedule` return the EFFECTIVE
 name so the log and sidecar say "linear (fallback from <name>)".
+
+## 2026-07-25 — `refine_loop` trusts its `duel_band` argument (CLI-layer validation only)
+ADR-039 slice-2 `security-auditor` (Fable) INFO. `main()` validates
+`--duel-band` as finite and >= 0 and exits 2 otherwise, but `refine_loop`
+itself re-checks nothing: a NaN passed programmatically makes every band test
+False, so the run silently disables duels and reverts to the promotion rule
+ADR-039 supersedes, with nothing in the log to say so. Latent today — `main()`
+is the only caller and validates first. Why not now: a second validation layer
+inside the loop is dead code until a second caller exists, and the right shape
+depends on what that caller is (a machine boundary wants typed validation, not
+a scattered isfinite). Trigger: the day `refine_loop` is reachable from the MCP
+server or the `--json` bridge — both already flagged in CLAUDE.md as
+Red-Zone-on-scope-change — or any second in-repo caller. Fix: validate
+`duel_band` (and the other loop floats: weights, `until_composite`) at that
+boundary, or move the checks into `refine_loop` and have `main()` surface them.
+
+## 2026-07-25 — reviewer subagents have no shell, so no ADR-039 review ran `git diff`
+Process debt, not code. All six `code-reviewer` / `security-auditor` passes
+across ADR-039 slices 1 and 2 reported the same limitation: the agent had only
+Read/Grep/Glob, could not run `git diff`, and therefore reviewed working-tree
+FILE STATE rather than the change. Each flagged that it could not rule out
+hunks elsewhere in the 3200-line `refine.py` or in other tracked files, and
+asked the parent session to confirm `git diff --stat`. That confirmation is a
+human/parent step that could be skipped silently, and it is exactly the check a
+reviewer exists to perform. Why not now: it is an agent-definition change under
+`~/.claude/agents/` affecting every project, not a change to this repo, and it
+wants one deliberate slice with its own §10A commit. Trigger: the next Red Zone
+review in any project, or the ADR-039 slice-3 review. Fix: add `Bash(git diff*)`
+/ `Bash(git status*)` to the reviewer agents' tool lists, or have the parent
+session write the diff to a file and hand the reviewer that path.

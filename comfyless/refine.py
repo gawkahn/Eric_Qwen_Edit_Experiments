@@ -82,7 +82,9 @@ DEFAULT_W_PA, DEFAULT_W_AES = 0.6, 0.4
 DEFAULT_PASS_THRESHOLD = 8
 #: Hard cap on generations (bounds spend — the loop's authoritative stop).
 DEFAULT_MAX_ITERATIONS = 10
-#: Early stop after this many iterations with no composite improvement.
+#: Early stop after this many iterations with nothing PROMOTED (ADR-039 D1
+#: retargeted this counter from composite gain to promotion — a challenger
+#: can score higher and still lose its duel, which is not progress).
 #: 0 = DISABLED (the default since 2026-07-18): the loop runs until it passes
 #: or hits --max-iterations. The original default of 2 quit before the
 #: hill-climb had room to show whether it was working — with 8-step distilled
@@ -90,7 +92,7 @@ DEFAULT_MAX_ITERATIONS = 10
 #: spend bound. Pass --patience N to opt back into the early stop.
 DEFAULT_PATIENCE = 0
 #: Stagnation seed escape (ADR-037 D2 amendment addendum): after this many
-#: consecutive non-improving iterations, every further non-improving
+#: consecutive iterations with nothing promoted, every further non-promoting
 #: derivation gets a resampled seed even when the planner DID change the
 #: config — a planner rewriting prompts against a seed-tied flaw never
 #: triggers the no-op escape and reprints the flaw to the cap (observed
@@ -122,6 +124,15 @@ JUDGE_ERROR_ABORT_AFTER = 3
 #: Hard ceiling on --max-iterations, and the bound --until-score runs to when
 #: --max-iterations is not explicitly given (D3).
 MAX_ITERATIONS_SANITY_CAP = 100
+#: Composite distance from best within which the promotion gate is decided by a
+#: swap-paired DUEL rather than by the scalar (ADR-039 D1). The absolute scale
+#: saturates — a 100-iteration run produced a chain of exact 9.6 ties whose
+#: quality visibly deteriorated — so inside this band the composite carries no
+#: usable information and the decision is made head-to-head instead. EXCLUSIVE
+#: at both ends. 0 disables duels entirely and leaves the strict-composite rule
+#: in force (ties still keep the incumbent).
+DEFAULT_DUEL_BAND = 1.0
+
 #: Judge-image budget when a backend does not declare `judge_max_images`
 #: (ADR-038 D3, amended). The anchor and the candidate always occupy two
 #: slots, so this default admits ZERO judge-marked refs — an undeclared
@@ -1968,6 +1979,8 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 w_pa: float = DEFAULT_W_PA, w_aes: float = DEFAULT_W_AES,
                 judge_timeout: int = JUDGE_HTTP_TIMEOUT,
                 judge_system_prompt: str = JUDGE_SYSTEM_PROMPT,
+                duel_band: float = DEFAULT_DUEL_BAND,
+                duel_system_prompt: str = DUEL_SYSTEM_PROMPT,
                 output_format: Optional[OutputFormat] = None,
                 edit_source: Optional[str] = None,
                 log: Callable[[str], None] = print) -> LoopOutcome:
@@ -1975,8 +1988,9 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
     iteration: generate → judge+plan (with the bounded iteration-history block)
     → record → stop-check (pass / cap / patience / consecutive-judge-error
     abort) → apply overrides to the LINEAGE source: the just-promoted candidate's
-    config on strict composite improvement, `best`'s by-value snapshot otherwise
-    (ties included) — so config lineage and image lineage can never fork (D2).
+    config when the gate PROMOTED it, `best`'s by-value snapshot otherwise — so
+    config lineage and image lineage can never fork (D2). What counts as a
+    promotion is the ADR-039 gate below, not the raw composite delta.
     A generation failure is FATAL (every iteration would fail identically); a
     malformed judge verdict only consumes an iteration (F7), but
     JUDGE_ERROR_ABORT_AFTER CONSECUTIVE unusable verdicts abort loudly (D3 —
@@ -1989,12 +2003,30 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
     Winner = the passing candidate, or the top-composite candidate if none
     passed. Pass gate: both axes >= pass_threshold, or — when
     `until_composite` is set (ADR-037 D3 amendment) — weighted composite >=
-    that float target INSTEAD (pass_threshold ignored).
+    that float target INSTEAD (pass_threshold ignored). Both gates read the
+    ABSOLUTE composite and are checked BEFORE any duel; ADR-039 changes the
+    promotion gate only, never the stop gates (pinned by test).
+
+    PROMOTION GATE v3 (ADR-039 D1, edit mode): when the challenger's composite
+    lands within `duel_band` of best's — exclusive at both ends — the scalar
+    has stopped discriminating, so the decision is a swap-paired DUEL against
+    the incumbent instead, and only a consistent win in both orders promotes.
+    Outside the band the strict-composite rule stands. **Ties keep the
+    INCUMBENT everywhere**, which supersedes ADR-037's D2 amendment
+    (tie-promotes-newer): that rule made the winner of a tie chain its most
+    drifted member. A duel that cannot complete promotes NOTHING and never
+    falls back to the composite comparison — inside the band that would
+    silently restore the superseded rule — and its failed calls feed the
+    JUDGE_ERROR_ABORT_AFTER accounting, so a judge that scores fine but returns
+    malformed duel output aborts loudly instead of freezing the run at the
+    first promoted candidate. `duel_band <= 0` disables duels. t2i duels are
+    ADR-039-deferred: in t2i the strict-composite rule applies and a positive
+    band logs one notice.
 
     EDIT MODE (ADR-037 D5): `edit_source` (an operator-typed image path) makes
     every iteration an edit of the current source — the operator's seed at
-    iteration 0, then best's image, advancing on every promotion (composite
-    >= best since the D2 amendment; image lineage follows config lineage).
+    iteration 0, then best's image, advancing on every promotion (image
+    lineage follows config lineage; ADR-039 D1 decides what promotes).
     The JUDGE's comparison image is NOT the advancing source: it is the
     operator's ORIGINAL seed, loaded once at entry and held for the whole run
     (D5 amendment 2026-07-24 — cumulative drift must stay visible against a
@@ -2010,6 +2042,14 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
 
     best: Optional[Candidate] = None
     best_cfg: Optional[WorkingConfig] = None  # by-value snapshot (ADR-037 D2)
+    # The incumbent's image, pinned BY VALUE at judge resolution for the duel
+    # gate (ADR-039 D1). Never re-read from candidates/: ADR-038's accepted
+    # residual is that two concurrent runs sharing an --output-dir cross-
+    # overwrite candidates/ on colliding stems, so a path-based duel could
+    # compare against a FOREIGN run's image. Held downscaled because that is
+    # all a duel ever sends — the full-resolution candidate would cost two
+    # orders of magnitude more memory for bytes no judge call would use.
+    best_duel_img = None
     history: List[dict] = []                  # per-iteration records (ADR-037 D1)
     passed = False
     aborted = False
@@ -2018,8 +2058,8 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
     consecutive_judge_errors = 0
     # Edit mode (ADR-037 D5): current_source — the GENERATION input — is
     # LOOP-OWNED: the operator's seed at iteration 0, then best's image (a
-    # candidates/ file this loop wrote), advancing on every promotion (ties
-    # included, D2 amendment). Distinct from edit_source, the never-advancing
+    # candidates/ file this loop wrote), advancing on every promotion (a TIE
+    # is not one — ADR-039 D1). Distinct from edit_source, the never-advancing
     # ORIGINAL that anchors the judge's comparison (D5 amendment) — do not
     # collapse the two. The planner/judge never names or sees these paths.
     edit = edit_source is not None
@@ -2051,6 +2091,18 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
     # compares against fixed bytes for every iteration.
     _judge_ref_images = [r.image for r in (static_refs or [])
                          if r.judge and r.image is not None]
+    # ADR-039 D1 + Deferred: the duel mechanism is family-agnostic, but the
+    # first implementation targets EDIT mode, where the drift evidence that
+    # motivated the ADR actually lives. Said once at entry, never per iteration.
+    duels_enabled = duel_band > 0 and edit
+    if duel_band > 0 and not edit:
+        log(f"[refine] --duel-band {duel_band:g} ignored: t2i duels are "
+            f"deferred (ADR-039 §Deferred). The strict-composite promotion "
+            f"rule applies, with ties keeping the incumbent.")
+    elif duels_enabled:
+        log(f"[refine] promotion gate: composites within {duel_band:g} of "
+            f"best are decided by swap-paired duel; ties keep the incumbent "
+            f"(ADR-039 D1)")
 
     for i in range(max_iterations):
         iters_run = i + 1
@@ -2173,7 +2225,15 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 log(f"[refine] no usable improvement for {patience} iters — stopping")
                 break
             continue
-        consecutive_judge_errors = 0
+        # NOTE (ADR-039 D1): the consecutive-error counter is NOT reset here.
+        # A duel runs later in this same iteration and its failures feed the
+        # same accounting; resetting on the scoring call would make a judge
+        # that scores fine but always fails its duels alternate reset/increment
+        # and never reach the abort threshold — the exact "freeze at the first
+        # promoted candidate while burning generations to the cap" the ADR
+        # names. The reset happens once the iteration's judge calls have ALL
+        # succeeded, below.
+        judge_calls_ok = True
         # Feed THIS verdict's critique into the NEXT iteration's offer search
         # (flaw words live here, not in the prompt). String values only —
         # parse_verdict's F7 allowlist guarantees the shape.
@@ -2214,24 +2274,94 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
             passed = True
             break
 
-        # Unified lineage rule (ADR-037 D2, amended 2026-07-24): promotion on
-        # composite >= best — a TIE promotes the NEWER candidate (equal scores
-        # can hide sub-score-resolution improvements worth building on); only
-        # a strict DECLINE reverts the climb to best. Patience (when enabled;
-        # DEFAULT_PATIENCE=0 disables it) still counts ties as non-improvement.
-        # On a default run the only bound on a tie chain is --max-iterations —
-        # a constant-parity judge promotes every iteration, so cumulative
-        # unrequested drift can compound to the cap (security review MEDIUM,
-        # 2026-07-24; accepted with the cap as the bound, tie-streak limit
-        # deferred).
+        # Promotion gate v3 (ADR-039 D1). `improved` stays what it always was —
+        # the FACT of a strict composite gain, recorded in history and read by
+        # the planner. `promoted` is now the gate's DECISION, which inside the
+        # duel band is made head-to-head rather than by the scalar.
+        #
+        # Supersedes ADR-037's D2 amendment (tie-promotes-newer): ties keep the
+        # INCUMBENT, in and out of the band. That amendment was right that equal
+        # scores can hide real differences and wrong that the fix was guessing
+        # in the challenger's favor — its own security review predicted the
+        # failure, and a 100-iteration run realized it (winner = the most
+        # drifted member of a 9.6 tie chain).
         improved = best is None or comp > best.composite
-        promoted = best is None or comp >= best.composite
-        if promoted:
-            if not improved and best is not None:
+        duel_failed = False
+        if best is None:
+            promoted = True
+        elif duels_enabled and abs(comp - best.composite) < duel_band - 1e-9:
+            # Inside the band the composite carries no usable information.
+            # EXCLUSIVE at both ends: a challenger exactly `duel_band` away is
+            # decided by the scalar, which is the boundary the ADR names — and
+            # the epsilon makes that exclusivity real rather than FP-fuzzy.
+            # Composites are float sums (0.6*a + 0.4*b is inexact for most
+            # pairs), so a nominally-exact-boundary delta can round a ULP low
+            # and fall inside an unguarded `<`; the pass gate two screens up
+            # carries the same guard for the same reason. A band smaller than
+            # the epsilon is treated as no band, which is the correct reading
+            # of a band below float noise.
+            log(f"[refine] iter {i}: composite {comp:.2f} is within "
+                f"{duel_band:g} of best {best.composite:.2f} (iter "
+                f"{best.index}) — deciding by swap-paired duel")
+            try:
+                duel = duel_candidates(
+                    downscale_for_judge(img), best_duel_img, target_prompt,
+                    backend_cfg, ref_images_judge=_judge_ref_images,
+                    system_prompt=duel_system_prompt, timeout=judge_timeout,
+                    log=log)
+            except RefineError as e:
+                # Catch RefineError, not just DuelError (slice-1 review, LOW):
+                # a backend-config error is not a judge failure but must still
+                # resolve as void. `failed_calls` is absent on those, so charge
+                # 0 — only actual unusable judge calls push toward the abort.
+                charged = getattr(e, "failed_calls", 0)
+                promoted = False
+                duel_failed = True
+                judge_calls_ok = False
+                consecutive_judge_errors += charged
+                # The error text embeds the endpoint URL and endpoint-controlled
+                # response bytes (Finding 9): operator log only. NOTHING about
+                # this failure enters the history block — the iteration records
+                # with its ordinary flags, so the F8-P surface is unchanged.
+                log(f"[refine] iter {i}: duel unusable ({e}) — VOID: promoting "
+                    f"nothing and keeping best (iter {best.index}). The "
+                    f"composite rule is NOT a fallback here (ADR-039 D1).")
+            else:
+                for n in duel.notices:
+                    log(f"[refine] iter {i}: duel notice: {n}")
+                promoted = duel.outcome == DUEL_A
+                if promoted:
+                    log(f"[refine] iter {i}: duel WIN in both orders — "
+                        f"promoting over best (iter {best.index})")
+                else:
+                    why = ("lost both orders" if duel.outcome == DUEL_B
+                           else f"no consistent winner {duel.per_order}")
+                    log(f"[refine] iter {i}: duel {why} — keeping the "
+                        f"incumbent (iter {best.index}) (ADR-039 D1)")
+        else:
+            # Outside the band (or duels disabled): the strict-composite rule,
+            # unchanged except that a TIE no longer promotes the challenger.
+            promoted = comp > best.composite
+            if not promoted and comp == best.composite:
                 log(f"[refine] iter {i}: composite {comp:.2f} ties best "
-                    f"(iter {best.index}) — promoting the newer candidate "
-                    f"(ADR-037 D2 amendment)")
+                    f"(iter {best.index}) — keeping the incumbent (ADR-039 D1 "
+                    f"supersedes ADR-037's tie-promotes-newer)")
+        if duel_failed and consecutive_judge_errors >= JUDGE_ERROR_ABORT_AFTER:
+            log(f"[refine] ABORT: {JUDGE_ERROR_ABORT_AFTER} consecutive "
+                f"unusable judge calls — a judge that cannot complete duels "
+                f"cannot promote anything, so the run would burn generations "
+                f"to the cap around a frozen incumbent (ADR-039 D1). "
+                f"Candidates so far are kept.")
+            aborted = True
+            break
+        if judge_calls_ok:
+            consecutive_judge_errors = 0
+        if promoted:
             best = cand
+            # Pin the new incumbent's image BY VALUE for future duels, at judge
+            # resolution (see best_duel_img above). Taken from the decoded
+            # candidate we already hold — never re-read from candidates/.
+            best_duel_img = downscale_for_judge(img)
             # By-value snapshot of the config that PRODUCED this candidate —
             # taken now, before apply_overrides re-binds cfg, and immune to the
             # loop's in-place cfg.base mutation. NEVER rebuilt from sidecars.
@@ -2246,7 +2376,13 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 # their exact {iteration, judge_error} shape (Finding 9 / NIT-3).
                 if "is_best" in rec:
                     rec["is_best"] = False
-        if improved:
+        # Progress = PROMOTION, not a composite tick (ADR-039 D1). Under the
+        # duel gate a challenger can score higher and still lose the duel; if
+        # that reset the counter, the stagnation escape and --patience would
+        # both go blind on exactly the plateau this ADR exists to break —
+        # the scalar creeping upward while nothing actually gets promoted.
+        # Outside the band the two are identical (promotion IS strict gain).
+        if promoted:
             no_improve = 0
         else:
             no_improve += 1
@@ -2255,7 +2391,7 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
             log(f"[refine] iteration cap {max_iterations} reached — stopping")
             break
         if patience > 0 and no_improve >= patience:
-            log(f"[refine] no composite improvement for {patience} iters — stopping")
+            log(f"[refine] nothing promoted for {patience} iters — stopping")
             break
 
         # Apply the planner's validated overrides → next config, derived from
@@ -2271,9 +2407,9 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
         if source_cfg is None:  # unreachable: promotion always sets best_cfg
             source_cfg = cfg
         if not promoted and best is not None:  # best is always set here
-            log(f"[refine] iter {i}: composite {comp:.2f} did not beat best "
-                f"{best.composite:.2f} (iter {best.index}) — climbing from "
-                f"best's config (ADR-037 D2)")
+            log(f"[refine] iter {i}: not promoted (composite {comp:.2f} vs "
+                f"best {best.composite:.2f}, iter {best.index}) — climbing "
+                f"from best's config (ADR-037 D2)")
         prev_prompt = cfg.prompt  # the prompt that produced THIS candidate
         apply_notices: List[str] = []
         cfg = apply_overrides(source_cfg, verdict, resolved_ops, apply_notices)
@@ -2318,15 +2454,15 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
         # triggers the no-op branch above, so the seed stays pinned to best's
         # while every rewrite reprints the flaw (observed live: 12 straight
         # declines at one seed). Once no_improve reaches the threshold, every
-        # further non-improving derivation explores a fresh seed; strict
-        # improvement resets the counter upstream. elif: the no-op branch
+        # further non-promoting derivation explores a fresh seed; a PROMOTION
+        # resets the counter upstream (ADR-039 D1). elif: the no-op branch
         # already resampled — never double-bump one iteration.
         elif (explore_after > 0 and no_improve >= explore_after
                 and _seed is not None):
             seed_resamples += 1
             cfg.base["seed"] = _seed + seed_resamples
-            log(f"[refine] iter {i}: {no_improve} iterations without "
-                f"improvement — resampling seed {_seed} -> "
+            log(f"[refine] iter {i}: {no_improve} iterations without a "
+                f"promotion — resampling seed {_seed} -> "
                 f"{_seed + seed_resamples} to explore (stagnation escape; "
                 f"--explore-after 0 disables)")
         # History record for this iteration (ADR-037 D1): the prompt that
@@ -2607,6 +2743,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "(default: generic; edit-generic in edit mode). "
                         "Different judge models may need different rubrics; "
                         "the JSON output contract is fixed.")
+    p.add_argument("--duel-recipe", default=None, metavar="NAME",
+                   help=f"Duel rubric recipe from comfyless/judge_recipes/ "
+                        f"(default: {DEFAULT_DUEL_RECIPE}). A duel recipe must "
+                        f"declare kind = \"duel\"; its output contract (a "
+                        f"winner, not scores) is fixed by the code.")
     p.add_argument("--judge-timeout", type=int, default=JUDGE_HTTP_TIMEOUT,
                    metavar="SEC", help="Per-call judge HTTP timeout")
     # Loop controls.
@@ -2631,17 +2772,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "COMPOSITE >= SCORE and --pass-threshold is ignored "
                         "(ADR-037 D3 amendment)")
     p.add_argument("--patience", type=int, default=DEFAULT_PATIENCE,
-                   help="Early-stop after N iters with no composite gain; "
-                        "0 disables — run until pass or --max-iterations "
-                        "(default 0)")
+                   help="Early-stop after N iters with nothing PROMOTED "
+                        "(ADR-039: a duel loss is not progress even when the "
+                        "composite rose); 0 disables — run until pass or "
+                        "--max-iterations (default 0)")
     p.add_argument("--explore-after", type=int, default=DEFAULT_EXPLORE_AFTER,
-                   help=f"After N consecutive non-improving iterations, "
-                        f"resample the seed on every further non-improving "
+                   help=f"After N consecutive iterations with nothing "
+                        f"promoted, resample the seed on every further "
                         f"one (stagnation escape — a prompt rewrite can't fix "
                         f"a seed-tied flaw). 0 disables. Default "
                         f"{DEFAULT_EXPLORE_AFTER}. Note: a positive "
                         f"--patience <= this stops the run before the escape "
                         f"fires")
+    p.add_argument("--duel-band", type=float, default=DEFAULT_DUEL_BAND,
+                   metavar="DELTA",
+                   help=f"Composite distance from best inside which promotion "
+                        f"is decided by a swap-paired DUEL instead of the "
+                        f"score (default {DEFAULT_DUEL_BAND:g}; exclusive at "
+                        f"both ends). Only a consistent win in both orders "
+                        f"promotes; ties keep the incumbent. 0 disables duels "
+                        f"and leaves the strict-composite rule. Edit mode "
+                        f"only — t2i duels are ADR-039-deferred. Costs 2 extra "
+                        f"judge calls per banded iteration")
     p.add_argument("--w-prompt-adherence", type=float, default=DEFAULT_W_PA,
                    help="Composite weight for prompt-adherence (default 0.6)")
     p.add_argument("--w-aesthetics", type=float, default=DEFAULT_W_AES,
@@ -3130,6 +3282,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[refine] {_wname} must be a finite number, got {_wval!r}",
                   file=sys.stderr)
             return 2
+    # Same discipline for the duel band (ADR-039 slice plan, the --w-* precedent):
+    # a NaN band makes every band test False, so the run silently reverts to the
+    # very promotion rule ADR-039 supersedes, with nothing in the log to say so.
+    if not math.isfinite(args.duel_band) or args.duel_band < 0:
+        print(f"[refine] --duel-band must be a finite number >= 0, got "
+              f"{args.duel_band!r} (0 disables duels)", file=sys.stderr)
+        return 2
     try:
         until_composite = _parse_until_score(args.until_score)
         max_iterations = _resolve_max_iterations(args.max_iterations,
@@ -3226,6 +3385,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[refine] judge recipe error: {e}", file=sys.stderr)
         return 2
 
+    # Duel rubric → duel system prompt (ADR-039 D2). Loaded at ENTRY even when
+    # the band may never be hit, so a bad --duel-recipe fails before the first
+    # generation rather than at the first banded iteration, hours in.
+    try:
+        duel_system_prompt = compose_duel_system_prompt(
+            load_duel_recipe(args.duel_recipe or DEFAULT_DUEL_RECIPE))
+    except RefineError as e:
+        print(f"[refine] duel recipe error: {e}", file=sys.stderr)
+        return 2
+
     # --params is only meaningful when seeding from an image.
     if args.params and not args.seed_image:
         print("[refine] --params requires --seed-image (it overrides the seed's "
@@ -3316,7 +3485,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             offer_family=_detect_family_for_gate(cfg.base.get("model") or ""),
             w_pa=args.w_prompt_adherence,
             w_aes=args.w_aesthetics, judge_timeout=args.judge_timeout,
-            judge_system_prompt=judge_system_prompt, output_format=out_fmt,
+            judge_system_prompt=judge_system_prompt,
+            duel_band=args.duel_band, duel_system_prompt=duel_system_prompt,
+            output_format=out_fmt,
             edit_source=edit_source, static_refs=static_refs, log=log)
     except RefineError as e:
         # A fatal generation error (e.g. daemon failure, model not found) surfaces

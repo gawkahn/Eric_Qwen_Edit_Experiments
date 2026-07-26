@@ -342,3 +342,19 @@ and `--until-score` gates read the absolute composite only.
   still-owed named negative tests and the fact that D4's anchor duel — the
   compensating control for the duel-specific injection residual — lands only in
   slice 4, after slices 2-3.
+- 2026-07-25 — **Slice 2 implemented** (the banded gate: duel inside the band,
+  strict composite outside, ties keep the incumbent everywhere, void duels
+  promote nothing and feed the abort accounting; `--duel-band` / `--duel-recipe`).
+  Reviews: `docs/security/review-adr-039-slice2-promotion-gate-2026-07-25.md` —
+  no CRITICAL/HIGH; the binding flags-only duel-error history test from slice 1
+  is now written, band exclusivity is epsilon-guarded, and the `--duel-band`
+  validation test no longer passes vacuously.
+  **D4 is hereby load-bearing, not belt-and-braces** (security review, escalated
+  INFO): with the default band, once best's composite exceeds `10 - duel_band`
+  — the saturated regime this ADR exists to address — the out-of-band promotion
+  path is UNREACHABLE, so every promotion requires the incumbent's duel consent
+  and an entrenched injected incumbent holds an absolute veto until the anchor
+  duel exists. Slice 4 should not slip far behind slice 3.
+  Two further accepted residuals, bounded by `--max-iterations`: sideways
+  duel-win chains are unbounded until D3's cap (slice 3), and a charged-0 void
+  withholds the error-counter reset without incrementing it.

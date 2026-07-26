@@ -664,7 +664,11 @@ class _FakeGen:
         os.makedirs(output_dir, exist_ok=True)
         ext = output_format.extension if output_format is not None else ".png"
         path = os.path.join(output_dir, f"{stem}{ext}")
-        _PILImage.new("RGB", (4, 4), (7, 8, 9)).save(path)  # PIL infers fmt from ext
+        # Per-call pixel value: identical fixtures would make a STALE
+        # best_duel_img indistinguishable from a correctly-updated one in the
+        # duel tests (code review INFO). PNG round-trips this exactly.
+        _PILImage.new("RGB", (4, 4),
+                      (7, 8, (len(self.seeds_seen) - 1) % 256)).save(path)
         return refine.GenOutcome(image_path=path, metadata={"seed": self.seed})
 
 
@@ -847,13 +851,15 @@ _d, _o, _fg, _fj = _run_loop([_mkverdict(5, 5)], max_iter=3, patience=99, seed=7
 # These verdicts carry NO overrides, so every subsequent config is a no-op vs
 # its lineage source: the D2 amendment (2026-07-24) resamples the seed by a
 # MONOTONIC loop-level counter (source seed + Nth-no-op) so the loop explores
-# instead of regenerating the identical image. All-tie chain: iter1 = 777+1,
-# iter2 = 778+2 (the tie promoted iter1's bumped config as the new source).
-# (An iteration whose planner DID change the config keeps the pinned seed —
-# below the stagnation threshold; covered by the D2-amendment block below.)
+# instead of regenerating the identical image. All-tie chain under ADR-039 D1:
+# ties now keep the INCUMBENT, so the lineage source stays iter0's unbumped
+# config (seed 777) and the counter alone separates the samples — 777+1, 777+2.
+# (Before ADR-039 the tie promoted iter1's already-bumped config, giving
+# 778 then 780.) The invariant under test is unchanged: strictly increasing,
+# never a repeat.
 check("iteration 0 uses the initial seed", _fg.seeds_seen[0] == -1)
 check("no-op iterations resample via the monotonic counter",
-      _fg.seeds_seen[1:] == [778, 780], detail=str(_fg.seeds_seen))
+      _fg.seeds_seen[1:] == [778, 779], detail=str(_fg.seeds_seen))
 
 print("\n== slice 3: refine_loop — no-pass run finalizes top composite ==")
 _d, _o, _fg, _fj = _run_loop(
@@ -1434,19 +1440,21 @@ check("iter2 re-derived from BEST's config after regression (D2)",
 check("winner remains iter0", _o.winner_path is not None
       and os.path.basename(_o.winner_path) == "candidate_00.png")
 
-# D2 amendment (2026-07-24): a TIE promotes the NEWER candidate — equal scores
-# can hide sub-score-resolution improvements worth building on. iter1 (prompt
-# "B") ties iter0 → iter1 becomes best; iter2 derives from iter1's config,
-# and the winner is the tied NEWER candidate. Only a strict decline reverts
-# (pinned by the regression block above).
+# ADR-039 D1 SUPERSEDES the D2 amendment's tie rule: a TIE keeps the
+# INCUMBENT. The amendment was right that equal scores can hide real
+# differences and wrong that the fix was guessing in the challenger's favor —
+# a 100-iteration run made the winner the most drifted member of a 9.6 tie
+# chain. In t2i (duels ADR-039-deferred) the strict-composite rule decides, so
+# iter1's tie does NOT promote: iter2 derives from iter0's config ("p") and the
+# winner stays the INCUMBENT, iter0.
 _d, _o, _fg, _fj = _run_loop_p(
     [_mkverdict_ov(6, 6, "B"), _mkverdict_ov(6, 6, None), _mkverdict_ov(5, 5, None)],
     max_iterations=3, patience=0)
-check("tie promotes the newer candidate: iter2 derives from iter1 (\"B\")",
-      _fg.prompts_seen[2] == "B", detail=str(_fg.prompts_seen))
-check("winner is the tied NEWER candidate (iter1)",
+check("a tie keeps the incumbent: iter2 derives from iter0 (\"p\")",
+      _fg.prompts_seen[2] == "p", detail=str(_fg.prompts_seen))
+check("winner is the INCUMBENT, not the tied newer candidate (ADR-039 D1)",
       _o.winner_path is not None
-      and os.path.basename(_o.winner_path) == "candidate_01.png")
+      and os.path.basename(_o.winner_path) == "candidate_00.png")
 
 # D2 amendment: an iteration whose planner DID change the config keeps the
 # pinned seed (attribution preserved — below the stagnation threshold); a
@@ -1573,16 +1581,19 @@ _d, _o, _fg, _fj = _run_loop_p(
 check("mixed no-op + stagnation triggers: strictly increasing unique seeds",
       _fg.seeds_seen == [-1, 123, 124, 125, 126],
       detail=str(_fg.seeds_seen))
-# Tie-chain stagnation (code review SHOULD): ties promote, so the source
-# carries the previously-bumped seed and assigned seeds SKIP values — the
-# interesting uniqueness case (123 -> 124 via counter1, then 124+2=126).
+# Tie chain under ADR-039 D1 (was the skip-value uniqueness case): ties no
+# longer promote, so the lineage source is iter0's snapshot for the whole chain
+# and its seed never advances — the monotonic counter is the ONLY source of
+# separation, giving 123+1 then 123+2. The skip-value case it used to cover
+# cannot arise in t2i any more; the invariant it protected (strictly
+# increasing, no repeats) is what is still pinned here.
 _d, _o, _fg, _fj = _run_loop_p(
     [_mkverdict_ov(6, 6, "B"), _mkverdict_ov(6, 6, "C"),
      _mkverdict_ov(6, 6, "D"), _mkverdict_ov(6, 6, "E"),
      _mkverdict_ov(6, 6, "F")],
     max_iterations=5, patience=0)
-check("tie-chain stagnation: skip-value seeds stay unique",
-      _fg.seeds_seen == [-1, 123, 123, 124, 126],
+check("tie-chain stagnation: resampled seeds stay unique and increasing",
+      _fg.seeds_seen == [-1, 123, 123, 124, 125],
       detail=str(_fg.seeds_seen))
 # Help-text claim (code review SHOULD): a positive --patience <= the
 # threshold stops the run BEFORE the escape ever fires.
@@ -2417,11 +2428,18 @@ class _FakeJudgeE(_FakeJudge):
                                 planner_loras, **kw)
 
 
-def _run_loop_e(script, *, edit_source, refuse_daemon=False, **kw):
+def _run_loop_e(script, *, edit_source, refuse_daemon=False, duel=None, **kw):
+    """Edit-mode loop harness. `duel_band` defaults to 0 here (duels OFF) so the
+    pre-ADR-039 edit tests keep testing exactly what they tested, with no judge
+    HTTP call; the v3 gate tests pass an explicit band plus a `duel` stub."""
+    kw.setdefault("duel_band", 0.0)
     d = _tf.mkdtemp(prefix="refine_edit_test_")
     fg = _FakeGenE(refuse_daemon=refuse_daemon)
     fj = _FakeJudgeE(script)
     _rg, _jc = refine.run_generation, refine.judge_candidate
+    _dc = refine.duel_candidates
+    if duel is not None:
+        refine.duel_candidates = duel
     refine.run_generation, refine.judge_candidate = fg, fj
     msgs = []
     try:
@@ -2433,6 +2451,7 @@ def _run_loop_e(script, *, edit_source, refuse_daemon=False, **kw):
             log=msgs.append, **kw)
     finally:
         refine.run_generation, refine.judge_candidate = _rg, _jc
+        refine.duel_candidates = _dc
     return d, out, fg, fj, msgs
 
 
@@ -2460,25 +2479,23 @@ check("history records carry accepted in edit mode",
       _fj.histories_seen[2][0].get("accepted") is True
       and _fj.histories_seen[2][1].get("accepted") is False)
 
-# D2 amendment (2026-07-24): a TIE advances the edit source to the NEWER
-# candidate's image — image lineage follows config lineage on ties. Pinned so
-# a future refactor gating current_source on `improved` (strict) instead of
-# `promoted` forks image lineage from config lineage and fails here. The tied
-# iteration's history record carries the divergent flag combination
-# improved=False / is_best=True / accepted=True.
+# ADR-039 D1 (supersedes the D2 amendment): with duels OFF (band 0), a tie
+# keeps the incumbent, so the edit source does NOT advance to the tied newer
+# candidate. Image lineage still follows config lineage exactly — the property
+# the old test protected — it is the promotion rule underneath that changed.
 _d, _o, _fg, _fj, _m = _run_loop_e(
     [_mkverdict_ov(6, 6, None), _mkverdict_ov(6, 6, None), _mkverdict_ov(5, 5, None)],
     edit_source=_seed_png, max_iterations=3, patience=0)
-check("tie advances the edit source to the newer candidate (D2 amendment)",
-      _fg.refs_seen[2][0]["path"].endswith("candidate_01.png"),
+check("a tie does NOT advance the edit source (ADR-039 D1)",
+      _fg.refs_seen[2][0]["path"].endswith("candidate_00.png"),
       detail=str(_fg.refs_seen))
-check("judge anchor stays the ORIGINAL even under tie-advanced sources",
+check("judge anchor stays the ORIGINAL across the chain",
       all(s.size == (8, 8) for s in _fj.sources_seen),
       detail=str([s.size for s in _fj.sources_seen]))
 _rec1 = _fj.histories_seen[2][1]
-check("tied edit iteration history: improved=False, is_best=True, accepted=True",
-      _rec1.get("improved") is False and _rec1.get("is_best") is True
-      and _rec1.get("accepted") is True, detail=str(_rec1))
+check("tied edit iteration history: improved=False, is_best=False, accepted=False",
+      _rec1.get("improved") is False and _rec1.get("is_best") is False
+      and _rec1.get("accepted") is False, detail=str(_rec1))
 
 # t2i runs: no refs, no source image, no accepted key — slice-A shape intact.
 _d, _o2, _fg2, _fjh2 = _run_loop_h(
@@ -3074,6 +3091,237 @@ try:
 finally:
     refine.parse_verdict = _orig_pv
 check("parse_verdict is never called on a duel response", _pv_calls == [])
+
+# ── ADR-039 slice 2: the banded promotion gate ───────────────────────────────
+#
+# The named negatives this slice owes: a tie keeps the incumbent (the inverted
+# rule); the band is exclusive at BOTH ends; a duel that disagrees promotes
+# nothing; a failed duel promotes nothing AND feeds the abort counter; and the
+# pass / --until-score gates read the absolute composite only, BEFORE any duel.
+
+print("\n== ADR-039 slice 2: banded gate — duels decide inside the band ==")
+
+
+class _FakeDuel:
+    """Scripted duel_candidates: one outcome per call (last repeats). An
+    Exception entry is raised. Records the images and refs each duel saw."""
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = 0
+        self.pairs = []
+        self.refs_seen = []
+        self.prompts_seen = []
+
+    def __call__(self, image_a, image_b, target_prompt, backend_cfg, **kw):
+        item = self.outcomes[min(self.calls, len(self.outcomes) - 1)]
+        self.calls += 1
+        self.pairs.append((image_a, image_b))
+        self.refs_seen.append(kw.get("ref_images_judge"))
+        self.prompts_seen.append(target_prompt)
+        if isinstance(item, Exception):
+            raise item
+        return refine.DuelResult(outcome=item, per_order=(item, item))
+
+
+# Two 6/6 verdicts: an exact tie, so iteration 1 lands in the band and the duel
+# is what decides. Challenger wins both orders -> it promotes and, in edit
+# mode, becomes the next source.
+_fd = _FakeDuel([refine.DUEL_A])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    [_mkverdict_ov(6, 6, None), _mkverdict_ov(6, 6, None), _mkverdict_ov(6, 6, None)],
+    edit_source=_seed_png, max_iterations=3, patience=0, duel_band=1.0, duel=_fd)
+check("a banded iteration runs exactly one duel", _fd.calls == 2)
+check("a duel win promotes the challenger and advances the edit source",
+      _fg.refs_seen[2][0]["path"].endswith("candidate_01.png"),
+      detail=str(_fg.refs_seen))
+check("the duel is asked about the operator's target prompt",
+      _fd.prompts_seen[0] == "p")
+# The incumbent side of each duel must be the CURRENT pin, never a stale one.
+# _FakeGenE paints candidate N with blue channel N, so a duel whose image_b
+# still carries iteration 0's pixels after iteration 1 was promoted is caught
+# here (code review INFO — with identical fixtures this assertion is vacuous).
+check("each duel's challenger is THIS candidate, incumbent is the CURRENT best",
+      [(a.getpixel((0, 0))[2], b.getpixel((0, 0))[2]) for a, b in _fd.pairs]
+      == [(1, 0), (2, 1)],
+      detail=str([(a.getpixel((0, 0)), b.getpixel((0, 0)))
+                  for a, b in _fd.pairs]))
+
+# Same tie, but the duel finds no consistent winner: the incumbent stays.
+_fd = _FakeDuel([refine.DUEL_TIE])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    [_mkverdict_ov(6, 6, None), _mkverdict_ov(6, 6, None), _mkverdict_ov(6, 6, None)],
+    edit_source=_seed_png, max_iterations=3, patience=0, duel_band=1.0, duel=_fd)
+check("a duel tie keeps the incumbent (the inverted rule)",
+      _fg.refs_seen[2][0]["path"].endswith("candidate_00.png")
+      and os.path.basename(_o.winner_path or "") == "candidate_00.png",
+      detail=str(_fg.refs_seen))
+_fd = _FakeDuel([refine.DUEL_B])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    [_mkverdict_ov(6, 6, None), _mkverdict_ov(6, 6, None)],
+    edit_source=_seed_png, max_iterations=2, patience=0, duel_band=1.0, duel=_fd)
+check("losing the duel keeps the incumbent",
+      os.path.basename(_o.winner_path or "") == "candidate_00.png")
+
+print("\n== ADR-039 D1: a BELOW-best challenger can win inside the band ==")
+# The deliberately retired invariant: composite never decreases across
+# promotions. 6.0 then 5.5 is a decline of 0.5 — inside a 1.0 band, so the
+# duel decides and a both-orders win promotes the LOWER-scoring candidate.
+_fd = _FakeDuel([refine.DUEL_A])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    [_mkverdict_ov(6, 6, None), _mkverdict_ov(6, 5, None), _mkverdict_ov(6, 6, None)],
+    edit_source=_seed_png, max_iterations=3, patience=0, duel_band=1.0, duel=_fd)
+check("a lower-composite duel winner IS promoted (retired invariant)",
+      _fg.refs_seen[2][0]["path"].endswith("candidate_01.png"),
+      detail=str(_fg.refs_seen))
+
+print("\n== ADR-039 D1: the band is EXCLUSIVE at both ends ==")
+# 6.0 -> 5.0 is a decline of exactly 1.0; 6.0 -> 7.0 a gain of exactly 1.0.
+# At the boundary the scalar decides, so no duel runs in either direction.
+for _label, _second, _promotes in (("below", _mkverdict_ov(5, 5, None), False),
+                                   ("above", _mkverdict_ov(7, 7, None), True)):
+    _fd = _FakeDuel([refine.DUEL_A])
+    _d, _o, _fg, _fj, _m = _run_loop_e(
+        [_mkverdict_ov(6, 6, None), _second],
+        edit_source=_seed_png, max_iterations=2, patience=0,
+        duel_band=1.0, duel=_fd)
+    _won = os.path.basename(_o.winner_path or "") == "candidate_01.png"
+    check(f"a challenger exactly {_label} the band edge is decided by the "
+          f"scalar, not a duel", _fd.calls == 0 and _won is _promotes,
+          detail=f"duels={_fd.calls} winner={_o.winner_path}")
+# Just inside the edge, the duel takes over.
+_fd = _FakeDuel([refine.DUEL_TIE])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    [_mkverdict_ov(6, 6, None), _mkverdict_ov(7, 6, None)],
+    edit_source=_seed_png, max_iterations=2, patience=0, duel_band=1.0, duel=_fd)
+check("a +0.6 gain INSIDE the band is duelled, and a tie keeps the incumbent",
+      _fd.calls == 1 and os.path.basename(_o.winner_path or "")
+      == "candidate_00.png")
+
+print("\n== ADR-039 D1: a void duel promotes nothing and feeds the abort ==")
+_fd = _FakeDuel([refine.DuelError("endpoint down", failed_calls=1)])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    [_mkverdict_ov(6, 6, None)] * 6,
+    edit_source=_seed_png, max_iterations=6, patience=0, duel_band=1.0, duel=_fd)
+check("consecutive void duels abort the run (JUDGE_ERROR_ABORT_AFTER)",
+      _o.aborted is True
+      and _o.iterations == 1 + refine.JUDGE_ERROR_ABORT_AFTER,
+      detail=f"aborted={_o.aborted} iters={_o.iterations}")
+check("the aborted run still keeps its best-so-far winner",
+      os.path.basename(_o.winner_path or "") == "candidate_00.png")
+check("a void duel NEVER falls back to the composite rule",
+      not any("duel WIN" in m for m in _m) and any("VOID" in m for m in _m))
+check("the void-duel log names no fallback and stays operator-side",
+      any("composite rule is NOT a fallback" in m for m in _m))
+# A scoring judge that works must not paper over a duel judge that does not:
+# the counter is charged across iterations even though every scoring call
+# succeeded.
+check("a working scoring call does not reset the duel error counter",
+      _fd.calls == refine.JUDGE_ERROR_ABORT_AFTER
+      and _fj.calls == refine.JUDGE_ERROR_ABORT_AFTER + 1)
+# BINDING forward constraint from the slice-1 review record (Finding 9 /
+# F8-P): a duel failure must put NOTHING but ordinary structural flags into
+# the judge-bound history. The DuelError message embeds the endpoint URL and
+# up to 300 chars of endpoint-controlled body; a future edit adding it to the
+# record "for debuggability" would feed that straight back into LLM context.
+_void_hist = json.dumps(_fj.histories_seen[-1] or [])
+check("a void duel leaks NO error text into judge-bound history",
+      "endpoint down" not in _void_hist and "duel" not in _void_hist.lower()
+      and "http" not in _void_hist,
+      detail=_void_hist[:200])
+check("the void iteration's history record keeps the ordinary closed key set",
+      all(set(r) <= {"iteration", "scores", "prompt_excerpt",
+                     "prompt_provenance", "lora_ops_applied", "improved",
+                     "is_best", "judge_error", "accepted"}
+          for r in (_fj.histories_seen[-1] or [])),
+      detail=_void_hist[:200])
+# A non-judge failure (bad backend config) is void too, but charges nothing.
+_fd = _FakeDuel([RefineError("judge backend config missing 'url'")])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    [_mkverdict_ov(6, 6, None)] * 4,
+    edit_source=_seed_png, max_iterations=4, patience=0, duel_band=1.0, duel=_fd)
+check("a config-error duel is void but never charges the abort counter",
+      _o.aborted is False and _o.iterations == 4,
+      detail=f"aborted={_o.aborted} iters={_o.iterations}")
+
+print("\n== ADR-039: stop gates read the ABSOLUTE composite, before any duel ==")
+_fd = _FakeDuel([refine.DUEL_B])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    [_mkverdict_ov(9, 9, None)],
+    edit_source=_seed_png, max_iterations=3, patience=0, duel_band=1.0, duel=_fd)
+check("the pass gate fires without consulting a duel",
+      _o.passed is True and _fd.calls == 0)
+_fd = _FakeDuel([refine.DUEL_B])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    [_mkverdict_ov(6, 6, None), _mkverdict_ov(6, 7, None)],
+    edit_source=_seed_png, max_iterations=4, patience=0, duel_band=1.0,
+    until_composite=6.4, duel=_fd)
+check("--until-score reads the composite only, and stops before any duel",
+      _o.passed is True and _o.iterations == 2 and _fd.calls == 0,
+      detail=f"iters={_o.iterations} duels={_fd.calls}")
+
+print("\n== ADR-039: duels are edit-mode only in this slice (Deferred) ==")
+_fd = _FakeDuel([refine.DUEL_A])
+_dc_orig = refine.duel_candidates
+refine.duel_candidates = _fd
+try:
+    _d, _o, _fg, _fj = _run_loop(
+        [_mkverdict(6, 6), _mkverdict(6, 6)], max_iter=2, patience=0)
+finally:
+    refine.duel_candidates = _dc_orig
+check("a t2i tie never runs a duel and keeps the incumbent",
+      _fd.calls == 0 and os.path.basename(_o.winner_path or "")
+      == "candidate_00.png")
+_msgs = []
+_fd = _FakeDuel([refine.DUEL_A])
+_dc_orig, refine.duel_candidates = refine.duel_candidates, _fd
+_rg, _jc = refine.run_generation, refine.judge_candidate
+refine.run_generation = _FakeGen(seed=123)
+refine.judge_candidate = _FakeJudge([_mkverdict(6, 6)])
+try:
+    refine.refine_loop(
+        WorkingConfig(prompt="p", loras=[], base={"seed": -1}),
+        target_prompt="t", catalog={}, roots=(), conn=None,
+        backend_cfg={"url": "http://x", "model": "m"},
+        output_dir=_tf.mkdtemp(prefix="refine_t2i_band_"), device="cuda",
+        max_iterations=1, patience=0, duel_band=1.0, log=_msgs.append)
+finally:
+    refine.duel_candidates = _dc_orig
+    refine.run_generation, refine.judge_candidate = _rg, _jc
+check("a positive --duel-band in t2i says so ONCE, at entry",
+      sum(1 for m in _msgs if "t2i duels are deferred" in m) == 1)
+
+print("\n== ADR-039: --duel-band validation (the --w-* precedent) ==")
+_band_dir = _tf.mkdtemp(prefix="refine_band_")
+import contextlib as _ctx  # noqa: E402
+import io as _io  # noqa: E402
+
+for _bad in ("nan", "-1", "-0.5", "inf"):
+    _err = _io.StringIO()
+    with _ctx.redirect_stderr(_err):
+        _rc = refine.main(["--prompt", "p", "--model", _band_dir,
+                           "--model-base", _band_dir, "--output-dir",
+                           _band_dir, "--judge-backend", "x",
+                           "--duel-band", _bad])
+    # rc == 2 alone is vacuous here — the unknown --judge-backend also exits 2,
+    # so a regression that dropped the finiteness check would still pass
+    # (security review LOW). A NaN band makes every band test False and
+    # silently reverts the run to the SUPERSEDED promotion rule, so the
+    # message itself is the thing worth pinning.
+    check(f"--duel-band {_bad} is rejected BY the band check, exit 2",
+          _rc == 2 and "--duel-band must be a finite number" in _err.getvalue(),
+          detail=f"rc={_rc} stderr={_err.getvalue()[:120]!r}")
+# The band check must fire BEFORE the judge-backend lookup, or a bad band on a
+# valid backend would cost a registry read (and, with autodetect, a live GET).
+_err = _io.StringIO()
+with _ctx.redirect_stderr(_err):
+    refine.main(["--prompt", "p", "--model", _band_dir, "--model-base",
+                 _band_dir, "--output-dir", _band_dir, "--judge-backend", "x",
+                 "--duel-band", "nan"])
+check("the band check precedes the judge-backend resolution",
+      "--duel-band" in _err.getvalue()
+      and "judge backend" not in _err.getvalue(),
+      detail=_err.getvalue()[:160])
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 print(f"\n{passed} passed, {failed} failed")
