@@ -2613,26 +2613,71 @@ _REF_MODES = ("both", "vl", "ref")
 _MAX_REF_IMAGES = 8
 
 
-def _parse_ref_image(spec: str) -> Dict[str, str]:
+#: Refine-local suffix marking a reference as judge-visible (ADR-038 D2/D3).
+#: NEVER a wire value — `mode` on the wire stays within `_REF_MODES`; the
+#: daemon's validator would reject "vl:judge" as a plain error (fatal, no
+#: RefPathError, no latch, misattributed). Callers that accept it must strip
+#: it before building any request.
+_REF_JUDGE_SUFFIX = "judge"
+
+
+def _parse_ref_image(spec: str, *, allow_judge: bool = False) -> Dict[str, Any]:
     """Parse a ``--ref-image`` ``PATH[:MODE]`` spec into ``{"path","mode"}``
-    (ADR-035 decisions 1 / 2a).
+    (ADR-035 decisions 1 / 2a); with ``allow_judge`` also ``PATH[:MODE][:judge]``
+    into ``{"path","mode","judge"}`` (ADR-038 D2).
 
     Split on the LAST colon like ``_parse_lora_arg``, but — unlike a LoRA weight —
     the suffix MUST be a valid MODE (``both``/``vl``/``ref``) or it is a HARD error:
     a silent fallback here would quietly change what the model conditions on. A
     path that itself contains a colon must therefore append an explicit mode, e.g.
     ``'my:file.png:both'``. Omitting ``:MODE`` selects ``both`` (scene lock).
+
+    ADR-038 D2 grammar, when ``allow_judge``: suffix order is FIXED and
+    ``:judge`` may appear only LAST. ``face.png:judge`` (no mode) is valid and
+    takes the default mode. ``face.png:judge:vl`` is a hard error naming the
+    expected order — never silently reordered, because a wrong split changes
+    what the model conditions on. ``allow_judge=False`` (generate's own CLI)
+    leaves ``:judge`` to fail as an unknown MODE, so the marking cannot leak
+    into a non-refine surface.
     """
+    judge = False
+    if allow_judge and ":" in spec:
+        idx = spec.rfind(":")
+        if spec[idx + 1:] == _REF_JUDGE_SUFFIX:
+            judge = True
+            spec = spec[:idx]  # strip and fall through to normal MODE parsing
     if ":" in spec:
         idx = spec.rfind(":")
         suffix = spec[idx + 1:]
         if suffix in _REF_MODES:
-            return {"path": spec[:idx], "mode": suffix}
+            path = spec[:idx]
+            # A ':judge' left INSIDE the path means the operator wrote
+            # 'face.png:judge:vl' — wrong order. Without this the mode split
+            # succeeds and 'face.png:judge' becomes the PATH: a silent
+            # misparse that changes what the model conditions on, which is
+            # exactly what ADR-035 decision 1 made mode parsing strict to
+            # prevent. Say so by name instead.
+            # …unless such a file genuinely EXISTS: ADR-038 D2 promises a file
+            # named 'photo:vl:judge' stays addressable under its full name,
+            # and without this the disambiguation branch advises appending a
+            # mode that then hard-errors — self-contradicting guidance with no
+            # escape hatch (code review SHOULD). A real wrong-order typo is
+            # unaffected: 'face.png:judge' does not exist as a file.
+            if (allow_judge and path.endswith(f":{_REF_JUDGE_SUFFIX}")
+                    and not os.path.isfile(path)):
+                raise ValueError(
+                    f"--ref-image {spec!r}: ':{_REF_JUDGE_SUFFIX}' must come "
+                    f"LAST (expected PATH[:MODE][:{_REF_JUDGE_SUFFIX}], e.g. "
+                    f"'{path[: -len(_REF_JUDGE_SUFFIX) - 1]}:{suffix}:"
+                    f"{_REF_JUDGE_SUFFIX}').")
+            entry = {"path": path, "mode": suffix}
+            return {**entry, "judge": judge} if allow_judge else entry
         raise ValueError(
             f"--ref-image {spec!r}: unknown MODE {suffix!r} "
             f"(expected one of {', '.join(_REF_MODES)}). A path containing a colon "
             f"must append an explicit mode, e.g. '{spec}:both'.")
-    return {"path": spec, "mode": "both"}
+    entry = {"path": spec, "mode": "both"}
+    return {**entry, "judge": judge} if allow_judge else entry
 
 
 def _validate_ref_image_specs(specs: List[str]) -> List[Dict[str, str]]:

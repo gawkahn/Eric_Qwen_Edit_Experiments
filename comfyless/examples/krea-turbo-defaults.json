@@ -1,0 +1,7 @@
+{
+    "model": "/home/gawkahn/projects/ai-lab/ai-base/models/hf-local/Krea-2-Turbo",
+    "text_encoder_path": "/home/gawkahn/projects/ai-lab/ai-base/models/hf-local/Huihui-Qwen3-VL-4B-Instruct-abliterated",
+    "vae_path": "/home/gawkahn/projects/ai-lab/ai-base/models/hf-local/Wan2.1-T2V-1.3B-Diffusers/vae/",
+    "upscale_vae_path": "/home/gawkahn/projects/ai-lab/ai-base/models/hf-local/Wan2.1-VAE-upscale2x",
+    "quant": "fp8"
+  }

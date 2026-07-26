@@ -349,3 +349,31 @@ guarantees are structural and a refactor could quietly undo them:
   IMMEDIATELY after this slice, ahead of the daemon progress-bar work
   ("eye-candy, not substantive") — which makes the duel-payload forward
   constraint above live rather than hypothetical.
+
+- 2026-07-25 — **IMPLEMENTED.** Both post-code reviews Fable, no fallback; no
+  CRITICAL/HIGH; auditor PASS on all seven framed questions
+  (`docs/security/review-adr-038-impl-2026-07-25.md`). Two substantive folds
+  before commit: (a) `pin_static_refs` copies the ORIGINAL VALIDATED BYTES
+  verbatim rather than re-encoding decoded RGB to PNG — the re-encode could
+  inflate an ordinary camera JPEG past `REF_IMAGE_MAX_BYTES`, which every
+  downstream load re-applies, so entry validation would pass and iteration 0
+  would die on the loop's OWN artifact (and `sha256` now describes the file
+  actually in use); (b) the four loop-level negative tests this ADR's slice
+  plan named "up front" were missing — no test passed `static_refs` through
+  `refine_loop` at all, leaving the whole generation-channel half
+  regression-uncovered — now added, including the binding
+  no-`judge`-on-the-wire assertion. Also folded: grammar/count refusals
+  hoisted ahead of catalog build and the judge-endpoint autodetect (the
+  earlier docstring claimed an ordering `main()` did not provide); D2's
+  addressability promise honored (the wrong-order guard yields when the path
+  EXISTS as a file, so a file literally named `photo:vl:judge` stays
+  reachable and the disambiguation message no longer advises a dead end);
+  `refs/` recreated per run with `OSError` → clean `RefineError`. Accepted
+  residual: two CONCURRENT runs sharing one `--output-dir` cross-overwrite
+  `refs/` — the same hazard `candidates/` already has, owned by the standing
+  run-dir-hygiene backlog item. **D4 note:** the symmetric style-register
+  rewrite (Grant, same day) changes aesthetics scoring for ALL edit runs, not
+  just multi-ref ones — the old text capped only painterly drift from a
+  photoreal source, which would have penalized an animation keyframe for
+  staying in its own register and rewarded drift toward photorealism.
+  Follow-up: the vault Comfyless manual needs `--ref-image` documented.

@@ -1606,6 +1606,136 @@ check("composite target absent from persisted verdict records",
       == ["composite", "critique", "iteration", "notices",
           "proposed_overrides", "scores", "verdict", "weights"])
 
+print("\n== ADR-038: multi-reference edit (static refs + identity judging) ==")
+# --- D2 grammar: PATH[:MODE][:judge], fixed order, :judge last only ---------
+_pr = _rg_gen._parse_ref_image
+check("D2: bare path -> mode both, judge False",
+      _pr("f.png", allow_judge=True) == {"path": "f.png", "mode": "both",
+                                         "judge": False})
+check("D2: PATH:MODE -> parsed, judge False",
+      _pr("f.png:vl", allow_judge=True) == {"path": "f.png", "mode": "vl",
+                                            "judge": False})
+check("D2: PATH:MODE:judge -> both parsed",
+      _pr("f.png:vl:judge", allow_judge=True) == {"path": "f.png",
+                                                  "mode": "vl", "judge": True})
+check("D2: bare PATH:judge -> default mode both",
+      _pr("f.png:judge", allow_judge=True) == {"path": "f.png",
+                                               "mode": "both", "judge": True})
+try:
+    _pr("f.png:judge:vl", allow_judge=True)
+    check("D2: wrong suffix order is a hard error", False)
+except ValueError as e:
+    check("D2: wrong suffix order is a hard error", "must come LAST" in str(e))
+try:
+    _pr("f.png:judge", allow_judge=False)
+    check("D2: generate's own CLI does NOT accept :judge", False)
+except ValueError as e:
+    check("D2: generate's own CLI does NOT accept :judge",
+          "unknown MODE" in str(e))
+check("D2: allow_judge=False keeps generate's dict shape unchanged",
+      _pr("f.png:vl") == {"path": "f.png", "mode": "vl"})
+
+# --- D2/D3 caps, refused at ENTRY ------------------------------------------
+try:
+    refine.resolve_static_refs(["a.png"] * 8, judge_max_images=6, max_refs=7)
+    check("D2: static-ref cap accounts for the loop's reserved slot", False)
+except RefineError as e:
+    check("D2: static-ref cap accounts for the loop's reserved slot",
+          "reserves one slot" in str(e))
+try:
+    refine.resolve_static_refs(["a.png:judge", "b.png:judge", "c.png:judge"],
+                               judge_max_images=4, max_refs=7)
+    check("D3: judge-ref cap = judge_max_images - 2", False)
+except RefineError as e:
+    check("D3: judge-ref cap = judge_max_images - 2",
+          "exceeds this backend's budget of 2" in str(e))
+_ok = refine.resolve_static_refs(["a.png:vl:judge", "b.png"],
+                                 judge_max_images=6, max_refs=7)
+check("D3: within budget parses to StaticRefs",
+      [(r.mode, r.judge) for r in _ok] == [("vl", True), ("both", False)])
+
+# --- D3 budget comes from the BACKEND, conservative when undeclared --------
+check("D3: undeclared judge_max_images -> conservative default (no judge refs)",
+      refine.resolve_judge_max_images({}, lambda *_a: None)
+      == refine.DEFAULT_JUDGE_MAX_IMAGES)
+check("D3: declared judge_max_images is honored",
+      refine.resolve_judge_max_images({"judge_max_images": 6},
+                                      lambda *_a: None) == 6)
+for _bad in (True, "6", 1, 0, None):
+    check(f"D3: unusable judge_max_images {_bad!r} -> conservative default",
+          refine.resolve_judge_max_images({"judge_max_images": _bad},
+                                          lambda *_a: None)
+          == refine.DEFAULT_JUDGE_MAX_IMAGES)
+
+# --- D3 judge payload: role labels, order, integer-only interpolation -------
+_pl = refine.build_judge_payload(
+    "m", "sys", "ctx", "data:cand", source_image_data_uri="data:anchor",
+    ref_image_data_uris=["data:ref1", "data:ref2"])
+_parts = _pl["messages"][1]["content"]
+_texts = [p["text"] for p in _parts if p["type"] == "text"]
+_uris = [p["image_url"]["url"] for p in _parts if p["type"] == "image_url"]
+check("D3: payload order is anchor, refs..., candidate",
+      _uris == ["data:anchor", "data:ref1", "data:ref2", "data:cand"],
+      detail=str(_uris))
+check("D3: reference labels are indexed 1..N",
+      "REFERENCE 1 (target identity):" in _texts
+      and "REFERENCE 2 (target identity):" in _texts, detail=str(_texts))
+check("D3: label template interpolates ONLY the integer index",
+      refine._JUDGE_REF_LABEL.count("{") == 1
+      and "{n}" in refine._JUDGE_REF_LABEL)
+check("D3: no refs -> payload byte-identical to the two-image shape",
+      refine.build_judge_payload("m", "sys", "ctx", "data:cand",
+                                 source_image_data_uri="data:anchor")
+      == refine.build_judge_payload("m", "sys", "ctx", "data:cand",
+                                    source_image_data_uri="data:anchor",
+                                    ref_image_data_uris=[]))
+
+# --- D5 pinning: loop-owned copies, all refs (not just judge-marked) --------
+_srcdir = _tf.mkdtemp(prefix="adr038_src_")
+_rundir = _tf.mkdtemp(prefix="adr038_run_")
+_ref_a = os.path.join(_srcdir, "face.png")
+_ref_b = os.path.join(_srcdir, "style.png")
+_PILImage.new("RGB", (16, 16), (10, 20, 30)).save(_ref_a)
+_PILImage.new("RGB", (16, 16), (40, 50, 60)).save(_ref_b)
+_pinned = refine.pin_static_refs(
+    [refine.StaticRef(_ref_a, "vl", True, ""),
+     refine.StaticRef(_ref_b, "both", False, "")],
+    _rundir, log=lambda *_a: None)
+check("D5: every static ref is copied into the loop-owned refs/ dir",
+      all(os.path.isfile(r.path)
+          and os.path.dirname(r.path) == os.path.join(_rundir, "refs")
+          for r in _pinned), detail=str([r.path for r in _pinned]))
+check("D5: pinning is by VALUE — a mid-run swap of the operator's file "
+      "cannot change what the loop uses",
+      _pinned[0].path != _ref_a and _pinned[1].path != _ref_b)
+check("D5: sha256 recorded for every ref (judge-marked or not)",
+      all(len(r.sha256) == 64 for r in _pinned))
+# Verbatim-bytes pinning (code review SHOULD): re-encoding to PNG could
+# inflate a legal camera JPEG past REF_IMAGE_MAX_BYTES, which every
+# downstream load re-applies — entry would pass and iteration 0 would die on
+# the loop's own artifact. Verbatim also keeps sha256 describing the file in
+# use.
+import hashlib as _hl  # noqa: E402
+check("D5: pinned copy is byte-identical to the operator's file",
+      all(_hl.sha256(open(r.path, "rb").read()).hexdigest() == r.sha256
+          for r in _pinned))
+check("D5: pinned copy keeps the source extension (no forced re-encode)",
+      all(r.path.endswith(".png") for r in _pinned))
+check("D5: only judge-marked refs hold a decoded image",
+      _pinned[0].image is not None and _pinned[1].image is None)
+_swap_before = open(_pinned[0].path, "rb").read()
+_PILImage.new("RGB", (16, 16), (200, 0, 0)).save(_ref_a)  # operator swaps it
+check("D5: the loop-owned copy is unaffected by the swap",
+      open(_pinned[0].path, "rb").read() == _swap_before)
+
+# --- D5 latch notice names the REFUSED path's directory --------------------
+check("D5: latch notice extracts the refused path's dir",
+      refine._refused_ref_dir(
+          "ref_images[1].path outside the ref-image roots: '/home/u/photos/f.png'")
+      == "/home/u/photos")
+check("D5: unparseable refusal degrades to None (generic wording)",
+      refine._refused_ref_dir("something else entirely") is None)
+
 print("\n== parity slice 1: shared family-defaults applier + --schedule port ==")
 # The overlay core now lives in family_defaults; both callers are adapters, so
 # the CFG-aliasing rule can't drift between them again (it shipped twice).
@@ -2277,10 +2407,12 @@ class _FakeJudgeE(_FakeJudge):
         super().__init__(script)
         self.histories_seen = []
         self.sources_seen = []
+        self.judge_refs_seen = []
 
     def __call__(self, image, target_prompt, cfg, backend_cfg, planner_loras, **kw):
         self.histories_seen.append(kw.get("history"))
         self.sources_seen.append(kw.get("source_image"))
+        self.judge_refs_seen.append(kw.get("ref_images_judge"))
         return super().__call__(image, target_prompt, cfg, backend_cfg,
                                 planner_loras, **kw)
 
@@ -2355,13 +2487,73 @@ _d, _o2, _fg2, _fjh2 = _run_loop_h(
 check("t2i history records have NO accepted key",
       all("accepted" not in r for r in (_fjh2.histories_seen[1] or [])))
 
+print("\n== ADR-038 slice-plan negative tests (loop level) ==")
+# These four are named in the ADR's slice plan because D1/D2's guarantees are
+# STRUCTURAL — a refactor (e.g. dataclasses.asdict(r) at the wire builder)
+# would silently undo them, producing either a leaked ':judge' mode (fatal,
+# misattributed, no latch) or a candidate displacing an identity reference.
+_sr_dir = _tf.mkdtemp(prefix="adr038_loop_")
+_sr_a = os.path.join(_sr_dir, "face.png")
+_sr_b = os.path.join(_sr_dir, "style.png")
+_PILImage.new("RGB", (12, 12), (1, 2, 3)).save(_sr_a)
+_PILImage.new("RGB", (12, 12), (4, 5, 6)).save(_sr_b)
+_static = refine.pin_static_refs(
+    [refine.StaticRef(_sr_a, "vl", True, ""),
+     refine.StaticRef(_sr_b, "ref", False, "")],
+    _tf.mkdtemp(prefix="adr038_loop_run_"), log=lambda *_a: None)
+
+# Script: improve (promote) → decline (revert) → decline again past
+# --explore-after (stagnation escape). Exercises all three lineage paths.
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    [_mkverdict_ov(7, 7, "B"), _mkverdict_ov(5, 5, None),
+     _mkverdict_ov(5, 5, "C"), _mkverdict_ov(5, 5, None)],
+    edit_source=_seed_png, max_iterations=4, patience=0,
+    static_refs=_static)
+_tails = [r[1:] for r in _fg.refs_seen]
+check("D1: static refs are CONTENT-IDENTICAL across promote/decline/escape",
+      all(t == _tails[0] for t in _tails) and len(_tails) == 4,
+      detail=str(_tails[:2]))
+check("D1: the pinned refs are exactly what rides the wire",
+      _tails[0] == [{"path": r.path, "mode": r.mode} for r in _static],
+      detail=str(_tails[0]))
+check("D2: loop source is always index 0; static refs never are",
+      all(r[0]["path"] not in {s.path for s in _static} for r in _fg.refs_seen)
+      and all(all(e["path"] != _fg.refs_seen[i][0]["path"] for e in r[1:])
+              for i, r in enumerate(_fg.refs_seen)))
+check("D2: current_source never appears at index > 0",
+      all(not any(e["path"].endswith("candidate_00.png") for e in r[1:])
+          for r in _fg.refs_seen), detail=str(_tails[0]))
+_wire_entries = [e for r in _fg.refs_seen for e in r]
+check("D2: NO wire entry carries 'judge' (binding containment negative)",
+      all("judge" not in e for e in _wire_entries)
+      and all(e["mode"] in _rg_gen._REF_MODES for e in _wire_entries),
+      detail=str(_wire_entries[:3]))
+check("D3: only judge-MARKED refs reach the judge",
+      all(len(s or []) == 1 for s in _fj.judge_refs_seen),
+      detail=str([len(s or []) for s in _fj.judge_refs_seen]))
+
+# A path passed as BOTH --seed-image and --ref-image: only slot 0 advances.
+_dup = refine.pin_static_refs([refine.StaticRef(_seed_png, "both", False, "")],
+                              _tf.mkdtemp(prefix="adr038_dup_"),
+                              log=lambda *_a: None)
+_d, _o, _fg2, _fj2, _m = _run_loop_e(
+    [_mkverdict_ov(7, 7, None), _mkverdict_ov(8, 8, None)],
+    edit_source=_seed_png, max_iterations=2, patience=0, static_refs=_dup)
+check("D1: seed path ALSO passed as a ref advances only slot 0",
+      _fg2.refs_seen[1][0]["path"].endswith("candidate_00.png")
+      and _fg2.refs_seen[1][1]["path"] == _dup[0].path,
+      detail=str(_fg2.refs_seen[1]))
+
 print("\n== slice B: daemon ref refusal latches the whole run in-process ==")
 _d, _o, _fg, _fj, _m = _run_loop_e(
     [_mkverdict_ov(5, 5, None)], edit_source=_seed_png,
     refuse_daemon=True, max_iterations=3, patience=0)
 check("run completes despite the refusal", _o.iterations == 3)
 check("refusal notice is loud and printed ONCE",
-      sum(1 for m in _m if "refused the edit-source ref" in m) == 1)
+      # Wording generalized by ADR-038: with static refs the refused path is
+      # not necessarily the edit source, so the notice says "a reference
+      # path" and names the refused path's own directory as the fix.
+      sum(1 for m in _m if "refused a reference path" in m) == 1)
 check("every successful generation ran in-process after the latch",
       _fg.forced_seen == [True, True, True])
 check("refs still threaded on the in-process path",
