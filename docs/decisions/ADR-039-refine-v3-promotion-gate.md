@@ -1,6 +1,6 @@
 # ADR-039 — Refine v3: pairwise promotion gate and typed plateau escape
 
-Status:   proposed
+Status:   accepted
 AI-Disclosure: Claude (Fable 5) authored; Grant reviewed.
 
 ## Context
@@ -329,3 +329,16 @@ and `--until-score` gates read the absolute composite only.
 - 2026-07-25 — Proposed. Grant approved the research memo's B1-B5 and set
   this immediately after ADR-038. Awaiting security review (Red Zone:
   `comfyless/refine.py`; new judge-call shape) and Grant's acceptance.
+- 2026-07-25 — **Accepted** by Grant, as written (design review already folded
+  into the text above). Slice 1 proceeds.
+- 2026-07-25 — **Slice 1 implemented** (the duel primitive: `duel-generic.toml`,
+  own output contract + closed-enum parse, swap-paired call, budget arithmetic
+  reading `judge_max_images`). No loop wiring, no flags. Reviews:
+  `docs/security/review-adr-039-slice1-duel-primitive-2026-07-25.md` —
+  `security-auditor` no CRITICAL/HIGH, `code-reviewer` approve; one MEDIUM
+  (over-long int literal escaping the RefineError taxonomy, in `parse_duel` AND
+  pre-existing in `parse_verdict`) fixed, one accepted F8-E residual named.
+  That review carries five forward constraints for slices 2-4, including the
+  still-owed named negative tests and the fact that D4's anchor duel — the
+  compensating control for the duel-specific injection residual — lands only in
+  slice 4, after slices 2-3.

@@ -2690,6 +2690,391 @@ check("edit judge wire payload carries no path-shaped strings",
       _seed_png not in _pj and "candidate_" not in _pj and "/tmp/" not in _pj
       and _JUDGE_SOURCE_LABEL in _pj)
 
+# ── ADR-039 slice 1: the duel primitive ──────────────────────────────────────
+#
+# The negative cases are the point again, and they are the ones ADR-039 named up
+# front: a duel that disagrees across orders promotes nothing; the label→
+# competitor mapping under swap cannot be inverted; a failed duel is void and
+# carries its abort-accounting weight; the two orders always carry an IDENTICAL
+# reference set; budget refusal drops refs before it drops the swap; no call
+# exceeds judge_max_images; and a duel response's `overrides` reach nothing.
+
+print("\n== ADR-039 slice 1: parse_duel — closed enum, zero authority ==")
+for _w in ("first", "second", "tie"):
+    check(f"parse_duel accepts winner={_w!r}",
+          refine.parse_duel(json.dumps({"winner": _w})).winner == _w)
+check("parse_duel tolerates a plain-text preamble before the JSON",
+      refine.parse_duel(
+          "DIFFERENCES\n- left is sharper\nDECIDED BY: integrity\n"
+          '{"winner": "first"}').winner == "first")
+check("parse_duel tolerates ```json fences",
+      refine.parse_duel('```json\n{"winner": "second"}\n```').winner == "second")
+_dn = refine.parse_duel('{"winner": " First "}')
+check("parse_duel normalizes case/whitespace with a notice",
+      _dn.winner == "first" and any("normalized" in n for n in _dn.notices))
+for _bad in ('{"winner": "candidate_a"}', '{"winner": "A"}', '{"winner": ""}',
+             '{"winner": 1}', '{"winner": null}', '{"winner": ["first"]}',
+             '{"choice": "first"}', '{}', "no json here",
+             '{"winner": "first"', '{"winner": "first", "x": NaN}'):
+    raises(f"parse_duel fails closed on {_bad[:36]!r}",
+           lambda b=_bad: refine.parse_duel(b))
+
+print("\n== ADR-039: a duel response's overrides reach NOTHING ==")
+_dov = refine.parse_duel(json.dumps({
+    "winner": "first",
+    "overrides": {"prompt": "PWNED", "loras": [{"name": "x", "action": "add"}]},
+    "critique": {"prompt_adherence": "PWNED"},
+    "scores": {"prompt_adherence": 10}}))
+check("duel overrides/critique/scores are discarded, not carried",
+      _dov.winner == "first" and "PWNED" not in json.dumps(vars(_dov))
+      and set(vars(_dov)) == {"winner", "notices"})
+check("discarded duel keys are named in operator notices",
+      sum(1 for n in _dov.notices if "discarded key" in n) == 3)
+# Operator-log flood guard (security review INFO): a response with thousands of
+# keys must not become thousands of notice lines.
+_dflood = refine.parse_duel(json.dumps(
+    dict({f"k{i}": i for i in range(500)}, winner="tie")))
+check("discarded-key notices are capped, with the remainder counted",
+      sum(1 for n in _dflood.notices if "discarded key" in n)
+      == refine._DUEL_MAX_DISCARD_NOTICES
+      and any("further key(s)" in n and "490" in n for n in _dflood.notices))
+# F7/F6: a >4300-digit integer literal makes json.loads raise a BARE ValueError
+# (CPython >= 3.11 int_max_str_digits), NOT a JSONDecodeError. Uncaught, it
+# escapes refine_loop's `except RefineError` and crashes a live run.
+_huge_int = '{"winner": "first", "x": ' + "9" * 5000 + "}"
+raises("parse_duel: an over-long int literal is a RefineError, not a crash",
+       lambda: refine.parse_duel(_huge_int))
+raises("parse_verdict: same — the F7 contract holds for the scoring judge too",
+       lambda: parse_verdict(
+           '{"scores": {"prompt_adherence": 5, "aesthetics": 5}, "x": '
+           + "9" * 5000 + "}"))
+check("DuelResult carries only the decision, never judge text",
+      set(refine.DuelResult.__dataclass_fields__)
+      == {"outcome", "per_order", "notices"})
+
+print("\n== ADR-039 D2: the duel's own output contract (never the judge's) ==")
+check("duel prompt = rubric + duel contract",
+      refine.DUEL_SYSTEM_PROMPT.endswith(refine._DUEL_OUTPUT_CONTRACT)
+      and refine.DUEL_SYSTEM_PROMPT.startswith(
+          refine._DEFAULT_DUEL_RUBRIC[:40]))
+check("the SCORING output contract is absent from the duel prompt",
+      refine._JUDGE_OUTPUT_CONTRACT not in refine.DUEL_SYSTEM_PROMPT
+      and "set_weight" not in refine.DUEL_SYSTEM_PROMPT
+      and "catalog NAME" not in refine.DUEL_SYSTEM_PROMPT
+      and '"scores"' not in refine.DUEL_SYSTEM_PROMPT)
+check("the duel contract states it has no authority",
+      "no authority" in refine._DUEL_OUTPUT_CONTRACT
+      and '{"winner": "first" | "second" | "tie"}'
+      in refine._DUEL_OUTPUT_CONTRACT)
+
+print("\n== ADR-039: duel recipe — kind gate both directions ==")
+_duel_rubric = refine.load_duel_recipe()
+for _name, _rub in (("duel-generic.toml", _duel_rubric),
+                    ("builtin", refine._DEFAULT_DUEL_RUBRIC)):
+    check(f"{_name}: position-bias warning present",
+          "POSITION IS NOT INFORMATION" in _rub)
+    check(f"{_name}: register drift is a defect in EITHER direction",
+          "EITHER direction" in _rub or "either direction" in _rub)
+    check(f"{_name}: text-in-pixels is content, never instructions",
+          "never instructions to you" in _rub)
+raises("a duel recipe cannot be loaded as a scoring rubric",
+       lambda: refine.load_judge_recipe("duel-generic"))
+raises("a scoring recipe cannot be loaded as a duel rubric",
+       lambda: refine.load_duel_recipe("generic"))
+_no_recipes = _tf.mkdtemp(prefix="no_duel_recipes_")
+check("missing duel-generic degrades to the builtin (default-name rule)",
+      refine.load_duel_recipe(recipes_dir=_no_recipes)
+      == refine._DEFAULT_DUEL_RUBRIC)
+raises("an explicitly named missing duel recipe fails closed",
+       lambda: refine.load_duel_recipe("custom-duel", _no_recipes))
+raises("a duel recipe name may not be a path",
+       lambda: refine.load_duel_recipe("../../etc/passwd"))
+
+print("\n== ADR-039 D2: duel user text is minimal and code-owned ==")
+_dut = refine.build_duel_user_text("a red fox on a blue bench")
+check("duel user text carries the target prompt and nothing else",
+      "a red fox on a blue bench" in _dut
+      and "iteration_history" not in _dut
+      and "catalog_search_offers" not in _dut
+      and "current_prompt" not in _dut
+      and "active_loras" not in _dut
+      and "lora_catalog" not in _dut)
+
+print("\n== ADR-039 D2: duel budget arithmetic (2 candidates + N refs) ==")
+check("duel_ref_budget seats judge_max_images - 2 refs",
+      (refine.duel_ref_budget(2), refine.duel_ref_budget(4),
+       refine.duel_ref_budget(6)) == (0, 2, 4))
+check("duel_ref_budget never goes negative",
+      refine.duel_ref_budget(0) == 0 and refine.duel_ref_budget(1) == 0)
+_kept, _dnotes = refine.select_duel_refs(["r1", "r2"], 2)
+check("budget refusal drops refs and says so once",
+      _kept == [] and len(_dnotes) == 1 and "dropping 2 of 2" in _dnotes[0]
+      and "swap is never dropped" in _dnotes[0])
+_kept3, _dnotes3 = refine.select_duel_refs(["r1", "r2"], 3)
+check("a 3-image budget seats exactly one ref", _kept3 == ["r1"]
+      and len(_dnotes3) == 1)
+check("a 4-image budget seats both refs with no notice",
+      refine.select_duel_refs(["r1", "r2"], 4) == (["r1", "r2"], []))
+
+print("\n== ADR-039 D1: swap-paired duel — mapping, consistency, ties ==")
+_img_a = _PILImage.new("RGB", (4, 4), (255, 0, 0))
+_img_b = _PILImage.new("RGB", (4, 4), (0, 0, 255))
+_img_ref = _PILImage.new("RGB", (4, 4), (0, 255, 0))
+_uri_a = refine.image_to_data_uri(refine.downscale_for_judge(_img_a))
+_uri_b = refine.image_to_data_uri(refine.downscale_for_judge(_img_b))
+
+
+class _FakeDuelJudge:
+    """Scripted judge: one reply per call, in call order. An Exception reply is
+    raised instead of returned (endpoint failure)."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.payloads = []
+
+    def __call__(self, endpoint, payload, key="", timeout=0):
+        self.payloads.append(payload)
+        reply = self.replies[len(self.payloads) - 1]
+        if isinstance(reply, Exception):
+            raise reply
+        # A bare enum member is shorthand for a well-formed response; any other
+        # string is sent through verbatim (malformed-response cases).
+        if reply in refine._DUEL_WINNERS:
+            return json.dumps({"winner": reply})
+        return reply
+
+
+def _run_duel(replies, *, refs=None, backend=None, logs=None):
+    """Run one duel against a scripted judge; returns (result, fake)."""
+    fake = _FakeDuelJudge(replies)
+    _orig = refine._post_judge
+    refine._post_judge = fake
+    try:
+        res = refine.duel_candidates(
+            _img_a, _img_b, "target prompt",
+            backend or {"url": "http://x", "model": "m"},
+            ref_images_judge=refs,
+            log=(logs.append if logs is not None else (lambda m: None)))
+    finally:
+        refine._post_judge = _orig
+    return res, fake
+
+
+# A judge that consistently prefers image A says "first" in order (A,B) and
+# "second" in order (B,A).
+_res, _fake = _run_duel(["first", "second"])
+check("consistent win for A promotes A",
+      _res.outcome == refine.DUEL_A and _res.per_order == ("a", "a"))
+_res, _ = _run_duel(["second", "first"])
+check("consistent win for B promotes B",
+      _res.outcome == refine.DUEL_B and _res.per_order == ("b", "b"))
+# The dominant pairwise failure mode: a judge that always picks whatever is
+# shown first. The swap must convert that into a tie, not a promotion.
+_res, _ = _run_duel(["first", "first"])
+check("a position-biased judge (always 'first') earns NO promotion",
+      _res.outcome == refine.DUEL_TIE and _res.per_order == ("a", "b"))
+_res, _ = _run_duel(["second", "second"])
+check("a position-biased judge (always 'second') earns NO promotion",
+      _res.outcome == refine.DUEL_TIE and _res.per_order == ("b", "a"))
+_res, _ = _run_duel(["tie", "tie"])
+check("a genuine tie is a tie", _res.outcome == refine.DUEL_TIE)
+for _r in (["tie", "first"], ["first", "tie"], ["tie", "second"]):
+    _res, _ = _run_duel(_r)
+    check(f"one order tying ({_r}) is not a consistent win",
+          _res.outcome == refine.DUEL_TIE)
+
+print("\n== ADR-039 D2: swap is real, and the mapping cannot be inverted ==")
+_res, _fake = _run_duel(["first", "second"])
+_c1 = _fake.payloads[0]["messages"][1]["content"]
+_c2 = _fake.payloads[1]["messages"][1]["content"]
+
+
+def _duel_images(content):
+    return [c["image_url"]["url"] for c in content if c.get("type") == "image_url"]
+
+
+check("two calls are made — the swap is mandatory", len(_fake.payloads) == 2)
+check("order 1 presents A first, order 2 presents B first",
+      _duel_images(_c1) == [_uri_a, _uri_b]
+      and _duel_images(_c2) == [_uri_b, _uri_a])
+check("candidate role labels are code-owned and interpolate nothing",
+      [c["text"] for c in _c1 if c.get("type") == "text"][-2:]
+      == [refine._DUEL_FIRST_LABEL, refine._DUEL_SECOND_LABEL])
+check("the duel shows NO source anchor (D2)",
+      _JUDGE_SOURCE_LABEL not in json.dumps(_fake.payloads[0]))
+check("duel calls run at temperature 0 with the response cap on the wire",
+      _fake.payloads[0]["temperature"] == 0.0
+      and _fake.payloads[0]["max_tokens"] == refine.DEFAULT_JUDGE_MAX_TOKENS)
+_res, _fake_mt = _run_duel(["tie", "tie"],
+                           backend={"url": "http://x", "model": "m",
+                                    "max_tokens": 512})
+check("backend max_tokens is honored on duel calls",
+      _fake_mt.payloads[0]["max_tokens"] == 512)
+raises("a duel inherits the backend max_tokens validation",
+       lambda: _run_duel(["tie", "tie"],
+                         backend={"url": "http://x", "model": "m",
+                                  "max_tokens": 0}))
+_dpj = json.dumps(_fake.payloads[0])
+check("duel wire payload carries no path-shaped strings",
+      "candidate_" not in _dpj and "/tmp/" not in _dpj
+      and ".png" not in _dpj and ".safetensors" not in _dpj)
+
+print("\n== ADR-039 D2: both orders carry an IDENTICAL reference set ==")
+_res, _fake_r = _run_duel(["first", "second"], refs=[_img_ref],
+                          backend={"url": "http://x", "model": "m",
+                                   "judge_max_images": 3})
+_imgs1 = _duel_images(_fake_r.payloads[0]["messages"][1]["content"])
+_imgs2 = _duel_images(_fake_r.payloads[1]["messages"][1]["content"])
+check("the reference rides both calls, identically",
+      len(_imgs1) == len(_imgs2) == 3 and _imgs1[0] == _imgs2[0]
+      and _imgs1[0] not in (_uri_a, _uri_b))
+check("references precede the candidates, labeled by index only",
+      _fake_r.payloads[0]["messages"][1]["content"][1]["text"]
+      == refine._JUDGE_REF_LABEL.format(n=1))
+check("only the candidate order differs between the two calls",
+      _imgs1[1:] == [_uri_a, _uri_b] and _imgs2[1:] == [_uri_b, _uri_a])
+
+print("\n== ADR-039 D2: budget refusal drops refs, never the swap ==")
+_blogs = []
+_res, _fake_b = _run_duel(["first", "second"], refs=[_img_ref, _img_ref],
+                          logs=_blogs,
+                          backend={"url": "http://x", "model": "m"})
+check("an undeclared budget (2) drops the refs and keeps both calls",
+      len(_fake_b.payloads) == 2
+      and all(len(_duel_images(p["messages"][1]["content"])) == 2
+              for p in _fake_b.payloads))
+check("the drop is announced exactly once, not per call",
+      sum(1 for m in _blogs if "dropping" in m) == 1)
+check("the drop notice has a SINGLE sink — it never rides DuelResult.notices",
+      not any("dropping" in n for n in _res.notices))
+check("no duel call ever carries more images than judge_max_images",
+      all(len(_duel_images(p["messages"][1]["content"])) <= 2
+          for p in _fake_b.payloads)
+      and all(len(_duel_images(p["messages"][1]["content"])) <= 3
+              for p in _fake_r.payloads))
+
+print("\n== ADR-039 D1: a failed duel is VOID — promotes nothing, counts ==")
+for _label, _replies in (
+        ("endpoint error on call 1", [RefineError("endpoint down"), "first"]),
+        ("malformed duel JSON on call 1", ["not json at all", "first"]),
+        ("unknown winner enum on call 1", ['{"winner": "left"}', "first"])):
+    _fake_f = _FakeDuelJudge(_replies)
+    _orig = refine._post_judge
+    refine._post_judge = _fake_f
+    try:
+        refine.duel_candidates(_img_a, _img_b, "t",
+                               {"url": "http://x", "model": "m"},
+                               log=lambda m: None)
+    except refine.DuelError as _e:
+        check(f"{_label}: DuelError, no outcome, 1 call charged",
+              _e.failed_calls == 1 and len(_fake_f.payloads) == 1
+              and isinstance(_e, RefineError))
+    except Exception as _e:  # noqa: BLE001
+        check(f"{_label}: DuelError", False, detail=f"raised {type(_e).__name__}")
+    else:
+        check(f"{_label}: DuelError", False, detail="did not raise")
+    finally:
+        refine._post_judge = _orig
+_fake_f2 = _FakeDuelJudge(["first", RefineError("endpoint down")])
+_orig = refine._post_judge
+refine._post_judge = _fake_f2
+try:
+    refine.duel_candidates(_img_a, _img_b, "t", {"url": "http://x", "model": "m"},
+                           log=lambda m: None)
+except refine.DuelError as _e:
+    check("one order succeeding is NOT a duel result", _e.failed_calls == 1
+          and len(_fake_f2.payloads) == 2)
+else:
+    check("one order succeeding is NOT a duel result", False,
+          detail="did not raise")
+finally:
+    refine._post_judge = _orig
+check("DuelError is a RefineError (the loop's existing failure class)",
+      issubclass(refine.DuelError, RefineError))
+
+print("\n== ADR-039 D2: inherited F5 cap — both candidates are downscaled ==")
+# The 4x4 fixtures above make downscale_for_judge an identity, so they cannot
+# tell a dropped downscale from a kept one (code review INFO). Send a candidate
+# wider than JUDGE_MAX_PX and pin that the WIRE bytes are the reduced ones.
+_big = _PILImage.new("RGB", (refine.JUDGE_MAX_PX * 2, 8), (200, 100, 50))
+_big_raw_uri = refine.image_to_data_uri(_big)
+_fake_big = _FakeDuelJudge(["tie", "tie"])
+_orig = refine._post_judge
+refine._post_judge = _fake_big
+try:
+    refine.duel_candidates(_big, _img_b, "t", {"url": "http://x", "model": "m"},
+                           log=lambda m: None)
+finally:
+    refine._post_judge = _orig
+_wire_first = _duel_images(_fake_big.payloads[0]["messages"][1]["content"])[0]
+check("an oversize candidate reaches the judge downscaled, not raw",
+      _wire_first != _big_raw_uri
+      and _wire_first == refine.image_to_data_uri(
+          refine.downscale_for_judge(_big))
+      and len(_wire_first) < len(_big_raw_uri))
+_big_ref = _PILImage.new("RGB", (refine.JUDGE_MAX_PX * 2, 8), (10, 20, 30))
+_fake_bref = _FakeDuelJudge(["tie", "tie"])
+refine._post_judge = _fake_bref
+try:
+    refine.duel_candidates(_img_a, _img_b, "t",
+                           {"url": "http://x", "model": "m",
+                            "judge_max_images": 3},
+                           ref_images_judge=[_big_ref], log=lambda m: None)
+finally:
+    refine._post_judge = _orig
+check("an oversize judge reference is downscaled too",
+      _duel_images(_fake_bref.payloads[0]["messages"][1]["content"])[0]
+      == refine.image_to_data_uri(refine.downscale_for_judge(_big_ref))
+      != refine.image_to_data_uri(_big_ref))
+
+print("\n== ADR-039: the image-budget backstop is void-with-0-charged ==")
+# Declared unreachable behind select_duel_refs; pin the branch so a future edit
+# that seats another image trips a void duel here, not an HTTP 400 mid-run.
+_orig_build = refine.build_duel_payload
+
+
+def _overstuffed_payload(*a, **kw):
+    p = _orig_build(*a, **kw)
+    p["messages"][1]["content"].append(
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}})
+    return p
+
+
+_fake_over = _FakeDuelJudge(["first", "second"])
+refine.build_duel_payload = _overstuffed_payload
+refine._post_judge = _fake_over
+try:
+    refine.duel_candidates(_img_a, _img_b, "t", {"url": "http://x", "model": "m"},
+                           log=lambda m: None)
+except refine.DuelError as _e:
+    check("an over-budget payload voids the duel before any call is made",
+          _e.failed_calls == 0 and len(_fake_over.payloads) == 0)
+else:
+    check("an over-budget payload voids the duel", False, detail="did not raise")
+finally:
+    refine.build_duel_payload = _orig_build
+    refine._post_judge = _orig
+
+print("\n== ADR-039: a duel never routes through parse_verdict ==")
+_pv_calls = []
+_orig_pv = refine.parse_verdict
+
+
+def _spy_parse_verdict(raw):
+    _pv_calls.append(raw)
+    return _orig_pv(raw)
+
+
+refine.parse_verdict = _spy_parse_verdict
+try:
+    _run_duel([json.dumps({"winner": "first",
+                           "overrides": {"prompt": "PWNED"}}),
+               json.dumps({"winner": "second",
+                           "overrides": {"prompt": "PWNED"}})])
+finally:
+    refine.parse_verdict = _orig_pv
+check("parse_verdict is never called on a duel response", _pv_calls == [])
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
