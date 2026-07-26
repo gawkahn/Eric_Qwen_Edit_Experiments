@@ -120,11 +120,22 @@ need, every extra image costs judge context and money, and vLLM enforces a
 hard per-request image cap (`--limit-mm-per-prompt`, currently 4 on `:8021`).
 Explicit marking keeps the payload intentional.
 
-**Cap: at most 2 judge-marked refs** (anchor + 2 refs + candidate = 4,
-exactly the configured vLLM limit). Exceeding it is refused at entry with a
-message naming the limit — fail-closed at the boundary, not a 400 mid-run
-(the 2026-07-24 incident, where a 1-image server limit aborted a run three
-iterations in, is the precedent).
+**Cap: the judge-image budget is a BACKEND PROPERTY, not a repo constant**
+(amended 2026-07-25 — see below). The number of judge-marked refs allowed is
+`judge_max_images - 2` (the anchor and the candidate always occupy two
+slots). Exceeding it is refused at entry with a message naming the limit —
+fail-closed at the boundary, not a 400 mid-run (the 2026-07-24 incident,
+where a 1-image server limit aborted a run three iterations in, is the
+precedent).
+
+`judge_max_images` belongs in the enhancer-registry backend entry
+(`enhancers.toml`) alongside the endpoint's other properties, NOT hardcoded
+in refine: it mirrors that endpoint's `--limit-mm-per-prompt` and drifts
+independently of this repo. A conservative default (2 → zero judge refs)
+applies when a backend does not declare it, so an undeclared backend degrades
+to today's two-image behavior rather than failing mid-run. The
+`JUDGE_ERROR_ABORT_AFTER` path remains the drift backstop if a declared value
+overstates what the endpoint accepts.
 
 ### D4 — Rubric: identity match is a THIRD criterion, not preservation
 
@@ -282,6 +293,14 @@ REPLACING. There is nothing in the anchor to match against.
   v3 ADR must therefore re-disposition D3's cap arithmetic rather than
   inherit it, and decide whether a duel drops the anchor (preservation is
   already scored elsewhere) or the endpoint's cap is raised.
+
+  **Update 2026-07-25 (Grant):** the backends are being raised to 6 images
+  (effective on their next restart), explicitly to make room for the
+  multi-ref duel. At 6 the collision dissolves: reference + candidate A +
+  candidate B + anchor = 4, leaving two slots spare. The v3 ADR still owns
+  the arithmetic — it must read the budget from the backend entry (D3 as
+  amended) rather than assume any number, since a duel runs against whatever
+  endpoint the operator points it at.
 - **Raising the vLLM image cap beyond 4.** Operator-side infra; D3's cap
   tracks whatever the endpoint is configured for.
 
