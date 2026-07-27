@@ -1525,6 +1525,118 @@ finally:
 
 
 # ──────────────────────────────────────────────────────────────────────
+print("\n── ADR-040 D2: opt-in root disclosure on ping ────────────────")
+
+# D2 removes the false premise ADR-037 D5 rested on ("the client cannot know
+# its roots") by letting `ping` report the daemon's output_dir and
+# ref_image_roots — but ONLY when explicitly asked (D2a). The hazard being
+# designed against: `ping` is the request a future HTTP/mcpo bridge forwards as
+# a health check, and root enumeration must not be the default answer to the
+# cheapest unauthenticated call.
+
+_D2_OUT = "/tmp/d2-output-dir"
+_D2_ROOTS = ("/tmp/d2-output-dir", "/tmp/d2-extra-ref-root")
+
+
+def _ping_response(extra: dict) -> dict:
+    """Drive one ping through the real _handle_connection, return the response."""
+    a, b = socket.socketpair()
+    try:
+        srv._send(a, {"type": "ping", **extra})
+        srv._handle_connection(
+            conn=b,
+            output_dir=_D2_OUT,
+            model_base="/tmp",
+            device="cuda",
+            precision="bf16",
+            server_state={},
+            ref_roots=_D2_ROOTS,
+        )
+        resp = srv._recv(a)
+        return resp if resp is not None else {}
+    finally:
+        a.close()
+        b.close()
+
+
+# 1. A plain ping discloses NO paths — the leak-by-default negative.
+_plain = _ping_response({})
+check("plain ping still answers pong (no existing client path changed)",
+      _plain.get("status") == "ok" and _plain.get("message") == "pong",
+      f"resp={_plain!r}")
+check("plain ping discloses no output_dir",
+      "output_dir" not in _plain, f"resp={_plain!r}")
+check("plain ping discloses no ref_image_roots",
+      "ref_image_roots" not in _plain, f"resp={_plain!r}")
+
+# 2. report_roots=True gets the actual values the GATE compares against.
+_opted = _ping_response({"report_roots": True})
+check("ping report_roots=True reports output_dir",
+      _opted.get("output_dir") == _D2_OUT, f"resp={_opted!r}")
+check("ping report_roots=True reports ref_image_roots exactly as the gate holds them",
+      _opted.get("ref_image_roots") == list(_D2_ROOTS), f"resp={_opted!r}")
+
+# Report/gate parity. NOTE what is and isn't provable here: feeding the
+# REPORTED value back into _check_ref_paths is a tautology (this helper hands
+# back what it was given), so that check is deliberately absent — both slice-1
+# reviewers flagged an earlier version of it. The real invariant is a WIRING
+# one: run_server must pass ref_image_roots (the _resolve_ref_roots output,
+# realpath'd) into _handle_connection's single `ref_roots` parameter, which
+# then serves BOTH the report and _check_ref_paths. One parameter feeding both
+# is what makes divergence unrepresentable — and divergence is what would let a
+# client pass D3 entry validation and still be refused mid-run, i.e. the
+# incident this ADR exists to kill, surviving behind a green check.
+check("run_server reports the RESOLVED roots, not the raw --ref-root spawn tuple",
+      "server_state, extra_roots, ref_image_roots" in _inspect.getsource(srv.run_server))
+_hc_src = _inspect.getsource(srv._handle_connection)
+check("one ref_roots parameter feeds both the report and the ref gate",
+      'resp["ref_image_roots"] = list(ref_roots)' in _hc_src
+      and "_check_ref_paths(req, ref_roots)" in _hc_src)
+
+# 3. Explicit False is not an opt-in.
+_off = _ping_response({"report_roots": False})
+check("ping report_roots=False discloses no paths",
+      "output_dir" not in _off and "ref_image_roots" not in _off,
+      f"resp={_off!r}")
+
+# 4. The flag is honored ONLY on ping (D2a) — fail-closed, not ignored, so a
+#    future request type cannot inherit a disclosure flag by accident.
+_err = srv._validate_request({"type": "generate", "model": "m", "prompt": "p",
+                              "report_roots": True})
+check("report_roots on a generate request is a ValidationError",
+      _err is not None and "report_roots" in _err, f"err={_err!r}")
+_err = srv._validate_request({"type": "unload", "report_roots": True})
+check("report_roots on an unload request is a ValidationError",
+      _err is not None and "report_roots" in _err, f"err={_err!r}")
+check("report_roots on ping itself validates clean",
+      srv._validate_request({"type": "ping", "report_roots": True}) is None,
+      f"err={srv._validate_request({'type': 'ping', 'report_roots': True})!r}")
+
+# 5. Type is owned by the canonical validator (ADR-012), not by an isinstance
+#    predicate in server.py — a non-bool is rejected before the value check.
+_err = srv._validate_request({"type": "ping", "report_roots": "yes"})
+check("non-bool report_roots is rejected by the canonical validator",
+      _err is not None and "report_roots" in _err, f"err={_err!r}")
+_err = srv._validate_request({"type": "ping", "report_roots": 1})
+check("int report_roots is rejected (bool kind, not truthy-int)",
+      _err is not None and "report_roots" in _err, f"err={_err!r}")
+_err = srv._validate_request({"type": "ping", "report_roots": None})
+check("null report_roots is rejected (the sloppy-client value)",
+      _err is not None and "report_roots" in _err, f"err={_err!r}")
+_err = srv._validate_request({"type": "ping", "report_roots": ["true"]})
+check("list report_roots is rejected",
+      _err is not None and "report_roots" in _err, f"err={_err!r}")
+
+# 6. The gate is `is True`, not truthiness — so it fails CLOSED even if the
+#    _RUNTIME_KIND registration is ever removed. Pin the identity comparison
+#    itself: without the registration, validate_machine_request passes unknown
+#    keys through unchanged and a truthiness gate would disclose on any
+#    non-empty string (slice-1 security review MEDIUM).
+check("the disclosure gate uses `is True`, not truthiness",
+      'req.get("report_roots") is True' in _hc_src)
+
+
+# ──────────────────────────────────────────────────────────────────────
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print("──────────────────────────────────────────────────")

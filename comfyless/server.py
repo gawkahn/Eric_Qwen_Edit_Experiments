@@ -171,6 +171,17 @@ def _validate_request(req: Any) -> Optional[str]:
     req_type = req.get("type")
     if req_type not in ("generate", "unload", "ping"):
         return f"Unknown request type: {req_type!r}. Expected: generate | unload | ping"
+
+    # report_roots is honored ONLY on 'ping' (ADR-040 D2a). The canonical
+    # validator has already type-checked it as bool; this is the request-type
+    # VALUE check, mirroring the quant/output_format allowlist precedent below.
+    # Fail-closed rather than ignore: a disclosure flag that is silently
+    # accepted on other request types is one a future request type inherits by
+    # accident, which is exactly the leak-by-default shape D2 exists to avoid.
+    if "report_roots" in req and req_type != "ping":
+        return (f"Field 'report_roots': honored only on type 'ping', "
+                f"not {req_type!r}. Expected: type 'ping'")
+
     if req_type != "generate":
         return None
 
@@ -416,7 +427,51 @@ def _handle_connection(
     req_type = req["type"]
 
     if req_type == "ping":
-        _send_safe(conn, {"status": "ok", "message": "pong"})
+        resp: dict = {"status": "ok", "message": "pong"}
+        # ADR-040 D2: opt-in root disclosure. The refine loop needs the actual
+        # values to derive its run dir under (D1) and to validate every path
+        # the daemon will read BEFORE the first generation (D3), replacing the
+        # false "the client cannot know its roots" premise ADR-037 D5 rested on.
+        #
+        # OPT-IN, never the default response: `ping` is precisely the request a
+        # future HTTP/mcpo bridge forwards as a health check, and root
+        # enumeration — including a broad --ref-root — must not be the answer to
+        # the cheapest unauthenticated call. A blindly forwarded plain ping
+        # discloses nothing.
+        #
+        # RESIDUAL (D2a): this daemon cannot discriminate an MCP caller from a
+        # CLI caller — same UID, same socket, same schema — so the flag guards
+        # against accidental forwarding, not a determined caller. The structural
+        # fix is the `la mcp serve` boundary (D2b). Full reasoning lives in the
+        # ADR; the long form for a maintainer hitting a failure is in
+        # test_mcp_server.py's D2a block.
+        #
+        # `is True`, not truthiness (slice-1 security review MEDIUM): the ONLY
+        # thing making this bool-only is the _RUNTIME_KIND registration in
+        # params_validation.py, and validate_machine_request passes UNKNOWN keys
+        # through unchanged — so de-registering or renaming that entry would
+        # silently turn this gate into any-truthy-string. Identity comparison
+        # fails closed regardless of registration state, and adds no isinstance
+        # (ADR-012 / the N19 invariant both stay intact).
+        if req.get("report_roots") is True:
+            # The values the GATE actually compares against, not the spawn-time
+            # strings: output_dir is realpath'd by run_server and every
+            # ref_image_roots member by _resolve_ref_roots. Reporting anything
+            # else would let a client pass entry validation (D3) and still be
+            # refused mid-run — the incident this ADR exists to kill, surviving
+            # behind a green check.
+            resp["output_dir"] = output_dir
+            resp["ref_image_roots"] = list(ref_roots)
+            # The accepted residual above is only tolerable if it is
+            # OBSERVABLE (slice-1 security review MEDIUM): every other
+            # security-relevant event on this surface logs (PathError,
+            # RefPathError), so a disclosure that left no trace would make the
+            # residual undetectable after the fact. Count-only and path-free on
+            # purpose — the roots are already in the startup banner, and this
+            # line should not become a second copy of them.
+            _log(f"report_roots: disclosed output_dir + {len(ref_roots)} "
+                 f"ref root(s) to a ping client")
+        _send_safe(conn, resp)
         return True
 
     if req_type == "unload":

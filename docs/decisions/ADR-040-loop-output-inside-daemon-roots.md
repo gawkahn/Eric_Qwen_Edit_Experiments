@@ -1,7 +1,7 @@
 # ADR-040 — The loop's output directory lives inside the daemon's roots
 
-Status:   proposed
-AI-Disclosure: Claude (Fable 5) authored; Grant reviewed.
+Status:   accepted
+AI-Disclosure: Claude (Fable 5) authored; revised by Claude (Opus 5); Grant reviewed.
 
 ## Context
 

@@ -5130,6 +5130,48 @@ check("lora-notice: handler passes resolved lora_names to the notice builder",
       "lora_names" in _hg_src and "lora_names.append(rr.name)" in _hg_src)
 
 # ════════════════════════════════════════════════════════════════════════
+# ADR-040 D2a — report_roots is CLI-plane only; the MCP surface never asks.
+#
+# READ THIS BEFORE "FIXING" A FAILURE HERE. This is a regression TRIPWIRE, not
+# a control. The daemon cannot discriminate an MCP caller from a CLI caller —
+# same UID, same socket, same request schema — so it will answer report_roots
+# for anyone who sets it. What this test buys is a loud failure on the day
+# someone adds daemon wire-client code to the MCP surface without thinking
+# about root disclosure. If the MCP plane ever legitimately needs roots, the
+# answer is the `la mcp serve` process boundary (ADR-040 D2b) — NOT relaxing
+# this test.
+_d2_src = inspect.getsource(mcps)
+check("D2a: mcp_server.py never emits report_roots",
+      "report_roots" not in _d2_src)
+
+# The tripwire's premise, pinned so a reader knows WHY the check above is
+# currently vacuous: today the MCP surface reaches generation IN-PROCESS and
+# holds no daemon socket client at all. If any of these appears, the
+# disclosure question is live and the check above stops being free.
+# `_delegate_to_server` and a raw AF_UNIX socket are in the set because both
+# reviewers noted the two-string version was narrower than its own name — the
+# likeliest route is delegation through generate.py, and a hand-rolled client
+# needs neither helper.
+check("D2a premise: mcp_server.py holds no daemon socket-client code",
+      "socket_path" not in _d2_src
+      and "_send_server_command" not in _d2_src
+      and "_delegate_to_server" not in _d2_src
+      and "AF_UNIX" not in _d2_src)
+
+# The real slice-2/3 hazard (slice-1 security review MEDIUM): D3a puts the
+# shared entry-check helper — the thing that SENDS report_roots — in
+# generate.py, and mcp_server.py calls generate() in-process. If the ping were
+# issued from inside generate(), the MCP process would obtain the daemon's
+# roots while every check above stayed green. Worse, D3's refusal message is
+# specified to name the --ref-root to add, so root paths would ride out through
+# the MCP error frame to an LLM caller. Assert it here, while the assertion is
+# still free.
+import comfyless.generate as _d2_gen  # noqa: E402
+check("D2a: generate() — the function mcp_server calls in-process — never sends report_roots",
+      "report_roots" not in inspect.getsource(_d2_gen.generate))
+
+
+# ════════════════════════════════════════════════════════════════════════
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print("──────────────────────────────────────────────────")

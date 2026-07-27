@@ -1867,3 +1867,25 @@ adjacent surface. Trigger: the face-swap end-to-end test, or the next catalog
 slice. Fix: a separate longer cap for template-shaped trained words (e.g.
 `TRIGGER_TEMPLATE_CAP` ~512 B, one per entry), or a dedicated
 `instruction_template` description column that the planner sees whole.
+
+## 2026-07-27 — daemon ValidationError refusals leave no server-side trace
+Found by the ADR-040 slice-1 security review (MEDIUM). Every other
+security-relevant refusal on the daemon surface logs before responding —
+`PathError` and `RefPathError` both `_log(...)` the redacted request — but the
+generic `ValidationError` branch in `_handle_connection` responds silently. A
+caller probing the new `report_roots` flag across `generate` / `unload`
+therefore leaves no record at all, which matters because ADR-040 D2a
+deliberately accepts a residual (the daemon cannot discriminate an MCP caller
+from a CLI caller) whose only cheap detective control is a log line. The
+disclosure half was closed in slice 1 — a successful `report_roots` ping now
+logs a count-only line — but the refusal half was left alone.
+Why not now: the branch is generic, so logging there changes behavior for
+EVERY validation error on the surface, not just this flag. That is a
+volume/PII-shaped decision of its own (request bodies carry prompts, and the
+existing path-error logs redact `prompt` explicitly for that reason), and
+bundling it into a slice about a ping field would be the "clean up while here"
+the constitution forbids. Trigger: the next `server.py` slice, or the first
+time an operator needs to reconstruct who probed the daemon. Fix: log the
+refusal with the same redaction the `PathError` branch uses
+(`{k: v for k, v in req.items() if k != "prompt"}`), or add a targeted log for
+value-check refusals only.

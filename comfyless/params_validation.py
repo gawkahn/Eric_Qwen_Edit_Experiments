@@ -160,6 +160,18 @@ _RUNTIME_KIND = types.MappingProxyType({
     #     only the interactive CLI on a TTY sends False.
     "ref_dims_explicit":  _KIND_BOOL,
     "ref_drop_strict":    _KIND_BOOL,
+    # Opt-in root disclosure on `ping` (ADR-040 D2). Registered here so the
+    # canonical validator type-rejects a non-bool before server._validate_request
+    # applies the request-type value check (honored ONLY on type='ping';
+    # D2a — a free-floating field is one a future request type inherits by
+    # accident). Deliberately absent from SCHEMA_KIND: this is a wire-only
+    # disclosure request, never a sidecar-replayable param.
+    #
+    # CLI-PLANE ONLY (D2a): refine/generate may set it; mcp_server.py may NOT.
+    # Stated here because this module is the one file BOTH planes read, so it
+    # is where a future author adding a field looks. Tripwire lives in
+    # test_mcp_server.py's D2a block.
+    "report_roots":       _KIND_BOOL,
     # (The quant triple lived here until 2026-07-08 — now in SCHEMA_KIND;
     # see the note there. The wire union below is unchanged by the move.)
 })
