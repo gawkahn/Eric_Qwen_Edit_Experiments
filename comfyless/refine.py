@@ -141,6 +141,15 @@ DEFAULT_SIDEWAYS_CAP = 3
 #: replaces.
 DEFAULT_SEED_BATCH = 3
 
+#: Consecutive FAILED seed batches before the config is declared exhausted
+#: (ADR-039 D3, amended 2026-07-26 after the first live run). One failed batch
+#: is thin evidence: a batch varies only the seed, so a single loss says noise
+#: cannot rescue this config — not that the planner is out of ideas. The live
+#: run ended at 6 of 20 generations with the planner still producing its most
+#: responsive moves (a LoRA swap and a targeted negative constraint) that it
+#: never got to evaluate.
+DEFAULT_EXHAUST_AFTER_BATCHES = 2
+
 #: Promotions between anchor duels (ADR-039 D4): every N-th promotion, current
 #: best is duelled against the run's EARLIEST promoted best. If the old one
 #: wins, the chain has drifted and the run reverts to it. This is the KL-anchor
@@ -2066,6 +2075,7 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 duel_system_prompt: str = DUEL_SYSTEM_PROMPT,
                 sideways_cap: int = DEFAULT_SIDEWAYS_CAP,
                 seed_batch: int = DEFAULT_SEED_BATCH,
+                exhaust_after_batches: int = DEFAULT_EXHAUST_AFTER_BATCHES,
                 anchor_duel_every: int = DEFAULT_ANCHOR_DUEL_EVERY,
                 output_format: Optional[OutputFormat] = None,
                 edit_source: Optional[str] = None,
@@ -2114,7 +2124,9 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
     iterations with nothing promoted — and a batch generates `seed_batch` arms
     at best's config varying only the seed, picking a winner by
     single-elimination duels with an earliest-arm tie-break. A batch winner that
-    cannot beat best ends the run as `exhausted`. Separately, every
+    cannot beat best ends the run as `exhausted` after `exhaust_after_batches`
+    consecutive such losses (D3 amended 2026-07-26 — one loss says noise cannot
+    rescue the config, not that the planner is out of ideas). Separately, every
     `anchor_duel_every` promotions, best is duelled against the run's FIRST best
     (pinned by value at first promotion); if the old one wins, the chain has
     drifted and the run reverts to the pinned config and image, marking the
@@ -2167,6 +2179,9 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
     # even when a batch has just answered the same plateau.
     plateau_streak = 0
     pending_batch = False
+    #: Consecutive seed batches whose winner failed the gate (D3 amendment).
+    #: Reset by any promotion — a batch that leads anywhere clears the count.
+    failed_batches = 0
     # D4 anchor state, pinned BY VALUE at the FIRST promotion: decoded bytes
     # copied into a loop-owned file, the judge-resolution image held in memory,
     # and a config snapshot. The anchor duel and any revert consume ONLY these —
@@ -2648,14 +2663,24 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
         # through to the ordinary not-promoted path: charged, best kept, run
         # continues — identical to a void inside the bracket.
         if batch_iteration and not promoted and not duel_failed:
+            failed_batches += 1
+            if failed_batches >= exhaust_after_batches:
+                log(f"[refine] iter {i}: seed batch {failed_batches}/"
+                    f"{exhaust_after_batches} failed against best (iter "
+                    f"{best.index if best else '-'}) — this config is "
+                    f"EXHAUSTED: varying the seed at fixed config cannot "
+                    f"improve on it across repeated batches, and rewording has "
+                    f"already plateaued. Stopping with the current best "
+                    f"(ADR-039 D3, amended).")
+                exhausted = True
+                break
             log(f"[refine] iter {i}: the seed batch's winner did not beat best "
-                f"(iter {best.index if best else '-'}) — this config is "
-                f"EXHAUSTED: varying the seed at fixed config cannot improve "
-                f"on it, and rewording has already plateaued. Stopping with "
-                f"the current best (ADR-039 D3).")
-            exhausted = True
-            break
+                f"(iter {best.index if best else '-'}) — batch "
+                f"{failed_batches}/{exhaust_after_batches} failed. A batch "
+                f"varies only the seed, so one loss is not proof the config is "
+                f"spent: returning to the planner (ADR-039 D3, amended)")
         if promoted:
+            failed_batches = 0   # a batch that led anywhere clears the count
             best = cand
             # Pin the new incumbent's image BY VALUE for future duels, at judge
             # resolution (see best_duel_img above). Taken from the decoded
@@ -2839,6 +2864,12 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                             rec["is_best"] = True
                     reverted = True
                     reverts += 1
+                    # A revert changes WHICH CONFIG the exhaustion evidence is
+                    # about, so the batch counter cannot carry across it (both
+                    # reviewers): otherwise one loss at the drifted config plus
+                    # one at the anchor's would exhaust the run on the claim
+                    # that a single config is spent.
+                    failed_batches = 0
                     sideways_streak = 0
                     plateau_streak = 0
                     # The promotion this iteration recorded has just been
@@ -3310,6 +3341,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         f"tie-break (default {DEFAULT_SEED_BATCH}, minimum "
                         f"2). These generations count against "
                         f"--max-iterations")
+    p.add_argument("--exhaust-after-batches", type=int,
+                   default=DEFAULT_EXHAUST_AFTER_BATCHES, metavar="N",
+                   help=f"Declare the config EXHAUSTED (and stop) after N "
+                        f"consecutive seed batches whose winner failed the "
+                        f"gate (default {DEFAULT_EXHAUST_AFTER_BATCHES}). A "
+                        f"batch varies only the seed, so one loss is thin "
+                        f"evidence that the planner is out of ideas")
     p.add_argument("--anchor-duel-every", type=int,
                    default=DEFAULT_ANCHOR_DUEL_EVERY, metavar="N",
                    help=f"Every N promotions, duel current best against the "
@@ -3818,6 +3856,10 @@ def main(argv: Optional[List[str]] = None) -> int:
               f"the plateau escape), got {args.sideways_cap!r}",
               file=sys.stderr)
         return 2
+    if args.exhaust_after_batches < 1:
+        print(f"[refine] --exhaust-after-batches must be >= 1, got "
+              f"{args.exhaust_after_batches!r}", file=sys.stderr)
+        return 2
     if args.anchor_duel_every < 0:
         print(f"[refine] --anchor-duel-every must be an integer >= 0 (0 "
               f"disables the drift check), got {args.anchor_duel_every!r}",
@@ -4029,6 +4071,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             duel_band=args.duel_band, duel_system_prompt=duel_system_prompt,
             sideways_cap=args.sideways_cap, seed_batch=args.seed_batch,
             anchor_duel_every=args.anchor_duel_every,
+            exhaust_after_batches=args.exhaust_after_batches,
             output_format=out_fmt,
             edit_source=edit_source, static_refs=static_refs, log=log)
     except RefineError as e:

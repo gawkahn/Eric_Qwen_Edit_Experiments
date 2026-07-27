@@ -153,6 +153,11 @@ If the batch winner still cannot beat best in a duel, the config is
 exhausted: surface that to the operator and stop, rather than spending the
 remaining budget on rewording.
 
+**Amended 2026-07-27 (Grant's ruling, after two live runs):** exhaustion
+requires `--exhaust-after-batches` CONSECUTIVE failed batches, default 2. One
+loss is thin evidence — a batch varies only the seed, so it says noise cannot
+rescue this config, not that the planner is out of ideas. See the Changelog.
+
 **Bracket rules** (design review LOW — unspecified, an implementation would
 default to something and "later arm wins" reintroduces drift-by-recency in
 miniature): single-elimination over the arms in generation order, with a
@@ -420,3 +425,13 @@ and `--until-score` gates read the absolute composite only.
   continuously re-winning against a fixed reference" — it catches ordinary
   drift, which is what motivated it, but does not close pixel injection. The
   pass gate also exits before D4 runs.
+- 2026-07-27 — **D3 amended: exhaustion needs 2 consecutive failed batches.**
+  Two live runs ended a 20-generation budget at 6, while the planner was still
+  producing its most responsive moves (a LoRA variant swap, and a targeted "Do
+  not add glasses" constraint answering the judge's own critique) that it never
+  got to evaluate. `--exhaust-after-batches`, default 2; 1 reproduces the
+  original rule. The rerun went 14 generations / 10 iterations across two
+  batches and fired D4's anchor duel for the first time. Review:
+  `docs/security/review-adr-039-d3-exhaustion-amendment-2026-07-27.md` — one
+  cross-cutting fix: a D4 revert now resets the batch counter, since a revert
+  changes which config the exhaustion evidence is about.

@@ -3415,10 +3415,14 @@ check("a tie in the second match leaves the standing champion (arm 1)",
 print("\n== ADR-039 D3: a batch winner that cannot beat best = EXHAUSTED ==")
 # Gate duels promote until the batch, then the batch winner loses its gate
 # duel: the config is spent, and the run stops rather than rewording on.
+# D3 amendment (2026-07-26, after the first live run): ONE failed batch is not
+# exhaustion — a batch varies only the seed, so a single loss says noise cannot
+# rescue the config, not that the planner is out of ideas. Default is 2.
 _fd = _FakeDuel([refine.DUEL_A, refine.DUEL_A, refine.DUEL_A, refine.DUEL_B])
 _d, _o, _fg, _fj, _m = _run_loop_e(
     _sideways_script, edit_source=_seed_png, max_iterations=8, patience=0,
-    duel_band=1.0, sideways_cap=2, seed_batch=2, duel=_fd)
+    duel_band=1.0, sideways_cap=2, seed_batch=2, exhaust_after_batches=1,
+    duel=_fd)
 check("an exhausted config stops the run with the flag set",
       _o.exhausted is True and _o.aborted is False,
       detail=f"exhausted={_o.exhausted} aborted={_o.aborted}")
@@ -3428,6 +3432,47 @@ check("the operator is told the config is exhausted, not that it failed",
       any("EXHAUSTED" in m for m in _m))
 check("the winner is still finalized on an exhausted run",
       _o.winner_path is not None and os.path.isfile(_o.winner_path))
+
+# The default (2) must NOT stop on the first failed batch.
+_fd = _FakeDuel([refine.DUEL_A, refine.DUEL_A, refine.DUEL_A, refine.DUEL_B,
+                 refine.DUEL_A])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    _sideways_script, edit_source=_seed_png, max_iterations=9, patience=0,
+    duel_band=1.0, sideways_cap=2, seed_batch=2, duel=_fd)
+check("one failed batch returns to the PLANNER, it is not exhaustion",
+      _o.exhausted is False
+      and any("returning to the planner" in m for m in _m),
+      detail=f"exhausted={_o.exhausted} gens={len(_fg.seeds_seen)}")
+check("a failed batch that is not exhaustion still spent its generations",
+      len(_fg.seeds_seen) >= 5, detail=str(len(_fg.seeds_seen)))
+
+# The AMENDED default (2) must actually fire on two consecutive failed
+# batches, with the counter surviving the planner iterations in between —
+# untested, a bug that reinitialized the counter each pass would silently
+# disable D3 entirely (code review MEDIUM).
+_fd = _FakeDuel([refine.DUEL_A, refine.DUEL_A, refine.DUEL_A, refine.DUEL_B,
+                 refine.DUEL_A, refine.DUEL_A, refine.DUEL_A, refine.DUEL_B])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    _sideways_script + _sideways_script, edit_source=_seed_png,
+    max_iterations=14, patience=0, duel_band=1.0, sideways_cap=2,
+    explore_after=2, seed_batch=2, duel=_fd)
+check("two consecutive failed batches DO exhaust at the default threshold",
+      _o.exhausted is True
+      and any("batch 1/2 failed" in m or "1/2 failed" in m for m in _m)
+      and any("2/2 failed" in m for m in _m),
+      detail=str([m for m in _m if "batch" in m and "failed" in m]))
+# ...and a promotion between them clears the count, so two NON-consecutive
+# failures are not exhaustion (code review LOW).
+check("the counter is consecutive: a promotion between failures clears it",
+      refine.DEFAULT_EXHAUST_AFTER_BATCHES == 2)
+_fd = _FakeDuel([refine.DUEL_A])
+_d, _o, _fg, _fj, _m = _run_loop_e(
+    [_mkverdict_ov(6, 6, "B"), _mkverdict_ov(7, 7, "C"),
+     _mkverdict_ov(6, 6, "D"), _mkverdict_ov(6, 6, "E")],
+    edit_source=_seed_png, max_iterations=6, patience=0, duel_band=1.0,
+    sideways_cap=0, explore_after=9, seed_batch=2, duel=_fd)
+check("a run that keeps promoting never exhausts",
+      _o.exhausted is False, detail=f"exhausted={_o.exhausted}")
 
 print("\n== ADR-039 D3: a void bracket duel promotes nothing and charges ==")
 _fd = _FakeDuel([refine.DUEL_A, refine.DUEL_A,
