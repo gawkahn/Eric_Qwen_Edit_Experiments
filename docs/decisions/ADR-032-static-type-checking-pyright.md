@@ -75,5 +75,13 @@ install — unfixable from this repo without stub packages.
   baseline increases outright. Deliberate increases use `# user-approved`
   (hook) / `Policy-override:` (git-policy). Count parsing anchored to
   pyright's summary-line shape in both the hook and the CI job.
+- 2026-07-27 — the single global baseline integer is superseded by per-root
+  baselines (`comfyless`/`nodes`/`pipelines`) — see
+  `docs/decisions/ADR-042-per-root-typecheck-baselines.md`. This ADR's
+  posture (tool choice, ratchet-not-drive-to-zero, the `comfy.*`
+  missing-import precedent, the two enforcement layers) is unchanged and
+  still governs; only the shape of the number the mechanism reads changed.
+  Status stays `accepted`. AI-Disclosure for this amendment: Claude
+  (Sonnet 5) authored; Grant reviewed.
 
 AI-Disclosure: Claude (Fable 5) authored; Grant reviewed.
