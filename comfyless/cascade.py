@@ -223,7 +223,12 @@ def _resolve_scaffolding(repo: str, allow_hf_download: bool) -> str:
 
 def _load_unet(path: str, torch_dtype, *, label: str, config_subfolder: str, scaffolding_dir: str):
     """Load a StableCascadeUNet from either a single safetensors file or a diffusers tree."""
-    from diffusers import StableCascadeUNet
+    # Imported from the defining submodule, not top-level `diffusers` — this
+    # symbol is absent from diffusers 0.39.0's TYPE_CHECKING re-export block
+    # (an upstream gap between its lazy _import_structure and its static
+    # stub), so `from diffusers import StableCascadeUNet` is a real runtime
+    # import but a pyright false negative either way you cut it.
+    from diffusers.models.unets.unet_stable_cascade import StableCascadeUNet
     if os.path.isdir(path):
         _log(f"[comfyless] {label}: loading diffusers tree from {path}")
         return StableCascadeUNet.from_pretrained(path, torch_dtype=torch_dtype)
@@ -256,7 +261,11 @@ def _load_unet(path: str, torch_dtype, *, label: str, config_subfolder: str, sca
 
 def _load_stage_a(path: Optional[str], torch_dtype, *, scaffolding_dir: str):
     """Load the Paella VQ-VAE (Stage A). Defaults to scaffolding/vqgan/."""
-    from diffusers.pipelines.wuerstchen import PaellaVQModel  # transitive of StableCascadeDecoderPipeline
+    # PaellaVQModel moved under `deprecated.wuerstchen` at some prior diffusers
+    # bump; the old `diffusers.pipelines.wuerstchen` submodule path no longer
+    # exists at all (ModuleNotFoundError) — this was a dead import, unexercised
+    # by test_cascade.py's mocked paths, until pyright caught it (ADR-042).
+    from diffusers.pipelines.deprecated.wuerstchen.modeling_paella_vq_model import PaellaVQModel
     target = path or os.path.join(scaffolding_dir, "vqgan")
     if os.path.isdir(target):
         _log(f"[comfyless] stage_a: loading diffusers tree from {target}")
@@ -284,9 +293,14 @@ def build_pipelines(cfg: Dict[str, Any], device: str, allow_hf_download: bool):
 
     Returns (prior_pipeline, decoder_pipeline). Both moved to `device`.
     """
-    from diffusers import StableCascadePriorPipeline, StableCascadeDecoderPipeline
+    # Imported from the defining submodules, not top-level `diffusers` /
+    # `diffusers.schedulers` — pyright doesn't credit diffusers 0.39.0's lazy
+    # `__getattr__` re-exports as PUBLIC re-exports (reportPrivateImportUsage),
+    # even though the top-level import works fine at runtime.
+    from diffusers.pipelines.stable_cascade.pipeline_stable_cascade_prior import StableCascadePriorPipeline
+    from diffusers.pipelines.stable_cascade.pipeline_stable_cascade import StableCascadeDecoderPipeline
     from transformers import CLIPTextModelWithProjection, CLIPTokenizer
-    from diffusers.schedulers import DDPMWuerstchenScheduler
+    from diffusers.schedulers.scheduling_ddpm_wuerstchen import DDPMWuerstchenScheduler
 
     prior_dtype   = _resolve_torch_dtype(cfg["prior_dtype"])
     decoder_dtype = _resolve_torch_dtype(cfg["decoder_dtype"])

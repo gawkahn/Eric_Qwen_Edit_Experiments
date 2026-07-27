@@ -1915,3 +1915,32 @@ introduced the regression. Fix, if it recurs often: extend
 `scripts/typecheck-per-root.sh`'s grouping to support a second-level
 override (e.g. `comfyless/generate.py` as its own baseline key) so a leased
 file can ratchet independently of the root it lives in.
+
+## 2026-07-27 — comfyless/cascade.py's Stable Cascade imports are untested against real diffusers
+Found by code-reviewer during the ADR-042 comfyless/ drawdown (verifying the
+`cascade.py` import-path fixes). `test_cascade.py` replaces `build_pipelines`
+wholesale with a mock (`test_cascade.py:659-660`), so its 152/152 green does
+NOT exercise the real `from diffusers... import StableCascadePriorPipeline,
+StableCascadeDecoderPipeline, DDPMWuerstchenScheduler` / `PaellaVQModel`
+imports this slice fixed — pyright is the only thing that caught the dead
+`PaellaVQModel` import path (see the ADR-040/ADR-042 handoff commit history),
+and would be the only thing to catch the next one. Compounding factor: the
+pinned diffusers 0.39.0 already carries `_last_supported_version = "0.35.2"`
+on `StableCascadePriorPipeline` (`DeprecatedPipelineMixin`, warning-only, not
+a raise, per code-reviewer) — this pipeline is upstream-abandoned, so its
+internal import paths are more likely than most to shift or vanish on a
+future diffusers bump, silently, since nothing here would catch it except a
+pyright run.
+Why not now: writing a real (non-mocked) smoke test for `build_pipelines`
+needs real Stable Cascade weights on disk or a much heavier mock that
+actually imports the real diffusers classes — a bigger lift than this
+drawdown slice's scope (fixing existing pyright errors, not writing new
+coverage). Trigger: the next diffusers version bump (re-run pyright on
+`comfyless/cascade.py` specifically as part of that bump's proof, don't rely
+on `test_cascade.py` staying green), or a Stable Cascade generation request
+actually failing in practice. Fix: either a lightweight test that imports
+(not mocks) `PaellaVQModel`/`StableCascadeDecoderPipeline`/etc. and asserts
+they're still importable from the paths `cascade.py` uses, or accept the
+residual and rely on the pyright ratchet catching it at the next diffusers
+bump (this repo's precedent for "pyright is the safety net, not the test
+suite" — see ADR-032's `comfy.*` missing-import cluster).

@@ -429,6 +429,19 @@ def validate_machine_request(payload: Any) -> ValidationResult:
             continue
         ok, payload_or_err = _check_field(key, value, kind)
         if not ok:
+            # _check_field's docstring invariant: (False, payload) always
+            # pairs payload with a ValidationResult — true for every current
+            # return (each is `_make_err(...)`). Narrowed without raising:
+            # this module's own "never raises across the boundary" contract
+            # (docs/vision/slice-machine-boundary-validator.md) covers this
+            # function too, and server.py's accept loop has no exception
+            # handler at all, so an AssertionError here would be as fatal as
+            # a caller crash — fail closed with a structured error instead.
+            if not isinstance(payload_or_err, ValidationResult):
+                return _make_err(
+                    "internal_error", key,
+                    f"validator contract violation for field kind {kind!r}",
+                )
             return payload_or_err
         validated[key] = payload_or_err
 

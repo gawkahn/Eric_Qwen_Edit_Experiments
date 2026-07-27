@@ -161,7 +161,7 @@ _KINDS = ("model", "lora", "transformer")
 # non-conventional layouts declare entries via the manifest. The
 # convention is anchored to this codebase's actual ComfyUI directory
 # layout (the 2026-05-23 Vision amendment).
-_SCAN_DIR_TO_KIND = {
+_SCAN_DIR_TO_KIND: Dict[str, Literal["lora", "transformer"]] = {
     "loras":            "lora",
     "checkpoints":      "transformer",
     "diffusion_models": "transformer",
@@ -488,7 +488,7 @@ def _scan(model_base_real: str) -> Iterator[Tuple[CatalogEntry, str]]:
 
 
 def _scan_kind_root(
-    root_real: str, kind: str
+    root_real: str, kind: Literal["lora", "transformer"]
 ) -> Iterator[Tuple[CatalogEntry, str]]:
     """Recursively yield (entry, stem) for every `.safetensors` under
     `root_real` (already realpath-resolved), minting each as `kind` (ADR-018).
@@ -738,10 +738,11 @@ def build_catalog(
     # model-base → lora roots → transformer roots → manifest.
     # Root validation fails CLOSED (ADR-018 §2): os.walk on a missing path
     # yields nothing, which would silently fail open into a partial catalog.
-    for flag, kind, paths in (
+    _kind_roots: Tuple[Tuple[str, Literal["lora", "transformer"], Tuple[str, ...]], ...] = (
         ("--lora-path", "lora", lora_paths),
         ("--transformer-path", "transformer", transformer_paths),
-    ):
+    )
+    for flag, kind, paths in _kind_roots:
         for p in paths:
             root_real = os.path.realpath(p)
             if not os.path.isdir(root_real):

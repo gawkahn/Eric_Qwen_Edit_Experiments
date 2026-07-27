@@ -228,10 +228,10 @@ def build(db_path: str,
     # infer_model_family already ran inside the scan). Base-name → family
     # resolves via the model dir realpath (bases point at the model root or
     # its transformer/ subdir).
-    model_dir_to_family = {
-        e["abs_path"]: e["model_family"]
+    model_dir_to_family: Dict[str, str] = {
+        e["abs_path"]: fam
         for e in scan.values()
-        if e["kind"] == "model" and e.get("model_family")
+        if e["kind"] == "model" and (fam := e.get("model_family"))
     }
     base_family: Dict[str, str] = {}
     for bname, bpath in manifest_bases.items():
@@ -247,9 +247,10 @@ def build(db_path: str,
     try:
         with conn:
             for name, e in sorted(scan.items()):
-                if e["kind"] == "model" and e.get("model_family"):
+                fam = e.get("model_family")
+                if e["kind"] == "model" and fam:
                     catalog_db.upsert_family(
-                        conn, name=e["model_family"],
+                        conn, name=fam,
                         hf_local_path=e["abs_path"])
                     stats["families"] += 1
             known_families = list(model_dir_to_family.values())

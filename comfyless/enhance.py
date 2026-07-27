@@ -301,7 +301,13 @@ def _load_reprompt(model_dir: str, device: str, precision: str, quant: str = "no
             print(f"[comfyless] WARNING: hunyuan-reprompt fp8 quantization "
                   f"failed ({e}) — reprompt model left in {precision}",
                   file=sys.stderr)
-    model = model.to(device).eval()
+    # pyright false positive: PreTrainedModel.to is @wraps(torch.nn.Module.to)
+    # (transformers/modeling_utils.py) — wrapping an OVERLOADED torch method
+    # collapses it to a single signature arm, so a plain `str` device
+    # mismatches even though DeviceLikeType (torch's own Union) includes str.
+    # Confirmed at runtime: this call works on every AutoModelForCausalLM
+    # instance. Not a None-reachability question — an upstream stub gap.
+    model = model.to(device).eval()  # pyright: ignore[reportArgumentType]
     # Tokenizer: requires TRC (custom HYTokenizer via auto_map); gated by the
     # hash check above.
     tok = AutoTokenizer.from_pretrained(
@@ -387,7 +393,16 @@ def enhance_hunyuan_reprompt(text: str, cfg: dict, n: int,
     # small card OOMs.
     try:
         with torch.no_grad():
-            gen = model.generate(
+            # pyright false positive: transformers 5.5.3's `GenerativePreTrainedModel`
+            # Protocol (transformers/_typing.py, self-documented as written for
+            # the `ty` checker, not pyright) is what `.generate()`'s own `self`
+            # annotation requires; `_BaseModelWithGenerate` (this function's
+            # declared model type) fails pyright's stricter Protocol variance
+            # check against it. A DIFFERENT upstream cause than the .to() call
+            # in _load_reprompt (that one is an @wraps-over-overload issue).
+            # Confirmed at runtime: every AutoModelForCausalLM instance
+            # implements .generate() via this exact mixin.
+            gen = model.generate(  # pyright: ignore[reportAttributeAccessIssue]
                 **enc, max_new_tokens=_REPROMPT_MAX_NEW_TOKENS,
                 num_return_sequences=max(1, n), **gen_kwargs,
             )
