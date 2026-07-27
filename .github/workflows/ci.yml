@@ -12,8 +12,9 @@
 #   - any semgrep SAST finding (0-baseline, 7 triaged suppressions inline)
 #   - any non-registry lock source, non-ADR-031 license, or known CVE in the
 #     locked deps (two documented no-fix ignores in osv-scanner.toml)
-#   - any pyright error count ABOVE .claude/typecheck-baseline (ADR-032
-#     ratchet — the authoritative fail-CLOSED mirror of the local hook)
+#   - any pyright error count ABOVE its root's .claude/typecheck-baseline
+#     entry (ADR-032 ratchet, ADR-042 per-root aggregation — the
+#     authoritative fail-CLOSED mirror of the local hook)
 #   - any test-suite failure (`just tests` — the standalone test_*.py battery;
 #     verified CPU-safe by a CUDA_VISIBLE_DEVICES="" full run at adoption)
 #
@@ -133,20 +134,30 @@ jobs:
           cache: false
       - run: mise trust ./mise.toml
       - run: mise install
-      # ADR-032 ratchet, fail CLOSED: no parseable count = failure (unlike the
-      # local hook, which fails open as a convenience layer).
-      - name: pyright (ratchet vs .claude/typecheck-baseline)
+      # ADR-032 ratchet (ADR-042 per-root), fail CLOSED: no parseable per-root
+      # counts = failure (unlike the local hook, which fails open as a
+      # convenience layer). scripts/typecheck-per-root.sh is the single
+      # source of the file->root grouping logic, shared with the local hook.
+      - name: pyright (ratchet vs .claude/typecheck-baseline, per root)
         run: |
           set -uo pipefail
-          out=$(mise exec -- pyright 2>&1) || true
-          echo "$out" | tail -3
-          # Anchor on pyright's summary-line shape, last match — a diagnostic
-          # containing "N error" text must not be parsed as the count.
-          current=$(echo "$out" | grep -oE '^[0-9]+ errors?, [0-9]+ warning' | tail -1 | grep -oE '^[0-9]+')
-          [ -n "$current" ] || { echo "FATAL: no error count parsed — failing closed"; exit 1; }
-          baseline=$(tr -dc '0-9' < .claude/typecheck-baseline)
-          echo "pyright errors: $current (baseline $baseline)"
-          [ "$current" -le "$baseline" ] || { echo "RATCHET VIOLATION: $current > $baseline (ADR-032)"; exit 1; }
+          current_lines=$(scripts/typecheck-per-root.sh)
+          [ -n "$current_lines" ] || { echo "FATAL: no per-root counts parsed — failing closed"; exit 1; }
+          echo "$current_lines"
+          rc=0
+          while IFS='=' read -r root current; do
+            [ -z "$root" ] && continue
+            current=$(printf '%s' "$current" | tr -dc '0-9')
+            [ -n "$current" ] || { echo "FATAL: unparseable count for root '$root' — failing closed"; rc=1; continue; }
+            baseline=$(grep -E "^${root}=" .claude/typecheck-baseline | tail -1 | cut -d= -f2 | tr -dc '0-9')
+            [ -n "$baseline" ] || { echo "FATAL: no baseline entry for root '$root' — failing closed"; rc=1; continue; }
+            echo "  $root: $current (baseline $baseline)"
+            if [ "$current" -gt "$baseline" ]; then
+              echo "RATCHET VIOLATION: $root: $current > $baseline (ADR-032/ADR-042)"
+              rc=1
+            fi
+          done <<< "$current_lines"
+          exit $rc
 
   supply-chain:
     name: supply chain (sources + license + cve)

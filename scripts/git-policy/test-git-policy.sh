@@ -37,12 +37,71 @@ no pc_no_floors '+    "foo[extra]^2.0",'
 ok pc_tech_debt_no_deletion $'@@ -1 +2 @@\n+Resolved: 2026-07-16 — done'
 no pc_tech_debt_no_deletion $'@@ -1 +0 @@\n-## 2026-01-01 — some entry header'
 
-# --- typecheck-ratchet baseline (ADR-032: may only decrease) ---
-ok pc_baseline_no_increase "1026" "1026"      # unchanged
-ok pc_baseline_no_increase "1026" "900"       # drawdown
-ok pc_baseline_no_increase ""     "1026"      # introducing the file
-no pc_baseline_no_increase "1026" "1076"      # bump — blocked
-ok pc_baseline_no_increase "1026\n" " 900 "   # whitespace/garble tolerated
+# --- typecheck-ratchet baseline (ADR-032: may only decrease; ADR-042: per root) ---
+ok pc_baseline_no_increase $'comfyless=52\nnodes=520\npipelines=454' $'comfyless=52\nnodes=520\npipelines=454'   # unchanged
+ok pc_baseline_no_increase $'comfyless=52\nnodes=520\npipelines=454' $'comfyless=8\nnodes=520\npipelines=454'    # drawdown on one root
+ok pc_baseline_no_increase ""                                        $'comfyless=52\nnodes=520\npipelines=454'  # introducing the file
+no  pc_baseline_no_increase $'comfyless=52\nnodes=520\npipelines=454' $'comfyless=60\nnodes=520\npipelines=454'  # bump on one root — blocked, even with the others unchanged
+no  pc_baseline_no_increase $'comfyless=52\nnodes=520\npipelines=454' $'comfyless=8\nnodes=520\npipelines=460'   # drawdown on one root does NOT excuse a bump on another
+ok pc_baseline_no_increase $'comfyless=52\nnodes=520\npipelines=454' $'comfyless=52\n nodes = 520 \npipelines=454' # NOT COMPARED at this layer (grep "^root=" misses the spaced form) — CI's "no baseline entry for root X" check is the backstop, not this function
+# Legacy bare-integer format at either side (pre-ADR-042, or the transition
+# commit's HEAD) has no `root=` lines — nothing to compare, so it never
+# blocks. This is deliberate (see _lib.sh): a root gets ratcheted only once
+# it HAS a prior per-root baseline to ratchet against.
+ok pc_baseline_no_increase "1026" $'comfyless=52\nnodes=520\npipelines=454'
+ok pc_baseline_no_increase "1026" "1076"
+# A newly-introduced root (present in new, absent from old) is not compared.
+ok pc_baseline_no_increase $'comfyless=52\nnodes=520' $'comfyless=52\nnodes=520\npipelines=454'
+
+# --- scripts/typecheck-per-root.sh (ADR-042 mechanism, PYRIGHT_OUTPUT_FILE
+# test-injection escape hatch — no live pyright run) ---
+per_root_script="$repo_root/scripts/typecheck-per-root.sh"
+tprd="$(mktemp -d)"
+
+# Normal multi-root sample: 2 errors in comfyless, 1 in nodes, 1 in an
+# out-of-scope path (must get its OWN bucket, not be silently dropped — the
+# dynamic-bucketing fix), 1 WARNING in pipelines that must NOT count.
+cat > "$tprd/normal.txt" <<EOF
+$repo_root/comfyless/mcp_server.py
+  $repo_root/comfyless/mcp_server.py:10:1 - error: bad thing (reportX)
+  $repo_root/comfyless/mcp_server.py:20:1 - error: bad thing 2 (reportX)
+$repo_root/nodes/foo.py
+  $repo_root/nodes/foo.py:5:1 - error: bad thing (reportX)
+$repo_root/scripts/rogue.py
+  $repo_root/scripts/rogue.py:1:1 - error: unexpected out-of-scope file (reportX)
+$repo_root/pipelines/bar.py
+  $repo_root/pipelines/bar.py:1:1 - warning: must not count (reportX)
+4 errors, 1 warnings, 0 informations
+EOF
+got="$(PYRIGHT_OUTPUT_FILE="$tprd/normal.txt" bash "$per_root_script" 2>/dev/null)"
+want=$'comfyless=2\nnodes=1\nscripts=1'
+if [ "$got" = "$want" ]; then pass=$((pass+1)); else
+    fail=$((fail+1)); echo "FAIL: typecheck-per-root.sh normal sample — got [$got] want [$want]"
+fi
+
+# Crashed/misconfigured checker (no pyright summary line) must fail CLOSED:
+# nothing on stdout, non-zero exit. This is what every caller's "no per-root
+# counts" branch depends on (code-reviewer 2026-07-27, HIGH).
+echo "Traceback (most recent call last): pyright blew up" > "$tprd/crashed.txt"
+got="$(PYRIGHT_OUTPUT_FILE="$tprd/crashed.txt" bash "$per_root_script" 2>/dev/null)"
+rc=$?
+if [ -z "$got" ] && [ "$rc" -ne 0 ]; then pass=$((pass+1)); else
+    fail=$((fail+1)); echo "FAIL: typecheck-per-root.sh did not fail closed on a crashed checker (stdout=[$got] rc=$rc)"
+fi
+
+# A root that reaches 0 errors legitimately produces no line for that root
+# (nothing to bucket) — not an error, not a false "still has errors".
+cat > "$tprd/clean_root.txt" <<EOF
+$repo_root/nodes/foo.py
+  $repo_root/nodes/foo.py:5:1 - error: bad thing (reportX)
+1 errors, 0 warnings, 0 informations
+EOF
+got="$(PYRIGHT_OUTPUT_FILE="$tprd/clean_root.txt" bash "$per_root_script" 2>/dev/null)"
+if [ "$got" = "nodes=1" ]; then pass=$((pass+1)); else
+    fail=$((fail+1)); echo "FAIL: typecheck-per-root.sh clean-root sample — got [$got] want [nodes=1]"
+fi
+
+rm -rf "$tprd"
 
 # --- more floor forms ---
 no pc_no_floors '+    "baz==latest",'

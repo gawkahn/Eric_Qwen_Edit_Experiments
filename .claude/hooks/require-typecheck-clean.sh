@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Static-analysis ratchet (global CLAUDE.md §15; ADR-032) — from the
-# quality-gate kit template ~/.claude/templates/hooks/require-typecheck-clean.sh.
+# Static-analysis ratchet (global CLAUDE.md §15; ADR-032 posture, ADR-042
+# per-root aggregation) — descended from the quality-gate kit template
+# ~/.claude/templates/hooks/require-typecheck-clean.sh.
 #
-# Runs pyright before a `git commit` and BLOCKS when it reports MORE
-# diagnostics than the committed baseline integer (.claude/typecheck-baseline).
-# The count may only ratchet DOWN. When the baseline reaches 0 this becomes a
-# hard must-be-clean gate.
+# Runs pyright before a `git commit` and BLOCKS when ANY root reports MORE
+# diagnostics than that root's committed baseline
+# (.claude/typecheck-baseline, `root=count` lines). Each root may only
+# ratchet DOWN independently.
 #
 # T1 for this repo, but LOCAL-CONVENIENCE only: fails OPEN if the checker
 # cannot run (not installed, ENOENT, unparseable output). The AUTHORITATIVE
@@ -16,14 +17,9 @@
 
 set -euo pipefail
 
-# ─── project-specific config (ADR-032) ──────────────────────────────────────
-TYPECHECK_CMD="mise exec -- pyright"   # scope comes from pyproject [tool.pyright]
+# ─── project-specific config (ADR-032/ADR-042) ──────────────────────────────
+PER_ROOT_SCRIPT="${CLAUDE_PROJECT_DIR:-.}/scripts/typecheck-per-root.sh"
 BASELINE_FILE="${CLAUDE_PROJECT_DIR:-.}/.claude/typecheck-baseline"
-# pyright's summary is its LAST line: "N errors, M warnings, K informations".
-# Anchor on that shape and take the last match — a diagnostic message that
-# happens to contain "N error" text must not be parsed as the count
-# (code-reviewer 2026-07-16).
-extract_count() { grep -oE '^[0-9]+ errors?, [0-9]+ warning' | tail -1 | grep -oE '^[0-9]+' || true; }
 # ────────────────────────────────────────────────────────────────────────────
 
 input=$(cat)
@@ -45,47 +41,65 @@ fi
 # a different repo's count could wedge a clean commit — code-reviewer 2026-07-16).
 cd "${CLAUDE_PROJECT_DIR:-.}"
 
-# Run the checker. Fail OPEN on any inability to produce a numeric count —
-# the local hook is convenience; CI is the real gate.
-output=$(eval "$TYPECHECK_CMD" 2>&1) || true
-current=$(printf '%s' "$output" | extract_count)
-if ! printf '%s' "$current" | grep -qE '^[0-9]+$'; then
-    echo "[typecheck-ratchet] '$TYPECHECK_CMD' produced no error count — failing OPEN. CI (T3) is the authoritative gate." >&2
+# Fail OPEN on any inability to produce per-root counts — the local hook is
+# convenience; CI is the real gate.
+if [ ! -x "$PER_ROOT_SCRIPT" ]; then
+    echo "[typecheck-ratchet] $PER_ROOT_SCRIPT missing/not executable — failing OPEN. CI (T3) is the authoritative gate." >&2
+    exit 0
+fi
+
+current_lines=$("$PER_ROOT_SCRIPT" 2>/dev/null) || true
+if [ -z "$current_lines" ]; then
+    echo "[typecheck-ratchet] no per-root counts produced — failing OPEN. CI (T3) is the authoritative gate." >&2
     exit 0
 fi
 
 # Baseline comes from HEAD, not the working tree — otherwise a commit that
-# introduces new errors AND bumps the integer in the same commit would
-# self-legalize past the ratchet (code-reviewer 2026-07-16, MEDIUM). A
-# legitimate drawdown (lowering the baseline) still passes: the current count
-# is compared against HEAD's higher number. Deliberate INCREASES need the
-# `# user-approved` override (or Policy-override at the git-policy layer).
-baseline=0
-head_baseline=$(git show HEAD:.claude/typecheck-baseline 2>/dev/null | tr -dc '0-9' || true)
-if [ -n "$head_baseline" ]; then
-    baseline=$head_baseline
-elif [ -f "$BASELINE_FILE" ]; then
-    baseline=$(tr -dc '0-9' < "$BASELINE_FILE")
-    [ -n "$baseline" ] || baseline=0
-fi
+# introduces new errors AND bumps a root's count in the same commit would
+# self-legalize past the ratchet (code-reviewer 2026-07-16, MEDIUM, carried
+# forward to the per-root form). A root with no HEAD baseline (new root, or
+# HEAD still on the pre-ADR-042 bare-integer format) is not compared — there
+# is nothing to ratchet against yet.
+head_baseline=$(git show HEAD:.claude/typecheck-baseline 2>/dev/null || true)
 
-if [ "$current" -gt "$baseline" ]; then
+blocked=0
+report=""
+while IFS='=' read -r root current; do
+    [ -z "$root" ] && continue
+    current=$(printf '%s' "$current" | tr -dc '0-9')
+    [ -z "$current" ] && continue
+    # `|| true`: under `set -e`, a `grep` that finds no match (a root absent
+    # from head_baseline — the whole point of the "no prior baseline" branch
+    # below, and the ONLY case on the transition commit itself) makes the
+    # pipeline's exit status non-zero via pipefail, which would abort this
+    # script mid-loop and skip every remaining root (code-reviewer 2026-07-27).
+    old=$(printf '%s\n' "$head_baseline" | grep -E "^${root}=" | tail -1 | cut -d= -f2 | tr -dc '0-9' || true)
+    if [ -z "$old" ]; then
+        report="${report}[typecheck-ratchet] $root: $current (no prior baseline for this root — not compared)"$'\n'
+        continue
+    fi
+    if [ "$current" -gt "$old" ]; then
+        report="${report}BLOCKED: $root regressed — $current diagnostics, baseline is $old."$'\n'
+        blocked=1
+    elif [ "$current" -lt "$old" ]; then
+        report="${report}[typecheck-ratchet] $root: $current < baseline $old — good, lower it in $BASELINE_FILE."$'\n'
+    else
+        report="${report}[typecheck-ratchet] $root: $current (unchanged)"$'\n'
+    fi
+done <<< "$current_lines"
+
+printf '%s' "$report" >&2
+
+if [ "$blocked" -eq 1 ]; then
     cat >&2 <<EOF
-BLOCKED: type-check regressed — $current diagnostics, baseline is $baseline.
 
-    $TYPECHECK_CMD
-
-A commit may only lower the count (global CLAUDE.md §15 ratchet; ADR-032).
+A commit may only lower a root's count (global CLAUDE.md §15 ratchet; ADR-032/ADR-042).
 Fix the new diagnostic, or — if you deliberately raised the baseline —
 update $BASELINE_FILE in this same commit.
 
 Override (rare): append \`# user-approved\` to the bash command.
 EOF
     exit 2
-fi
-
-if [ "$current" -lt "$baseline" ]; then
-    echo "[typecheck-ratchet] $current < baseline $baseline — good. Lower $BASELINE_FILE to $current in this commit to tighten the ratchet." >&2
 fi
 
 exit 0

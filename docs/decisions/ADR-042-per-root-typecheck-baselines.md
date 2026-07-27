@@ -157,5 +157,20 @@ already has 0 errors, so it needs no separate carve-out.
 
 - 2026-07-27 — accepted. Baseline mechanism converted to per-root; comfyless/
   drawdown slices (mechanism + 3 fix commits) tracked here as they land.
+- 2026-07-27 — mechanism-slice code-reviewer clarifications on §Decision 1-2
+  (no behavior change, wording only): (a) only the local hook
+  (`.claude/hooks/require-typecheck-clean.sh`) and the CI `typecheck` job
+  actually invoke pyright and group diagnostics by root, via the shared
+  `scripts/typecheck-per-root.sh`. The two git-policy layers
+  (`pc_baseline_no_increase` in `scripts/git-policy/_lib.sh`, called from
+  `pre-commit-checks.sh` and `check-range.sh`) never run pyright — they only
+  compare the committed baseline FILE's old vs new content per root, which is
+  what catches a same-commit self-legalizing bump. (b) §Decision 1's "a
+  bare-integer file is no longer valid input" describes the steady state
+  going forward, not the transition commit itself: `pc_baseline_no_increase`
+  and the local hook both deliberately treat a bare-integer HEAD (no `root=`
+  lines) as "no prior baseline for any root" — nothing to compare, nothing
+  blocks — which is exactly what let the mechanism-implementation commit land
+  without needing a manual override.
 
 AI-Disclosure: Claude (Sonnet 5) authored; Grant reviewed.

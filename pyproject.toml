@@ -82,10 +82,15 @@ dependencies = [
 # Type checker config (ADR-032). pyright is a Node tool pinned in mise.toml,
 # NOT a pyproject/uv.lock dep. Scope: this repo's code roots; test suites stay
 # out per global §15 (they deliberately violate the contracts they test).
-# Baseline 1026 (ratchet — .claude/typecheck-baseline may only go down).
+# Baseline is per-root now (ADR-042) — .claude/typecheck-baseline, ratchet
+# only goes down, per root.
 [tool.pyright]
 include = ["comfyless", "nodes", "pipelines"]
-exclude = ["**/__pycache__"]
+# integrations/openwebui/generate_image_tool.py imports fastapi/starlette/
+# open_webui.* which resolve only inside the OpenWebUI container it's
+# installed into — pyright is checking it against the wrong runtime by
+# construction (ADR-042 §4). Excluded, not "fixed".
+exclude = ["**/__pycache__", "comfyless/integrations/openwebui/generate_image_tool.py"]
 pythonVersion = "3.12"
 venvPath = "."
 venv = ".venv"

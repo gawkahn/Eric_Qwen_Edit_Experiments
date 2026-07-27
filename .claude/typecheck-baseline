@@ -1,1 +1,7 @@
-1026
+# Per-root pyright ratchet baseline (ADR-032 posture; ADR-042 per-root
+# aggregation). One line per root declared in pyproject.toml
+# [tool.pyright] include. A commit may only lower a root's count — see
+# scripts/typecheck-per-root.sh for how the live count is computed.
+comfyless=48
+nodes=520
+pipelines=454

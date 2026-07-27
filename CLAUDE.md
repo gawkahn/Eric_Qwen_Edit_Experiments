@@ -199,12 +199,16 @@ the kit README in `~/.claude/templates/quality-gate-kit-python-uv/`):
    semgrep sast, supply-chain (sources/licenses/CVE), pyright ratchet, and
    the `just tests` battery on every push/PR; plus the commit-range policy
    check on PRs.
-4. **Typecheck ratchet (ADR-032):** `.claude/typecheck-baseline` (1026 at
-   adoption) may only go DOWN. A second PreToolUse hook runs pyright (~11 s)
-   before every `git commit` and blocks a count above HEAD's baseline;
-   same-commit baseline bumps are blocked at the git-policy layer too.
-   Deliberate bump: `# user-approved` on the command / `Policy-override:` in
-   the message. When you fix type errors, lower the baseline in that commit.
+4. **Typecheck ratchet (ADR-032; per-root, ADR-042):** `.claude/typecheck-baseline`
+   holds one `root=count` line per top-level pyright root (`comfyless`,
+   `nodes`, `pipelines` at adoption of ADR-042) — each root may only go DOWN
+   independently, not one combined integer. A second PreToolUse hook runs
+   `scripts/typecheck-per-root.sh` (~11 s) before every `git commit` and
+   blocks if ANY root's count is above HEAD's baseline for that root;
+   same-commit baseline bumps are blocked at the git-policy layer too (also
+   per root). Deliberate bump: `# user-approved` on the command /
+   `Policy-override:` in the message. When you fix type errors, lower that
+   root's line in `.claude/typecheck-baseline` in the same commit.
 
 Toolchain pins: `mise.toml` (gitleaks, just, osv-scanner, node, pyright —
 `mise trust ./mise.toml && mise install`). Recipes: `just secrets`,

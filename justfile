@@ -70,8 +70,9 @@ policy-test:
     bash scripts/git-policy/test-git-policy.sh
 
 # Static type check (ADR-032). pyright pinned in mise.toml; scope + venv come
-# from pyproject [tool.pyright]. Ratchet gate: error count must not exceed
-# .claude/typecheck-baseline (currently large; may only go down).
+# from pyproject [tool.pyright]. Ratchet gate (ADR-042): per-root error count
+# (see scripts/typecheck-per-root.sh) must not exceed that root's entry in
+# .claude/typecheck-baseline — each root may only go down independently.
 typecheck:
     mise exec -- pyright
 

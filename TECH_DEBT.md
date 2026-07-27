@@ -1889,3 +1889,29 @@ time an operator needs to reconstruct who probed the daemon. Fix: log the
 refusal with the same redaction the `PathError` branch uses
 (`{k: v for k, v in req.items() if k != "prompt"}`), or add a targeted log for
 value-check refusals only.
+
+## 2026-07-27 — comfyless/ per-root pyright baseline mixes concurrently-edited files
+ADR-042 chose per-ROOT (not per-file) pyright baselines. `comfyless/generate.py`
+is under active concurrent edit by the ADR-040 session (file lease, see the
+2026-07-27 typecheck-drawdown handoff) while this session drives the rest of
+`comfyless/` down. Both sessions share one working tree, so a live
+`pyright`/`just typecheck` run picks up whichever WIP edits are on disk at that
+instant — observed directly during this slice: `generate.py`'s live count
+moved 7→8 between the handoff being written and this slice's mechanism
+commit, with no intervening commit on either side. The `comfyless` root total
+therefore isn't purely a function of committed history; it can shift under a
+session that touches nothing in its own lease.
+Why not now: the alternative (per-file baselines) is the granularity ADR-042
+explicitly rejected as unmaintainable at 72-files-repo scope, and the
+concurrent-session pattern itself is expected/normal in this repo (see
+`feedback_concurrent_sessions` memory). Splitting `comfyless/generate.py` into
+its own baseline root just for this would special-case one file inside one
+directory, which the pyright root-grouping mechanism (first path segment)
+doesn't support without real complexity.
+Trigger: a ratchet false-block where the blocked root's regression is
+entirely inside a file the blocked commit never touched — check `git diff`
+against the blocked root's files before assuming the commit under review
+introduced the regression. Fix, if it recurs often: extend
+`scripts/typecheck-per-root.sh`'s grouping to support a second-level
+override (e.g. `comfyless/generate.py` as its own baseline key) so a leased
+file can ratchet independently of the root it lives in.

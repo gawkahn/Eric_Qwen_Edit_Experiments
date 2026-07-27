@@ -87,21 +87,33 @@ pc_tech_debt_no_deletion() {
     return 0
 }
 
-# Typecheck-ratchet baseline may only decrease (ADR-032; code-reviewer
-# 2026-07-16 MEDIUM: a same-commit baseline bump must not self-legalize new
-# type errors). $1 = old value (empty if the file is new — allowed), $2 = new.
+# Typecheck-ratchet baseline may only decrease, PER ROOT (ADR-032 posture;
+# ADR-042 per-root aggregation; code-reviewer 2026-07-16 MEDIUM: a same-commit
+# baseline bump must not self-legalize new type errors — still holds per
+# root). $1 = old file content, $2 = new file content. Content is `root=count`
+# lines (comment lines starting with '#' and blanks are ignored); a bare
+# integer (the pre-ADR-042 format) has no `root=` lines and is treated as "no
+# history for any root" — nothing to compare against, so nothing blocks. A
+# root present in only one side (newly introduced, or dropped) is not
+# compared either.
 pc_baseline_no_increase() {
-    local old new
-    old=$(printf '%s' "$1" | tr -dc '0-9')
-    new=$(printf '%s' "$2" | tr -dc '0-9')
-    [ -z "$old" ] && return 0   # introducing the baseline file is fine
-    [ -z "$new" ] && return 0   # deletion/garble is the typecheck gate's problem, not a ratchet bump
-    if [ "$new" -gt "$old" ]; then
-        echo "BLOCKED: .claude/typecheck-baseline raised $old -> $new (ADR-032: ratchet only goes down)." >&2
-        echo "  Fix the new type errors, or use the documented override for a deliberate bump." >&2
-        return 1
-    fi
-    return 0
+    local old="$1" new="$2"
+    local roots root old_count new_count rc=0
+    roots=$({ printf '%s\n' "$old"; printf '%s\n' "$new"; } \
+        | grep -oE '^[A-Za-z0-9_./-]+=' | tr -d '=' | sort -u)
+    while IFS= read -r root; do
+        [ -z "$root" ] && continue
+        old_count=$(printf '%s\n' "$old" | grep -E "^${root}=" | tail -1 | cut -d= -f2 | tr -dc '0-9')
+        new_count=$(printf '%s\n' "$new" | grep -E "^${root}=" | tail -1 | cut -d= -f2 | tr -dc '0-9')
+        [ -z "$old_count" ] && continue   # introducing this root is fine
+        [ -z "$new_count" ] && continue   # root removed/garbled — not a ratchet bump
+        if [ "$new_count" -gt "$old_count" ]; then
+            echo "BLOCKED: .claude/typecheck-baseline[$root] raised $old_count -> $new_count (ADR-032/ADR-042: ratchet only goes down)." >&2
+            echo "  Fix the new type errors, or use the documented override for a deliberate bump." >&2
+            rc=1
+        fi
+    done <<< "$roots"
+    return $rc
 }
 
 # If any changed file is Red Zone, the message must reference an existing
