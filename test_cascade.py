@@ -810,7 +810,11 @@ sidecar_dict = {
     "model_family": "stable-cascade",
     "config_source": "/tmp/some.json",
     "output_path": "/tmp/some.png",
-    "iterate_batch_id": "abcd1234" * 4,
+    "iterate_batch_id": "abcd1234",
+    # ADR-040 D1b: run_id is now a known key, so a saved sidecar carrying one
+    # must round-trip without warning. The value here is a FOREIGN run's id —
+    # the inheritance negative below depends on that.
+    "run_id": "f0f0f0f0",
     "run_index": 3,
     "total_runs": 10,
     "timestamp": "2026-04-26T12:34:56",
@@ -877,6 +881,39 @@ try:
           parsed.model == "/abs/path/sdxl" and extras == [])
 finally:
     _sys.argv = old_argv
+
+
+# ──────────────────────────────────────────────────────────────────────
+print("\n── ADR-040 D1b: run_id is minted here, never inherited ─────────")
+
+# The bug both slice-2a reviewers caught: registering run_id in _KNOWN_KEYS
+# without also minting it. validate_config COPIES unknown keys rather than
+# dropping them (warn only), and dispatch builds `sidecar = dict(cfg)` — so a
+# replayed sidecar, or an agent-supplied cascade_config over MCP, would inherit
+# a FOREIGN run's correlation id as this run's provenance. Registering the key
+# had also removed the "unknown keys ignored" line that previously flagged it,
+# making the inheritance silent.
+check("run_id is a known cascade key (round-trips without warning)",
+      "run_id" in c._KNOWN_KEYS)
+
+import inspect as _inspect  # noqa: E402
+_rid_src = _inspect.getsource(c)
+check("cascade MINTS its own run_id (D1b names it the third entrypoint)",
+      "run_id = mint_run_id()" in _rid_src)
+check("the minted run_id is written into the sidecar update block, so it "
+      "OVERWRITES any value inherited from a replayed config",
+      '"run_id":           run_id,' in _rid_src)
+
+# The structural guarantee, stated as the reviewers framed it: a _KNOWN_KEYS
+# provenance key must be either overwritten in the update block or popped —
+# iterate_batch_id takes the first route, output_format/quality the second.
+# run_id must not be the one key that is neither.
+_rid_update = _rid_src.split("sidecar.update({")[1].split("})")[0]
+check("every provenance key in the sidecar update is authoritative for THIS run",
+      all(k in _rid_update for k in ('"iterate_batch_id"', '"run_id"',
+                                     '"run_index"', '"timestamp"')))
+check("cascade mints from the shared helper, not a raw uuid4",
+      "mint_run_id" in _rid_src and "uuid.uuid4()" not in _rid_src)
 
 
 # ──────────────────────────────────────────────────────────────────────

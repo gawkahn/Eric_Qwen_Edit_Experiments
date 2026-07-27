@@ -23,7 +23,6 @@ import json
 import os
 import sys
 import time
-import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -86,7 +85,10 @@ _KNOWN_KEYS = {
     # ── Sidecar runtime metadata — written by dispatch(), accepted on
     #    replay so a saved sidecar round-trips cleanly without warnings.
     "model_family", "config_source", "output_path",
-    "iterate_batch_id", "run_index", "total_runs",
+    # ADR-040 D1b: run_id joins iterate_batch_id here — pure run provenance,
+    # accepted on replay so a stamped sidecar round-trips without warnings,
+    # never consumed as topology.
+    "iterate_batch_id", "run_id", "run_index", "total_runs",
     "timestamp", "elapsed_seconds", "prior_seconds", "decoder_seconds",
     # ADR-034 slice 4: jpeg-run output provenance (the format name + the
     # 0.0-1.0 quality fraction the file cannot reveal). Recorded on jpeg runs
@@ -892,7 +894,15 @@ def dispatch(args: argparse.Namespace, config_paths: List[str]) -> int:
         iterate_inputs["_primary"] = iterate_inputs[args.iterate[0][0]]
 
     # ── Run loop ──────────────────────────────────────────────────────
-    iterate_batch_id = uuid.uuid4().hex
+    # ADR-040 D1b: one minting helper across every entrypoint. This site used
+    # to mint a 32-char hex while generate.py minted a 36-char dashed UUID —
+    # the same field in two formats. Both are now 8 hex from mint_run_id.
+    from comfyless.generate import mint_run_id
+    iterate_batch_id = mint_run_id()
+    # ADR-040 D1b: cascade is the third entrypoint the ADR names. Distinct from
+    # iterate_batch_id — this identifies the INVOCATION, that identifies a sweep
+    # within it — from the one shared helper.
+    run_id = mint_run_id()
     fail_count = 0
     current_cfg_path: Optional[str] = None
     prior_pipe = None
@@ -1007,6 +1017,19 @@ def dispatch(args: argparse.Namespace, config_paths: List[str]) -> int:
             "prior_seconds":    runtime["prior_seconds"],
             "decoder_seconds":  runtime["decoder_seconds"],
             "iterate_batch_id": iterate_batch_id,
+            # ADR-040 D1b: THIS run's id, overwriting unconditionally. Both
+            # reviewers caught the hazard of registering run_id in _KNOWN_KEYS
+            # without also minting it: validate_config copies unknown keys
+            # rather than dropping them (`cfg = dict(raw)`, warn only), and
+            # `sidecar = dict(cfg)` above copies them into the new run's
+            # record — so a replayed sidecar, or an agent-supplied
+            # cascade_config over MCP, would have inherited a FOREIGN run's
+            # correlation id as this run's provenance, silently (registering
+            # the key had also removed the "unknown keys ignored" audit line
+            # that previously flagged it). iterate_batch_id is safe only
+            # because it is overwritten here; output_format/quality only
+            # because they are popped below. run_id must be one or the other.
+            "run_id":           run_id,
             "run_index":        run_index,
             "total_runs":       total,
             "timestamp":        time.strftime("%Y-%m-%dT%H:%M:%S"),

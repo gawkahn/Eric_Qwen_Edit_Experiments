@@ -128,13 +128,49 @@ _SKIP_SIDECAR_KEYS = {"timestamp", "elapsed_seconds", "contract_version",
                       # ADR-034: output format/quality are an OUTPUT concern,
                       # recorded as provenance on jpeg runs but never a replay
                       # param — re-pass --output-format/--quality to replay.
-                      "output_format", "quality"}
+                      "output_format", "quality",
+                      # ADR-040 D1b: run correlation ids. Pure provenance —
+                      # they identify WHICH invocation produced a record, never
+                      # an input to reproduce it. `iterate_batch_id` predates
+                      # run_id and was missing from this set, so a --params
+                      # replay of any --iterate sidecar logged a spurious
+                      # "dropping unknown key" line; both are registered here
+                      # now. This silences the warning only — neither was ever
+                      # a schema param, so _validate_params dropped them
+                      # regardless and nothing reaches generate() that did not
+                      # before.
+                      "run_id", "iterate_batch_id"}
 # ADR-035 slice 5: ref_images is deliberately NOT in _SKIP_SIDECAR_KEYS —
 # recorded references replay, but ONLY through the decision-7 file-derived
 # trust gate (_gate_file_derived_refs in _run_cli_mode): loud per-path echo,
 # outside-roots REFUSAL, moved-file / hash-mismatch warnings. The key never
 # reaches generate() or the wire from `p` — the gate pops it and re-injects
 # survivors through the typed --ref-image channel.
+
+
+def mint_run_id() -> str:
+    """Mint a correlation id: 8 hex chars, once per invocation (ADR-040 D1b).
+
+    The ONE minting helper for both `run_id` (every invocation) and
+    `iterate_batch_id` (sweeps only). They stay DISTINCT fields — `run_id`
+    identifies the invocation, `iterate_batch_id` a sweep WITHIN it — so a
+    future sweep-inside-a-run nests cleanly instead of losing the outer
+    identity. Sharing the helper, not the value, is the code reuse.
+
+    8 hex is 32 bits of real randomness (uuid4's version nibble sits outside
+    `hex[:8]`): short enough to live in a run dirname an operator types and to
+    read off a log line, and the ~77k-same-stem birthday point is far past any
+    real workload. It is adequate as the D1 run-dir collision defense ONLY
+    because the derived dir is created with `exist_ok=False` as a loud
+    assertion — never as a suffix-on-collision retry.
+
+    Supersedes two divergent mint sites: a 36-char dashed UUID here and a
+    32-char hex in cascade.py. Nothing parses these values (they are compared
+    for equality to group records), so the shortening is safe and historical
+    sidecars carrying longer ids never compare against new ones in a way that
+    matters.
+    """
+    return uuid.uuid4().hex[:8]
 
 
 def _type_name(t) -> str:
@@ -3259,6 +3295,7 @@ def _delegate_to_server(
     loras: list,
     *,
     iterate_batch_id: Optional[str] = None,
+    run_id: Optional[str] = None,
     savepath_override: Optional[str] = None,
     ref_dims_explicit: bool = False,
 ) -> Optional[int]:
@@ -3299,6 +3336,11 @@ def _delegate_to_server(
         # the sidecar carries the id; the PNG does not.
         if iterate_batch_id:
             metadata["iterate_batch_id"] = iterate_batch_id
+        # ADR-040 D1b: same client-side stamp, same reason — the sidecar is
+        # written HERE, after the response, so correlation needs no wire field
+        # and server.py stays untouched.
+        if run_id:
+            metadata["run_id"] = run_id
         _log(f"[comfyless] Saved: {output_path}")
         if output_path:
             stem = os.path.splitext(output_path)[0]
@@ -3891,7 +3933,10 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
             print("Aborted.", file=sys.stderr)
             return 1
 
-    iterate_batch_id = str(uuid.uuid4()) if plan is not None else None
+    # ADR-040 D1b: run_id is minted for EVERY invocation; iterate_batch_id only
+    # for a sweep. Distinct fields, one helper (see mint_run_id).
+    run_id = mint_run_id()
+    iterate_batch_id = mint_run_id() if plan is not None else None
     iterate_inputs = plan["input_tokens"] if plan is not None else None
 
     # Inline prompt-enhancement state (ADR-026). Memoized per unique input
@@ -4015,6 +4060,7 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
             delegate_rc = _delegate_to_server(
                 args, p_cur, loras_cur,
                 iterate_batch_id=iterate_batch_id,
+                run_id=run_id,
                 savepath_override=wire_savepath,
                 # ADR-035 slice 4: same dims-explicit signal the in-process
                 # path uses (below) — user set BOTH width and height via
@@ -4122,6 +4168,10 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
             )
             if iterate_batch_id:
                 metadata["iterate_batch_id"] = iterate_batch_id
+            # ADR-040 D1b: parity with the delegated path above — an in-process
+            # run's sidecar carries the same correlation id, so grouping works
+            # regardless of whether a daemon served the generation.
+            metadata["run_id"] = run_id
             stem = os.path.splitext(output_path)[0]
             sidecar_path = f"{stem}.json"
             with open(sidecar_path, "w") as f:

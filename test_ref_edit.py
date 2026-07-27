@@ -595,6 +595,64 @@ check("seam: no ref_images → None, p untouched",
           _ap.Namespace(ref_image=[], params=None), _p_none) is None
       and _p_none == {"prompt": "p"})
 
+# ── ADR-040 D1b: the delegated-path sidecar carries run_id ───────────────────
+# Behavioral coverage for generate.py's stamp (code review: half the slice had
+# none). Drives the real _delegate_to_server against a stubbed daemon and reads
+# the sidecar it writes off disk.
+import tempfile as _rid_tf  # noqa: E402
+import json as _rid_json  # noqa: E402
+
+_rid_dir = _rid_tf.mkdtemp(prefix="rid_deleg_")
+_rid_img = os.path.join(_rid_dir, "x.png")
+open(_rid_img, "wb").close()
+
+_orig_socket_path = _srvmod.socket_path
+_orig_send = cg._send_server_command
+try:
+    _srvmod.socket_path = lambda device="cuda": _FakeSock()
+    cg._send_server_command = lambda req, device="cuda": {
+        "status": "ok", "output_path": _rid_img,
+        "metadata": {"seed": 7, "elapsed_seconds": 1.0}}
+
+    _buf = _io.StringIO()
+    with _ctxlib.redirect_stderr(_buf):
+        cg._delegate_to_server(_deleg_args(), {"model": "/m", "prompt": "p"}, [],
+                               run_id="c0ffee11")
+    with open(os.path.splitext(_rid_img)[0] + ".json") as _fh:
+        _rid_side = _rid_json.load(_fh)
+    check("delegated path stamps run_id into the sidecar",
+          _rid_side.get("run_id") == "c0ffee11", f"sidecar={_rid_side!r}")
+    check("delegated path leaves iterate_batch_id unset when not sweeping "
+          "(distinct fields, not aliases)",
+          "iterate_batch_id" not in _rid_side, f"sidecar={_rid_side!r}")
+
+    # The correlation promise D1b actually makes: ONE run_id shared across a
+    # sweep, while iterate_batch_id is separately minted. Two delegated calls
+    # from one invocation share run_id and share the batch id.
+    _rid_seen = []
+    for _i in range(2):
+        _img_i = os.path.join(_rid_dir, f"s{_i}.png")
+        open(_img_i, "wb").close()
+        cg._send_server_command = (lambda p: (lambda req, device="cuda": {
+            "status": "ok", "output_path": p,
+            "metadata": {"seed": 7, "elapsed_seconds": 1.0}}))(_img_i)
+        with _ctxlib.redirect_stderr(_io.StringIO()):
+            cg._delegate_to_server(_deleg_args(), {"model": "/m", "prompt": "p"},
+                                   [], run_id="5weep000",
+                                   iterate_batch_id="ba7c4111")
+        with open(os.path.splitext(_img_i)[0] + ".json") as _fh:
+            _rid_seen.append(_rid_json.load(_fh))
+    check("a sweep shares ONE run_id across its sidecars",
+          {s.get("run_id") for s in _rid_seen} == {"5weep000"})
+    check("a sweep's iterate_batch_id is carried separately, not aliased to run_id",
+          {s.get("iterate_batch_id") for s in _rid_seen} == {"ba7c4111"})
+finally:
+    _srvmod.socket_path = _orig_socket_path
+    cg._send_server_command = _orig_send
+    import shutil as _rid_sh
+    _rid_sh.rmtree(_rid_dir, ignore_errors=True)
+
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

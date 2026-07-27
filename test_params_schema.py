@@ -1479,6 +1479,68 @@ finally:
     _sys.argv = _old_argv
 
 
+# ── ADR-040 D1b: run_id / iterate_batch_id as run provenance ─────────────────
+import contextlib  # noqa: E402
+import comfyless.generate as _rid_gen  # noqa: E402
+
+# The minting contract. 8 hex from uuid4; distinct values per call.
+_rid_a, _rid_b = _rid_gen.mint_run_id(), _rid_gen.mint_run_id()
+check("mint_run_id returns 8 characters", len(_rid_a) == 8, f"got {_rid_a!r}")
+check("mint_run_id returns lowercase hex only",
+      all(c in "0123456789abcdef" for c in _rid_a), f"got {_rid_a!r}")
+check("mint_run_id returns a distinct value per call", _rid_a != _rid_b)
+
+# The registration duty. Both ids are pure provenance, so a --params replay of
+# a stamped sidecar must not warn about them. Before ADR-040, iterate_batch_id
+# was absent from this set and every --iterate replay logged a spurious
+# "dropping unknown key" line.
+check("run_id is in _SKIP_SIDECAR_KEYS",
+      "run_id" in _rid_gen._SKIP_SIDECAR_KEYS)
+check("iterate_batch_id is in _SKIP_SIDECAR_KEYS (the pre-ADR-040 wart)",
+      "iterate_batch_id" in _rid_gen._SKIP_SIDECAR_KEYS)
+
+# Neither is a schema param — they must never round-trip as a replayable input.
+check("run_id is NOT a COMFYLESS_SCHEMA key",
+      "run_id" not in _rid_gen.COMFYLESS_SCHEMA)
+check("iterate_batch_id is NOT a COMFYLESS_SCHEMA key",
+      "iterate_batch_id" not in _rid_gen.COMFYLESS_SCHEMA)
+
+# End-to-end through the PRODUCTION loader, not a reimplementation of its
+# filter (code review): writing our own comprehension over _SKIP_SIDECAR_KEYS
+# would assert set membership a second time and stay green even if the real
+# filter line in _load_sidecar were deleted.
+import os  # noqa: E402
+import tempfile as _rid_tf  # noqa: E402
+_rid_sidecar = {"model": "/m/x", "prompt": "p", "steps": 20,
+                "run_id": _rid_a, "iterate_batch_id": _rid_b}
+with _rid_tf.NamedTemporaryFile("w", suffix=".json", delete=False) as _fh:
+    json.dump(_rid_sidecar, _fh)
+    _rid_path = _fh.name
+_rid_buf = io.StringIO()
+try:
+    with contextlib.redirect_stderr(_rid_buf):
+        _rid_clean = _rid_gen._load_sidecar(_rid_path)
+finally:
+    os.unlink(_rid_path)
+check("a sidecar carrying run_id + iterate_batch_id logs no unknown-key warning",
+      "dropping unknown key" not in _rid_buf.getvalue(),
+      f"stderr={_rid_buf.getvalue()!r}")
+check("neither correlation id survives into replay params",
+      "run_id" not in _rid_clean and "iterate_batch_id" not in _rid_clean,
+      f"clean={_rid_clean!r}")
+
+# NEGATIVE CONTROL: prove the assertion above can fail. A genuinely unknown key
+# still warns and is still dropped — so the clean result is the skip-set
+# working, not the check being vacuous.
+_rid_buf2 = io.StringIO()
+with contextlib.redirect_stderr(_rid_buf2):
+    _rid_gen._validate_params({"model": "/m/x", "bogus_key": 1},
+                              source="sidecar:test")
+check("negative control: an unknown key DOES warn (the check above is not vacuous)",
+      "dropping unknown key" in _rid_buf2.getvalue(),
+      f"stderr={_rid_buf2.getvalue()!r}")
+
+
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print("──────────────────────────────────────────────────")

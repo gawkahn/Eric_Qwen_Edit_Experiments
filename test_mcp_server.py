@@ -5222,6 +5222,29 @@ check("D2a behavioral: report_roots in generate arguments is IGNORED, "
 check("D2a: report_roots is not a property of the generate input schema",
       "report_roots" not in mcps._GENERATE_INPUT_SCHEMA["properties"])
 
+# ── ADR-040 D1b: run_id never surfaces in agent-facing params ─────────
+# The ADR names this as an up-front negative test. The guarantee is STRUCTURAL,
+# not list-dependent — the non-cascade branch normalizes through
+# _validate_params (run_id is not a COMFYLESS_SCHEMA key) and the cascade branch
+# renders through a positive allowlist. But slice 2a is what makes a sidecar
+# legally able to CARRY run_id, so the tripwire belongs in this commit.
+_rid_sc = {"model": "qwen-image", "prompt": "p", "steps": 20,
+           "run_id": "f0f0f0f0", "iterate_batch_id": "a1a1a1a1"}
+_rid_path = os.path.join(_d2_out, "rid-probe.json")
+with open(_rid_path, "w") as _fh:
+    json.dump(_rid_sc, _fh)
+_rid_res = _run(mcps._call_tool_impl(
+    _d2_cfg, "extract_params", {"path": _rid_path}))
+_rid_text = _rid_res[0].text
+check("D1b: run_id never appears in MCP extract_params output",
+      "run_id" not in _rid_text, f"text={_rid_text[:300]!r}")
+check("D1b: iterate_batch_id never appears either (the sibling key)",
+      "iterate_batch_id" not in _rid_text, f"text={_rid_text[:300]!r}")
+# Negative control: a real schema param DOES come back, so the two checks above
+# are the filter working rather than extract_params having failed outright.
+check("negative control: a genuine param survives extract_params",
+      "steps" in _rid_text, f"text={_rid_text[:300]!r}")
+
 
 # ════════════════════════════════════════════════════════════════════════
 print("\n──────────────────────────────────────────────────")

@@ -486,6 +486,42 @@ and the daemonless run is unaffected by all of it.
 
 ## Changelog
 
+- 2026-07-27 — **Slice 2a shipped (D1b only).** Slice 2 as planned (D1 + D1b +
+  D3) was split for reviewability per §3 SRR: 2a is the correlation primitive,
+  which needs no daemon interaction; 2b is the derived run dir, the mirror-tree
+  removal, and entry validation. Same scope, two reviewable diffs. Both
+  reviewers judged the split coherent.
+  **Scoping correction to D1b's "every record":** the claim holds for the
+  `generate` CLI mode, `refine`, and `cascade`. It does NOT cover
+  `_run_json_mode` (the `--json` bridge writes no sidecar — metadata goes to
+  stdout, so no on-disk record is left uncorrelated) or `comfyless/video.py`'s
+  segment sidecars (never in this ADR's scope). Named here rather than left
+  ambiguous.
+  **A registration bug this slice introduced and closed before commit:**
+  `run_id` was added to cascade's `_KNOWN_KEYS` without cascade also MINTING
+  one. `validate_config` copies unknown keys rather than dropping them (warn
+  only), and dispatch builds `sidecar = dict(cfg)` — so a replayed sidecar, or
+  an agent-supplied `cascade_config` over MCP, would have inherited a FOREIGN
+  run's correlation id as this run's provenance, and registering the key had
+  also removed the `unknown keys ignored` audit line that previously flagged
+  it. Both reviewers caught it independently. Cascade now mints its own and the
+  sidecar `update()` block overwrites unconditionally — matching how
+  `iterate_batch_id` is protected, and how `output_format`/`quality` are popped
+  for the same reason. This also completes D1b's "every entrypoint".
+  **`run_id` is REQUIRED, not `Optional[str] = None`** (code review): a None
+  writes `"run_id": null` into every record, and since the id's whole purpose
+  is equality-grouping, that collapses every unset run into one bucket — worse
+  than a missing key. Keyword-only-without-default makes pyright enforce it at
+  every call site.
+  Tests moved from source-greps to behavioral where a harness already existed:
+  the loop's records are now read off disk on both `_generate_one` paths
+  (including the RefRefused in-process fallback), the delegated `generate`
+  sidecar is asserted against a stubbed daemon, a sweep is asserted to share one
+  `run_id` while carrying a separate `iterate_batch_id`, and `_load_sidecar` is
+  exercised rather than its filter reimplemented. A source-count assertion was
+  removed as unsound — it would have stayed green if a third, unstamped call
+  site were added, which is precisely the failure the choke point exists to
+  prevent.
 - 2026-07-27 — Design security RE-review of the same-day revision
   (`security-auditor`, invoked WITHOUT a `model:` argument per Grant's standing
   no-elevation instruction — but the transcript shows it ran on

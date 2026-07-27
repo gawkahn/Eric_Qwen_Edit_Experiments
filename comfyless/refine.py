@@ -2033,13 +2033,19 @@ def _write_json(path: str, obj: dict) -> None:
         json.dump(obj, f, indent=2, default=str)
 
 
-def verdict_record(cand: Candidate, w_pa: float, w_aes: float) -> dict:
+def verdict_record(cand: Candidate, w_pa: float, w_aes: float,
+                   *, run_id: str) -> dict:
     """The path-free per-candidate audit record (`*.verdict.json`). Carries scores,
     critique, the composite, and the overrides the planner PROPOSED (by name — the
-    raw LoraOp.name, no resolved path). `_assert_no_paths` gates it."""
+    raw LoraOp.name, no resolved path). `_assert_no_paths` gates it.
+
+    `run_id` (ADR-040 D1b) ties this record to every other record from the same
+    invocation. It is path-free by construction (8 hex), so `_assert_no_paths`
+    holds unchanged — the gate is key-based and the value carries no separator."""
     v = cand.verdict
     rec = {
         "iteration": cand.index,
+        "run_id": run_id,
         "scores": {"prompt_adherence": v.prompt_adherence,
                    "aesthetics": v.aesthetics},
         "composite": cand.composite,
@@ -2079,6 +2085,13 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 anchor_duel_every: int = DEFAULT_ANCHOR_DUEL_EVERY,
                 output_format: Optional[OutputFormat] = None,
                 edit_source: Optional[str] = None,
+                # REQUIRED, not Optional-with-None (code review): a None here
+                # writes `"run_id": null` into every record, and since the id's
+                # whole purpose is equality-grouping, that collapses every
+                # unset run into ONE bucket — worse than a missing key. Being
+                # keyword-only-without-default makes pyright enforce it at
+                # every call site instead of trusting each caller to remember.
+                run_id: str,
                 log: Callable[[str], None] = print) -> LoopOutcome:
     """Trajectory-aware hill-climb (ADR-027 §Loop + ADR-037 D1/D2/D3). Each
     iteration: generate → judge+plan (with the bounded iteration-history block)
@@ -2281,11 +2294,11 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
             # re-attempt churn (slice-B review INFO-7).
             gen_kwargs = {"force_in_process": True}
         try:
-            return run_generation(gen_cfg, device=device,
-                                  output_dir=candidates_dir,
-                                  stem=stem_name, precision=precision,
-                                  output_format=output_format, log=log,
-                                  **gen_kwargs)
+            out = run_generation(gen_cfg, device=device,
+                                 output_dir=candidates_dir,
+                                 stem=stem_name, precision=precision,
+                                 output_format=output_format, log=log,
+                                 **gen_kwargs)
         except RefRefusedError as e:
             # Decided ONCE, loudly, then in-process for the REST of the run
             # (ADR-037 D5 / ADR-035 4b — the daemon is the authoritative ref
@@ -2309,11 +2322,18 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 f"--unload it if this run OOMs.")
             in_process_latch = True
             gen_kwargs["force_in_process"] = True
-            return run_generation(gen_cfg, device=device,
-                                  output_dir=candidates_dir,
-                                  stem=stem_name, precision=precision,
-                                  output_format=output_format, log=log,
-                                  **gen_kwargs)
+            out = run_generation(gen_cfg, device=device,
+                                 output_dir=candidates_dir,
+                                 stem=stem_name, precision=precision,
+                                 output_format=output_format, log=log,
+                                 **gen_kwargs)
+        # ADR-040 D1b: ONE stamp, after ONE join of both paths — the choke point
+        # is structural rather than a comment claiming two call sites were both
+        # remembered. The loop writes the load-plane sidecar from `metadata` in
+        # three places (per-iteration, seed-batch arm, duel arm); stamping per
+        # write site is how one of them silently ends up with no correlation id.
+        out.metadata["run_id"] = run_id
+        return out
 
     def _run_seed_batch(arms: int, base_cfg: WorkingConfig,
                         iter_idx: int) -> Tuple[WorkingConfig, GenOutcome, Any]:
@@ -2506,7 +2526,8 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
             # Full error text goes to the on-disk operator artifact ONLY; the
             # history record is structural flags (Finding 9 — the message embeds
             # the endpoint URL + endpoint-controlled response bytes).
-            _write_json(stem + ".verdict.json", {"iteration": i, "error": str(e)})
+            _write_json(stem + ".verdict.json",
+                        {"iteration": i, "run_id": run_id, "error": str(e)})
             history.append(history_error_record(i))
             consecutive_judge_errors += 1
             if consecutive_judge_errors >= JUDGE_ERROR_ABORT_AFTER:
@@ -2547,7 +2568,8 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                          metadata=outcome.metadata, verdict=verdict, composite=comp)
         for n in verdict.notices:
             log(f"[refine] iter {i}: verdict notice: {n}")
-        _write_json(stem + ".verdict.json", verdict_record(cand, w_pa, w_aes))
+        _write_json(stem + ".verdict.json",
+                    verdict_record(cand, w_pa, w_aes, run_id=run_id))
         log(f"[refine] iter {i}: prompt_adherence={verdict.prompt_adherence} "
             f"aesthetics={verdict.aesthetics} composite={comp:.2f}")
 
@@ -4027,6 +4049,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[refine] {e}", file=sys.stderr)
         return 2
 
+    # ADR-040 D1b: one run_id per invocation, minted at session start, stamped
+    # into every record this run writes. Slice 2b puts it in the derived run
+    # dirname too, so the directory an operator is looking at names the id that
+    # ties its contents together.
+    from comfyless.generate import mint_run_id
+    run_id = mint_run_id()
+    log(f"[refine] run_id: {run_id}")
+
     if not os.path.isdir(args.output_dir):
         os.makedirs(args.output_dir, exist_ok=True)
 
@@ -4072,6 +4102,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             sideways_cap=args.sideways_cap, seed_batch=args.seed_batch,
             anchor_duel_every=args.anchor_duel_every,
             exhaust_after_batches=args.exhaust_after_batches,
+            run_id=run_id,
             output_format=out_fmt,
             edit_source=edit_source, static_refs=static_refs, log=log)
     except RefineError as e:

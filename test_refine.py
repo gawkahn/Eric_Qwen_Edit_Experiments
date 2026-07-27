@@ -580,7 +580,7 @@ _vr = Verdict(6, 7, "revise",
 _cand = Candidate(index=2, image_path="/root/candidate_02.png",
                   metadata={"seed": 42, "loras": [{"path": "/root/x.safetensors"}]},
                   verdict=_vr, composite=6.4)
-_rec = verdict_record(_cand, DEFAULT_W_PA, DEFAULT_W_AES)
+_rec = verdict_record(_cand, DEFAULT_W_PA, DEFAULT_W_AES, run_id="r0")
 _recs = json.dumps(_rec)
 check("verdict_record contains no filesystem path", "/root/" not in _recs)
 check("verdict_record contains no .safetensors", ".safetensors" not in _recs)
@@ -691,7 +691,7 @@ class _FakeJudge:
 
 
 def _run_loop(script, *, max_iter=10, patience=2, threshold=8, seed=123,
-              judge_system_prompt=None, output_format=None):
+              judge_system_prompt=None, output_format=None, run_id="deadbeef"):
     d = _tf.mkdtemp(prefix="refine_loop_test_")
     fg, fj = _FakeGen(seed=seed), _FakeJudge(script)
     _rg, _jc = refine.run_generation, refine.judge_candidate
@@ -705,7 +705,8 @@ def _run_loop(script, *, max_iter=10, patience=2, threshold=8, seed=123,
             cfg, target_prompt="a detailed test scene", catalog={}, roots=(),
             conn=None, backend_cfg={"url": "http://x", "model": "m"},
             output_dir=d, device="cuda", pass_threshold=threshold,
-            max_iterations=max_iter, patience=patience, log=lambda *_a: None,
+            max_iterations=max_iter, patience=patience, run_id=run_id,
+            log=lambda *_a: None,
             **extra)
     finally:
         refine.run_generation, refine.judge_candidate = _rg, _jc
@@ -1413,6 +1414,7 @@ def _mkverdict_ov(pa, aes, ov):
 
 
 def _run_loop_p(script, **kw):
+    kw.setdefault("run_id", "deadbeef")
     d = _tf.mkdtemp(prefix="refine_v2_test_")
     fg, fj = _FakeGenP(), _FakeJudge(script)
     _rg, _jc = refine.run_generation, refine.judge_candidate
@@ -1611,11 +1613,15 @@ check("patience <= explore-after stops before any stagnation resample",
 # on-disk record.
 with open(os.path.join(_d, "candidates", "candidate_00.verdict.json")) as _fh:
     _vr_raw = _fh.read()
+# `run_id` joined this allowlist deliberately (ADR-040 D1b, 2026-07-27): it is
+# path-free run provenance, reviewed as safe for a persisted record. The
+# allowlist is the control that FORCED this to be a decision rather than a
+# silent addition — it failed on the new key until updated here.
 check("composite target absent from persisted verdict records",
       "until" not in _vr_raw
       and sorted(json.loads(_vr_raw).keys())
       == ["composite", "critique", "iteration", "notices",
-          "proposed_overrides", "scores", "verdict", "weights"])
+          "proposed_overrides", "run_id", "scores", "verdict", "weights"])
 
 print("\n== ADR-038: multi-reference edit (static refs + identity judging) ==")
 # --- D2 grammar: PATH[:MODE][:judge], fixed order, :judge last only ---------
@@ -2030,7 +2036,7 @@ try:
             target_prompt="p", catalog={}, roots=(), conn=object(),
             backend_cfg={"url": "http://x", "model": "m"}, output_dir=_d3,
             device="cuda", pass_threshold=8, max_iterations=2, patience=0,
-            log=lambda *_a: None)
+            run_id="deadbeef", log=lambda *_a: None)
     finally:
         refine.run_generation, refine.judge_candidate = _rg, _jc
 finally:
@@ -2109,6 +2115,7 @@ class _FakeJudgeH(_FakeJudge):
 
 
 def _run_loop_h(script, **kw):
+    kw.setdefault("run_id", "deadbeef")
     d = _tf.mkdtemp(prefix="refine_v2h_test_")
     fg, fj = _FakeGenP(), _FakeJudgeH(script)
     _rg, _jc = refine.run_generation, refine.judge_candidate
@@ -2446,6 +2453,7 @@ def _run_loop_e(script, *, edit_source, refuse_daemon=False, duel=None, **kw):
     msgs = []
     try:
         cfg = WorkingConfig(prompt="p", loras=[], base={"seed": -1})
+        kw.setdefault("run_id", "deadbeef")
         out = refine.refine_loop(
             cfg, target_prompt="p", catalog={}, roots=(), conn=None,
             backend_cfg={"url": "http://x", "model": "m"}, output_dir=d,
@@ -3291,7 +3299,8 @@ try:
         target_prompt="t", catalog={}, roots=(), conn=None,
         backend_cfg={"url": "http://x", "model": "m"},
         output_dir=_tf.mkdtemp(prefix="refine_t2i_band_"), device="cuda",
-        max_iterations=1, patience=0, duel_band=1.0, log=_msgs.append)
+        max_iterations=1, patience=0, duel_band=1.0, run_id="deadbeef",
+        log=_msgs.append)
 finally:
     refine.duel_candidates = _dc_orig
     refine.run_generation, refine.judge_candidate = _rg, _jc
@@ -3814,6 +3823,50 @@ with _ctx.redirect_stderr(_err):
 check("--anchor-duel-every -1 is rejected by its own check, exit 2",
       _rc == 2 and "--anchor-duel-every must be" in _err.getvalue(),
       detail=f"rc={_rc} stderr={_err.getvalue()[:120]!r}")
+
+# ── ADR-040 D1b: run_id correlation on the loop's records ────────────────────
+# Before this, refine minted no iterate_batch_id (it never passes --iterate), so
+# every candidate sidecar and verdict record from a refine run had NO
+# correlation key at all — nothing tied the artifacts of one run together.
+
+_rid_rec = verdict_record(_cand, DEFAULT_W_PA, DEFAULT_W_AES, run_id="a1b2c3d4")
+check("verdict_record carries the run_id it was given",
+      _rid_rec.get("run_id") == "a1b2c3d4", f"rec={_rid_rec!r}")
+
+# run_id must never reach the LLM. _assert_no_paths is KEY-based, so it says
+# nothing about a value — the property that actually matters is that the judge
+# and duel payload builders never see the key at all. (An earlier version of
+# this block asserted `"/" not in run_id` on a literal the test itself supplied:
+# unfailable, and it named the wrong gate.)
+_rid_cfg = WorkingConfig(prompt="p", loras=[], base={"seed": 1, "run_id": "zz"})
+check("run_id never enters the judge payload",
+      "run_id" not in refine.build_judge_user_text(
+          "a detailed test scene", _rid_cfg, []))
+check("run_id never enters the duel payload",
+      "run_id" not in refine.build_duel_user_text("a detailed test scene"))
+
+# BEHAVIORAL, not source-grep (code review): drive the real loop through the
+# real _write_json and read the artifacts off disk. Covers both _generate_one
+# paths — the normal one and the RefRefused in-process fallback — which a
+# source-count assertion could not: adding a THIRD unstamped call site leaves
+# the count at 2 and passes green.
+_rid_d, _rid_out, _rid_fg, _rid_fj = _run_loop(
+    [_mkverdict(9, 9)], max_iter=1, run_id="cafe1234")
+with open(os.path.join(_rid_d, "candidates", "candidate_00.json")) as _fh:
+    check("load-plane sidecar carries run_id (normal daemon path)",
+          json.load(_fh).get("run_id") == "cafe1234")
+with open(os.path.join(_rid_d, "candidates", "candidate_00.verdict.json")) as _fh:
+    check("verdict record carries the SAME run_id as its sidecar",
+          json.load(_fh).get("run_id") == "cafe1234")
+
+_rid_de, _rid_oe, _rid_fge, _rid_fje, _rid_msgs = _run_loop_e(
+    [_mkverdict_ov(9, 9, None)], edit_source=_seed_png, refuse_daemon=True,
+    max_iterations=1, patience=0, run_id="beef5678")
+with open(os.path.join(_rid_de, "candidates", "candidate_00.json")) as _fh:
+    check("load-plane sidecar carries run_id on the RefRefused in-process "
+          "fallback path too",
+          json.load(_fh).get("run_id") == "beef5678")
+
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 print(f"\n{passed} passed, {failed} failed")
