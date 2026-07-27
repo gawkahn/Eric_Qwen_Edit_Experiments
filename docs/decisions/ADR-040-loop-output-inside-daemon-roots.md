@@ -51,28 +51,165 @@ response field).
 
 ### D1 — When a daemon serves the run, the loop's output directory is derived under the daemon's output root
 
-`refine` resolves its run directory to `<daemon output_dir>/<run stem>` when a
-daemon is reachable on the target device. `refs/` and `candidates/` are then
-inside a ref root **by definition**, and the class of failure above becomes
+`refine` resolves its run directory to `<daemon output_dir>/<run stem>-<run_id>`
+when a daemon is reachable on the target device. `refs/` and `candidates/` are
+then inside a ref root **by definition**, and the class of failure above becomes
 unrepresentable rather than diagnosed.
 
-**The derived run dir is created EXCLUSIVELY, and this is load-bearing**
-(design review HIGH). Today the operator picks distinct `--output-dir`s, so
-ADR-038's accepted `candidates/` collision residual is unlikely in practice. D1
-would make the run dir a deterministic function of daemon state plus a stem —
-and this environment runs concurrent sessions by design against a daemon built
-to serve them. Two runs deriving the same stem would SHARE a run dir, and
-`pin_static_refs` opens with an unconditional `shutil.rmtree(refs_dir)`
-(`refine.py:3124`): run B would delete and repin `refs/` while run A is
-mid-iteration, so run A either dies on a missing `ref_00.jpg` or silently reads
-run B's reference bytes — reopening exactly the judge-vs-generation divergence
-ADR-038 D5 closed. It would also delete a COMPLETED prior run's pinned
-provenance whenever a stem repeats.
+**D1 also kills the path-mirror tree, which is the operator-visible half of the
+bug** (Grant, 2026-07-27: he had complained about this behavior directly, and
+separately wondered where the `…0001`-suffixed images the daemon reports were
+going). `run_generation` passes refine's ABSOLUTE run path as `savepath`
+(`refine.py:1908`), but the daemon treats `savepath` as a RELATIVE template —
+`savepath.lstrip("/")`, then joined under its own root (`server.py:866-869`).
+The daemon therefore writes a **full mirror of the absolute path underneath its
+own output dir**, and refine moves the file back out afterwards. Measured on
+2026-07-27: 31 directories under `$DAEMON_OUT/home/gawkahn/…`, holding 2 orphaned
+candidate PNGs (2.9 MB) from runs that died before the move.
 
-Therefore: the run directory is created with `os.makedirs(..., exist_ok=False)`
-(O_EXCL-equivalent) and, on collision, gets a uniqueness suffix rather than
-joining the existing directory. The stem is `[A-Za-z0-9_-]` only — no path
-separators, no operator text interpolated unescaped.
+**The `…0001` naming is a separate mechanism, and conflating the two was an
+error in this ADR's first revision** (caught by the 2026-07-27 security
+re-review). `_resolve_savepath` (`generate.py:522-524`) appends the counter
+**unconditionally** — it starts at `counter = 1` and returns
+`f"{stem}{counter:04d}{extension}"` — so the daemon's FIRST file for stem
+`candidate_00` is always `candidate_000001.png`. It is the first slot, not a
+fired collision (a collision would be `…0002`). This resolves Grant's standing
+side question about where those files were going: the daemon's log names
+`candidate_000001.png` and the run dir shows `candidate_00.png`, and they are
+the same bytes — `shutil.move` (`refine.py:1953`) reconciles the two namespaces.
+
+**Therefore D1 removes the MIRROR, not the rename.** Making the savepath
+relative stops the shadow tree and the cross-filesystem-tree move, but the
+daemon still applies its counter suffix, so the canonical `output_dir/stem<ext>`
+name that ADR-034 D7, the stale-other-extension warning
+(`refine.py:1897-1905`), and the candidate-as-next-edit-source contract all
+depend on is still not what the daemon writes. A **same-directory
+`os.replace(daemon_name, canonical)` remains** — atomic, no longer crossing
+trees, and ADR-034 D7 is untouched.
+
+Deleting the rename outright was considered and rejected: it would force refine
+to adopt counter-suffixed names everywhere (an ADR-034 D7 amendment with a
+consumer list), and a same-stem regeneration inside one run would then yield
+`…0002`, breaking the `candidate_NN` ↔ file mapping. Worse, any implementer who
+dropped the rename while leaving a canonical-name assumption in place would let
+a stale canonical file in a reused directory be judged and pinned as the new
+candidate — the judge-vs-generation divergence ADR-038 D5 closed. The rename is
+load-bearing; only its cross-tree scope was accidental.
+
+**The run directory is uniquely named at session start, not deduplicated on
+collision** (Grant's ruling, superseding the first draft's suffix scheme —
+*"if I were building serious multiuser stuff here I'd be wanting truly unique
+dirnames for every run, set at session start — like UUID-unique, not just
+'check to see if it exists and append a string if it does'"*). `run_id` is
+minted once per invocation (D1b) and appended to the stem, so collision is
+structurally impossible rather than handled.
+
+This subsumes the design review's HIGH finding rather than answering it with a
+retry loop. That finding: D1 would make the run dir a deterministic function of
+daemon state plus a stem, and this environment runs concurrent sessions against
+a daemon built to serve them; two runs deriving the same stem would SHARE a run
+dir, and `pin_static_refs` opens with an unconditional `shutil.rmtree(refs_dir)`
+(`refine.py:3155`), so run B would delete and repin `refs/` while run A is
+mid-iteration — run A then either dies on a missing `ref_00.jpg` or silently
+reads run B's reference bytes, reopening the judge-vs-generation divergence
+ADR-038 D5 closed. It would also destroy a COMPLETED prior run's pinned
+provenance whenever a stem repeated. With a per-invocation `run_id` in the
+name, no two runs can address the same directory in the first place.
+
+`os.makedirs(..., exist_ok=False)` is retained, but demoted to an **assertion**
+— it now catches only a `run_id` collision (astronomically unlikely) or a
+logic error, and fails the run rather than suffixing. The stem is
+`[A-Za-z0-9_-]` only — no path separators, no operator text interpolated
+unescaped.
+
+**The exclusive create MUST be the first filesystem operation on the run dir**
+(re-review MEDIUM), before `pin_static_refs`, before `candidates/`, and before
+any write derived from a wire value. Two things depend on the ordering, and
+both fail silently if it slips. First, `pin_static_refs` calls
+`os.makedirs(refs_dir, exist_ok=True)` (`refine.py:3156`), which **creates
+parent directories** — if pinning runs first it materializes the run dir itself
+and the assertion can never fire, restoring silent sharing. Second, the run dir
+is derived from a value the DAEMON supplied over the wire (the D2 `output_dir`);
+a fresh exclusive create is what bounds every subsequent client write — and
+`pin_static_refs`' `rmtree` — to a directory this invocation provably just
+made, even against a buggy or malicious ping response. The ordering is a named
+test, not a code comment.
+
+**Uniqueness is guaranteed for DERIVED run dirs only** (re-review MEDIUM).
+Derivation applies only when no `--output-dir` was given (D3), so two concurrent
+runs handed the *same explicit* `--output-dir` still share it, and
+`pin_static_refs`' unconditional `shutil.rmtree(refs_dir)` still destroys the
+live sibling's pinned refs. That is the prior review's HIGH surviving on the
+explicit path, and this ADR does not close it — an operator who names the
+directory owns its concurrency. What this ADR does add, per the warn-don't-block
+preference: when an explicit `--output-dir` already contains a `refs/` from
+another run, the loop warns loudly at entry and proceeds.
+
+### D1b — `run_id` is the correlation primitive, and `iterate_batch_id` derives from the same minting helper
+
+A `run_id` is minted **once per invocation, at process start**, in every
+entrypoint (`generate`, `refine`, `cascade`), and stamped into every record the
+run writes: the load-plane sidecar, the path-free `*.verdict.json`, and the
+duel-arm records. It appears verbatim in the D1 run dirname, so the directory an
+operator is looking at names the ID that ties its contents together.
+
+This closes a real gap: `iterate_batch_id` (ADR-008) is minted only when
+`--iterate` is given (`generate.py:3894`), so **every refine run today produces
+candidate sidecars with no correlation key at all**.
+
+**`run_id` and `iterate_batch_id` stay DISTINCT fields sharing one minting
+helper — they are not aliased** (Grant raised the case that decides this: a
+future judge run that itself drives `--batch`/`--iterate`). `run_id` identifies
+the invocation; `iterate_batch_id` identifies a sweep *within* it. Nested, the
+outer identity survives and both group correctly; aliased, the nesting case
+loses one of them. Code reuse is the shared helper; correlation is `run_id`
+being present on every record unconditionally. Collapsing them is a one-line
+change later if nesting is ruled out.
+
+**Format: 8 hex characters** (`uuid.uuid4().hex[:8]`), from one helper both
+fields call. Short enough to live in a dirname an operator types and to read off
+a log line. That is 32 bits of real randomness (uuid4's version nibble sits
+outside `hex[:8]`), so a birthday collision needs ~77k runs sharing one stem
+before it is even 50/50. 8 hex is adequate as the run-dir collision defense
+**only because** D1's `exist_ok=False` assertion fails loudly on the residual
+case — which is why that assertion's ordering is normative above rather than
+best-effort.
+
+This also resolves a pre-existing inconsistency: `iterate_batch_id` is minted as
+a 36-char dashed UUID in `generate.py:3894` but a 32-char hex in
+`cascade.py:895`. Both move to the helper. Nothing parses these values — they
+are compared for equality to group records — so shortening is safe, and
+historical sidecars carrying longer IDs never compare against new ones in a way
+that matters.
+
+**No wire change is required, and this is why the correlation work is not Red
+Zone.** Both clients write their sidecars themselves after the daemon returns —
+`generate.py:3303` patches the response metadata and dumps `{stem}.json`;
+`refine.py:2459` does the same via `_write_json`. `iterate_batch_id` already
+rides this path with an explicit "stamped client-side so downstream grouping
+works without requiring a server change" note. `run_id` follows the identical
+route: `server.py` is untouched.
+
+Two registration duties, both mandatory or the field becomes noise:
+
+- **`_SKIP_SIDECAR_KEYS` (`generate.py:120`)** gains `run_id` AND
+  `iterate_batch_id`. The latter is a **pre-existing wart this slice closes**:
+  it is absent today, so a `--params` replay of any `--iterate` sidecar already
+  prints `schema: dropping unknown key 'iterate_batch_id'`. Non-schema
+  provenance keys belong in that set — they are "known-and-intentional
+  non-params", exactly its stated purpose.
+- **The MCP `extract_params` drop-list** gains `run_id`, beside
+  `iterate_batch_id` (`docs/vision/slice-4-mcp-extract-params.md` item 20).
+  Runtime provenance must not surface in planner- or agent-facing params. The
+  re-review verified this is **already structural** rather than list-dependent:
+  the non-cascade path normalizes through `_validate_params` (which drops every
+  non-schema key) and the cascade path renders from raw through an allowlist, so
+  `run_id` could not survive `extract_params` even with no change. The list
+  entry is therefore documentation of an existing guarantee — worth writing
+  down, but it is not the thing keeping the key out.
+
+`run_id` is path-free, so `_assert_no_paths` continues to hold over the verdict
+records unchanged.
 
 An explicit `--output-dir` remains an override for the daemonless case and for
 operators who know what they are doing; when one is given AND a daemon is
@@ -105,6 +242,64 @@ anyway, so it buys nothing.
 
 **The reported values are the REALPATH'D ones the gate actually compares
 against**, not the spawn-time strings.
+
+#### D2a — `report_roots` is CLI-plane only, and the MCP server is barred from it by test
+
+Grant, 2026-07-27: *"Leaking real paths to an unauthenticated ping is exactly
+what I was talking about when I said this was challenging for the MCP case."*
+He ruled that this is handled **now**, sequenced into this ADR, not deferred
+behind an integration of unknown timing.
+
+The honest statement of the problem: **the daemon cannot discriminate an MCP
+call from a CLI call.** Same UID, same socket, same request schema
+(`server.py:418`). No authentication framework is being built here, and the
+opt-in flag alone does not settle it — it stops a *blindly forwarded* health
+check, but not a bridge that forwards the flag too.
+
+What actually holds today is narrower and testable: **the MCP server has no
+reason to ever ask.** D2 exists for the refine loop, a CLI-plane client.
+ADR-015 already means the MCP surface trades in catalog NAMES, not paths, and
+D4 extends that to reference images as handles. So:
+
+- `report_roots` is documented as a **CLI-plane request field**. `refine` and
+  `generate` may set it; `mcp_server.py` may not.
+- `report_roots` is **schema-validated as a bool and honored ONLY on
+  `type: "ping"`** (re-review LOW). On any other request type it is a
+  `ValidationError`. Without this the flag is a free-floating field a future
+  request type could inherit by accident.
+- A **negative test asserts `mcp_server.py` never emits `report_roots`.**
+
+**That test is a regression tripwire, not a control, and the difference
+matters.** The daemon will answer *any* same-UID caller that sets the flag; the
+test asserts the absence of a string in a file that today contains no
+daemon-socket client code at all (no `socket_path`, no `_send_server_command` —
+the MCP server reaches generation in-process). So it cannot stop a leak, it can
+only catch the day someone adds wire-client code to that file without thinking
+about roots. Today's real exposure through the mcpo/OWUI chain is nil for the
+same reason.
+
+This is a **residual risk, recorded as such, not a mitigation that closes the
+hole.** A future caller that does forward the flag re-opens it. The bound on the
+damage is that root enumeration is the whole disclosure — no write authority is
+granted, and D1 removes the loop's need for the operator to name paths at all.
+
+#### D2b — the intended structural fix is the `la mcp serve` boundary
+
+Recorded explicitly because **this ADR is one of the documents the integration
+will read**, and a residual risk that is only implied will not survive the
+handoff.
+
+The `local_agents` project is building an MCP server framework; once its first
+server (Obsidian MCP) lands and the general shape is settled, the intent is to
+run **our** MCP server under `la mcp serve`. That is the lever that can supply
+the discrimination the daemon cannot: a distinct socket per plane, or a daemon
+whose roots live inside an MCP-owned tree — i.e. D4's "handle, not path" answer
+arriving as a process boundary instead of as validation logic.
+
+Neither shape is chosen here, and this ADR does not block on that project's
+timeline. Whoever wires that integration should treat D2a's test as the
+**tripwire to revisit**: if the MCP plane ever legitimately needs roots, the
+answer is the process boundary, **not** relaxing the test.
 
 ### D3 — Entry-time validation, never a mid-run refusal
 
@@ -155,6 +350,47 @@ ADR-037 D5's stated contract, which is its own amendment; D3 reduces the
 frequency to the stale-ping window and the pre-D2 case. Named so that silence
 is not read as endorsement of the fatal path.
 
+#### D3a — the entry check is a shared helper, and `generate`'s one-shot path consumes it too
+
+The first draft deferred this (*"the one-shot case fails fast today because it
+makes a single call; the loop is what accumulates cost"*). Grant challenged the
+deferral on 2026-07-27 and it does not survive contact with the code.
+
+**The one-shot's failure mode is identical, not milder.** `generate.py:3331`
+catches `RefPathError` and falls back in-process — the same fallback that OOM'd
+on 2026-07-26 — and its own warning text concedes it: *"the daemon still holds
+its pipeline's GPU memory, so this in-process run shares the device — `--unload`
+the daemon if it OOMs."* On a warm single-GPU box that is not a degrade, it is a
+crash. The difference between one-shot and loop is **how much time is wasted
+before crashing**, not whether the run survives.
+
+The deferral was therefore reasoning about *cost of discovery* when the fact
+that matters is *the fallback being fatal*. Leaving it deferred would also ship
+two different behaviors for one misconfiguration — the kind of divergence that
+gets re-litigated in a future session with no record of why.
+
+Decision: the containment check is implemented **once**, as a shared helper over
+(paths, reported roots) applying the D3 `_within` semantics, with no
+loop-specific assumptions. The loop consumes it in slice 2 and the one-shot CLI
+in slice 3. This is **sequenced, not deferred** — small slices per §3 SRR,
+without leaving the trap in the CLI. The `Deferred` section keeps only genuinely
+out-of-scope items.
+
+**Scope: the check runs only when the daemon would actually serve the request**
+(re-review MEDIUM). Delegation is already skipped entirely when `--output` is
+set (`generate.py:3271-3273`), so gating on "a socket exists" would refuse runs
+that were never going to reach the daemon. The condition is: a socket exists
+for the device AND delegation is not skipped. The daemonless path and the
+`--output` path are untouched.
+
+**This is a deliberate policy change and the message must say so.** Refusal
+replaces a fallback that genuinely works on a box with VRAM to spare — it is
+only fatal against a warm daemon holding most of the device. Per the
+warn-don't-block preference, the refusal names its escape: `--output` (which
+forces in-process and skips delegation) or adding the `--ref-root` that would
+make the reference legal. The operator keeps the ability to shoot themselves in
+the foot; they just have to say so.
+
 ### D4 — External callers do not get a path surface at all
 
 Out of scope for this ADR's implementation, recorded because D2 raises it.
@@ -191,33 +427,136 @@ arguments and stay that way.
 - **The external/LLM caller surface (D4)** — its own ADR.
 - **Multi-daemon / per-device root divergence.** The loop targets one device per
   run; a run that spans devices would need per-device root resolution.
-- **Retro-fitting D3 to `generate`'s one-shot path.** The one-shot case fails
-  fast today because it makes a single call; the loop is what accumulates cost
-  before discovering the problem.
+- **Cleaning up the existing mirror tree.** The 31 stale directories and 2
+  orphaned PNGs under `$DAEMON_OUT/home/gawkahn/…` are operator data; D1 stops
+  new ones being created but this ADR deletes nothing. Removal is an operator
+  action, offered separately.
+- **Collapsing `iterate_batch_id` into `run_id`.** D1b keeps them distinct to
+  preserve the nesting case; if a sweep-inside-a-run is ever ruled out, the
+  merge is a one-line change and its own slice.
+
+*(Retro-fitting D3 to `generate`'s one-shot path was listed here in the first
+draft. It is no longer deferred — see D3a; it is slice 3.)*
 
 ## Slice plan
 
-1. **D2 wire field** — `ping` returns `output_dir` + `ref_image_roots`;
-   `server.py` is Red Zone, so ADR (this) → `security-auditor` → code.
-2. **D1 + D3 in the loop** — derive the run dir under the daemon root, validate
-   at entry, keep the latch as backstop. Update the vault manual with worked
-   examples, including an edit run with `--ref-image` (flagged as missing since
-   the ADR-038 review).
+1. **D2 wire field + D2a** — `ping` returns `output_dir` + `ref_image_roots`
+   behind `report_roots`; `server.py` is Red Zone, so ADR (this) →
+   `security-auditor` → code. Includes the negative test barring
+   `mcp_server.py` from emitting `report_roots`.
+2. **D1 + D1b + D3 in the loop** — mint `run_id`, derive the run dir under the
+   daemon root, drop the savepath mirror and the post-hoc move, validate at
+   entry via the shared helper, keep the latch as backstop. Register `run_id` +
+   `iterate_batch_id` in `_SKIP_SIDECAR_KEYS` and `run_id` in the MCP
+   `extract_params` drop-list. Update the vault manual with worked examples,
+   including an edit run with `--ref-image` (flagged as missing since the
+   ADR-038 review).
+3. **D3a retrofit** — `generate`'s one-shot path consumes the same entry-check
+   helper, so a bad `--ref-image` is refused before model load instead of
+   falling into the in-process OOM.
 
 Negative tests named up front: an explicit `--output-dir` outside the daemon's
 roots is caught at ENTRY, before any model load or generation, and is REFUSED
-rather than relocated; two runs deriving the same stem never share a run dir
-(exclusive creation, and `pin_static_refs`' `rmtree` therefore cannot touch a
-foreign run's refs); a prefix-sibling path (`/data/out` vs `/data/output`) fails
-entry validation, as does a symlinked dir that resolves outside; a derived run
-dir always contains `refs/` and `candidates/` and is echoed at entry; a daemon
-that reports no roots (pre-D2) still latches exactly as today AND warns at
-entry; a plain `ping` without `report_roots` discloses no paths; `ping` gaining
-fields does not change any existing client path; and the daemonless run is
-unaffected by all of it.
+rather than relocated; two DERIVED runs never share a run dir (distinct
+`run_id`s, so `pin_static_refs`' `rmtree` cannot touch a foreign run's refs) and
+an `exist_ok=False` collision FAILS rather than suffixing; the exclusive create
+is the FIRST filesystem operation on the run dir, ordered before
+`pin_static_refs` (whose `makedirs(exist_ok=True)` would otherwise materialize
+it); a shared EXPLICIT `--output-dir` already holding another run's `refs/`
+warns loudly and proceeds; a prefix-sibling path (`/data/out` vs `/data/output`)
+fails entry validation, as does a symlinked dir that resolves outside; a derived
+run dir always contains `refs/` and `candidates/`, carries `run_id` in its name,
+and is echoed at entry; no daemon write lands outside the derived run dir (the
+mirror tree is not recreated), the remaining rename is same-directory, and the
+bytes the judge reads are the bytes the daemon wrote in THAT iteration (never a
+stale canonical file in a reused directory); `run_id` appears in every sidecar
+and verdict record and survives a `--params` replay without a `dropping unknown
+key` warning, as does `iterate_batch_id`; `run_id` never appears in MCP
+`extract_params` output; `mcp_server.py` never emits `report_roots`;
+`report_roots` on a non-`ping` request type is a ValidationError; a ping
+response with a malformed `output_dir` / `ref_image_roots` (non-str, relative,
+NUL-bearing) behaves exactly as the pre-D2 case and never reaches `makedirs` or
+`rmtree`; a daemon that reports no roots (pre-D2) still latches exactly as today
+AND warns at entry; a plain `ping` without `report_roots` discloses no paths;
+`ping` gaining fields does not change any existing client path; a one-shot
+`generate` with an out-of-roots `--ref-image` is refused at entry rather than
+falling back in-process, the refusal names `--output` and `--ref-root` as
+escapes, and the check does NOT fire when `--output` already skips delegation;
+and the daemonless run is unaffected by all of it.
 
 ## Changelog
 
+- 2026-07-27 — Design security RE-review of the same-day revision
+  (`security-auditor`, invoked WITHOUT a `model:` argument per Grant's standing
+  no-elevation instruction — but the transcript shows it ran on
+  **`claude-fable-5` for all 40 turns anyway**, via the agent file's frontmatter
+  pin. That pin was documented as non-functional (CLAUDE.md §5A); it is
+  evidently functional in the current Claude Code build, so omitting `model:`
+  no longer avoids Fable. Flagged to Grant; not resolved here.) Findings folded
+  before acceptance. **One HIGH, and it
+  corrected a factual error introduced by the revision itself:** the revision
+  claimed `candidate_000001.png` proved the daemon's collision counter had
+  fired, and concluded D1 removes the move step entirely. `_resolve_savepath`
+  (`generate.py:522-524`) appends the counter UNCONDITIONALLY from `counter = 1`,
+  so `…0001` is the first slot, not a collision — and the daemon therefore still
+  does not write the canonical name after D1. Removing the rename would have
+  forced an unstated ADR-034 D7 amendment and, in one foreseeable
+  implementation, re-opened the judge-vs-generation divergence ADR-038 D5
+  closed. D1 now removes the MIRROR and keeps a same-directory `os.replace`.
+  **Three MEDIUM:** run_id uniqueness applies to DERIVED dirs only, so a shared
+  explicit `--output-dir` still carries the prior HIGH — now stated as a
+  residual with an entry warning rather than implied closed, and the negative
+  test scoped to derived runs; the `exist_ok=False` create must be the FIRST
+  filesystem op (`pin_static_refs`' `makedirs(exist_ok=True)` would otherwise
+  materialize the run dir and silence the assertion, and the fresh create is
+  what bounds writes derived from a wire value); D3a's check must fire only when
+  the daemon would actually serve the request (`--output` already skips
+  delegation) and must name its escape, since refusal replaces a fallback that
+  works on a roomy box. **Three LOW:** D2a's test relabeled a regression
+  tripwire rather than a control (the daemon answers any same-UID caller;
+  `mcp_server.py` holds no wire-client code at all today), plus `report_roots`
+  honored only on `type: ping`; a negative test added for malformed ping wire
+  values, which the body promised to type-check but no test covered; birthday
+  arithmetic corrected to ~77k. The reviewer independently verified the
+  no-wire-change claim, `_assert_no_paths` still holding, the `iterate_batch_id`
+  skip-keys wart being real, every load-bearing line reference, that no ADR-037
+  D5 prohibited alternative is smuggled in, and that no new write authority or
+  root widening is granted. It also found D1b's MCP claim UNDERstated — `run_id`
+  cannot survive `extract_params` even unlisted, since both paths already filter
+  structurally.
+- 2026-07-27 — Revised on Grant's rulings across four items, before any code.
+  **D1:** the collision-suffix scheme is replaced by a per-invocation `run_id`
+  in the dirname, minted at session start — *"truly unique dirnames for every
+  run… not just 'check to see if it exists and append a string if it does'"*;
+  `exist_ok=False` is demoted to an assertion. D1 also now states the
+  consequence the first draft missed: it eliminates the absolute-path MIRROR
+  TREE the daemon builds under its own output dir (measured: 31 dirs, 2 orphaned
+  PNGs) and the post-hoc `shutil.move` — a behavior Grant had complained about
+  directly, and the answer to where the `…0001`-suffixed images were going.
+  **D1b (new):** `run_id` becomes the correlation primitive on every record,
+  closing the gap that refine runs mint no `iterate_batch_id` and so have no
+  correlation key at all; the two stay DISTINCT fields sharing one minting
+  helper, because Grant named the nesting case (`--batch` inside a judge run)
+  that aliasing would break. Verified to need NO wire change — both clients
+  write sidecars themselves post-response — so the correlation half is not Red
+  Zone. Registration duties recorded, including a pre-existing wart this closes:
+  `iterate_batch_id` is absent from `_SKIP_SIDECAR_KEYS`, so `--params` replay
+  of an `--iterate` sidecar already logs a spurious unknown-key drop.
+  **D2a/D2b (new):** the MCP path leak is handled NOW rather than deferred
+  behind the `local_agents` timeline. The daemon cannot discriminate MCP from
+  CLI (same UID, same socket, same schema); no auth is built. Instead
+  `report_roots` is CLI-plane only, enforced by a negative test barring
+  `mcp_server.py` from emitting it, and the residual risk is recorded AS a
+  residual. D2b names `la mcp serve` as the intended structural fix explicitly,
+  because this ADR is a document that integration will read, and marks D2a's
+  test as the tripwire to revisit. **D3a (new):** the `generate` one-shot
+  deferral is REVERSED — the one-shot's fallback is the same fatal in-process
+  OOM (`generate.py:3331`, whose own warning concedes it), so the deferral was
+  reasoning about cost-of-discovery when the fatality of the fallback is what
+  matters; the entry check becomes a shared helper and the retrofit is sequenced
+  as slice 3. Slice plan now 3 slices; `Deferred` holds only genuinely
+  out-of-scope items plus the mirror-tree cleanup (operator data, not deleted
+  here).
 - 2026-07-26 — Design security review (`security-auditor`, Fable, no fallback)
   folded before acceptance: one HIGH — the derived run dir plus
   `pin_static_refs`' unconditional `rmtree` would have made two concurrent runs
