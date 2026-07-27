@@ -161,9 +161,39 @@ anyway" framing.
   field).
 - Schema placement is correct: `_RUNTIME_KIND` only, so `report_roots` never
   reaches `COMFYLESS_SCHEMA`, the sidecar, the `params_schema.py` drift guard,
-  or the MCP tool schema. `_GENERATE_INPUT_SCHEMA` is `additionalProperties: False`
-  and the handler builds explicit kwargs, so a recognized-but-unused key cannot
-  ride in.
+  or the MCP tool schema.
+
+## Correction — MCP input schemas are advisory, not enforced
+
+**Raised by Grant on reading this review, and it corrects a claim made in it.**
+The original text read: *"`_GENERATE_INPUT_SCHEMA` is `additionalProperties: False`
+and the handler builds explicit kwargs, so a recognized-but-unused key cannot
+ride in."* Grant's inference from that was reasonable — that some schema rule
+would reject a stray key — and it does not hold.
+
+`comfyless/mcp_server.py:2873` registers the dispatcher as
+`@app.call_tool(validate_input=False)`. That is deliberate and documented: the
+framework's default `validate_input=True` short-circuits schema-invalid input
+**before** the handler runs, which would bypass the per-invocation audit line
+(invariant 5). The consequence is that **`additionalProperties: False` is
+advisory documentation for the agent, not a server-side gate.** Nothing rejects
+an unknown key at the MCP boundary.
+
+The real defense is only the second clause: the handlers read named keys and
+ignore the rest. That is sufficient here, but it is a different guarantee —
+ignore-by-construction rather than reject-by-schema — and the distinction
+matters for any future field whose mere presence would be meaningful.
+
+**Closed by behavioral tests**, since every other MCP-side assertion in this
+slice was a source-grep for absence and none of them would have caught this:
+
+- a `ping` tool call is rejected as `UnknownTool`, discloses no path, and `ping`
+  is absent from the advertised tool list;
+- `report_roots` smuggled into `generate`'s arguments **does not fail the call**
+  — which is itself the proof that `additionalProperties: False` is unenforced —
+  and is ignored, with no root- or path-shaped field in the response;
+- `report_roots` is not a property of the generate input schema, so an agent
+  reading the tool definition is never told the field exists.
 - No existing client sends `ping` at all, so the "no existing client path
   changed" claim is safe but vacuous.
 - Edit scope is clean — two source files, two test files, zero slice-2 bleed, no

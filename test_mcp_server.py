@@ -5170,6 +5170,58 @@ import comfyless.generate as _d2_gen  # noqa: E402
 check("D2a: generate() — the function mcp_server calls in-process — never sends report_roots",
       "report_roots" not in inspect.getsource(_d2_gen.generate))
 
+# ── BEHAVIORAL, not source-grep (Grant, 2026-07-27) ───────────────────
+# The checks above are absence assertions. These actually SEND the two things
+# an agent could try and pin what the server does.
+#
+# READ THIS, it corrects a natural assumption: `additionalProperties: False` in
+# _GENERATE_INPUT_SCHEMA is NOT enforced server-side. The framework decorator is
+# `@app.call_tool(validate_input=False)` (mcp_server.py:2873) — deliberately, so
+# that every invocation emits an audit line instead of the framework
+# short-circuiting schema-invalid input before our handler runs. So the schema
+# is advisory documentation FOR THE AGENT; the actual defense against a stray
+# key is that the handlers read named keys and ignore the rest.
+
+_d2_mb, _d2_out, _d2_inside, _d2_cfg = _setup_mb_and_out()
+
+# 1. `ping` is not an MCP tool. Sending one is an UnknownTool error, not a
+#    pass-through to the daemon socket.
+_d2_ping_err = None
+try:
+    _run(mcps._call_tool_impl(_d2_cfg, "ping", {"report_roots": True}))
+except ValueError as _e:
+    _d2_ping_err = str(_e)
+except BaseException as _e:
+    _d2_ping_err = f"UNEXPECTED-{type(_e).__name__}: {_e}"
+check("D2a behavioral: a `ping` tool call is rejected as UnknownTool",
+      _d2_ping_err is not None and "Unknown tool" in _d2_ping_err,
+      f"err={_d2_ping_err!r}")
+check("D2a behavioral: the UnknownTool error discloses no path",
+      _d2_ping_err is not None and "/" not in _d2_ping_err,
+      f"err={_d2_ping_err!r}")
+check("D2a behavioral: 'ping' is absent from the advertised tool list",
+      "ping" not in {t.name for t in _run(mcps._list_tools_impl(_d2_cfg))})
+
+# 2. `report_roots` smuggled into the generate tool's arguments. It is NOT
+#    schema-rejected (validate_input=False, see above) — it is IGNORED, because
+#    _handle_generate reads named keys. Pin the real behavior, not the assumed
+#    one: the call succeeds and nothing root-shaped comes back.
+_d2_r, _d2_raised, _d2_err = _call(_d2_cfg, {
+    "prompt": "a test image", "model": "qwen-image", "report_roots": True})
+check("D2a behavioral: report_roots in generate arguments does not fail the call",
+      _d2_raised is None, f"raised={_d2_raised!r}")
+check("D2a behavioral: report_roots in generate arguments is IGNORED, "
+      "and no root/path field comes back",
+      _d2_r is not None
+      and "ref_image_roots" not in _d2_r[0].text
+      and "output_dir" not in _d2_r[0].text,
+      f"text={(_d2_r[0].text if _d2_r else None)!r}")
+
+# 3. The schema does not advertise it either — so an agent reading the tool
+#    definition is never told the field exists.
+check("D2a: report_roots is not a property of the generate input schema",
+      "report_roots" not in mcps._GENERATE_INPUT_SCHEMA["properties"])
+
 
 # ════════════════════════════════════════════════════════════════════════
 print("\n──────────────────────────────────────────────────")
