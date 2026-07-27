@@ -155,7 +155,15 @@ def _validate_request(req: Any) -> Optional[str]:
     # Canonical type validation handles non-dict payloads + every type rule.
     result = validate_machine_request(req)
     if not result.ok:
-        err = result.error
+        # ValidationResult's own documented invariant (comfyless/params_
+        # validation.py): ok=False always pairs with a populated `error`
+        # dict — narrowed without raising, matching the MCP plane's idiom
+        # for the same dataclass (mcp_server.py: `err = val.error or {}`).
+        # This function's own contract is "never raises across the boundary"
+        # (docs/vision/slice-machine-boundary-validator.md), and the daemon's
+        # accept loop has no exception handler at all — an assert firing
+        # here would be as fatal as any other unguarded exception.
+        err = result.error or {"field": "<root>", "reason": "validator returned no error detail"}
         if err["field"] == "<root>":
             return f"Request must be a dict; {err['reason']}"
         return f"Field {err['field']!r}: {err['reason']}"

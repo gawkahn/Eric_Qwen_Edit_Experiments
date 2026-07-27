@@ -849,7 +849,7 @@ class ResolveResult:
 
 def resolve_reference(
     catalog: CatalogDict,
-    raw_ref: str,
+    raw_ref: object,
     roots: Union[str, Tuple[str, ...]],
     *,
     expected_kind: Optional[Union[str, Tuple[str, ...]]] = None,

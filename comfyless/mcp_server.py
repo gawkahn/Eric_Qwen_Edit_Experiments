@@ -1622,7 +1622,7 @@ def _encode_return_image(
             scale = eff_px / longest
             img = src.resize(
                 (max(1, round(w * scale)), max(1, round(h * scale))),
-                Image.LANCZOS)
+                Image.Resampling.LANCZOS)
         else:
             img = src.copy()  # detach from the file; strips metadata on re-save
 
@@ -1643,7 +1643,7 @@ def _encode_return_image(
         s = new_longest / cur_longest
         img = img.resize(
             (max(1, round(img.size[0] * s)), max(1, round(img.size[1] * s))),
-            Image.LANCZOS)
+            Image.Resampling.LANCZOS)
         b64 = _encode(img)
         iters += 1
 
@@ -1990,7 +1990,15 @@ async def _handle_generate(
         rr = resolve_reference(
             cfg.catalog, model_in, cfg.all_roots, expected_kind="model")
         if not rr.ok:
-            raise _reference_error(rr.cause)
+            # ResolveResult's own documented invariant: ok=False always pairs
+            # with a populated `cause`. `or "UnknownName"` (not an assert):
+            # a future invariant break must still fall into the SAME uniform
+            # agent-facing frame (ADR-015 HIGH-1 oracle-closure, keystone
+            # test N5) rather than surface as a distinguishable internal
+            # error — security-auditor 2026-07-27.
+            raise _reference_error(rr.cause or "UnknownName")
+        # Symmetric invariant: ok=True always pairs with populated abs_path/name.
+        assert rr.abs_path is not None and rr.name is not None
         model_abs = rr.abs_path
         model_name = rr.name
         if rr.path_was_discarded:
@@ -2024,7 +2032,10 @@ async def _handle_generate(
             cfg.catalog, transformer_val, cfg.all_roots,
             expected_kind="transformer")
         if not rr.ok:
-            raise _reference_error(rr.cause)
+            # See the model-resolution block above: `or "UnknownName"` keeps
+            # a future invariant break inside the uniform agent-facing frame.
+            raise _reference_error(rr.cause or "UnknownName")
+        assert rr.abs_path is not None and rr.name is not None
         transformer_abs = rr.abs_path
         transformer_name = rr.name
         if rr.path_was_discarded:
@@ -2059,11 +2070,16 @@ async def _handle_generate(
                 raise _MCPHandlerError(
                     "ValidationError",
                     f"validation failed: loras[{i}].weight: expected number")
+            # Subscript, not .get(): "name" presence was already checked
+            # above — this also drops the spurious `| None` .get() adds.
             rr = resolve_reference(
-                cfg.catalog, lora.get("name"), cfg.all_roots,
+                cfg.catalog, lora["name"], cfg.all_roots,
                 expected_kind="lora")
             if not rr.ok:
-                raise _reference_error(rr.cause)
+                # See the model-resolution block above: `or "UnknownName"`
+                # keeps a future invariant break inside the uniform frame.
+                raise _reference_error(rr.cause or "UnknownName")
+            assert rr.abs_path is not None and rr.name is not None
             loras_resolved.append({"path": rr.abs_path, "weight": float(w)})
             lora_names.append(rr.name)
             if rr.path_was_discarded:
@@ -2344,7 +2360,11 @@ async def _handle_generate_cascade(
             cfg.catalog, raw_v, cfg.all_roots,
             expected_kind=("model", "transformer"))
         if not rr.ok:
-            raise _reference_error(rr.cause)
+            # See the model-resolution block in _handle_generate: `or
+            # "UnknownName"` keeps a future invariant break inside the
+            # uniform agent-facing frame.
+            raise _reference_error(rr.cause or "UnknownName")
+        assert rr.abs_path is not None and rr.name is not None
         resolved_cc[stage] = rr.abs_path
         stage_names[stage] = rr.name
         if rr.path_was_discarded:
@@ -2645,6 +2665,14 @@ def _db_family_names(cfg: _StartupConfig, kind: str,
     the metadata DB (ADR-022 S5 family filter). Read-only per-request
     connection; the serving catalog stays the name authority — the DB
     only narrows which serving names are listed."""
+    # Defense-in-depth, matching _handle_search's identical guard: the one
+    # current caller already checks this, but a private helper shouldn't
+    # assume every future caller will re-derive the same guard correctly.
+    if cfg.catalog_db_path is None:
+        raise _MCPHandlerError(
+            "ValidationError",
+            "model_family filter requires the server to be spawned with "
+            "--catalog-db")
     from comfyless.catalog_db import connect_readonly, CatalogDBError
     try:
         conn = connect_readonly(cfg.catalog_db_path)
