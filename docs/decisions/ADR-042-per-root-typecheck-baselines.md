@@ -172,5 +172,33 @@ already has 0 errors, so it needs no separate carve-out.
   lines) as "no prior baseline for any root" — nothing to compare, nothing
   blocks — which is exactly what let the mechanism-implementation commit land
   without needing a manual override.
+- 2026-07-27 — comfyless/ drawdown complete for this slice's scope.
+  **Measured final: comfyless=13**, split exactly as predicted in §Decision 3:
+  `__init__.py`'s 6 (structural, ModuleType monkeypatch, left residual) +
+  `generate.py`'s 7 (out of scope — ADR-040 session's active file lease,
+  unchanged by this slice). All 9 previously-`str | None` / narrowing errors
+  across `catalog.py`, `catalog_builder.py`, `params_validation.py`,
+  `cascade.py`, `enhance.py`, `server.py`, `mcp_server.py` resolved to real
+  narrowing, a real bug fix (`cascade.py`'s dead `PaellaVQModel` import path),
+  or a justified scoped `pyright: ignore` (two `enhance.py` sites, an
+  upstream `transformers` stub/checker mismatch — see the commit body).
+  `enhance.py`'s 2 residual-by-suppression sites mean the "shape of the
+  floor" from §Decision 3 (structural residual only, no swept-under-the-rug
+  suppressions) is slightly softer in practice than "zero suppressions" —
+  both are scoped to a single line each, comment-justified, and confirmed
+  correct at runtime by two independent reviewer passes (code-reviewer
+  corrected the stated cause for one of the two; both verified against the
+  actual transformers 5.5.3 source). Not counted toward the 13 residual
+  (those lines report 0 errors now) — noted here for the record since
+  §Decision 3 implied the floor would be suppression-free.
+  Two security-auditor findings, both applied: `server.py`'s and
+  `params_validation.py`'s narrowing fixes were changed from `assert`
+  to non-raising fallbacks after the daemon accept loop was found to have
+  no exception handler at all (`docs/security/review-server-validate-
+  request-typecheck-2026-07-27.md`); `mcp_server.py`'s failure-branch
+  narrowings were changed from `assert` to `rr.cause or "UnknownName"` to
+  preserve the ADR-015 uniform-error property under a future regression
+  (`docs/security/review-mcp-server-catalog-typecheck-2026-07-27.md`).
+  Full test battery (`just tests`, 29 suites) green throughout.
 
 AI-Disclosure: Claude (Sonnet 5) authored; Grant reviewed.
