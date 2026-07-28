@@ -2029,3 +2029,54 @@ Fix: the shape `pin_seed_image` now uses — re-read via
 read, and write through `os.open(..., O_WRONLY|O_CREAT|O_EXCL, 0o600)` instead
 of letting `copyfile` open the destination. Extracting one shared
 pin-bytes-to-run-dir helper for both call sites is the natural form.
+
+## 2026-07-28 — Kohya SDXL LoRAs stay `wrong_arch` after the ADR-014 native-convert amendment
+
+The 2026-07-28 ADR-014 amendment routes non-diffusers LoRA key layouts through
+the base family's own `LoraLoaderMixin.lora_state_dict()` before shape-matching,
+which recovers the ~54 Kohya **Flux** false negatives (measured 494/494 layers,
+100%). The ~13 Kohya **SDXL** files (pony / SDXL / Illustrious, `lora_te1_*` +
+unet) are NOT recovered — they still measure 0% and still classify `wrong_arch`.
+Two independent causes, both confirmed empirically against
+`loras/pony/Cunnilingus Close Up V2.safetensors`:
+1. `_convert_non_diffusers_lora_to_diffusers` emits `.lora.down.weight` /
+   `.lora.up.weight`, which are absent from `_ADAPTER_SUFFIXES`
+   (`nodes/eric_diffusion_lora_check.py:24` has `.lora_down.weight`, with an
+   underscore). `_strip_adapter_suffix` therefore returns `sfx=None` for every
+   key and ZERO layers are extracted — the match is 0% before naming is even
+   consulted.
+2. Deeper, and not fixed by (1): the converted keys carry flat block indexing
+   (`unet.down_blocks.4.1.proj_in`) while the SDXL base index is
+   `down_blocks.1.attentions.0.proj_in`. diffusers performs further remapping
+   inside the UNet loader that has not been traced.
+Also note the SDXL LoRAs carry text-encoder keys (`lora_te1_*`) that no
+transformer/unet base index can ever match — the base is a unet dir, so those
+layers are structurally unmatchable and any future fix must decide whether they
+count toward `total_layers`.
+Why not now: Grant's scope call on 2026-07-28. Cause (2) is an open-ended dig of
+unknown depth, and holding the proven Flux fix behind it would keep ADR-041
+(semantic LoRA offers) blocked on a corpus missing a third of its Flux LoRAs.
+Trigger: the SDXL/pony/Illustrious families becoming load-bearing for refine or
+MCP offers, or any report that pony LoRAs are missing from catalog search.
+Fix: start at cause (1) — it is a two-token suffix addition and makes the real
+failure in (2) measurable instead of masked. Then trace diffusers'
+`unet.load_attn_procs` / `_maybe_expand_lora_state_dict` remapping and decide
+whether to shape-match post-remap or index the unet under both conventions.
+
+## 2026-07-28 — `R_ARCH_MISMATCH_DIFFUSERS_ONLY` is a dead reason-code constant
+
+`scripts/lora_audit.py:121` declares
+`R_ARCH_MISMATCH_DIFFUSERS_ONLY = "arch_mismatch_diffusers_only"` and nothing in
+`scripts/`, `nodes/`, or `test_lora_audit.py` references it. It reads like it
+was minted for exactly the Kohya-vs-diffusers case the 2026-07-28 amendment
+addresses, but its name asserts a *mismatch* — the opposite of what that
+amendment records (those files are `usable`), so it was deliberately not
+repurposed; the amendment added `R_OK_NATIVE_CONVERT` instead.
+Why not now: §4 edit-scope discipline — deleting or wiring an unrelated constant
+inside the amendment's diff is a "clean up while here" change. It is inert, so
+it costs nothing to leave.
+Trigger: the next slice that touches the reason-code block, or the SDXL
+follow-up above (which may legitimately want a genuine arch-mismatch code).
+Fix: delete it, or wire it in the SDXL slice if a real
+"converted, still mismatched" reason turns out to be wanted. Confirm the closed
+reason-set docs in ADR-014 §3 agree either way.

@@ -581,3 +581,47 @@ Rejected for MVP. A sandbox means even a critical bug in the deserialization or 
   - **S4** (`--delete`: triple-gate + F-5 pre-unlink reclassify + F-16 dir-fd-relative unlink + preview mode) — `code-reviewer` (Opus) APPROVED, `security-auditor` (Opus) **CLEAN** (`review-lora-audit-s4-2026-06-27.md`). Both review LOWs folded in-slice: the F-8 escape-target leak (absolute outside-root path removed from the manifest `delete_skipped_containment_failed` detail; the identical pre-existing S1 `_passes_scan_containment` instances logged as TECH_DEBT 2026-06-27 for later unification) and the backstop-`Warning_` consistency gap.
 
   The MVP contract (adapters-only, `kind: "lora"`) is complete: a single top-level `lora_audit.json` manifest the catalog can ingest, with optional dry-load / convert / delete. **Out of scope and next in this thread:** transformer / checkpoint auditing (`kind: "transformer"` — the forward-compat hook is already in the schema) and the LoHa-conversion investigation, both per the Deferred section. This branch was rebased onto `main` on 2026-06-27 (linear; carried the `starlette → 1.3.1` CVE-2026-48710 lock bump through the merge).
+
+- **2026-07-28 (amendment — non-diffusers key formats classify via the loader's own converter)**: The core decision does not change (shape-match against a per-family base index remains the classifier). What changes is **what counts as "the LoRA's keys"**: the shape-match now runs against the key layout the *runtime loader* will actually see, not the layout on disk.
+
+  **Problem.** The catalog rebuild investigation (Backlog 2026-07-25) found 587 LoRAs excluded `wrong_arch`. 485 are Wan video and that exclusion is CORRECT — there is no image-plane base. But ~80 sit in *configured-base* families and are false negatives: they are **Kohya-format** files whose keys `_resolve_to_param_key` (`nodes/eric_diffusion_lora_check.py:174`) cannot resolve. That helper handles the Kohya *naming* convention (underscore-flattened, `lora_`/`unet_` prefix strip) but only as a **literal prefix strip** — it has no notion of the *structural* remap that BFL→diffusers requires (`double_blocks` → `transformer_blocks`, fused `qkv` split into `to_q`/`to_k`/`to_v`). So a `lora_unet_double_blocks_*` file scores 0% against a diffusers Flux base and falls through to `wrong_arch`. The dominant group is ~54 Flux LoRAs — **which comfyless loads successfully today**, because `load_lora_weights` converts them natively. They are working LoRAs that are simply invisible to catalog search, the MCP `list_loras` surface, and refine's planner offers. Against a searchable corpus of 241 non-excluded LoRAs, this is roughly a third more.
+
+  **Decision.** In `_classify_lora`, when no base yields a usable verdict, **re-run the shape-match against the state dict as converted by that base family's own diffusers `LoraLoaderMixin.lora_state_dict()`** before falling through to the `find_matching_plan` convertable probe. The mixin is resolved *data-driven*, not from a hardcoded family table: read `<base>/../model_index.json` → `_class_name` → `getattr(diffusers, cls)` → walk `__mro__` for the `*LoraLoaderMixin`. This is the same `model_index.json` → `_class_name` detection the generic loader already uses (CLAUDE.md "Auto-detection"), so a new family gains conversion coverage with no audit-side edit. Verified to resolve for all 9 configured bases:
+
+  | base | `_class_name` | mixin |
+  |---|---|---|
+  | `qwen-image` | `QwenImagePipeline` | `QwenImageLoraLoaderMixin` |
+  | `flux` | `FluxPipeline` | `FluxLoraLoaderMixin` |
+  | `flux2` | `Flux2Pipeline` | `Flux2LoraLoaderMixin` |
+  | `flux2klein` | `Flux2KleinPipeline` | `Flux2LoraLoaderMixin` |
+  | `krea` | `Krea2Pipeline` | `Krea2LoraLoaderMixin` |
+  | `zimage` | `ZImagePipeline` | `ZImageLoraLoaderMixin` |
+  | `chroma` | `ChromaPipeline` | `FluxLoraLoaderMixin` |
+  | `sd3` | `StableDiffusion3Pipeline` | `SD3LoraLoaderMixin` |
+  | `sdxl` | `StableDiffusionXLPipeline` | `StableDiffusionXLLoraLoaderMixin` (deferred — see below) |
+
+  **Why delegate rather than write the mappings.** The Backlog named two options — teach the classifier the Kohya→diffusers key mappings, or add a post-mapping classification. Both were drafted as *audit-owned* mapping tables; both are rejected. A hand-written table is a second, divergent copy of logic diffusers already owns (`_convert_kohya_flux_lora_to_diffusers`, `_convert_non_diffusers_qwen_lora_to_diffusers`, …), it drifts silently on every diffusers bump, and — the disqualifying property — it lets the audit assert loadability the real loader does not deliver, or deny loadability it does. Delegating makes the audit's answer **the loader's answer by construction**, which is the only version of this classifier worth trusting. It also composes with Vision invariant 7 (reuse-only): `lora_state_dict()` is a public classmethod that accepts a plain in-memory state dict, needs no network, no weights, and no pipeline instantiation.
+
+  **This is not a rubber stamp**, which is the property that makes it safe. Conversion is attempted, then the *existing* shape-matcher adjudicates the result; a file whose keys the converter does not recognize passes through unchanged and still fails the match. Measured on real files under the configured LoRA root:
+
+  - **Kohya Flux** (`kdny_body_flux.safetensors`, `lora_unet_double_blocks_*`) → converts to `transformer.transformer_blocks.N.attn.to_q.…`; **494/494 layers resolve (100%)** against the `flux` base. Was `wrong_arch`.
+  - **Wan negative control** (`SVI_v2_PRO_Wan2.2-I2V-A14B_LOW…`) → `FluxLoraLoaderMixin.lora_state_dict` returns it **unchanged** (`diffusion_model.blocks.*`); **0/400 resolve (0.0%)**, still `wrong_arch`. The converter declined to touch a foreign layout.
+  - **Kohya SDXL** (`pony/…`) → **0%**, blocked. Deferred, see below.
+
+  **Schema.** Additive and forward-compatible under the `audit_version: 1` contract (§"`audit_version: 1` is the contract" — new reason codes and new *optional* entry fields are explicitly not breaks; parsers ignore unknown keys per Vision invariant 12). Two additions:
+  - New usable reason code `R_OK_NATIVE_CONVERT = "ok_native_convert"` — classification stays `usable` (these files load today; that is the whole finding).
+  - New optional entry field `native_convert: {"mixin": str, "base": str, "verdict": {…}}` carrying the post-conversion `LoRACheckResult` dict. This preserves verdict granularity (OK / NORM_TARGETING / DIM_MISMATCH_PARTIAL survive conversion and must remain visible) without minting a combinatorial `<reason>_via_native_convert` code per existing reason.
+
+  The pre-existing constant `R_ARCH_MISMATCH_DIFFUSERS_ONLY` is **dead** (declared at `scripts/lora_audit.py:121`, never referenced) and is deliberately *not* repurposed here: its name asserts a mismatch, the opposite of what this records. Left untouched per §4 edit-scope discipline; logged as a TECH_DEBT observation.
+
+  **Cost.** None on the fast path. The header-only shape-match still adjudicates every file first; conversion is reached only in the branch that *already* loads the full state dict for the `find_matching_plan` probe (`_classify_lora`, no-usable-verdict path). The 241 currently-usable LoRAs never enter it.
+
+  **Deferred — Kohya SDXL (~13 files: pony / SDXL / Illustrious).** In scope for the Backlog item, explicitly **out of scope for this amendment** (Grant's call, 2026-07-28), because it is blocked on two distinct causes rather than one:
+  1. `_convert_non_diffusers_lora_to_diffusers` emits `.lora.down.weight` / `.lora.up.weight`, which are absent from `_ADAPTER_SUFFIXES` (`nodes/eric_diffusion_lora_check.py:24`, which has `.lora_down.weight`). Zero layers are extracted, so the match is 0% before naming is even considered.
+  2. Deeper: the converted keys carry flat block indexing (`unet.down_blocks.4.1.proj_in`) while the SDXL base index is `down_blocks.1.attentions.0.proj_in`. Fixing (1) alone does not resolve them — diffusers performs further remapping inside the UNet loader that has not been traced.
+
+  Shipping the flux-family fix now unblocks **ADR-041** (semantic LoRA offers), which must not be tuned over a corpus missing a third of its Flux LoRAs. SDXL becomes its own slice with the two blockers above as its starting point; filed to TECH_DEBT.
+
+  **Proof obligations** (`test_lora_audit.py`, 197 tests today): real Kohya `lora_unet_double_blocks_*` key fixtures classifying `usable` / `ok_native_convert`; a Wan fixture that must STILL classify `wrong_arch` (the anti-rubber-stamp negative); mixin resolution driven from a synthetic `model_index.json` including the absent-class and no-mixin-in-MRO fallbacks; and an assertion that the fast path does not load a state dict for an already-usable file. **`_TOOL_VERSION` bumps `0.2.0 → 0.3.0`** (additive schema change, SemVer-ish per §"Tool-version bumps").
+
+  Reviewer cadence: `code-reviewer` (Opus, `model: "opus"` at invocation). `scripts/lora_audit.py` is not in `scripts/git-policy/_red-zone-paths.sh` and this amendment adds no boundary surface — no `security-auditor` gate. **The fix is invisible until the operator re-runs `audit → catalog_cli build`**; that is an operator action, offered rather than performed.
