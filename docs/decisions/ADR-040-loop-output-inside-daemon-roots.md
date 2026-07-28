@@ -417,6 +417,11 @@ Already what `pin_static_refs` does (ADR-038 D5) — it copies every `--ref-imag
 into `<output-dir>/refs/`. The copy was never the problem; the destination was.
 D1 fixes the destination, so no new move step is needed.
 
+*(Corrected 2026-07-28: that last sentence was true for `--ref-image` and false
+for `--seed-image`, which `pin_static_refs` never covered — the seed was read
+from wherever the operator put it, on every pre-promotion iteration. A new pin
+step WAS needed and now exists; see the ADR-037 D5 amendment of 2026-07-28.)*
+
 **Have the daemon accept a per-request ref-root extension.** Prohibited by
 ADR-037 D5 and re-prohibited here: wire trust fields, daemon exemptions, and
 root merging remain prohibited. The daemon's roots are spawn-time operator
@@ -486,6 +491,18 @@ and the daemonless run is unaffected by all of it.
 
 ## Changelog
 
+- 2026-07-28 (later) — **The `--seed-image` warn-vs-refuse divergence is GONE,
+  and so is the warning this ADR added.** Superseding the slice-2b and slice-3
+  entries below, which record the warning as current behavior: the seed is now
+  PINNED into the run dir (ADR-037 D5 amendment, 2026-07-28), so the daemon
+  never sees the operator's path and an out-of-roots seed cannot latch the loop
+  in-process. Both slice-2b reviewers called pinning the real answer; it
+  dissolves the question instead of answering it. `generate --ref-image
+  /outside` still exits 2 (D3a) — the surfaces no longer diverge, because the
+  refine side no longer has a case to diverge ON.
+  Also corrects this ADR's "Alternatives Rejected" claim that `pin_static_refs`
+  meant "no new move step is needed" — true for `--ref-image`, false for the
+  seed, which that function never covered.
 - 2026-07-28 — **Vault user docs closed** (the slice-2 deliverable slice 2b did
   not do; outstanding since the ADR-038 review). Vault-only, no repo copy per
   the project CLAUDE.md. `Comfyless_Manual.md` gains five worked `--ref-image`

@@ -2138,6 +2138,7 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 anchor_duel_every: int = DEFAULT_ANCHOR_DUEL_EVERY,
                 output_format: Optional[OutputFormat] = None,
                 edit_source: Optional[str] = None,
+                edit_source_image: Any = None,
                 # REQUIRED, not Optional-with-None (code review): a None here
                 # writes `"run_id": null` into every record, and since the id's
                 # whole purpose is equality-grouping, that collapses every
@@ -2198,14 +2199,17 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
     drifted and the run reverts to the pinned config and image, marking the
     intervening mutations as failed.
 
-    EDIT MODE (ADR-037 D5): `edit_source` (an operator-typed image path) makes
-    every iteration an edit of the current source — the operator's seed at
-    iteration 0, then best's image, advancing on every promotion (image
-    lineage follows config lineage; ADR-039 D1 decides what promotes).
-    The JUDGE's comparison image is NOT the advancing source: it is the
-    operator's ORIGINAL seed, loaded once at entry and held for the whole run
-    (D5 amendment 2026-07-24 — cumulative drift must stay visible against a
-    fixed reference). Refs travel the TYPED channel only; one
+    EDIT MODE (ADR-037 D5): `edit_source` makes every iteration an edit of the
+    current source — the seed at iteration 0, then best's image, advancing on
+    every promotion (image lineage follows config lineage; ADR-039 D1 decides
+    what promotes). Since the D5 amendment of 2026-07-28 `edit_source` is the
+    LOOP-OWNED PINNED COPY of the operator's seed, not their path: every file
+    this loop reads after entry is one it owns, so a mid-run swap of the
+    operator's original cannot desynchronize the two channels the seed feeds.
+    The JUDGE's comparison image is NOT the advancing source: it is that same
+    pinned original, decoded once and held for the whole run (D5 amendment
+    2026-07-24 — cumulative drift must stay visible against a fixed reference;
+    `edit_source_image` lets the caller hand down the pin's single decode). Refs travel the TYPED channel only; one
     daemon ref refusal latches the whole run in-process with a loud notice.
     The caller owns the family gate — this function assumes an edit-capable
     model when edit_source is set."""
@@ -2303,7 +2307,21 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
     # edit source matches the generation-failure discipline); memory is
     # bounded by SEED_IMAGE_MAX_PIXELS; judge_candidate still downscales per
     # call. The anchor's path never rides the judge payload.
-    source_img = load_seed_image_capped(edit_source) if edit else None
+    #
+    # D5 amendment (2026-07-28): the caller pins the seed and hands the decode
+    # down, so the pin's ONE read serves both channels. Passing a path without
+    # its decode is a hard error, not a fallback-load: carrying "edit_source
+    # names a loop-owned copy" in a docstring rather than the signature is how
+    # a future caller — the video orchestrator and the LLM planner are the
+    # named candidates — silently reinstates BOTH defects this amendment closed
+    # (an operator path handed to the daemon, and an anchor validated by a
+    # weaker loader than generation uses). Both reviewers, 2026-07-28.
+    if edit and edit_source_image is None:
+        raise RefineError(
+            "refine_loop: edit_source must be PINNED before the loop runs — "
+            "call pin_seed_image() and pass its decoded image as "
+            "edit_source_image (ADR-037 D5 amendment 2026-07-28).")
+    source_img = edit_source_image if edit else None
     # Judge-visible static refs (ADR-038 D3): decoded ONCE at pin time, held
     # for the run. Same load-once discipline as the anchor above — the judge
     # compares against fixed bytes for every iteration.
@@ -3264,6 +3282,113 @@ def pin_static_refs(refs: List[StaticRef], output_dir: str,
     return pinned
 
 
+def pin_seed_image(path: str, output_dir: str,
+                   log: Callable[[str], None] = print) -> Tuple[str, Any]:
+    """Copy the edit seed into a loop-owned dir and return (copy path, decoded
+    image) — ADR-037 D5 amendment (2026-07-28).
+
+    The seed was the ONE reference the loop neither pinned nor refused, and the
+    argument `pin_static_refs` already makes applies to it unchanged: it is
+    consumed on TWO channels — the judge's anchor holds its decoded BYTES for
+    the run, while `current_source` names its PATH, re-opened by whoever
+    generates on every pre-promotion iteration. Swap the file mid-run and
+    generation conditions on new bytes while the judge scores identity against
+    old ones, so "scores describe the generation's inputs" quietly stops being
+    true. That TOCTOU needs no daemon; the cold in-process path re-reads too.
+
+    Pinning also dissolves ADR-040's warn-vs-refuse question rather than
+    answering it: the daemon only ever sees this copy, which lives inside the
+    run dir and therefore inside a reference root by construction (ADR-040 D1).
+    An out-of-roots seed stops being a latch, an OOM risk, and a reason to grant
+    `--ref-root` over the operator's whole photo directory.
+
+    `load_ref_image_capped`, not `load_seed_image_capped` — same choice and same
+    reason as `pin_static_refs`. It is not a narrowing: the seed is handed to
+    generation AS a `ref_images` entry, so it already had to clear this exact
+    loader at iteration 0; this only moves the failure to entry, where the
+    caps and the format allowlist can still be a clean refusal. The decoded
+    image is returned so the anchor costs ONE read, not two.
+
+    `source/`, not `refs/`: `pin_static_refs` opens with an unconditional
+    `rmtree(refs/)`, so sharing that directory would make correctness depend on
+    which pinning step runs first.
+    """
+    import hashlib
+    from comfyless.ref_image import (load_ref_image_capped,
+                                     _read_ref_bytes_capped,
+                                     REF_IMAGE_MAX_BYTES, RefImageError)
+    try:
+        loaded = load_ref_image_capped(path)
+    except RefImageError as e:
+        raise RefineError(f"--seed-image {path!r}: {e}") from e
+    src_dir = os.path.join(output_dir, "source")
+    # Refuse BEFORE the rmtree when the seed lives in the directory about to be
+    # deleted (security review MEDIUM). `--output-dir /runs/r1 --seed-image
+    # /runs/r1/source/seed.png` — re-running from a previous run's pinned seed —
+    # otherwise validates, then deletes the operator's file, then fails to copy
+    # it: the run refuses AND their seed is gone. Only reachable with an
+    # explicit --output-dir; a derived run dir was exclusively created moments
+    # ago and cannot contain anything.
+    from comfyless.server import _within
+    if _within(path, src_dir):
+        raise RefineError(
+            f"--seed-image {path!r} lives inside {src_dir!r}, which this run "
+            f"replaces. Copy it somewhere else first, or omit --output-dir to "
+            f"get a fresh derived run directory.")
+    try:
+        # Fresh every run, same rationale as refs/: a partial source/ from a
+        # failed earlier run in a REUSED explicit --output-dir would otherwise
+        # leave a stale seed beside the new one.
+        if os.path.isdir(src_dir):
+            shutil.rmtree(src_dir)
+        os.makedirs(src_dir, exist_ok=True)
+    except OSError as e:
+        raise RefineError(f"cannot prepare the loop-owned seed directory "
+                          f"{src_dir!r}: {e}") from e
+    ext = os.path.splitext(path)[1].lower() or ".img"
+    dst = os.path.join(src_dir, f"seed{ext}")
+    # Deliberately NOT shutil.copyfile: that is a SECOND read of a path only the
+    # operator controls, and an unguarded one — no byte cap, and it rejects
+    # FIFOs but not block/char devices. A file that changed or grew between the
+    # two reads would be pinned having passed nothing, with the write bounded by
+    # nothing (a symlink to /dev/zero fills the disk), and `loaded.sha256` would
+    # describe bytes no longer on disk. That is this slice's own two-channel
+    # desync, narrowed to an entry window rather than removed (both reviewers,
+    # 2026-07-28). Re-read through the SAME capped, regular-file-guarded reader
+    # and refuse unless the bytes are the ones that were validated.
+    try:
+        data = _read_ref_bytes_capped(path, REF_IMAGE_MAX_BYTES)
+    except RefImageError as e:
+        raise RefineError(f"--seed-image {path!r}: {e}") from e
+    if hashlib.sha256(data).hexdigest() != loaded.sha256:
+        raise RefineError(
+            f"--seed-image {path!r}: the file changed while it was being "
+            f"pinned. Nothing was generated; re-run when the file is stable.")
+    try:
+        # O_EXCL, not open(dst,'wb'): the latter FOLLOWS a symlink and
+        # truncates, so on a group-writable explicit --output-dir a planted
+        # source/seed.png symlink would redirect this write anywhere the process
+        # can reach (security review LOW). 0600 keeps a private photo private
+        # even when the parent is not 0700 — only DERIVED run dirs get 0700.
+        # VERBATIM bytes, never a re-encode: ADR-038 D5's finding applies
+        # identically here — re-encoding a decoded camera JPEG to PNG can
+        # inflate it past the cap every downstream load re-applies, so entry
+        # would pass and iteration 0 would die on the loop's own artifact.
+        fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+    except OSError as e:
+        raise RefineError(f"--seed-image {path!r}: cannot pin a copy to "
+                          f"{dst!r}: {e}") from e
+    # Name the ORIGINAL, not just the copy: after this slice nothing else
+    # records where the run's seed came from — the deleted ADR-040 warning was
+    # the last line that echoed it, candidate sidecars record the pinned path,
+    # and the copy itself is rmtree'd by the next run in a reused --output-dir.
+    log(f"[refine] pinned seed image {path!r} (sha256={loaded.sha256[:12]}…) "
+        f"-> {dst}")
+    return dst, loaded.image
+
+
 def _resolve_startup_loras(catalog, roots, specs: List[str]) -> List[LoraSlot]:
     """Resolve optional `--lora NAME[:WEIGHT]` seed LoRAs through the SAME ADR-015
     resolver the planner output uses (F2). User CLI input is trusted, but routing it
@@ -4076,9 +4201,28 @@ def main(argv: Optional[List[str]] = None) -> int:
             log("[refine] edit mode: the seed image is the pixels-only edit "
                 "source; --prompt is the edit instruction; generation params "
                 "come from CLI flags + family defaults (ADR-037 D5).")
-            # F5 gates (byte + pixel caps) validate the source up front; the
-            # pixels are discarded — the loop re-opens the file per iteration.
-            load_seed_image_capped(str(args.seed_image))
+            # Reject an unusable seed HERE, before the catalog scan and config
+            # build — the cheapest possible refusal. Kept after the D5
+            # amendment because the pin cannot run until the run directory
+            # exists, which is much further down, and an operator who typed a
+            # 2 GB file should not pay for a catalog scan first.
+            #
+            # `load_ref_image_capped`, NOT `load_seed_image_capped` (security
+            # review MEDIUM): this is the FIRST touch of the operator's file, so
+            # running it through the weaker loader meant the amendment's claimed
+            # hardening did not apply where it matters most — a non-allowlisted
+            # seed still dispatched into PIL's plugin zoo (EPS shells out to
+            # Ghostscript) and only got refused afterwards, `--seed-image
+            # /path/to/fifo` blocked forever because the O_NONBLOCK+S_ISREG
+            # guard lives only in the other loader, and PIL's raw error text
+            # was echoed. Pixels are discarded — the pinned copy, not this read,
+            # is what the loop uses.
+            try:
+                from comfyless.ref_image import (load_ref_image_capped,
+                                                 RefImageError)
+                load_ref_image_capped(str(args.seed_image))
+            except RefImageError as e:
+                raise RefineError(f"--seed-image {args.seed_image!r}: {e}") from e
             edit_source = os.path.abspath(str(args.seed_image))
             cfg = build_config_from_args(args, catalog, roots, log=log)
             target_prompt = str(args.prompt)
@@ -4182,6 +4326,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         _outside = paths_outside_roots(
             [output_dir,
              os.path.join(output_dir, "refs"),
+             # The daemon reads the pinned seed too since the D5 amendment.
+             # Contained transitively via output_dir, but this list is stated
+             # as "prove, don't assume" — a new daemon-read path belongs in it
+             # (both reviewers, 2026-07-28).
+             os.path.join(output_dir, "source"),
              os.path.join(output_dir, "candidates")],
             daemon_roots.ref_image_roots)
         if _outside:
@@ -4212,30 +4361,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                   f"mid-run and the in-process fallback could OOM against its "
                   f"resident pipeline. {_fix}", file=sys.stderr)
             return 2
-        if edit_source and paths_outside_roots([edit_source],
-                                               daemon_roots.ref_image_roots):
-            # The seed image is the one reference this slice neither pins nor
-            # refuses. Warn rather than refuse: the in-process latch still
-            # completes the run on a box with VRAM to spare, and D3 makes
-            # refusal normative only for the loop-owned directories above.
-            # The gap — and the reviewers' judgment that the seed BELONGS
-            # pinned like a static ref — is recorded in ADR-040's Changelog
-            # and TECH_DEBT, not left as an implicit "the loop cannot".
-            #
-            # Order the fixes narrow-first: --ref-root cannot name a single
-            # file, so suggesting it over a photo directory grants the daemon
-            # read+VAE-encode across that whole tree for its lifetime — the
-            # breadth ADR-035 Finding 6 warns about and _resolve_ref_roots
-            # warns about at runtime.
-            log(f"[refine] WARNING: --seed-image {edit_source!r} is outside the "
-                f"daemon's reference roots, so iteration 0's edit source will "
-                f"be REFUSED and the whole run latches in-process (ADR-037 D5) "
-                f"— which can OOM while the daemon holds VRAM. Best fix: move "
-                f"or copy the seed under a reported root "
-                f"({daemon_roots.output_dir!r} is one). Broader fallback: "
-                f"restart the daemon with --ref-root "
-                f"{os.path.dirname(edit_source)!r} — that grants the whole "
-                f"directory, so prefer the narrowest one that holds the seed.")
+        # NO seed check here any more (ADR-037 D5 amendment, 2026-07-28). Slice
+        # 2b warned that an out-of-roots --seed-image would be refused mid-run
+        # and latch the loop in-process; the seed is now PINNED into the run dir
+        # below, so the daemon never sees the operator's path at all and the
+        # condition cannot arise. Deleting the warning is the point of pinning —
+        # leaving it would fire on a path nothing reads after entry.
 
     # D1: the exclusive create is the FIRST filesystem operation on the run dir.
     # Ordering is normative, not hygiene: pin_static_refs' makedirs(refs_dir,
@@ -4273,7 +4404,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         + (" (derived under the daemon's output root — ADR-040 D1)"
            if derived else ""))
 
-    if not derived and os.path.isdir(os.path.join(output_dir, "refs")):
+    if not derived and any(os.path.isdir(os.path.join(output_dir, d))
+                           for d in ("refs", "source")):
         # D1 residual, stated rather than implied closed: uniqueness is
         # guaranteed for DERIVED dirs only. pin_static_refs opens with an
         # unconditional rmtree(refs/), so a concurrent sibling handed the same
@@ -4309,6 +4441,31 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[refine] {e}", file=sys.stderr)
             return 2
 
+    # ADR-037 D5 amendment (2026-07-28): pin the SEED by value too — it was the
+    # last reference read from an operator-owned path after entry, on two
+    # channels that a mid-run swap could desynchronize (judge anchor vs the
+    # per-iteration generation source). From here on `edit_source` names a
+    # loop-owned copy inside the run dir, so it is inside a daemon reference
+    # root by construction (ADR-040 D1) and the out-of-roots latch this used to
+    # warn about cannot happen. Independent of `pin_static_refs` — separate
+    # directory, no ordering coupling with its rmtree.
+    edit_source_image = None
+    if edit_source:
+        try:
+            edit_source, edit_source_image = pin_seed_image(
+                edit_source, output_dir, log)
+        except RefineError as e:
+            # Name the run dir: by now it exists and may already hold verbatim
+            # copies of the operator's reference photos from pin_static_refs.
+            # Nothing sweeps them (ADR-040 Deferred), so a refusal that does not
+            # say where they are leaves copies the operator does not know about
+            # (security review LOW).
+            print(f"[refine] {e}\n[refine] nothing was generated; the run "
+                  f"directory {output_dir!r} was created and may hold pinned "
+                  f"copies of your reference images — remove it if you do not "
+                  f"want them kept.", file=sys.stderr)
+            return 2
+
     try:
         result = refine_loop(
             cfg, target_prompt=target_prompt, catalog=catalog, roots=roots,
@@ -4329,7 +4486,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             exhaust_after_batches=args.exhaust_after_batches,
             run_id=run_id,
             output_format=out_fmt,
-            edit_source=edit_source, static_refs=static_refs, log=log)
+            edit_source=edit_source, edit_source_image=edit_source_image,
+            static_refs=static_refs, log=log)
     except RefineError as e:
         # A fatal generation error (e.g. daemon failure, model not found) surfaces
         # here as a clean exit, not a traceback (code review slice-3, LOW-8).

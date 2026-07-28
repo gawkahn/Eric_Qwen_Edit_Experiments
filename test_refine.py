@@ -1745,6 +1745,102 @@ _PILImage.new("RGB", (16, 16), (200, 0, 0)).save(_ref_a)  # operator swaps it
 check("D5: the loop-owned copy is unaffected by the swap",
       open(_pinned[0].path, "rb").read() == _swap_before)
 
+# --- D5 amendment 2026-07-28: the SEED is pinned by value too ---------------
+# The seed was the last reference read from an operator-owned path after entry,
+# and it is read on TWO channels — the judge's anchor holds its decoded bytes
+# for the run while `current_source` names its path, re-opened by whoever
+# generates each pre-promotion iteration. That is the TOCTOU pin_static_refs
+# already closes for every other ref, and it needs no daemon to occur.
+_seeddir = _tf.mkdtemp(prefix="adr037_seedsrc_")
+_seedrun = _tf.mkdtemp(prefix="adr037_seedrun_")
+_seed_orig = os.path.join(_seeddir, "portrait.png")
+_PILImage.new("RGB", (16, 16), (7, 8, 9)).save(_seed_orig)
+_seed_pin, _seed_img = refine.pin_seed_image(_seed_orig, _seedrun,
+                                             log=lambda *_a: None)
+check("D5a: the seed is copied into a loop-owned dir under the run dir",
+      os.path.isfile(_seed_pin)
+      and os.path.dirname(_seed_pin) == os.path.join(_seedrun, "source"))
+check("D5a: pinned into source/, NOT refs/ — pin_static_refs rmtree's refs/, "
+      "so sharing it would make correctness depend on call order",
+      not os.path.exists(os.path.join(_seedrun, "refs")))
+check("D5a: the copy is byte-identical to the operator's file (no re-encode)",
+      open(_seed_pin, "rb").read() == open(_seed_orig, "rb").read())
+check("D5a: the extension is preserved", _seed_pin.endswith(".png"))
+check("D5a: the decode is returned, so the anchor costs ONE read not two",
+      _seed_img is not None and _seed_img.size == (16, 16))
+_anchor_before = _seed_img.tobytes()
+_seed_pin_before = open(_seed_pin, "rb").read()
+# THE POINT OF THE SLICE: swap the operator's file mid-run. Generation reads
+# the pinned path and the judge holds the pinned decode, so neither moves —
+# "scores describe the generation's inputs" keeps holding.
+_PILImage.new("RGB", (16, 16), (250, 1, 1)).save(_seed_orig)
+check("D5a: a mid-run swap of the operator's seed changes NOTHING the loop "
+      "generates from",
+      open(_seed_pin, "rb").read() == _seed_pin_before)
+check("D5a: ...and nothing the judge anchors against",
+      _seed_img.tobytes() == _anchor_before)
+# The loader moves from load_seed_image_capped (caps only) to
+# load_ref_image_capped (caps + format allowlist + regular-file guard). Not a
+# narrowing: the seed is fed to generation AS a ref, so it already had to clear
+# this loader at iteration 0 — the failure just moves to entry, where it is a
+# clean refusal instead of a dead run.
+_bad_seed = os.path.join(_seeddir, "notreally.png")
+open(_bad_seed, "wb").write(b"GIF89a" + b"\0" * 32)
+try:
+    refine.pin_seed_image(_bad_seed, _seedrun, log=lambda *_a: None)
+    _seed_bad_rc = "no raise"
+except refine.RefineError as _e_seed:
+    _seed_bad_rc = str(_e_seed)
+check("D5a: a seed outside the format allowlist refuses AT ENTRY, naming the "
+      "flag and the path",
+      "--seed-image" in _seed_bad_rc and _bad_seed in _seed_bad_rc,
+      detail=_seed_bad_rc)
+# A reused explicit --output-dir must not leave a previous run's seed beside
+# the new one (same rationale as refs/).
+_stale = os.path.join(_seedrun, "source", "seed.jpg")
+open(_stale, "wb").write(b"stale")
+refine.pin_seed_image(_seed_orig, _seedrun, log=lambda *_a: None)
+check("D5a: source/ is refreshed per run — a stale seed from an earlier run "
+      "in a reused dir does not survive",
+      not os.path.exists(_stale)
+      and os.path.isfile(os.path.join(_seedrun, "source", "seed.png")))
+# Re-running from a PREVIOUS run's pinned seed is a natural workflow, and the
+# rmtree would delete the operator's file and then fail to copy it — refusing
+# the run AND destroying the seed (security review MEDIUM).
+try:
+    refine.pin_seed_image(os.path.join(_seedrun, "source", "seed.png"),
+                          _seedrun, log=lambda *_a: None)
+    _self_rc = "no raise"
+except refine.RefineError as _e_self:
+    _self_rc = str(_e_self)
+check("D5a: a seed living inside the directory the pin replaces is refused "
+      "BEFORE the rmtree, so it is never destroyed",
+      "lives inside" in _self_rc
+      and os.path.isfile(os.path.join(_seedrun, "source", "seed.png")),
+      detail=_self_rc)
+# The pinned bytes must be the VALIDATED bytes. copyfile would have re-read the
+# path (uncapped, unguarded); the pin reads through the capped guarded reader
+# and refuses on mismatch, so a file that changes mid-pin cannot land unchecked.
+check("D5a: the pinned file is written with an exclusive create at 0600, so a "
+      "planted symlink cannot redirect the write and a private photo is not "
+      "left world-readable",
+      oct(os.stat(os.path.join(_seedrun, "source", "seed.png")).st_mode)[-3:]
+      == "600")
+# refine_loop must not accept an unpinned edit source — carrying that invariant
+# in a docstring is how a future caller silently reinstates both closed defects.
+try:
+    refine.refine_loop(
+        WorkingConfig(prompt="p", loras=[], base={}), target_prompt="p",
+        catalog={}, roots=(), conn=None, backend_cfg={"url": "u", "model": "m"},
+        output_dir=_seedrun, device="cuda", edit_source=_seed_orig,
+        run_id="deadbeef", log=lambda *_a: None)
+    _unpinned_rc = "no raise"
+except refine.RefineError as _e_unpinned:
+    _unpinned_rc = str(_e_unpinned)
+check("D5a: refine_loop REFUSES an edit_source that was never pinned "
+      "(fail-closed contract, not a docstring)",
+      "must be PINNED" in _unpinned_rc, detail=_unpinned_rc)
+
 # --- D5 latch notice names the REFUSED path's directory --------------------
 check("D5: latch notice extracts the refused path's dir",
       refine._refused_ref_dir(
@@ -2454,6 +2550,12 @@ def _run_loop_e(script, *, edit_source, refuse_daemon=False, duel=None, **kw):
     try:
         cfg = WorkingConfig(prompt="p", loras=[], base={"seed": -1})
         kw.setdefault("run_id", "deadbeef")
+        # ADR-037 D5 amendment: refine_loop refuses an unpinned edit_source, so
+        # the harness pins exactly as main does. Pinning here (not a decode
+        # shortcut) keeps the tests exercising the real entry path.
+        if edit_source is not None and "edit_source_image" not in kw:
+            edit_source, kw["edit_source_image"] = refine.pin_seed_image(
+                edit_source, d, log=lambda *_a: None)
         out = refine.refine_loop(
             cfg, target_prompt="p", catalog={}, roots=(), conn=None,
             backend_cfg={"url": "http://x", "model": "m"}, output_dir=d,
@@ -2470,8 +2572,12 @@ def _run_loop_e(script, *, edit_source, refuse_daemon=False, duel=None, **kw):
 _d, _o, _fg, _fj, _m = _run_loop_e(
     [_mkverdict_ov(6, 6, None), _mkverdict_ov(4, 4, None), _mkverdict_ov(5, 5, None)],
     edit_source=_seed_png, max_iterations=3, patience=0)
-check("iter0 ref is the operator seed",
-      _fg.refs_seen[0] == [{"path": _seed_png, "mode": "both"}])
+check("iter0 ref is the PINNED seed — loop-owned, under the run dir, never "
+      "the operator's path (D5 amendment)",
+      len(_fg.refs_seen[0]) == 1
+      and _fg.refs_seen[0][0]["mode"] == "both"
+      and _fg.refs_seen[0][0]["path"] == os.path.join(_d, "source", "seed.png"),
+      detail=str(_fg.refs_seen[0]))
 check("promoted candidate becomes the next edit source",
       _fg.refs_seen[1][0]["path"].endswith("candidate_00.png"))
 check("rejected candidate NEVER promoted to edit source (D5)",
@@ -2685,10 +2791,24 @@ check("edit entry ran to the (stubbed) loop", _rc == 0)
 check("seed's embedded params NEVER reach the edit config (LOW-5)",
       "SENTINEL" not in _cfg_blob
       and _loop_capture["target_prompt"] == "make it night")
-check("edit_source is the seed path, config model is the CLI model",
-      _loop_capture["edit_source"] == os.path.abspath(_chunk_seed)
-      and _loop_capture["cfg"].base.get("model") not in
-      ("/SENTINEL_MODEL/path",))
+# ADR-037 D5 amendment (2026-07-28): edit_source is no longer the operator's
+# path — it is the loop-owned PINNED COPY under the run dir. That is the whole
+# point: nothing reads the operator's file after entry, so a mid-run swap
+# cannot desynchronize the judge's anchor from the generation source, and the
+# daemon never sees a path outside its roots.
+check("edit_source is the PINNED copy under the run dir, not the operator's "
+      "seed path (D5 amendment)",
+      _loop_capture["edit_source"] != os.path.abspath(_chunk_seed)
+      and os.path.basename(os.path.dirname(_loop_capture["edit_source"]))
+      == "source"
+      and os.path.isfile(_loop_capture["edit_source"]))
+check("the pinned seed is a VERBATIM byte copy, never a re-encode",
+      open(_loop_capture["edit_source"], "rb").read()
+      == open(_chunk_seed, "rb").read())
+check("the operator's original seed file is left untouched",
+      os.path.isfile(_chunk_seed))
+check("config model is the CLI model, not the seed's embedded one",
+      _loop_capture["cfg"].base.get("model") not in ("/SENTINEL_MODEL/path",))
 check("--width in edit mode notes dims-from-source (SHOULD-3)",
       "dims from the source" in _out_io.getvalue())
 
@@ -4201,13 +4321,50 @@ check("the exclusive create is the FIRST filesystem op on the run dir — "
       _rc5 == 0 and _pin_seen == [True], detail=f"rc={_rc5} err={_e5[:200]!r}")
 check("pinned reference copies land inside the derived run dir",
       os.path.isdir(os.path.join(_cap5["output_dir"], "refs")))
-# The one operator-typed path the loop CANNOT relocate for them (static refs
-# are pinned; the seed is read from where they put it). Warn, don't refuse —
-# the in-process latch still works on a box with VRAM to spare, and D3 makes
-# refusal normative only for the loop-owned directories.
-check("a --seed-image outside the daemon's roots warns about the latch + OOM",
-      "--seed-image" in _o5 and "latches in-process" in _o5
-      and "--ref-root" in _o5, detail=_o5[-400:])
+# ADR-037 D5 amendment (2026-07-28): the seed used to be the one operator-typed
+# path the loop could not relocate, so slice 2b WARNED that an out-of-roots seed
+# would latch the run in-process. It is now pinned like every other reference,
+# which makes that condition unrepresentable rather than warned — `_seed_png`
+# here lives in its own tmpdir, well outside `_dm_out`.
+check("an out-of-roots --seed-image no longer warns about a latch — pinning "
+      "removed the condition, so the warning would be about a path nothing "
+      "reads after entry",
+      "latches in-process" not in _o5, detail=_o5[-400:])
+# The promise behind that absence: the loop is handed a PINNED decode, not just
+# a path. Without this, deleting the whole edit_source_image wiring keeps the
+# suite green (code review 2026-07-28).
+check("main hands refine_loop the pin's decoded image, so the anchor costs "
+      "one read and the loop's fail-closed contract is satisfied",
+      _cap5.get("edit_source_image") is not None)
+check("the seed is pinned into the derived run dir, beside (not inside) refs/",
+      os.path.isfile(os.path.join(_cap5["output_dir"], "source",
+                                  "seed.png")),
+      detail=str(sorted(os.listdir(_cap5["output_dir"]))))
+check("the pinned seed is what the loop is handed, so the daemon only ever "
+      "sees a path inside its own roots",
+      _cap5.get("edit_source") == os.path.join(_cap5["output_dir"], "source",
+                                               "seed.png")
+      and _gen.paths_outside_roots([_cap5["edit_source"]], [_dm_out]) == [],
+      detail=f"edit_source={_cap5.get('edit_source')!r}")
+# pin_static_refs opens with rmtree(refs/). If the seed shared that directory,
+# correctness would depend on which pinning step ran first — this run does both.
+check("pinning the seed and pinning static refs do not interfere",
+      os.path.isdir(os.path.join(_cap5["output_dir"], "refs"))
+      and os.path.isfile(os.path.join(_cap5["output_dir"], "source",
+                                      "seed.png")))
+
+# The amendment's central operator-facing claim is "the failure moves to
+# ENTRY". Prove it end-to-end through main, not just at the helper: a file that
+# is not a real image exits 2 with the flag and path named, and never reaches
+# the loop (code review 2026-07-28).
+_bad_e2e = os.path.join(_tf.mkdtemp(prefix="adr037_bad_"), "fake.png")
+open(_bad_e2e, "wb").write(b"GIF89a" + b"\0" * 64)
+_rc_bad, _cap_bad, _o_bad, _e_bad = _run_main_2b(
+    ["--seed-image", _bad_e2e], ping=_DM_PING, model=_s2b_edit)
+check("an unusable --seed-image exits 2 at ENTRY, naming the flag and path",
+      _rc_bad == 2 and "--seed-image" in _e_bad and _bad_e2e in _e_bad,
+      detail=f"rc={_rc_bad} err={_e_bad[-300:]!r}")
+check("...and never reaches the loop", "output_dir" not in _cap_bad)
 
 # D3: REFUSAL, never a silent relocation of output the operator named.
 _far_dir = _tf.mkdtemp(prefix="adr040_far_out_")

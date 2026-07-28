@@ -287,6 +287,106 @@ Findings 1–8 before code; Findings 1–13 disposed as follows — 1↦D1, 2↦
 
 ## Changelog
 
+- 2026-07-28 — **D5 amendment: the seed image is PINNED BY VALUE into the run
+  directory, exactly as ADR-038 D5 pins `--ref-image`.** Proposed here; the
+  code is its own slice.
+
+  **The core D5 decision is unchanged** — the seed is still the pixels-only
+  edit source, plain foreign images (Gimp exports, photos, prior keyframes) are
+  still accepted, iteration 0 still edits the operator's seed and later
+  iterations still edit `best`'s image. What changes is WHICH BYTES those names
+  refer to after entry, so this is an amendment, not a new decision.
+
+  **Why: the seed is consumed on two channels, and they can disagree.** The
+  D5 anchor amendment (2026-07-24) pins the judge's comparison anchor by VALUE
+  at entry — `source_img = load_seed_image_capped(edit_source)`, loaded once.
+  But `current_source` starts as that same PATH and is re-opened by whoever
+  generates (the daemon, every pre-promotion iteration). Swap the file mid-run
+  and generation conditions on the new bytes while the judge scores identity
+  against the old ones — "scores describe the generation's inputs" silently
+  stops holding. That is verbatim the TOCTOU `pin_static_refs` already closes
+  for static refs, whose own docstring names this two-channel argument as the
+  reason to pin ALL refs rather than only judge-marked ones. The seed was the
+  one reference left unpinned, and the argument does not distinguish it. It is
+  also independent of any daemon: the re-read happens on the cold in-process
+  path too.
+
+  **The second thing it closes, which is why it surfaced now.** ADR-040 slice
+  2b left `--seed-image` outside the daemon's roots WARNING rather than
+  refusing, and slice 3 (D3a) made that a visible divergence from the sibling
+  `generate --ref-image` surface, which exits 2. Both slice-2b reviewers said
+  the real answer was to pin. Pinning dissolves the question instead of
+  answering it: the daemon only ever sees the loop-owned copy inside the run
+  dir — which is inside a reference root by construction under ADR-040 D1 — so
+  an out-of-roots seed is no longer a latch, no longer an OOM risk, and no
+  longer needs a warning or a `--ref-root` grant over the operator's photo
+  directory (the ADR-035 Finding 6 breadth exposure refusal would have forced).
+  The warn-vs-refuse divergence stops being a choice we defend and becomes
+  unrepresentable.
+
+  **Decision:**
+  - At loop entry, in edit mode, the seed is copied VERBATIM (never re-encoded,
+    per ADR-038 D5's own re-encode finding: a re-encoded camera JPEG can inflate
+    past the cap and kill iteration 0 on the loop's own artifact) into a
+    loop-owned directory under the run dir. `edit_source` and the initial
+    `current_source` both name the COPY; after entry the original path is never
+    read again.
+  - **Every read of the original goes through the capped, regular-file-guarded
+    reader, and the pinned bytes are proven to be the validated bytes.** The
+    first draft said "read exactly once" and both reviewers found the same HIGH:
+    `load_ref_image_capped` validates one set of bytes and `shutil.copyfile`
+    then re-reads the path, so what lands in `source/` had passed nothing.
+    `copyfile` applies no byte cap and rejects FIFOs but not devices, so the
+    write was bounded by nothing (a symlink to `/dev/zero` fills the disk), and
+    a file merely still being written — an editor save, a sync client, a camera
+    dump, exactly the actors motivating this amendment — would pin an oversized
+    copy that the daemon then refuses at iteration 0, on the loop's OWN
+    artifact. The check-then-use window ADR-035 6d was designed not to have,
+    reintroduced by the fix meant to remove one. So: re-read through
+    `_read_ref_bytes_capped`, refuse unless the SHA-256 matches what was
+    validated, and write with `O_EXCL` at `0600` — `copyfile`'s
+    `open(dst,'wb')` follows a symlink and truncates, so a planted
+    `source/seed.png` on a group-writable explicit `--output-dir` could
+    redirect the write.
+  - **The pin refuses when the seed lives inside the directory it replaces.**
+    `--output-dir /runs/r1 --seed-image /runs/r1/source/seed.png` — re-running
+    from a previous run's pinned seed — would otherwise validate, `rmtree` the
+    operator's file, and then fail to copy it: run refused AND seed destroyed.
+  - **`refine_loop` refuses an unpinned `edit_source`.** The invariant is in the
+    signature, not a docstring: a future caller (the video orchestrator and the
+    LLM planner are the named candidates) passing a path alone would otherwise
+    silently reinstate both closed defects — an operator path handed to the
+    daemon, and an anchor validated by a weaker loader than generation uses.
+  - The copy lands in `<run dir>/source/`, NOT `refs/`. `pin_static_refs` opens
+    with an unconditional `rmtree(refs/)`, so sharing that directory would make
+    correctness depend on call ordering between two pinning steps — a footgun
+    with no upside. Separate directory, no ordering coupling.
+  - The loader becomes `load_ref_image_capped` (ADR-035 6c), matching
+    `pin_static_refs`. This is NOT a narrowing of D5's "plain foreign images"
+    contract in practice: the seed is fed to generation AS a `ref_images` entry,
+    so it already had to pass that same loader at iteration 0 — the change moves
+    the failure from mid-run to entry, which is the direction the entry-refusal
+    discipline requires. Byte and pixel caps are identical either way (64 MB /
+    64 MP); what is gained is the format allowlist (no `Image.open` dispatch
+    across PIL's plugin zoo), the regular-file guard, and a SHA-256 for the log.
+  - The decoded image from that single read serves as the judge anchor — one
+    read, not two.
+  - ADR-040's `--seed-image` outside-roots warning is REMOVED, because the
+    condition it warned about can no longer occur.
+
+  **Accepted, and named rather than left implicit:** in the derived case a
+  verbatim copy of what is often a private photograph is now written INTO the
+  daemon's output root — the tree the ADR-040 review notes is readable by any
+  same-UID wire client, which `0700` does not defend against. The seed joins
+  `refs/` in that accepted residual. The copies persist after the run with no
+  retention policy (ADR-040 Deferred), so an edit run now leaves up to 8 refs
+  plus a seed on disk; a refusal after pinning says so and names the directory.
+
+  **Not changed:** seed MODE stays `both`; the planner still never names or
+  sees a path; `build_config_from_seed` (non-edit *seed mode*, where the image
+  is a params source and never a ref) keeps `load_seed_image_capped` and is out
+  of scope; the D5 family gate and the operator-typed `--model` requirement are
+  untouched.
 - 2026-07-25 (parity slice 2) — **Shared wire-warning surfacer.** From the
   refine↔generate parity audit (matrix: vault
   `Refine_Generate_Parity_Audit_2026-07-25.md`, Grant's call to run the

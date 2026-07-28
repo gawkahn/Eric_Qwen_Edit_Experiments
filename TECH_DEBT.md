@@ -1982,3 +1982,50 @@ mid-run. Fix: after the exclusive `makedirs`, copy the seed to
 point `edit_source` at the copy — only iteration 0 uses it as `current_source`
 (from iteration 1 the source is a candidate already inside the run dir), and
 the byte/pixel caps already ran at entry.
+Resolved: 2026-07-28 — `pin_seed_image` (ADR-037 D5 amendment 2026-07-28;
+`docs/security/review-adr037-seed-pin-2026-07-28.md`). Both consequences
+closed: the TOCTOU (nothing reads the operator's path after entry) and the
+out-of-roots latch (the daemon only sees the loop-owned copy, so ADR-040's
+warning was deleted rather than kept). Three deviations from the fix sketched
+above, each forced by a review finding: the copy lands in `<run dir>/source/`,
+NOT `refs/`, because `pin_static_refs` opens with an unconditional
+`rmtree(refs/)` and sharing the directory would make correctness depend on
+call order; `shutil.copyfile` was the wrong primitive — it is a second,
+uncapped, unguarded read, so the pinned bytes were never the validated bytes
+and the write was bounded by nothing (both reviewers, HIGH) — replaced by a
+capped guarded re-read, a SHA-256 equality check, and an `O_EXCL` 0600 write;
+and "the caps already ran at entry" was true but weak — that entry check used
+`load_seed_image_capped`, so the first decode of the operator's file skipped
+the format allowlist and the regular-file guard, and it now uses
+`load_ref_image_capped` too. ADR-040's "no new move step is needed" sentence
+corrected in the same slice, as this entry required.
+
+## 2026-07-28 — pin_static_refs has the same validate-then-copy window pin_seed_image just closed
+Found by `code-reviewer` and `security-auditor` (both, HIGH) while reviewing
+the ADR-037 D5 seed-pin amendment, against `pin_seed_image`. The finding
+applies verbatim to its older sibling: `pin_static_refs` calls
+`load_ref_image_capped(r.path)` to validate and hash one set of bytes, then
+`shutil.copyfile(r.path, dst)` re-reads the path from scratch. The bytes that
+land in `<run dir>/refs/ref_NN.ext` are therefore never the bytes that passed
+the byte cap, the pixel cap, the format allowlist, or the regular-file guard,
+and `StaticRef.sha256` — which decision 7's replay gate compares against —
+describes a file we may no longer hold. `copyfile` imposes no size limit and
+rejects FIFOs but not block/char devices, so a `--ref-image` that grows or is
+swapped between the two reads produces an unbounded write into the run dir,
+and the daemon then refuses the loop's own artifact mid-run at its own
+`load_ref_image_capped` decode. `open(dst,'wb')` also follows a symlink and
+truncates, so a planted `refs/ref_00.png` on a group-writable explicit
+`--output-dir` redirects the write.
+Why not now: `pin_seed_image` was the slice under review and its boundary was
+the SEED. Changing `pin_static_refs` in the same commit would have mixed an
+unreviewed change into a Red Zone diff whose scope both reviewers checked, and
+ADR-035 slice 2's review explicitly signed off on "no check-then-use window"
+for the ingestion path — so correcting that record is part of the work, not a
+drive-by edit.
+Trigger: the next change to ADR-038 static-ref handling, or any report of a
+mid-run "reference exceeds cap" failure on a file that passed at entry.
+Fix: the shape `pin_seed_image` now uses — re-read via
+`_read_ref_bytes_capped`, refuse on SHA-256 mismatch against the validated
+read, and write through `os.open(..., O_WRONLY|O_CREAT|O_EXCL, 0o600)` instead
+of letting `copyfile` open the destination. Extracting one shared
+pin-bytes-to-run-dir helper for both call sites is the natural form.
