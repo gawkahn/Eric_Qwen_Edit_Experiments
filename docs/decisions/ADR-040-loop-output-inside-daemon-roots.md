@@ -486,6 +486,61 @@ and the daemonless run is unaffected by all of it.
 
 ## Changelog
 
+- 2026-07-27 — **Slice 3 shipped (D3a) — the slice plan is complete.**
+  `generate`'s one-shot path calls `refuse_out_of_roots_refs`, which consumes
+  the SAME `query_daemon_roots` + `paths_outside_roots` helpers slice 2b built
+  (D3a's "implement once, consume twice" — there is still exactly one
+  client-side spelling of containment, deferring to `server._within` by import).
+  An out-of-roots `--ref-image` now exits 2 before any model load instead of
+  falling into the in-process fallback that OOMs against a warm daemon. The
+  scope gate is the normative half and is enforced cheap-first — specs →
+  `_should_delegate_to_server` → socket → ping — so an `--output` run neither
+  refuses nor pings, and a daemonless run is untouched.
+  **The warn-vs-refuse divergence recorded in the slice-2b entry is now IN
+  EFFECT, not pending:** `generate --ref-image /outside` exits 2 while
+  `refine --seed-image /outside` warns and latches. Pinning the seed (which
+  would close it, and independently closes the ADR-038 D5 TOCTOU) remains its
+  own slice, gated on an ADR-037 D5 amendment, filed in TECH_DEBT.
+  Full record: `docs/security/review-adr040-slice3-2026-07-27.md`.
+  **The MEDIUM both reviewers found independently, because it is the shape of
+  bug this ADR keeps producing: a refusal whose named escape does not work.**
+  The message offered `--output` to force in-process, but
+  `_should_delegate_to_server` is `bool(savepath) or default_output` and the two
+  flags are independent — so on a `--savepath` run, adding `--output` changes
+  nothing and the operator hits the identical refusal. `--savepath` is the
+  documented way to name output with a daemon running, so that was the DOMINANT
+  configuration, and the only offer left standing was `--ref-root <whole
+  directory>` — the exact ADR-035 Finding 6 breadth grant the narrowest-first
+  ordering exists to discourage. The escape now branches on `args.savepath` and
+  names the flag that must GO. The tests were complicit and were rewritten:
+  asserting the string `--output` appears in the message is an assertion about
+  the implementation; driving the advised escape to `rc is None` is an assertion
+  about the promise.
+  **Placement is the promise, so placement is now pinned.** Every D3a test drove
+  the helper directly, so deleting the call site left them all green while
+  "refused at ENTRY" silently became false. Source-pinned checks now hold the
+  call, the exact default-output literal it passes, and its position before
+  `_confirm_iteration` and `def _run_one`.
+  Smaller findings folded: the pre-D2 daemon case emitted no notice, so a
+  skipped entry check was silent (D3 makes that notice normative for the sibling
+  surface — `refine` had it, `generate` did not); the "copy it here" destination
+  asserted `output_dir` was a member of `ref_image_roots` without checking, the
+  same misattribution slice 2b already paid for; the suggested `--ref-root` was
+  a LEXICAL dirname, which does not contain a symlinked reference the daemon
+  realpaths, and named only the first offending directory; the `except
+  ValueError` fail-open was documented as unreachable but is reachable via
+  `_apply_replay_ref_trust`, which rewrites `args.ref_image` from an untrusted
+  sidecar AFTER `main()` validated the typed specs — it now fails CLOSED; the
+  new entry ping queues behind an in-flight generation on the daemon's serial
+  accept loop with a 600 s deadline, so it now announces what it is waiting on;
+  and three operator-facing statements (`_should_delegate_to_server`'s
+  docstring, the `--ref-root` help text, the vault manual) still asserted "there
+  is NO client-side ref-root gate — the CLI cannot know the daemon's
+  --output-dir", the premise D2 retired. Accepted residuals, named: the
+  stale-ping window (a daemon restarted between ping and request), refusal even
+  when the daemon holds no VRAM (D3a rules on this explicitly), and the D2a
+  tripwire remaining name-enumeration — one wrapper longer now, with the
+  structural replacement recorded for when it is next touched.
 - 2026-07-27 — **Slice 2b shipped (D1 + D3).** The loop pings for roots
   (`{"type": "ping", "report_roots": true}`, a literal on a ping request and
   nowhere else), derives `<daemon output_dir>/refine-<run_id>` when no

@@ -239,6 +239,235 @@ finally:
     _srvmod.socket_path = _orig_socket_path
     cg._send_server_command = _orig_send
 
+# ── ADR-040 D3a — the one-shot entry gate (slice 3) ──────────────────────────
+# The fallback tested immediately above is FATAL against a warm daemon: it runs
+# in-process while the daemon still holds its pipeline's VRAM. D3a refuses at
+# entry instead, consuming the SAME containment helper the refine loop uses
+# (query_daemon_roots + paths_outside_roots — no second spelling on the client).
+# Scope is the load-bearing part: the check fires only when the daemon would
+# ACTUALLY serve the request, so `--output` runs (delegation skipped) and
+# daemonless runs are untouched.
+_d3a_root = tempfile.mkdtemp(prefix="d3a-roots-")
+_d3a_out = os.path.join(_d3a_root, "out")          # the daemon's output dir
+_d3a_sib = os.path.join(_d3a_root, "output")       # prefix SIBLING of it
+_d3a_far = os.path.join(_d3a_root, "photos")       # nowhere near a root
+for _d in (_d3a_out, _d3a_sib, _d3a_far):
+    os.makedirs(_d, exist_ok=True)
+_d3a_inside = os.path.join(_d3a_out, "kf.png")
+_d3a_outside = os.path.join(_d3a_far, "kf.png")
+_d3a_prefix = os.path.join(_d3a_sib, "kf.png")
+for _f in (_d3a_inside, _d3a_outside, _d3a_prefix):
+    open(_f, "wb").close()
+
+_d3a_sent = []
+
+
+def _d3a_ping(req, device="cuda"):
+    _d3a_sent.append(req)
+    return {"status": "ok", "output_dir": _d3a_out, "ref_image_roots": [_d3a_out]}
+
+
+def _d3a_args(*, ref_image=(), savepath="out/%seed%.png", device="cuda"):
+    return SimpleNamespace(ref_image=list(ref_image), savepath=savepath,
+                           device=device)
+
+
+def _d3a_run(args, using_default_output=False):
+    """Drive the REAL gate, returning (rc, stderr)."""
+    _buf = _io.StringIO()
+    with _ctxlib.redirect_stderr(_buf):
+        rc = cg.refuse_out_of_roots_refs(args, using_default_output)
+    return rc, _buf.getvalue()
+
+
+try:
+    _srvmod.socket_path = lambda device="cuda": _FakeSock()
+    cg._send_server_command = _d3a_ping
+
+    _rc, _err = _d3a_run(_d3a_args(ref_image=[_d3a_outside]))
+    check("D3a: out-of-roots --ref-image is REFUSED at entry (rc 2), not "
+          "left to the in-process fallback", _rc == 2, f"rc={_rc!r}")
+    check("D3a: the refusal names the offending path",
+          repr(_d3a_outside) in _err, _err)
+    check("D3a: the refusal names --ref-root as an escape",
+          "--ref-root" in _err, _err)
+
+    # The in-process escape must DISCHARGE, not merely appear. `--output` alone
+    # does not skip delegation when --savepath is set (the predicate is
+    # `bool(savepath) or default_output`), so on this branch the advice has to
+    # name the flag that must GO — otherwise it loops back to this refusal
+    # (code review 2026-07-27).
+    check("D3a: with --savepath set, the escape says to REPLACE it (adding "
+          "--output would not skip delegation)",
+          "replace --savepath with --output" in _err, _err)
+    _rc_esc, _err_esc = _d3a_run(
+        _d3a_args(ref_image=[_d3a_outside], savepath=None),
+        using_default_output=False)
+    check("D3a: following the advised escape actually clears the refusal",
+          _rc_esc is None, f"rc={_rc_esc!r} err={_err_esc!r}")
+
+    # The commonest invocation of all: no --savepath, no --output. It delegates
+    # on the default-output sentinel, so it must refuse too — and it is the one
+    # branch where plain "pass --output" is the correct advice.
+    _rc_dfl, _err_dfl = _d3a_run(
+        _d3a_args(ref_image=[_d3a_outside], savepath=None),
+        using_default_output=True)
+    check("D3a: a default-output run (no --savepath, no --output) is refused",
+          _rc_dfl == 2, f"rc={_rc_dfl!r}")
+    check("D3a: on the default-output branch the escape is plain 'pass --output'",
+          "pass --output" in _err_dfl and "replace --savepath" not in _err_dfl,
+          _err_dfl)
+    check("D3a: --ref-root is offered for the reference's DIRECTORY (it cannot "
+          "name a single file)", repr(_d3a_far) in _err, _err)
+    check("D3a: fixes are ordered narrowest-first — copy under a reported root "
+          "BEFORE the broad --ref-root grant",
+          _err.index("copy") < _err.index("--ref-root"), _err)
+    check("D3a: the refusal says WHY refusing beats the fallback (the daemon "
+          "still holds VRAM)", "OOM" in _err and "in-process" in _err, _err)
+
+    # The gate reads the PATH, not the raw spec: a MODE suffix must not make an
+    # out-of-roots reference look like an unknown path and slip through.
+    _rc, _err = _d3a_run(_d3a_args(ref_image=[f"{_d3a_outside}:vl"]))
+    check("D3a: a MODE-suffixed spec is checked by its path, not its spec string",
+          _rc == 2 and repr(_d3a_outside) in _err, f"rc={_rc!r} err={_err!r}")
+
+    # Containment comes from the shared helper (realpath + boundary), so a
+    # prefix sibling of the root is OUTSIDE. A startswith would have passed it.
+    _rc, _err = _d3a_run(_d3a_args(ref_image=[_d3a_prefix]))
+    check("D3a: a prefix-sibling directory is outside (shared helper semantics, "
+          "not startswith)", _rc == 2, f"rc={_rc!r}")
+
+    # Only the offending reference is named; an in-roots companion is not.
+    _rc, _err = _d3a_run(_d3a_args(ref_image=[_d3a_inside, _d3a_outside]))
+    check("D3a: a mixed set is refused and names ONLY the outside reference",
+          _rc == 2 and repr(_d3a_outside) in _err and repr(_d3a_inside) not in _err,
+          f"rc={_rc!r} err={_err!r}")
+
+    _rc, _err = _d3a_run(_d3a_args(ref_image=[_d3a_inside]))
+    check("D3a: an in-roots reference proceeds (rc None, no refusal, no notice "
+          "— only the line naming what the entry ping is waiting on)",
+          _rc is None and "is outside" not in _err and "NOTICE" not in _err,
+          f"rc={_rc!r} err={_err!r}")
+
+    # SCOPE — explicit --output skips delegation entirely, so the daemon was
+    # never going to serve this run and the gate must not refuse it.
+    _d3a_sent.clear()
+    _rc, _err = _d3a_run(_d3a_args(ref_image=[_d3a_outside], savepath=None),
+                         using_default_output=False)
+    check("D3a: does NOT fire when --output already skips delegation",
+          _rc is None, f"rc={_rc!r} err={_err!r}")
+    check("D3a: an --output run does not even ping the daemon", _d3a_sent == [])
+
+    # A run with no references never pays for a ping.
+    _d3a_sent.clear()
+    _rc, _err = _d3a_run(_d3a_args())
+    check("D3a: a run with no --ref-image proceeds without pinging",
+          _rc is None and _d3a_sent == [])
+
+    # A daemon that reports nothing (pre-D2, or a malformed report) is UNKNOWN,
+    # never "outside" — that case behaves exactly as before this slice and keeps
+    # the RefPathError fallback as its only backstop.
+    cg._send_server_command = lambda req, device="cuda": {"status": "ok"}
+    _rc, _err = _d3a_run(_d3a_args(ref_image=[_d3a_outside]))
+    check("D3a: a daemon reporting no roots does not refuse (pre-D2 parity)",
+          _rc is None, f"rc={_rc!r}")
+    check("D3a: ...but says so — a skipped entry check is announced, not silent",
+          "NOTICE" in _err and "CANNOT be validated" in _err, _err)
+    cg._send_server_command = lambda req, device="cuda": {
+        "status": "ok", "output_dir": "relative/dir", "ref_image_roots": [_d3a_out]}
+    _rc, _err = _d3a_run(_d3a_args(ref_image=[_d3a_outside]))
+    check("D3a: a malformed report is ignored whole, not partially trusted",
+          _rc is None, f"rc={_rc!r}")
+
+    # A responder whose output_dir is NOT in its own ref_image_roots must not
+    # be quoted as a safe destination — that misattribution is the one slice 2b
+    # already paid for on the refine side.
+    cg._send_server_command = lambda req, device="cuda": {
+        "status": "ok", "output_dir": _d3a_far, "ref_image_roots": [_d3a_out]}
+    _rc, _err = _d3a_run(_d3a_args(ref_image=[_d3a_prefix]))
+    check("D3a: the 'copy it here' destination comes from the VALIDATED root "
+          "list, never an output_dir the daemon did not list as a root",
+          _rc == 2 and repr(_d3a_out) in _err
+          and f"({_d3a_far!r} is one)" not in _err, f"rc={_rc!r} err={_err!r}")
+
+    # The --ref-root suggestion must be the path the daemon's realpath'ing
+    # _within will actually compare against: a lexical dirname does not contain
+    # a symlinked reference, so the operator would restart a 20B daemon for
+    # nothing.
+    cg._send_server_command = _d3a_ping
+    _d3a_link_dir = os.path.join(_d3a_root, "link-to-photos")
+    os.symlink(_d3a_far, _d3a_link_dir)
+    _rc, _err = _d3a_run(
+        _d3a_args(ref_image=[os.path.join(_d3a_link_dir, "kf.png")]))
+    check("D3a: --ref-root is suggested for the RESOLVED directory, not the "
+          "symlinked spelling the daemon would still refuse",
+          _rc == 2 and f"--ref-root {_d3a_far!r}" in _err, f"err={_err!r}")
+
+    # Two references in two different out-of-roots directories: grant BOTH, or
+    # the operator restarts the daemon twice to discover the second.
+    _d3a_far2 = os.path.join(_d3a_root, "more-photos")
+    os.makedirs(_d3a_far2, exist_ok=True)
+    _d3a_outside2 = os.path.join(_d3a_far2, "kf2.png")
+    open(_d3a_outside2, "wb").close()
+    _rc, _err = _d3a_run(_d3a_args(ref_image=[_d3a_outside, _d3a_outside2]))
+    check("D3a: every offending directory is granted at once, not just the first",
+          f"--ref-root {_d3a_far!r}" in _err and f"--ref-root {_d3a_far2!r}" in _err,
+          f"err={_err!r}")
+
+    # A spec set that reaches the gate UNVALIDATED — `_apply_replay_ref_trust`
+    # rewrites args.ref_image from an untrusted sidecar after main() validated
+    # the typed ones — must fail CLOSED. Swallowing it would let sidecar
+    # metadata silently disable the containment check for the whole run.
+    _rc, _err = _d3a_run(_d3a_args(ref_image=[f"{_d3a_outside}:bogus-mode"]))
+    check("D3a: an unparseable spec refuses (fail-closed), never silently "
+          "skips the containment check",
+          _rc == 2 and "bogus-mode" in _err, f"rc={_rc!r} err={_err!r}")
+
+    # The ping D3a sends is the D2a literal — `report_roots` on a ping request
+    # and nowhere else. A variable-built key would be a hard daemon-side
+    # ValidationError instead of a False.
+    cg._send_server_command = _d3a_ping
+    _d3a_sent.clear()
+    _d3a_run(_d3a_args(ref_image=[_d3a_inside]))
+    check("D3a: the gate's only wire traffic is one report_roots PING",
+          _d3a_sent == [{"type": "ping", "report_roots": True}], f"{_d3a_sent!r}")
+
+    # Daemonless: no socket, no ping, no refusal — the in-process run is
+    # unaffected by every line of this slice.
+    _srvmod.socket_path = lambda device="cuda": SimpleNamespace(
+        exists=lambda: False)
+    _d3a_sent.clear()
+    _rc, _err = _d3a_run(_d3a_args(ref_image=[_d3a_outside]))
+    check("D3a: a daemonless run is unaffected (no refusal, no ping)",
+          _rc is None and _d3a_sent == [], f"rc={_rc!r}")
+finally:
+    _srvmod.socket_path = _orig_socket_path
+    cg._send_server_command = _orig_send
+    import shutil as _d3a_sh
+    _d3a_sh.rmtree(_d3a_root, ignore_errors=True)
+
+# The checks above drive the helper directly, so every one of them stays green
+# if the CALL SITE is deleted — and "refused at ENTRY" is a claim about
+# placement, not about the helper. Pin the wiring by source (same technique as
+# test_params_schema.py's inline-expression pin): the gate is called from
+# _run_cli_mode, with the same default-output literal _run_one uses, BEFORE the
+# iteration confirm and before _run_one (which owns every HF resolution, model
+# load and GPU touch).
+import inspect as _d3a_insp
+_d3a_cli = _d3a_insp.getsource(cg._run_cli_mode)
+check("D3a wiring: _run_cli_mode calls the gate",
+      "refuse_out_of_roots_refs(" in _d3a_cli)
+check("D3a wiring: the call site passes the SAME default-output literal "
+      "_run_one uses (a divergence here silently breaks the --output scope gate)",
+      'refuse_out_of_roots_refs(args, args.output == "/tmp/comfyless.png")'
+      in _d3a_cli)
+check("D3a wiring: the gate precedes the iteration confirm",
+      _d3a_cli.index("refuse_out_of_roots_refs(")
+      < _d3a_cli.index("_confirm_iteration"))
+check("D3a wiring: the gate precedes _run_one (every model load lives inside it)",
+      _d3a_cli.index("refuse_out_of_roots_refs(")
+      < _d3a_cli.index("def _run_one"))
+
 # ── Ref-execution-kind predicate (ADR-035 slice 4 / ADR-036 decision 1) ──────
 # Returns (ref_kind, warn): "qwen-edit" (manual loop), "flux2-native" (stock
 # pipeline image= kwarg), or None (no refs / drop path). Unsupported family:

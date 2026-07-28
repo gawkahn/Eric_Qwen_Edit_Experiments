@@ -5159,11 +5159,18 @@ check("D2a: mcp_server.py never emits report_roots",
 # it, because the literal lives in generate.py. The set tracks the helper's
 # NAME, not the wire field — a new wrapper means a new entry, or the tripwire
 # silently stops tripping.
+#
+# `refuse_out_of_roots_refs` is slice 3's wrapper and the rule applied to
+# itself: it wraps `query_daemon_roots`, so it is one call away from both the
+# ping AND the refusal message, which names the daemon's output_dir and every
+# ref root verbatim. An MCP handler calling it would disclose roots into an
+# error frame with all four string checks above still green.
 check("D2a premise: mcp_server.py holds no daemon socket-client code",
       "socket_path" not in _d2_src
       and "_send_server_command" not in _d2_src
       and "_delegate_to_server" not in _d2_src
       and "query_daemon_roots" not in _d2_src
+      and "refuse_out_of_roots_refs" not in _d2_src
       and "AF_UNIX" not in _d2_src)
 
 # The real slice-2/3 hazard (slice-1 security review MEDIUM): D3a puts the

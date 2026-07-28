@@ -2621,10 +2621,13 @@ def _parse_args() -> argparse.Namespace:
                    help="[--serve] Reference-image root (ADR-035 6a; repeatable). "
                         "ADDS to the daemon's ref_image_roots (= --output-dir ∪ "
                         "these) — the disjoint allowlist that wire --ref-image "
-                        "paths are contained to. Not a client gate for typed "
-                        "--ref-image: the daemon is the authoritative gate, and a "
-                        "--ref-image outside its roots falls back to in-process "
-                        "with a warning. A root of '/', a mount root, or $HOME "
+                        "paths are contained to. The daemon stays the "
+                        "authoritative gate, but since ADR-040 D3a the CLI ASKS "
+                        "it for these roots and REFUSES a typed --ref-image "
+                        "outside them at entry (exit 2, naming the fix) instead "
+                        "of falling back in-process; a daemon too old to report "
+                        "roots keeps the old fallback-with-a-warning behavior. "
+                        "A root of '/', a mount root, or $HOME "
                         "warns loudly. On a --params replay it is ALSO an extra "
                         "replay ref root (decision 7: file-derived ref paths are "
                         "refused outside output-dir ∪ --ref-root ∪ weight roots).")
@@ -3374,12 +3377,145 @@ def _should_delegate_to_server(args: argparse.Namespace,
     --output-dir ∪ --ref-root). If a typed reference is outside those roots the
     daemon returns a RefPathError and `_delegate_to_server` falls back to
     in-process with a loud warning (decision 7 Finding 2, revised 4b). There is
-    NO client-side ref-root gate: the CLI cannot know the daemon's --output-dir,
-    and a client-side --ref-root would only work when it matched the daemon's
-    config — extra flag, no value, and misleading. The daemon's default
+    NO client-side ref-root FLAG: the CLI cannot know the daemon's --output-dir
+    on its own, and a client-side --ref-root would only work when it matched the
+    daemon's config — extra flag, no value, and misleading. The daemon's default
     output-dir ref root means a ref anywhere in the output tree delegates with no
-    flags at all."""
+    flags at all.
+
+    UPDATED by ADR-040 D3a: the CLI now ASKS (`report_roots` ping) rather than
+    guessing, so against a daemon that reports roots an out-of-roots
+    --ref-image is refused at ENTRY by `refuse_out_of_roots_refs` and the
+    fallback below is never reached — the fallback is fatal, not a degrade, when
+    the daemon still holds its pipeline's VRAM. A pre-D2 daemon reports nothing
+    and keeps exactly the RefPathError behavior described above. This predicate
+    is unchanged either way: it still depends only on savepath / default-output
+    / explicit --output, and it is what the D3a gate consults for scope."""
     return bool(args.savepath) or using_default_output
+
+
+def refuse_out_of_roots_refs(args: argparse.Namespace,
+                             using_default_output: bool) -> Optional[int]:
+    """ADR-040 D3a entry gate: refuse a one-shot `--ref-image` the daemon would
+    reject, BEFORE any model load. Returns 2 to refuse, None to proceed.
+
+    The one-shot's failure mode is not milder than the loop's, only cheaper to
+    discover: `_delegate_to_server` catches the daemon's `RefPathError` and
+    falls back in-process while the daemon still holds its pipeline's VRAM, and
+    on a warm single-GPU box that is a crash, not a degrade (the 2026-07-26
+    incident). Refusing at entry replaces a fallback that genuinely works on a
+    box with room to spare, so this is a deliberate policy change and the
+    message names its escapes (warn-don't-block: the operator keeps the foot-gun,
+    they just have to ask for it).
+
+    SCOPE — the check fires only when the daemon would ACTUALLY serve the
+    request (D3a, re-review MEDIUM): delegation is not skipped AND a socket
+    exists for the device. `--output` skips delegation outright, so gating on a
+    live socket alone would refuse runs that were never going to reach the
+    daemon. The daemonless path and the `--output` path stay untouched.
+
+    Containment is NOT re-derived here — `paths_outside_roots` is the one
+    client-side spelling (D3a), and a daemon that reports nothing yields None
+    from `query_daemon_roots`, which means "unknown", never "outside": that case
+    behaves exactly as pre-D2 and keeps the RefPathError fallback as its only
+    backstop.
+
+    THIS IS NOT THE SECURITY BOUNDARY and must never be relied on as one.
+    `server._check_ref_paths` is the authoritative gate; this check runs in the
+    caller's own process, on roots the daemon volunteered, and can go stale the
+    moment it returns (a daemon restarted with narrower roots between the ping
+    and the request). Its only job is to convert a fatal fallback into a clean
+    entry refusal. Every failure direction here is a FALSE NEGATIVE — it passes
+    and the daemon still refuses — never a grant.
+    """
+    specs = getattr(args, "ref_image", None) or []
+    if not specs:
+        return None
+    if not _should_delegate_to_server(args, using_default_output):
+        return None
+    from .server import socket_path
+    if not socket_path(args.device).exists():
+        return None
+    # The daemon's accept loop is SERIAL, so this ping queues behind any
+    # in-flight generation and the client deadline is 600 s. Say what is being
+    # waited on, or a stall here is an unattributable silent hang (security
+    # review LOW).
+    _log(f"[comfyless] checking --ref-image against the reference roots of the "
+         f"daemon on {args.device!r} (waits for any in-flight generation)…")
+    roots = query_daemon_roots(args.device,
+                               log=lambda m: _log(f"[comfyless] {m}"))
+    if roots is None:
+        # Nothing better is possible against a daemon that reports nothing, but
+        # silence is a choice — D3 makes the notice normative for the sibling
+        # surface and this one had been left mute (security review LOW).
+        _log(f"[comfyless] NOTICE: the daemon on {args.device!r} reports no "
+             f"roots, so --ref-image CANNOT be validated at entry. If it "
+             f"refuses the reference mid-run, this falls back in-process while "
+             f"the daemon still holds its VRAM — best effort, and it may OOM. "
+             f"Restart the daemon to pick up ADR-040 D2.")
+        return None
+    try:
+        parsed = _validate_ref_image_specs(specs)
+    except ValueError as e:
+        # NOT unreachable, and the reason is worth stating: `main()` validates
+        # the specs TYPED on the CLI, but `_apply_replay_ref_trust` rewrites
+        # `args.ref_image` from an untrusted --params sidecar AFTER that and
+        # BEFORE this gate, so these specs may be a set main() never saw.
+        # Fail CLOSED — swallowing it would let sidecar-derived metadata
+        # silently disable the containment check for the whole run (security
+        # review LOW). Today the same call raises uncaught further down, so a
+        # named refusal here is strictly the better failure.
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    # Absolutized exactly as the wire request does — `_abspath`'s empty-string
+    # guard included, so the string compared here IS the string sent, with no
+    # divergence to reason about.
+    outside = paths_outside_roots(
+        [os.path.abspath(s["path"]) if s["path"] else s["path"]
+         for s in parsed],
+        roots.ref_image_roots)
+    if not outside:
+        return None
+    # The in-process escape has to name the flag that actually flips
+    # `_should_delegate_to_server`, which is `bool(savepath) or default_output`.
+    # With `--savepath` set the predicate is ALREADY True, so ADDING `--output`
+    # changes nothing (its own help says so: "Ignored when a server is running")
+    # and the advice would loop straight back to this refusal. Name what has to
+    # GO, not just what to add (code review 2026-07-27).
+    _inproc = ("replace --savepath with --output <path>" if args.savepath
+               else "pass --output <path>")
+    # Name a destination taken from the VALIDATED root list. `output_dir` is
+    # a member for the real server (`_resolve_ref_roots` unions it in), but
+    # asserting that from one wire value about another is how slice 2b's
+    # refusal misattributed its own cause — a skewed or buggy responder would
+    # send the operator to a directory the daemon still refuses.
+    _dest = (roots.output_dir if roots.output_dir in roots.ref_image_roots
+             else roots.ref_image_roots[0])
+    # The daemon realpaths BOTH sides (`_within`, `_resolve_ref_roots`), so a
+    # lexical dirname would not contain a symlinked reference and the operator
+    # would restart a 20B daemon for nothing. Resolve, then dedupe — every
+    # offending directory at once, not just the first.
+    _grants = list(dict.fromkeys(os.path.dirname(os.path.realpath(p))
+                                 for p in outside))
+    # Fixes ordered narrowest-grant first. `--ref-root` cannot name a single
+    # file, so it grants the daemon read + VAE-encode over the reference's whole
+    # directory tree for its lifetime — the breadth ADR-035 Finding 6 warns
+    # about — which makes it the last resort, not the first suggestion.
+    print(
+        f"[comfyless] --ref-image "
+        f"{', '.join(repr(p) for p in outside)} is outside the reference roots "
+        f"of the daemon on {args.device!r} "
+        f"({', '.join(repr(r) for r in roots.ref_image_roots)}), so the daemon "
+        f"would refuse it and this run would fall back in-process while the "
+        f"daemon still holds its pipeline's GPU memory — which can OOM instead "
+        f"of degrading (ADR-040 D3a). Fixes, narrowest first: move or copy the "
+        f"reference under a reported root ({_dest!r} is one); or "
+        f"{_inproc} to force in-process generation and skip delegation entirely "
+        f"(same shared-VRAM risk, but you asked for it); or restart the daemon "
+        f"with {' '.join(f'--ref-root {g!r}' for g in _grants)} — that grants "
+        f"it the whole directory, so prefer the copy.",
+        file=sys.stderr)
+    return 2
 
 
 def _delegate_to_server(
@@ -4003,6 +4139,17 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
     _ref_rc = _apply_replay_ref_trust(args, p)
     if _ref_rc is not None:
         return _ref_rc
+
+    # ── ADR-040 D3a: refuse a reference the daemon would reject, at ENTRY ──
+    # Runs AFTER the replay gate (so it sees the refs actually headed for the
+    # wire, typed or re-injected) and BEFORE the iteration confirm, any HF
+    # resolution, and every model load. `using_default_output` is recomputed
+    # from the same literal `_run_one` uses; both are constant for the run.
+    # One check for the whole invocation, not one per iteration — the reference
+    # set does not vary across a sweep, and a ping per iteration would be noise.
+    _d3a_rc = refuse_out_of_roots_refs(args, args.output == "/tmp/comfyless.png")
+    if _d3a_rc is not None:
+        return _d3a_rc
 
     base_loras = [_parse_lora_arg(s) for s in args.lora] if args.lora else p.get("loras", [])
 
