@@ -2080,3 +2080,52 @@ follow-up above (which may legitimately want a genuine arch-mismatch code).
 Fix: delete it, or wire it in the SDXL slice if a real
 "converted, still mismatched" reason turns out to be wanted. Confirm the closed
 reason-set docs in ADR-014 §3 agree either way.
+
+## 2026-07-28 — native-convert coverage floor is a heuristic, not a coverage proof
+
+The ADR-014 amendment guards partial conversions with
+`_COVERAGE_FLOOR = 0.5` in `scripts/lora_audit.py._try_native_convert_match`:
+the converted dict must retain at least half the source's adapter layers.
+This catches the gross case (`code-reviewer` H-2 reproduced a stub returning
+1 of 10 source layers scoring `key_match_pct 100.0` and being promoted to
+`usable`), but it is NOT a conservation law. Converters that split fused
+projections — Kohya `qkv` into `to_q`/`to_k`/`to_v`, so one source layer
+becomes three — inflate `converted_layers` above `source_layers`. A file
+whose converter understood only ~2 of 10 source layers can still emerge with
+~6 converted layers and clear a floor of 5. The ratio is therefore a floor on
+gross loss, not a measure of semantic coverage.
+The compensating controls, none of them proofs either: base config ordering
+(`flux` before `flux2`, so the correct converter usually wins first), the
+strict verdict requirement on the converted path (OK / NORM_TARGETING only —
+`DIM_MISMATCH`-at-50% is refused there), and `source_layers` /
+`converted_layers` being recorded in the manifest's `native_convert` field so
+the ratio is auditable rather than hidden.
+Why not now: a sound measure needs per-converter knowledge of which SOURCE
+keys were consumed. diffusers exposes that inconsistently — some converters
+raise, some warn-and-drop (`_convert_kohya_flux2_lora_to_diffusers` logs
+`remaining_keys`), some silently pass through. Reconstructing it per family is
+the mapping-table coupling the amendment deliberately rejected.
+Trigger: a LoRA showing up in catalog search under a family it does not
+belong to, or any `native_convert` entry whose recorded
+`converted_layers`/`source_layers` ratio looks implausible. Also revisit on
+any diffusers bump that changes converter drop behaviour.
+Fix: capture the converter's own warning stream, or diff the source key set
+against the union of keys each converter's mapping consumed, and record true
+consumed-fraction instead of the layer-count ratio.
+
+## 2026-07-28 — `_resolve_lora_mixin` re-parses model_index.json per (file × base)
+
+`scripts/lora_audit.py._try_native_convert_match` calls `_resolve_lora_mixin`
+on every fall-through file for every base, and that helper re-opens
+`<base>/../model_index.json`, re-parses it, and re-walks the pipeline class
+MRO each time. With 9 configured bases and ~600 fall-through files that is
+~5400 small JSON reads per run where 9 would do. `code-reviewer` flagged it
+non-blocking.
+Why not now: the reads are tiny and the fall-through path already loads full
+LoRA state dicts, which dominates by orders of magnitude — the measurable cost
+is noise against that. Adding a cache field to `BaseSpec` is a widening of the
+reviewed diff for no observed win.
+Trigger: audit runtime becoming a complaint, or the base count growing well
+past 9.
+Fix: resolve once in `_prepare_bases` and cache the mixin on `BaseSpec`
+alongside `param_dict`, which is already populated there lazily.

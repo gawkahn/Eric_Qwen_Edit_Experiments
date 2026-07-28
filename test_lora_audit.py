@@ -1801,6 +1801,451 @@ def test_transformer_audit() -> None:
         (troot / "sameshape.safetensors").unlink()
 
 
+# ── ADR-014 amendment 2026-07-28: native-convert classification ────────
+# The audit re-runs the shape-match against the state dict as the base
+# family's own diffusers LoraLoaderMixin rewrites it, so Kohya-format files
+# (which the runtime loader converts natively) stop reading as wrong_arch.
+# These fixtures drive the REAL diffusers converter — a stub would prove the
+# wiring but not the claim, and the claim is "the loader would make this work."
+
+# Flux hidden size for the synthetic fixtures. Small enough to stay cheap,
+# structurally faithful enough that _convert_kohya_flux_lora_to_diffusers
+# performs its real qkv split (up = 3*D) and mlp/mod expansions.
+_NC_D = 16
+_NC_R = 2
+
+# The layers the real converter emits for a one-double-block Kohya LoRA at
+# _NC_D, with the base shapes each must resolve against. Written out rather
+# than derived from the converter's output — deriving them would make the
+# base fixture agree with the converter by construction and the test would
+# pass even if both were wrong together.
+_NC_BASE_SHAPES = {
+    "transformer_blocks.0.attn.add_k_proj.weight": (16, 16),
+    "transformer_blocks.0.attn.add_q_proj.weight": (16, 16),
+    "transformer_blocks.0.attn.add_v_proj.weight": (16, 16),
+    "transformer_blocks.0.attn.to_add_out.weight": (16, 16),
+    "transformer_blocks.0.attn.to_k.weight": (16, 16),
+    "transformer_blocks.0.attn.to_out.0.weight": (16, 16),
+    "transformer_blocks.0.attn.to_q.weight": (16, 16),
+    "transformer_blocks.0.attn.to_v.weight": (16, 16),
+    "transformer_blocks.0.ff.net.0.proj.weight": (64, 16),
+    "transformer_blocks.0.ff.net.2.weight": (16, 64),
+    "transformer_blocks.0.ff_context.net.0.proj.weight": (64, 16),
+    "transformer_blocks.0.ff_context.net.2.weight": (16, 64),
+    "transformer_blocks.0.norm1.linear.weight": (96, 16),
+    "transformer_blocks.0.norm1_context.linear.weight": (96, 16),
+}
+
+
+def _build_flux_like_base(root: Path, class_name: str = "FluxPipeline") -> Path:
+    """A diffusers-shaped model dir: <root>/model_index.json + transformer/.
+
+    Returns the transformer dir (what a --base flag points at). The
+    model_index.json is what _resolve_lora_mixin reads to decide which
+    LoraLoaderMixin the runtime loader would use.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "model_index.json").write_text(
+        json.dumps({"_class_name": class_name}), encoding="utf-8"
+    )
+    tdir = root / "transformer"
+    tdir.mkdir(parents=True, exist_ok=True)
+    safetensors.torch.save_file(
+        {k: torch.zeros(*v) for k, v in _NC_BASE_SHAPES.items()},
+        str(tdir / "model.safetensors"),
+    )
+    return tdir
+
+
+def _write_kohya_flux_lora(dest: Path) -> None:
+    """A minimal but structurally real Kohya/BFL Flux LoRA (one double block).
+
+    This is the dominant civitai Flux format: underscore-flattened keys,
+    `lora_unet_double_blocks_*`, fused qkv, lora_down/lora_up + alpha.
+    """
+    D, R = _NC_D, _NC_R
+    sd: dict = {}
+
+    def add(name: str, d_in: int, d_out: int) -> None:
+        sd[f"{name}.lora_down.weight"] = torch.zeros(R, d_in)
+        sd[f"{name}.lora_up.weight"] = torch.zeros(d_out, R)
+        sd[f"{name}.alpha"] = torch.tensor(float(R))
+
+    for side in ("img", "txt"):
+        add(f"lora_unet_double_blocks_0_{side}_attn_qkv", D, 3 * D)
+        add(f"lora_unet_double_blocks_0_{side}_attn_proj", D, D)
+        add(f"lora_unet_double_blocks_0_{side}_mlp_0", D, 4 * D)
+        add(f"lora_unet_double_blocks_0_{side}_mlp_2", 4 * D, D)
+        add(f"lora_unet_double_blocks_0_{side}_mod_lin", D, 6 * D)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    safetensors.torch.save_file(sd, str(dest))
+
+
+def _write_wan_like_lora(dest: Path) -> None:
+    """A Wan-video-shaped LoRA — the negative control.
+
+    Wan LoRAs are the 485 files that SHOULD stay excluded (no image-plane
+    base exists). Their `diffusion_model.blocks.*` layout is foreign to the
+    Flux converter, which passes it through untouched.
+    """
+    sd: dict = {}
+    for i in range(4):
+        for sub in ("cross_attn.k", "cross_attn.v", "self_attn.q", "ffn.0"):
+            sd[f"diffusion_model.blocks.{i}.{sub}.lora_A.weight"] = torch.zeros(2, 16)
+            sd[f"diffusion_model.blocks.{i}.{sub}.lora_B.weight"] = torch.zeros(16, 2)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    safetensors.torch.save_file(sd, str(dest))
+
+
+def _nc_base(mod, tdir: Path, name: str = "flux"):
+    """Build a BaseSpec with its param_dict populated, as _prepare_bases would."""
+    spec = mod.BaseSpec(name=name, path=tdir)
+    spec.param_dict = mod.build_param_dict_from_dir(str(tdir))
+    spec.param_names = tuple(
+        k for k in spec.param_dict if not k.startswith("_")
+    )
+    return spec
+
+
+def test_native_convert_kohya_flux_usable() -> None:
+    """A Kohya Flux LoRA classifies usable/ok_native_convert instead of
+    wrong_arch, and records which mixin/base made it match."""
+    mod = _import_script()
+    tmp = Path(tempfile.mkdtemp(prefix="lora_audit_nc_"))
+    try:
+        tdir = _build_flux_like_base(tmp / "FluxLike")
+        lora = tmp / "tree" / "kohya_flux.safetensors"
+        _write_kohya_flux_lora(lora)
+        base = _nc_base(mod, tdir)
+
+        # Premise: the on-disk layout does NOT match directly. Without this,
+        # the test could pass via the fast path and prove nothing.
+        direct = mod.check_lora(lora, param_dict=base.param_dict, log_prefix="")
+        check("amendment premise: raw Kohya keys are wrong_arch pre-conversion",
+              direct.verdict == "WRONG_ARCH",
+              f"got {direct.verdict} at {direct.key_match_pct:.0f}%")
+
+        cls, reason, verdicts, plan, native = mod._classify_lora(lora, [base])
+        check("Kohya Flux LoRA classifies usable",
+              cls == mod.CLASS_USABLE, f"got {cls}/{reason}")
+        check("reason is ok_native_convert",
+              reason == mod.R_OK_NATIVE_CONVERT, f"got {reason}")
+        check("native_convert names the real diffusers mixin",
+              isinstance(native, dict)
+              and native.get("mixin") == "FluxLoraLoaderMixin",
+              f"got {native}")
+        check("native_convert names the matching base",
+              isinstance(native, dict) and native.get("base") == "flux",
+              f"got {native}")
+        # Granularity claim: the post-conversion verdict is carried, not
+        # flattened into the single reason code.
+        v = (native or {}).get("verdict") or {}
+        check("native_convert carries the post-conversion verdict",
+              v.get("verdict") in ("OK", "NORM_TARGETING")
+              and v.get("key_match_pct") == 100.0,
+              f"got {v}")
+        check("no convert_plan on a native-convert hit",
+              plan is None, f"got {plan}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _write_kohya_foreign_lora(dest: Path) -> None:
+    """Kohya-SUFFIXED keys (`.lora_down.weight` + `.alpha`) under foreign
+    block names.
+
+    This is the negative control that actually ENGAGES the converter: the
+    `is_kohya` sniff in `FluxLoraLoaderMixin.lora_state_dict` fires on
+    `.lora_down.weight`, so the Kohya->diffusers converter runs and rejects
+    the file. Contrast `_write_wan_like_lora`, whose keys trip no sniff at
+    all and are returned untouched.
+    """
+    sd: dict = {}
+    for i in range(4):
+        for sub in ("cross_attn_k", "self_attn_q", "ffn_0"):
+            n = f"lora_unet_blocks_{i}_{sub}"
+            sd[f"{n}.lora_down.weight"] = torch.zeros(2, 16)
+            sd[f"{n}.lora_up.weight"] = torch.zeros(16, 2)
+            sd[f"{n}.alpha"] = torch.tensor(2.0)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    safetensors.torch.save_file(sd, str(dest))
+
+
+def test_native_convert_wan_still_wrong_arch() -> None:
+    """Anti-rubber-stamp: running the converter must not make a foreign
+    architecture usable. Covers BOTH decline modes — converter not engaged
+    (Wan), and converter engaged then rejecting (Kohya-suffixed foreign)."""
+    mod = _import_script()
+    tmp = Path(tempfile.mkdtemp(prefix="lora_audit_nc_wan_"))
+    try:
+        tdir = _build_flux_like_base(tmp / "FluxLike")
+        base = _nc_base(mod, tdir)
+
+        lora = tmp / "tree" / "wan_video.safetensors"
+        _write_wan_like_lora(lora)
+        cls, reason, verdicts, plan, native = mod._classify_lora(lora, [base])
+        check("Wan LoRA is NOT promoted to usable",
+              cls != mod.CLASS_USABLE, f"got {cls}/{reason}")
+        check("Wan LoRA keeps the wrong_arch reason",
+              reason == mod.R_WRONG_ARCH, f"got {reason}")
+        check("Wan LoRA records no native_convert",
+              native is None, f"got {native}")
+
+        # The Wan fixture trips no converter sniff, so the mixin returns it
+        # untouched — document that so the control is not mistaken for
+        # proof that a converter ran and declined.
+        mixin = mod._resolve_lora_mixin(base)
+        wan_sd = mod._load_state_dict(str(lora))
+        passthrough = mixin.lora_state_dict(dict(wan_sd))
+        if isinstance(passthrough, tuple):
+            passthrough = passthrough[0]
+        check("Wan control: converter is a no-op on these keys (documented)",
+              set(passthrough) == set(wan_sd))
+
+        # Second control: keys that DO engage the Kohya branch and are then
+        # rejected. This is the one that proves a running converter cannot
+        # launder a foreign architecture into `usable`.
+        foreign = tmp / "tree" / "kohya_foreign.safetensors"
+        _write_kohya_foreign_lora(foreign)
+        engaged = False
+        try:
+            mixin.lora_state_dict(dict(mod._load_state_dict(str(foreign))))
+        except Exception:
+            engaged = True
+        check("foreign-Kohya control genuinely engages the converter",
+              engaged, "converter accepted keys it should have rejected")
+
+        cls2, reason2, _v2, _p2, native2 = mod._classify_lora(foreign, [base])
+        check("converter-engaged foreign LoRA is NOT promoted to usable",
+              cls2 != mod.CLASS_USABLE, f"got {cls2}/{reason2}")
+        check("converter-engaged foreign LoRA records no native_convert",
+              native2 is None, f"got {native2}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class _DrainingMixin:
+    """Stub standing in for a diffusers mixin that mutates its argument.
+
+    `QwenImageLoraLoaderMixin` really does this — it pops the caller's keys
+    and can drain the dict to empty. Stubbed rather than driven through real
+    diffusers so the regression stays pinned even if that converter changes.
+    """
+    @staticmethod
+    def lora_state_dict(state_dict):
+        drained = dict(state_dict)
+        state_dict.clear()
+        return drained
+
+
+class _SliverMixin:
+    """Stub for a converter that drops what it does not recognise and
+    returns only the sliver it understood (real behaviour of
+    `_convert_kohya_flux2_lora_to_diffusers`, which warns and continues)."""
+    @staticmethod
+    def lora_state_dict(state_dict):
+        return {
+            "transformer.transformer_blocks.0.attn.to_q.lora_A.weight":
+                torch.zeros(2, 16),
+            "transformer.transformer_blocks.0.attn.to_q.lora_B.weight":
+                torch.zeros(16, 2),
+        }
+
+
+def test_native_convert_does_not_mutate_caller_state_dict() -> None:
+    """The probe must not corrupt the state dict the later
+    `find_matching_plan` convertable probe consumes."""
+    mod = _import_script()
+    tmp = Path(tempfile.mkdtemp(prefix="lora_audit_nc_mut_"))
+    try:
+        tdir = _build_flux_like_base(tmp / "FluxLike")
+        base = _nc_base(mod, tdir)
+        lora = tmp / "tree" / "kohya_flux.safetensors"
+        _write_kohya_flux_lora(lora)
+        sd = mod._load_state_dict(str(lora))
+        before = set(sd)
+
+        orig = mod._resolve_lora_mixin
+        mod._resolve_lora_mixin = lambda b: _DrainingMixin
+        try:
+            mod._try_native_convert_match(lora, sd, base)
+        finally:
+            mod._resolve_lora_mixin = orig
+
+        check("a mutating converter cannot drain the caller's state dict",
+              set(sd) == before,
+              f"lost {len(before) - len(set(sd))} of {len(before)} keys")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_native_convert_partial_conversion_rejected() -> None:
+    """Coverage floor: a converter that understood only a sliver must not
+    yield `usable`, even though the sliver itself matches 100%."""
+    mod = _import_script()
+    tmp = Path(tempfile.mkdtemp(prefix="lora_audit_nc_part_"))
+    try:
+        tdir = _build_flux_like_base(tmp / "FluxLike")
+        base = _nc_base(mod, tdir)
+        lora = tmp / "tree" / "kohya_flux.safetensors"
+        _write_kohya_flux_lora(lora)
+        sd = mod._load_state_dict(str(lora))
+
+        # Premise: the sliver the stub returns DOES match the base fully, so
+        # only the coverage floor can be what rejects it.
+        sliver = _SliverMixin.lora_state_dict(sd)
+        r = mod.check_lora(lora, param_dict=base.param_dict, log_prefix="",
+                           state_dict=sliver)
+        check("partial-conversion premise: the sliver matches 100%",
+              r.key_match_pct == 100.0 and r.verdict == "OK",
+              f"got {r.verdict} at {r.key_match_pct:.0f}%")
+
+        orig = mod._resolve_lora_mixin
+        mod._resolve_lora_mixin = lambda b: _SliverMixin
+        try:
+            hit = mod._try_native_convert_match(lora, sd, base)
+        finally:
+            mod._resolve_lora_mixin = orig
+
+        check("sliver conversion is rejected by the coverage floor",
+              hit is None, f"got {hit}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_resolve_lora_mixin_fallbacks() -> None:
+    """Every mixin-resolution failure mode degrades to None, never an error.
+    A family diffusers cannot convert must classify exactly as it did before
+    the amendment."""
+    mod = _import_script()
+    tmp = Path(tempfile.mkdtemp(prefix="lora_audit_nc_mix_"))
+    try:
+        ok_dir = _build_flux_like_base(tmp / "Good")
+        check("happy path resolves FluxLoraLoaderMixin",
+              getattr(mod._resolve_lora_mixin(_nc_base(mod, ok_dir)),
+                      "__name__", None) == "FluxLoraLoaderMixin")
+
+        # chroma rides the Flux mixin — the data-driven lookup should find it
+        # with no family table in the audit.
+        chroma_dir = _build_flux_like_base(tmp / "Chroma", "ChromaPipeline")
+        check("ChromaPipeline resolves via MRO to FluxLoraLoaderMixin",
+              getattr(mod._resolve_lora_mixin(_nc_base(mod, chroma_dir)),
+                      "__name__", None) == "FluxLoraLoaderMixin")
+
+        # Missing model_index.json
+        bare = _build_flux_like_base(tmp / "Bare")
+        (tmp / "Bare" / "model_index.json").unlink()
+        check("missing model_index.json → None",
+              mod._resolve_lora_mixin(_nc_base(mod, bare)) is None)
+
+        # Malformed JSON
+        badjson = _build_flux_like_base(tmp / "BadJson")
+        (tmp / "BadJson" / "model_index.json").write_text("{ not json",
+                                                          encoding="utf-8")
+        check("malformed model_index.json → None",
+              mod._resolve_lora_mixin(_nc_base(mod, badjson)) is None)
+
+        # _class_name absent
+        nocls = _build_flux_like_base(tmp / "NoClass")
+        (tmp / "NoClass" / "model_index.json").write_text("{}", encoding="utf-8")
+        check("absent _class_name → None",
+              mod._resolve_lora_mixin(_nc_base(mod, nocls)) is None)
+
+        # Valid JSON that is not an object. `.get` on a list raises
+        # AttributeError, which `except (OSError, ValueError)` would NOT
+        # catch — it would escape to _classify_one and turn ONE malformed
+        # base into a per-file `classification: error` across the corpus.
+        for payload, label in (("[]", "list"), ('"abc"', "string"),
+                               ("3", "number"), ("null", "null")):
+            d = _build_flux_like_base(tmp / f"NonDict{label}")
+            (tmp / f"NonDict{label}" / "model_index.json").write_text(
+                payload, encoding="utf-8")
+            ok = True
+            try:
+                ok = mod._resolve_lora_mixin(_nc_base(mod, d)) is None
+            except Exception as e:
+                ok = False
+                label = f"{label} (raised {type(e).__name__})"
+            check(f"non-dict model_index.json ({label}) → None, no raise", ok)
+
+        # Class not present in this diffusers version
+        unknown = _build_flux_like_base(tmp / "Unknown",
+                                        "TotallyNotARealPipeline")
+        check("unknown pipeline class → None",
+              mod._resolve_lora_mixin(_nc_base(mod, unknown)) is None)
+
+        # A real diffusers export that is NOT a pipeline with a LoRA mixin
+        nomixin = _build_flux_like_base(tmp / "NoMixin", "AutoencoderKL")
+        check("class with no LoraLoaderMixin in MRO → None",
+              mod._resolve_lora_mixin(_nc_base(mod, nomixin)) is None)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_native_convert_not_reached_on_fast_path() -> None:
+    """Cost claim: a LoRA that already matches on disk never enters the
+    convert probe — no state-dict load, no converter."""
+    mod = _import_script()
+    tmp = Path(tempfile.mkdtemp(prefix="lora_audit_nc_fast_"))
+    try:
+        tdir = _build_flux_like_base(tmp / "FluxLike")
+        base = _nc_base(mod, tdir)
+        # A diffusers-format LoRA that matches the base directly.
+        lora = tmp / "tree" / "already_usable.safetensors"
+        lora.parent.mkdir(parents=True, exist_ok=True)
+        safetensors.torch.save_file({
+            "transformer_blocks.0.attn.to_q.lora_A.weight": torch.zeros(2, 16),
+            "transformer_blocks.0.attn.to_q.lora_B.weight": torch.zeros(16, 2),
+            "transformer_blocks.0.attn.to_k.lora_A.weight": torch.zeros(2, 16),
+            "transformer_blocks.0.attn.to_k.lora_B.weight": torch.zeros(16, 2),
+        }, str(lora))
+
+        tripped = []
+        orig_probe = mod._try_native_convert_match
+        orig_load = mod._load_state_dict
+        mod._try_native_convert_match = lambda *a, **k: tripped.append("probe")
+        mod._load_state_dict = lambda *a, **k: tripped.append("load")
+        try:
+            cls, reason, _v, _p, native = mod._classify_lora(lora, [base])
+        finally:
+            mod._try_native_convert_match = orig_probe
+            mod._load_state_dict = orig_load
+
+        check("already-usable LoRA still classifies usable",
+              cls == mod.CLASS_USABLE, f"got {cls}/{reason}")
+        check("fast path keeps its original reason (not ok_native_convert)",
+              reason != mod.R_OK_NATIVE_CONVERT, f"got {reason}")
+        check("fast path loads no state dict and runs no converter",
+              tripped == [], f"tripped {tripped}")
+        check("fast path emits no native_convert", native is None)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_native_convert_manifest_additivity() -> None:
+    """Schema additivity: `native_convert` appears ONLY on entries that
+    needed conversion, so every other LoRA entry stays byte-identical to
+    tool 0.2.0 output."""
+    mod = _import_script()
+    plain = mod.FileEntry(relative_path="a.safetensors",
+                          classification=mod.CLASS_USABLE, reason=mod.R_OK)
+    check("entry without conversion omits the native_convert key",
+          "native_convert" not in plain.to_json())
+
+    converted = mod.FileEntry(
+        relative_path="b.safetensors",
+        classification=mod.CLASS_USABLE,
+        reason=mod.R_OK_NATIVE_CONVERT,
+        native_convert={"mixin": "FluxLoraLoaderMixin", "base": "flux",
+                        "verdict": {"verdict": "OK"}},
+    )
+    out = converted.to_json()
+    check("converted entry emits native_convert",
+          out.get("native_convert", {}).get("mixin") == "FluxLoraLoaderMixin")
+    check("tool version bumped for the additive schema change",
+          mod._TOOL_VERSION == "0.3.0", f"got {mod._TOOL_VERSION}")
+
+
 def main() -> int:
     print("=" * 70)
     print(f"  test_lora_audit.py — S1+S2+S3+S4 of ADR-014")
@@ -1844,6 +2289,13 @@ def main() -> int:
         test_delete_containment_outside_root()
         test_delete_per_file_fault_isolation()
         test_transformer_audit()
+        test_native_convert_kohya_flux_usable()
+        test_native_convert_wan_still_wrong_arch()
+        test_native_convert_does_not_mutate_caller_state_dict()
+        test_native_convert_partial_conversion_rejected()
+        test_resolve_lora_mixin_fallbacks()
+        test_native_convert_not_reached_on_fast_path()
+        test_native_convert_manifest_additivity()
     finally:
         teardown_fixtures()
     print("\n" + "─" * 70)

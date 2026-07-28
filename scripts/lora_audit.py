@@ -76,6 +76,7 @@ check_lora = _check_mod.check_lora
 build_param_dict_from_dir = _check_mod.build_param_dict_from_dir
 LoRACheckResult = _check_mod.LoRACheckResult
 _read_safetensors_header = _check_mod._read_safetensors_header
+_strip_adapter_suffix = _check_mod._strip_adapter_suffix
 find_matching_plan = _convert_mod.find_matching_plan
 convert_state_dict = _convert_mod.convert_state_dict  # S3: convert-path writer
 detect_lora_format = _convert_base_mod.detect_lora_format
@@ -84,7 +85,9 @@ load_lora_with_key_fix = _qwen_mod.load_lora_with_key_fix
 unload_adapters = _qwen_mod.unload_adapters
 
 # ── Tool contract constants ────────────────────────────────────────────
-_TOOL_VERSION = "0.2.0"  # 0.2.0: kind:"transformer" entries (ADR-021)
+_TOOL_VERSION = "0.3.0"  # 0.2.0: kind:"transformer" entries (ADR-021)
+#                        # 0.3.0: ok_native_convert + native_convert field
+#                        #        (ADR-014 amendment 2026-07-28)
 _AUDIT_VERSION = 1
 
 EXIT_OK = 0
@@ -111,6 +114,16 @@ CLASS_ERROR = "error"
 R_OK = "ok"
 R_NORM_TARGETING = "norm_targeting"
 R_DIM_MISMATCH_PARTIAL = "dim_mismatch_partial"
+# ADR-014 amendment 2026-07-28: matched only after the base family's own
+# diffusers LoraLoaderMixin converted the key layout (Kohya -> diffusers).
+# Still CLASS_USABLE — the runtime loader performs this same conversion, so
+# these files load today. Granularity lives in FileEntry.native_convert.
+R_OK_NATIVE_CONVERT = "ok_native_convert"
+# Minimum share of the SOURCE adapter layers a conversion must retain before
+# its post-conversion match is trusted. Guards the partial-conversion case:
+# converters that drop unrecognised keys with a warning would otherwise let a
+# barely-understood file score 100% on the sliver that survived.
+_COVERAGE_FLOOR = 0.5
 R_LORA_PASSTHROUGH = "lora_passthrough"
 R_LORA_QKV_SPLIT = "lora_qkv_split"
 R_LOKR_TO_LORA_SVD = "lokr_to_lora_svd"
@@ -225,6 +238,13 @@ class FileEntry:
     prognosis: Optional[dict[str, Any]] = None
     matched_bases: Optional[list[str]] = None
     duplicate_of: Optional[str] = None
+    # ADR-014 amendment 2026-07-28. Set only when the on-disk key layout
+    # failed the direct shape-match but the base family's own diffusers
+    # LoraLoaderMixin converted it into a matching one:
+    #   {"mixin": str, "base": str, "verdict": {<LoRACheckResult dict>}}
+    # Carries the post-conversion verdict so OK / NORM_TARGETING /
+    # DIM_MISMATCH_PARTIAL granularity survives the single reason code.
+    native_convert: Optional[dict[str, Any]] = None
 
     def to_json(self) -> dict[str, Any]:
         out = {
@@ -251,6 +271,11 @@ class FileEntry:
             out["prognosis"] = self.prognosis
             out["matched_bases"] = self.matched_bases or []
             out["duplicate_of"] = self.duplicate_of
+        # Same additivity discipline as the transformer keys above: emitted
+        # only on the entries it applies to, so every LoRA entry that did not
+        # need conversion stays byte-identical to tool 0.2.0 output.
+        if self.native_convert is not None:
+            out["native_convert"] = self.native_convert
         return out
 
 
@@ -804,11 +829,156 @@ def _is_usable_verdict(r) -> tuple[bool, str]:
     return False, ""
 
 
+def _adapter_layer_count(keys) -> int:
+    """Count distinct adapter target layers in a LoRA key namespace.
+
+    Same grouping `check_lora` uses (a layer is one `_strip_adapter_suffix`
+    base with a recognised adapter suffix), so the pre/post-conversion
+    counts in `_try_native_convert_match` are directly comparable.
+    """
+    layers = set()
+    for k in keys:
+        base_key, sfx = _strip_adapter_suffix(k)
+        if sfx is not None:
+            layers.add(base_key)
+    return len(layers)
+
+
+def _resolve_lora_mixin(base: BaseSpec):
+    """Resolve the diffusers `*LoraLoaderMixin` the RUNTIME loader would use
+    for this base, or None (ADR-014 amendment 2026-07-28).
+
+    Data-driven, so a new family gains conversion coverage with no edit here:
+    `<base>/../model_index.json` -> `_class_name` -> `getattr(diffusers, cls)`
+    -> first `*LoraLoaderMixin` in the MRO. This is the same detection the
+    generic loader uses (CLAUDE.md "Auto-detection"), which is what makes the
+    audit's answer the loader's answer rather than a parallel guess.
+
+    Best-effort enrichment only. Every failure mode — no `model_index.json`,
+    unreadable/!JSON, absent `_class_name`, class not in this diffusers
+    version, no mixin in the MRO — returns None, and the caller then reports
+    exactly what the direct shape-match already concluded. A base whose family
+    diffusers cannot convert must never become an audit ERROR.
+    """
+    index_path = base.path.parent / "model_index.json"
+    try:
+        with open(index_path, "rb") as fh:
+            loaded = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    # A model_index.json that parses to a list/str/number is malformed for
+    # our purposes; `.get` on it would raise AttributeError and escape.
+    if not isinstance(loaded, dict):
+        return None
+    class_name = loaded.get("_class_name")
+    if not isinstance(class_name, str) or not class_name:
+        return None
+    try:
+        import diffusers
+    except Exception:
+        return None
+    try:
+        # diffusers' _LazyModule raises (not AttributeError) when a named
+        # export's backend is unavailable, so the getattr default is not
+        # sufficient on its own.
+        pipeline_cls = getattr(diffusers, class_name, None)
+    except Exception:
+        return None
+    if pipeline_cls is None or not isinstance(pipeline_cls, type):
+        return None
+    for ancestor in pipeline_cls.__mro__:
+        if ancestor.__name__.endswith("LoraLoaderMixin") and hasattr(
+            ancestor, "lora_state_dict"
+        ):
+            return ancestor
+    return None
+
+
+def _try_native_convert_match(
+    path: Path, state_dict: dict, base: BaseSpec
+) -> Optional[tuple[str, dict[str, Any]]]:
+    """Re-run the shape-match against `state_dict` as the base family's own
+    diffusers converter would rewrite it (ADR-014 amendment 2026-07-28).
+
+    Returns (reason, native_convert_record) on a usable post-conversion
+    verdict, else None. The conversion is attempted and then the SAME
+    `check_lora` matcher adjudicates the result — a foreign layout (Wan
+    against a Flux base) passes through the converter untouched and still
+    fails the match.
+
+    Two guards keep a PARTIAL conversion from being promoted. Some converters
+    (`_convert_kohya_flux2_lora_to_diffusers`) drop unrecognised source keys
+    with only a warning and return what they understood. Since `check_lora`
+    computes `key_match_pct` over the POST-conversion dict, those dropped
+    keys are invisible to it: a file the converter barely understood could
+    otherwise score 100% on the sliver that survived.
+      1. `_COVERAGE_FLOOR` — the converted dict must retain at least half the
+         source's adapter layers.
+      2. The post-conversion verdict must be OK or NORM_TARGETING. The
+         DIM_MISMATCH-at-50% acceptance `_is_usable_verdict` allows on the
+         direct path is deliberately NOT honoured here, because a partial
+         conversion plus a partial dim match compounds two weak signals.
+    Neither guard is a proof — a converter that splits fused projections
+    (qkv -> to_q/to_k/to_v) inflates the converted layer count, so the ratio
+    is a heuristic floor, not a conservation law. See the ADR-014 amendment
+    and the TECH_DEBT entry for the named residual.
+    """
+    try:
+        mixin = _resolve_lora_mixin(base)
+    except Exception:
+        # Belt and braces: a base misconfiguration must never become a
+        # per-FILE audit error across the whole corpus (Vision invariant 9).
+        return None
+    if mixin is None:
+        return None
+    try:
+        # Defensive copy: diffusers' `lora_state_dict` mutates a dict
+        # argument in place — every `load_lora_weights` implementation
+        # copies before calling it for exactly this reason. The Qwen
+        # converter pops the caller's keys and can drain the dict to empty,
+        # which would corrupt both the remaining bases in this loop and the
+        # `find_matching_plan` probe that consumes `state_dict` afterwards.
+        converted = mixin.lora_state_dict(dict(state_dict))
+    except Exception:
+        # Converters raise on layouts they do not recognise. That is a
+        # "no" for this base, not a tool failure.
+        return None
+    if isinstance(converted, tuple):  # SDXL-style (state_dict, network_alphas)
+        converted = converted[0]
+    if not converted:
+        return None
+
+    source_layers = _adapter_layer_count(state_dict)
+    converted_layers = _adapter_layer_count(converted)
+    if source_layers and converted_layers < _COVERAGE_FLOOR * source_layers:
+        return None
+
+    try:
+        r = check_lora(path, param_dict=base.param_dict, log_prefix="",
+                       state_dict=converted)
+    except Exception:
+        return None
+    if r.verdict not in ("OK", "NORM_TARGETING"):
+        return None
+    return R_OK_NATIVE_CONVERT, {
+        "mixin": mixin.__name__,
+        "base": base.name,
+        "verdict": _verdict_to_dict(r),
+        # Recorded so the residual above is auditable from the manifest
+        # rather than hidden behind a boolean.
+        "source_layers": source_layers,
+        "converted_layers": converted_layers,
+    }
+
+
 def _classify_lora(
     path: Path, bases: list[BaseSpec]
-) -> tuple[str, str, dict[str, dict[str, Any]], Optional[dict[str, Any]]]:
-    """Run shape-match against every base; if no usable, attempt convertable.
-    Returns (classification, reason, verdicts_by_base, convert_plan_or_None).
+) -> tuple[str, str, dict[str, dict[str, Any]], Optional[dict[str, Any]],
+           Optional[dict[str, Any]]]:
+    """Run shape-match against every base; if no usable, attempt the native
+    convert probe, then convertable.
+    Returns (classification, reason, verdicts_by_base, convert_plan_or_None,
+    native_convert_or_None).
     Raises if every available base errored on this file — caller (_classify_one)
     converts that into classification=error per Vision invariant 9."""
     verdicts: dict[str, dict[str, Any]] = {}
@@ -845,7 +1015,10 @@ def _classify_lora(
         )
 
     if best_usable_reason is not None:
-        return CLASS_USABLE, best_usable_reason, verdicts, None
+        # Fast path: the on-disk layout already matched. The state dict is
+        # never loaded and no converter runs — the ~241 already-usable LoRAs
+        # pay nothing for the amendment below.
+        return CLASS_USABLE, best_usable_reason, verdicts, None, None
 
     # No usable verdict — probe convertable. Requires loading state dict.
     try:
@@ -856,7 +1029,7 @@ def _classify_lora(
     if header is not None:
         fmt = detect_lora_format(header.keys())
         if fmt == "loha":
-            return CLASS_UNCONVERTABLE, R_LOHA_UNSUPPORTED, verdicts, None
+            return CLASS_UNCONVERTABLE, R_LOHA_UNSUPPORTED, verdicts, None, None
 
     # Try find_matching_plan against each base.
     try:
@@ -864,7 +1037,22 @@ def _classify_lora(
     except Exception as e:
         # Can't load — surface as unconvertable with arch hint if any.
         reason = _pick_unconvertable_reason(verdicts, header_present=header is not None)
-        return CLASS_UNCONVERTABLE, reason, verdicts, None
+        return CLASS_UNCONVERTABLE, reason, verdicts, None, None
+
+    # ADR-014 amendment 2026-07-28: before declaring this unconvertable,
+    # ask whether the RUNTIME loader would have made it work. Kohya-format
+    # files (the dominant civitai Flux layout) fail the direct shape-match
+    # but `load_lora_weights` converts them natively, so comfyless loads
+    # them today. Runs on the state dict already loaded above — no extra
+    # read. Bases are tried in config order so the reported base matches
+    # the direct-match loop's precedence.
+    for base in bases:
+        if base.param_dict is None:
+            continue
+        hit = _try_native_convert_match(path, state_dict, base)
+        if hit is not None:
+            reason, native_record = hit
+            return CLASS_USABLE, reason, verdicts, None, native_record
 
     for base in bases:
         if base.param_dict is None:
@@ -884,12 +1072,14 @@ def _classify_lora(
                     "target_family": plan.target_family,
                     "target_base": base.name,
                 },
+                None,
             )
 
     return (
         CLASS_UNCONVERTABLE,
         _pick_unconvertable_reason(verdicts, header_present=header is not None),
         verdicts,
+        None,
         None,
     )
 
@@ -1883,7 +2073,8 @@ def _classify_one(path: Path, rel: str, bases: list[BaseSpec]) -> FileEntry:
             size_bytes=size,
         )
 
-    classification, reason, verdicts, convert_plan = _classify_lora(path, bases)
+    (classification, reason, verdicts, convert_plan,
+     native_convert) = _classify_lora(path, bases)
     return FileEntry(
         relative_path=rel,
         classification=classification,
@@ -1892,6 +2083,7 @@ def _classify_one(path: Path, rel: str, bases: list[BaseSpec]) -> FileEntry:
         size_bytes=size,
         verdicts_by_base=verdicts,
         convert_plan=convert_plan,
+        native_convert=native_convert,
     )
 
 

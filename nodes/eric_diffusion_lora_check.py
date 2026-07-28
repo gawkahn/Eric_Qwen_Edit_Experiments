@@ -199,19 +199,31 @@ def _resolve_to_param_key(lora_base_key: str, param_dict: Dict) -> Optional[str]
 
 
 def check_lora(lora_path, transformer=None, param_dict: Optional[Dict] = None,
-               log_prefix: str = "[LoRA-Check]") -> LoRACheckResult:
+               log_prefix: str = "[LoRA-Check]",
+               state_dict: Optional[Dict] = None) -> LoRACheckResult:
     """Check a LoRA file's compatibility against a model.
 
     Provide either:
       transformer  — loaded nn.Module (pipe.transformer), fastest for in-loader use
       param_dict   — pre-built dict from build_param_dict_from_dir(), for batch scanning
+
+    `state_dict` supplies the LoRA's keys/shapes IN MEMORY instead of reading
+    them from `lora_path`'s safetensors header. Callers that transform a LoRA
+    before checking it — e.g. lora_audit's ADR-014 native-convert probe, which
+    runs the state dict through the family's diffusers LoraLoaderMixin — use
+    this to check the CONVERTED layout against the base while still reporting
+    the original path. `lora_path` is then used only for reporting; the file is
+    not opened. Default None preserves the header-reading behaviour exactly.
     """
     if param_dict is None:
         if transformer is None:
             raise ValueError("Provide transformer or param_dict")
         param_dict = _build_param_dict_from_transformer(transformer)
 
-    header = _read_safetensors_header(lora_path)
+    if state_dict is not None:
+        header = {k: {"shape": tuple(t.shape)} for k, t in state_dict.items()}
+    else:
+        header = _read_safetensors_header(lora_path)
 
     # Group header keys by target layer, collect down/up shapes
     layers: Dict[str, Dict] = {}
