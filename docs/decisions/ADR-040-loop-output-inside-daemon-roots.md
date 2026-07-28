@@ -486,6 +486,25 @@ and the daemonless run is unaffected by all of it.
 
 ## Changelog
 
+- 2026-07-28 — **Vault user docs closed** (the slice-2 deliverable slice 2b did
+  not do; outstanding since the ADR-038 review). Vault-only, no repo copy per
+  the project CLAUDE.md. `Comfyless_Manual.md` gains five worked `--ref-image`
+  examples — edit a daemon-written image with no flags, the out-of-roots
+  refusal with its verbatim transcript and which of the three fixes to take,
+  two-reference `:MODE` routing, replaying an edit sidecar, and chaining
+  generate → edit-refine. The refusal transcript was rendered from the real
+  code path, not transcribed, because a documented error message that does not
+  match the emitted one is worse than none.
+  Two staleness bugs found while writing, both predating this ADR: the manual
+  claimed `--params` replay "deliberately does NOT replay `ref_images` yet
+  (ADR-035 slice 5, open)" — slice 5 SHIPPED, and a comfyless sidecar does
+  replay refs through its trust gate; only the Eric-Save PNG chunk drops them
+  permanently, which is a different provenance question. And
+  `Comfyless_Refine.md` still documented `--output-dir` as *required* and the
+  daemon path as always a cross-tree move, both of which D1 changed in slice
+  2b — it now documents omitting the flag as the recommended daemon path, the
+  three-branch savepath behavior, and the `--seed-image` warn-vs-refuse
+  divergence with its rationale and cheapest fix.
 - 2026-07-27 — **Slice 3 shipped (D3a) — the slice plan is complete.**
   `generate`'s one-shot path calls `refuse_out_of_roots_refs`, which consumes
   the SAME `query_daemon_roots` + `paths_outside_roots` helpers slice 2b built
