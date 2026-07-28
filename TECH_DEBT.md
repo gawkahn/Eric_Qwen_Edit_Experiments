@@ -1944,3 +1944,41 @@ they're still importable from the paths `cascade.py` uses, or accept the
 residual and rely on the pyright ratchet catching it at the next diffusers
 bump (this repo's precedent for "pyright is the safety net, not the test
 suite" — see ADR-032's `comfy.*` missing-import cluster).
+
+## 2026-07-27 — refine's --seed-image is the only reference not pinned into the run dir
+Found independently by `code-reviewer` and `security-auditor` during the
+ADR-040 slice 2b review (`docs/security/review-adr040-slice2b-2026-07-27.md`,
+MEDIUM). `pin_static_refs` copies every `--ref-image` into `<run dir>/refs/`
+and the ADR-038 D5 docstring gives the reason: a reference is consumed on TWO
+channels — pinned bytes for the judge, and a PATH re-read every iteration by
+whoever generates — so leaving the path unpinned reopens the TOCTOU that
+amendment closed. `--seed-image` has that exact shape and is not pinned:
+`source_img = load_seed_image_capped(edit_source)` pins the judge's comparison
+anchor at loop entry, while `current_source` (the same operator path) is
+re-opened by the daemon on every generation until the first promotion. A
+mid-run replace/re-encode/truncate — concurrent session, editor save, sync
+client — makes generation condition on new bytes while the judge scores
+identity against old ones, silently breaking "scores describe the
+generation's inputs". This is an INTEGRITY defect independent of ADR-040: it
+exists daemon or no daemon.
+Second, smaller consequence: because the seed is not relocated into the run
+dir, an out-of-roots `--seed-image` under a daemon still latches the run
+in-process (ADR-037 D5) and can OOM. Slice 2b WARNS about that at entry rather
+than refusing — a deliberate divergence from D3a's refuse-at-entry ruling for
+the sibling `generate --ref-image` surface, recorded in the ADR-040 Changelog.
+Pinning closes both: the run dir is inside a ref root by construction under D1,
+so the failure becomes unrepresentable rather than warned.
+Why not now: it is a behavior change to ADR-037 D5's edit-source contract
+(what `edit_source` points at, and what the judge's anchor is loaded from), so
+it needs an ADR amendment and its own reviewable slice — not a bolt-on to a
+slice whose boundary is D1+D3. ADR-040's "Alternatives Rejected" also asserts
+`pin_static_refs` already covers this ("no new move step is needed"), which is
+true for `--ref-image` and false for `--seed-image`; that sentence needs
+correcting in the same slice.
+Trigger: the next change to refine's edit-source handling, ADR-038/ADR-037
+edit-ref work, or a live run where the seed image is observed to change
+mid-run. Fix: after the exclusive `makedirs`, copy the seed to
+`<run dir>/refs/seed<ext>` with the existing `shutil.copyfile` primitive and
+point `edit_source` at the copy — only iteration 0 uses it as `current_source`
+(from iteration 1 the source is a candidate already inside the run dir), and
+the byte/pixel caps already ran at entry.

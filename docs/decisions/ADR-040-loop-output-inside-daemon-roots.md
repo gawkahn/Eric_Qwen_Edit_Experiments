@@ -486,6 +486,70 @@ and the daemonless run is unaffected by all of it.
 
 ## Changelog
 
+- 2026-07-27 — **Slice 2b shipped (D1 + D3).** The loop pings for roots
+  (`{"type": "ping", "report_roots": true}`, a literal on a ping request and
+  nowhere else), derives `<daemon output_dir>/refine-<run_id>` when no
+  `--output-dir` was given, validates at entry through a shared
+  `paths_outside_roots` helper that defers to `server._within` by import rather
+  than re-deriving containment (slice 3 consumes the same one, per D3a), sends
+  the savepath template RELATIVE when the run dir is inside the daemon's output
+  root, and keeps a same-directory `os.replace`. `--output-dir` becomes
+  optional; an explicit dir outside the reported roots is an entry refusal.
+  Full record: `docs/security/review-adr040-slice2b-2026-07-27.md`.
+  **Scoping correction to D1's mirror-tree claim.** §Deferred says "D1 stops
+  new ones being created"; that holds for run dirs under the daemon's OUTPUT
+  dir, which is every derived run and any explicit dir inside it. A third
+  branch is reachable and unfixable from the client: an explicit `--output-dir`
+  inside a `--ref-root` but NOT under the daemon's output dir passes entry
+  validation (ref roots ⊋ output dir) and still needs the absolute template,
+  because the daemon only ever writes under its own root. That case still
+  builds a mirror and still moves cross-tree. Now covered by a named test
+  rather than left as the branch an implementer is likeliest to get wrong.
+  **`--seed-image` outside the roots WARNS rather than refuses, and that is a
+  divergence from D3a's ruling for the sibling surface — recorded, not
+  implied.** When slice 3 lands, `generate --ref-image /outside` will exit 2
+  while `refine --seed-image /outside` warns and latches. The distinction taken
+  here: D3's refusal is normative for the loop-OWNED directories, while the
+  seed is operator-typed input the loop does not relocate — and refusal's only
+  escape would be `--ref-root <photo directory>`, the breadth exposure ADR-035
+  Finding 6 warns about, since `--ref-root` cannot name a single file. Both
+  reviewers agreed the real answer is to PIN the seed into the run dir exactly
+  as `pin_static_refs` does for `--ref-image`, which makes the failure
+  unrepresentable rather than warned. That is deferred to its own slice
+  because it amends ADR-037 D5's edit-source contract, and it is filed in
+  TECH_DEBT. The security auditor found the case for pinning does not rest on
+  this ADR at all: the seed is consumed on TWO channels — pinned bytes for the
+  judge's anchor (`load_seed_image_capped` at entry) and a PATH the daemon
+  re-reads every pre-promotion iteration — so a mid-run swap makes generation
+  condition on new bytes while the judge scores identity against old ones. That
+  is the exact TOCTOU ADR-038 D5 closed for every other reference, and it
+  exists daemon or no daemon. The ADR's "Alternatives Rejected" claim that
+  `pin_static_refs` means "no new move step is needed" is true for
+  `--ref-image` and false for `--seed-image`.
+  **A guard this slice nearly broke and restored before commit:** D2a's
+  negative test asserts `mcp_server.py` never emits `report_roots`. Slice 2b
+  put the wire literal inside `query_daemon_roots`, a NAMED WRAPPER — so all
+  three tripwire assertions (string absence, premise symbol set,
+  `inspect.getsource(generate)`) stayed green if `mcp_server.py` called the
+  helper. The slice-1 review predicted exactly this and pinned the assertion to
+  `generate()` because the helper did not exist yet. The premise symbol set now
+  lists `query_daemon_roots` and says in-comment that it tracks the helper's
+  NAME, not the wire field.
+  Smaller findings folded: the containment refusal now branches on `derived`
+  (an operator who omitted `--output-dir` was being told to omit it, and
+  pointed back at the root that failed — reachable only against a daemon
+  reporting an `output_dir` outside its own `ref_image_roots`); derived run
+  dirs are created `0o700` because under D1 the location is no longer the
+  operator's choice and pinned copies of their private reference photos land
+  in it (explicit dirs keep default modes — they chose that path); the seed
+  warning now leads with "move it under a root" and marks `--ref-root` the
+  broad fallback; `--output-dir ""` is refused rather than silently derived;
+  and the D1 dirname charset, normative but previously unenforced, is pinned by
+  a test over `RUN_DIR_STEM` and `mint_run_id`. Accepted residuals, named:
+  a TOCTOU window on the EXPLICIT branch only (the derived branch is immune —
+  `exist_ok=False` raises on a pre-existing symlink), and a malformed ping
+  being indistinguishable from a pre-D2 daemon (both degrade to the ADR-037 D5
+  latch, which is what D3 preserves on purpose).
 - 2026-07-27 — **Slice 2a shipped (D1b only).** Slice 2 as planned (D1 + D1b +
   D3) was split for reviewability per §3 SRR: 2a is the correlation primitive,
   which needs no daemon interaction; 2b is the derived run dir, the mirror-tree

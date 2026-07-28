@@ -40,7 +40,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Sequence,
+                    Tuple, TypeGuard)
 
 import torch
 
@@ -3138,6 +3139,98 @@ def _send_server_command(req: dict, device: str = "cuda") -> Optional[dict]:
             }
     finally:
         conn.close()
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  ADR-040 D2/D3 — the daemon's roots, and the ONE containment check
+# ════════════════════════════════════════════════════════════════════════
+
+class DaemonRoots(NamedTuple):
+    """The roots a daemon reports for an opt-in `report_roots` ping (D2).
+
+    Both members are the REALPATH'D values the daemon's own gate compares
+    against, not its spawn-time strings — reporting anything else would let a
+    client pass entry validation and still be refused mid-run.
+    """
+    output_dir: str
+    ref_image_roots: Tuple[str, ...]
+
+
+def _valid_reported_path(v: Any) -> TypeGuard[str]:
+    """ADR-012 machine-boundary shape check for one reported root."""
+    return isinstance(v, str) and bool(v) and v.startswith("/") and "\0" not in v
+
+
+def query_daemon_roots(device: str = "cuda",
+                       log: Callable[[str], None] = print
+                       ) -> Optional[DaemonRoots]:
+    """Ask the daemon for `device` to report its output dir and ref roots.
+
+    Returns None whenever the roots are NOT usable, which the caller must treat
+    exactly as the pre-D2 case (ADR-040 D3): no daemon, an unreachable or
+    erroring daemon, a daemon too old to report, or a report whose shape does
+    not type-check. Only a fully validated report yields a DaemonRoots.
+
+    `report_roots` is added here as a LITERAL on a `type: "ping"` request and
+    nowhere else. The daemon's check is PRESENCE-based (`"report_roots" in req`
+    plus `is True`), so the key on any other request type is a hard
+    ValidationError — building it from a variable, or threading it through
+    `_build_server_request`, would turn a False into a refused generation.
+    It is also a CLI-plane field (D2a): `mcp_server.py` must never call this.
+
+    The daemon is trusted-equivalent (same UID, same socket), but per the
+    ADR-012 machine-boundary discipline its response is still untrusted INPUT —
+    these values are joined into paths and become the parent of an
+    `os.makedirs` and of `pin_static_refs`' `rmtree`. Shape-check first,
+    `repr()` in every log line.
+    """
+    resp = _send_server_command({"type": "ping", "report_roots": True}, device)
+    if resp is None:
+        return None
+    if resp.get("status") != "ok":
+        log(f"daemon on {device!r} did not answer a roots ping "
+            f"({resp.get('error', resp.get('status'))!r}) — treating it as a "
+            f"daemon that reports no roots")
+        return None
+    if "output_dir" not in resp and "ref_image_roots" not in resp:
+        # A daemon predating D2. Not an error, and not this helper's notice to
+        # give — the caller knows whether that matters for what it is doing.
+        return None
+    out = resp.get("output_dir")
+    roots = resp.get("ref_image_roots")
+    if not _valid_reported_path(out):
+        log(f"daemon on {device!r} reported a malformed output_dir {out!r} — "
+            f"ignoring the whole report (behaving as a daemon that reports "
+            f"nothing)")
+        return None
+    if (not isinstance(roots, list) or not roots
+            or not all(_valid_reported_path(r) for r in roots)):
+        log(f"daemon on {device!r} reported malformed ref_image_roots "
+            f"{roots!r} — ignoring the whole report (behaving as a daemon "
+            f"that reports nothing)")
+        return None
+    return DaemonRoots(output_dir=out, ref_image_roots=tuple(roots))
+
+
+def paths_outside_roots(paths: Sequence[str],
+                        roots: Sequence[str]) -> List[str]:
+    """The subset of `paths` that no root in `roots` contains (ADR-040 D3).
+
+    The ONE client-side containment check — the refine loop consumes it at
+    entry, `generate`'s one-shot path consumes it in slice 3, and neither may
+    reimplement it. It defers to `server._within` rather than re-deriving the
+    rule: realpath BOTH sides, then `path == root or path.startswith(root +
+    os.sep)`. A plain `startswith`, or a check without realpath, diverges from
+    the gate — a symlinked run dir or a prefix-sibling (`/data/out` vs
+    `/data/output`) would pass at entry and be refused mid-run, and the
+    incident this exists to kill would survive behind a green entry check.
+
+    An EMPTY `roots` means nothing is contained; callers that have no validated
+    report must not call this at all (a `None` from `query_daemon_roots` is
+    "unknown", never "outside").
+    """
+    from .server import _within
+    return [p for p in paths if not any(_within(p, r) for r in roots)]
 
 
 def _send_unload(device: str = "cuda") -> int:

@@ -61,6 +61,12 @@ SEED_IMAGE_MAX_BYTES = 64 * 1024 ** 2
 #: (Image.size) BEFORE full decode — the byte cap does not bound pixel count, and
 #: PIL's own MAX_IMAGE_PIXELS is a mutable process-global we do not rely on.
 SEED_IMAGE_MAX_PIXELS = 64 * 1024 ** 2
+#: Stem of a DERIVED run directory (ADR-040 D1): the run dir is
+#: `<daemon --output-dir>/<stem>-<run_id>`. A fixed literal on purpose — the
+#: ADR requires `[A-Za-z0-9_-]` with no path separators and no operator text
+#: interpolated unescaped, and `run_id` (not the stem) is what makes the name
+#: unique. Changing this to anything operator-derived reopens that hole.
+RUN_DIR_STEM = "refine"
 #: Judge scores are integers in this inclusive range.
 SCORE_MIN, SCORE_MAX = 1, 10
 #: Planner-supplied LoRA weights are clamped to this absolute magnitude (F6).
@@ -1868,6 +1874,7 @@ def run_generation(cfg: WorkingConfig, *, device: str, output_dir: str,
                    output_format: Optional[OutputFormat] = None,
                    ref_images: Optional[List[Dict[str, str]]] = None,
                    force_in_process: bool = False,
+                   daemon_output_dir: Optional[str] = None,
                    log: Callable[[str], None] = print) -> GenOutcome:
     """Generate one candidate, returning it at the canonical path
     `output_dir/stem<ext>` (ADR-034 D7: `<ext>` follows the resolved
@@ -1876,10 +1883,20 @@ def run_generation(cfg: WorkingConfig, *, device: str, output_dir: str,
     change reuses the pipeline, a LoRA change evicts+reloads server-side). Falls
     back to a COLD in-process generate() when no daemon is reachable.
 
-    The daemon owns path resolution: it re-roots the savepath template under its
-    own --output-dir ("the client never dictates paths"), so its returned image
-    lands OUTSIDE our candidates/ tree. We MOVE it to the canonical path so the ADR
-    §Output layout holds and daemon/cold naming is uniform (code review slice-3)."""
+    The daemon owns path resolution: it treats `savepath` as a template RELATIVE
+    to its own --output-dir ("the client never dictates paths"). `daemon_output_dir`
+    is that root, as reported by a D2 roots ping — pass it and, when our directory
+    lies INSIDE it, the template is sent relative so the daemon writes STRAIGHT
+    into our candidates/ tree (ADR-040 D1). Without it (or for a directory outside
+    that root) the old absolute template is sent, which the daemon mirrors under
+    its own root, and the result is moved back across trees.
+
+    EITHER WAY the returned name needs reconciling: `_resolve_savepath` appends
+    its counter UNCONDITIONALLY from 1, so the daemon's first file for stem
+    `candidate_00` is `candidate_000001.png` — the first slot, not a fired
+    collision. The rename to the canonical `stem<ext>` is what ADR-034 D7, the
+    stale-other-extension warning above, and the candidate-as-next-edit-source
+    contract all depend on; only its cross-tree scope was accidental."""
     from comfyless import generate as gen
     from comfyless.server import socket_path
 
@@ -1905,7 +1922,31 @@ def run_generation(cfg: WorkingConfig, *, device: str, output_dir: str,
                 f"mispaired stem.")
 
     if not force_in_process and socket_path(device).exists():
+        # ADR-040 D1: the daemon strips leading slashes off `savepath` and joins
+        # the rest under its OWN --output-dir (server.py:927-928). Sending our
+        # absolute path therefore built a full MIRROR of it beneath the daemon's
+        # root — measured 2026-07-27 at 31 shadow directories holding orphaned
+        # candidates — and forced a cross-tree move back. When our directory is
+        # inside the daemon's root, send the RELATIVE template: same resolved
+        # destination, no shadow tree, and the move below collapses to a
+        # same-directory rename.
+        #
+        # A run dir inside a --ref-root but OUTSIDE the daemon's output dir is
+        # a real third case: it passes entry validation (ref roots ⊋ output
+        # dir) and still needs the absolute template, because the daemon only
+        # ever writes under its own root. D1's mirror removal is therefore
+        # scoped to run dirs under that root — see the ADR-040 Changelog.
         savepath = os.path.join(output_dir, stem)
+        if daemon_output_dir and not gen.paths_outside_roots([output_dir],
+                                                             [daemon_output_dir]):
+            # ONE spelling of containment on the client (D3a): the shared
+            # helper, not a second _within call site. It realpaths both sides,
+            # so the relpath below is taken off exactly the values the check
+            # compared — which is what guarantees no `..` component can appear
+            # and that the daemon's re-join reconstructs this very directory.
+            _rel = os.path.relpath(os.path.realpath(output_dir),
+                                   os.path.realpath(daemon_output_dir))
+            savepath = stem if _rel == "." else os.path.join(_rel, stem)
         args_ns = _daemon_namespace(device, precision, savepath, output_format,
                                     ref_images=ref_images)
         req = gen._build_server_request(args_ns, params, loras,
@@ -1949,8 +1990,19 @@ def run_generation(cfg: WorkingConfig, *, device: str, output_dir: str,
                     f"--output-format expects {ext} — likely a stale daemon "
                     f"(restart it to honor the format). Saving the daemon's bytes "
                     f"honestly as {os.path.basename(move_target)}.")
-            if os.path.abspath(out_path) != os.path.abspath(move_target):
-                shutil.move(out_path, move_target)
+            _src, _dst = os.path.abspath(out_path), os.path.abspath(move_target)
+            if _src != _dst:
+                if os.path.dirname(_src) == os.path.dirname(_dst):
+                    # ADR-040 D1: the relative-savepath case — only the daemon's
+                    # counter suffix differs, so this is an ATOMIC same-directory
+                    # rename. Keeping it (rather than adopting counter-suffixed
+                    # names) is load-bearing: without it a stale canonical file
+                    # left in a reused directory would be judged and pinned as
+                    # this iteration's candidate — the judge-vs-generation
+                    # divergence ADR-038 D5 closed.
+                    os.replace(_src, _dst)
+                else:
+                    shutil.move(_src, _dst)
             # Surface EVERY daemon-side warning channel (invariant N1 parity
             # with _delegate_to_server via the shared surfacer — parity audit
             # slice 2, 2026-07-25). This path previously read only
@@ -2066,6 +2118,7 @@ def verdict_record(cand: Candidate, w_pa: float, w_aes: float,
 # ── Loop controller (greedy hill-climb) ──────────────────────────────────────
 def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
                 conn, backend_cfg: dict, output_dir: str, device: str,
+                daemon_output_dir: Optional[str] = None,
                 precision: str = "bf16",
                 pass_threshold: int = DEFAULT_PASS_THRESHOLD,
                 until_composite: Optional[float] = None,
@@ -2296,6 +2349,7 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
         try:
             out = run_generation(gen_cfg, device=device,
                                  output_dir=candidates_dir,
+                                 daemon_output_dir=daemon_output_dir,
                                  stem=stem_name, precision=precision,
                                  output_format=output_format, log=log,
                                  **gen_kwargs)
@@ -2324,6 +2378,7 @@ def refine_loop(cfg: WorkingConfig, *, target_prompt: str, catalog, roots,
             gen_kwargs["force_in_process"] = True
             out = run_generation(gen_cfg, device=device,
                                  output_dir=candidates_dir,
+                                 daemon_output_dir=daemon_output_dir,
                                  stem=stem_name, precision=precision,
                                  output_format=output_format, log=log,
                                  **gen_kwargs)
@@ -3268,8 +3323,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Diffusers model directory (required with --prompt; with "
                         "--seed-image it defaults to the seed's model and, if given, "
                         "overrides it). Validated against --model-base under a daemon.")
-    p.add_argument("--output-dir", required=True,
-                   help="Run directory; candidates/ and winners/ are created inside")
+    p.add_argument("--output-dir", default=None,
+                   help="Run directory; candidates/ and winners/ are created "
+                        "inside. OPTIONAL when a daemon serving --device reports "
+                        "its roots: omit it and the run dir is DERIVED as "
+                        "<daemon --output-dir>/" + RUN_DIR_STEM + "-<run_id>, "
+                        "which puts refs/ and candidates/ inside a daemon "
+                        "reference root by definition and gives every run a "
+                        "unique directory (ADR-040 D1). REQUIRED otherwise. An "
+                        "explicit directory outside the daemon's reference roots "
+                        "is refused at entry, never silently relocated.")
     # Resolver plane (mirrors the MCP server startup roots).
     p.add_argument("--model-base", required=True,
                    help="Root that all model/LoRA paths must be within (catalog scan)")
@@ -4057,8 +4120,168 @@ def main(argv: Optional[List[str]] = None) -> int:
     run_id = mint_run_id()
     log(f"[refine] run_id: {run_id}")
 
-    if not os.path.isdir(args.output_dir):
-        os.makedirs(args.output_dir, exist_ok=True)
+    # ── ADR-040 D1/D3: resolve the run directory against the daemon's roots ──
+    # Everything here happens BEFORE the first filesystem operation on the run
+    # dir, and long before any model load: a misconfiguration must be a clean
+    # entry refusal, never the mid-run refusal that latches in-process and OOMs
+    # against a daemon still holding most of VRAM (the 2026-07-26 incident).
+    from comfyless.generate import query_daemon_roots, paths_outside_roots
+    from comfyless.server import socket_path
+    socket_present = socket_path(args.device).exists()
+    daemon_roots = (query_daemon_roots(args.device,
+                                       log=lambda m: log(f"[refine] {m}"))
+                    if socket_present else None)
+
+    derived = False
+    if args.output_dir is not None:
+        # `is not None`, not truthiness (code review): `--output-dir ""` from an
+        # unset shell variable would otherwise fall silently into the derive
+        # branch. An empty string is a mistake, and it says so.
+        if not args.output_dir.strip():
+            print("[refine] --output-dir is empty — pass a directory, or omit "
+                  "the flag entirely to derive one under the daemon's output "
+                  "root (ADR-040 D1).", file=sys.stderr)
+            return 2
+        output_dir = os.path.abspath(args.output_dir)
+    elif daemon_roots is not None:
+        # D1: derived under the daemon's OWN output root, so refs/ and
+        # candidates/ are inside a reference root by definition, and the class
+        # of failure this ADR exists to kill becomes unrepresentable rather
+        # than diagnosed. run_id — not a collision check — is what makes the
+        # name unique (D1b).
+        #
+        # Both halves of this name are code-owned and `[A-Za-z0-9_-]` only, as
+        # D1 requires: RUN_DIR_STEM is a literal, and mint_run_id returns
+        # uuid4 hex (pinned by a charset test in test_refine.py). No operator
+        # text is interpolated here — that is the property, not an accident.
+        output_dir = os.path.join(daemon_roots.output_dir,
+                                  f"{RUN_DIR_STEM}-{run_id}")
+        derived = True
+    else:
+        print(f"[refine] --output-dir is required here: no daemon on "
+              f"{args.device!r} reported roots to derive a run directory under "
+              f"(ADR-040 D1). Either pass --output-dir, or start a daemon for "
+              f"that device.", file=sys.stderr)
+        return 2
+
+    if socket_present and daemon_roots is None:
+        # D3: nothing better is possible against a daemon that reports nothing,
+        # but silence is a choice. The ADR-037 D5 latch stays as the backstop.
+        log(f"[refine] NOTICE: the daemon on {args.device!r} reports no roots, "
+            f"so this run's paths CANNOT be validated at entry. If it refuses a "
+            f"reference mid-run the loop falls back in-process — best effort, "
+            f"not recoverable: the daemon still holds its VRAM, so that "
+            f"fallback may OOM. Restart the daemon to pick up ADR-040 D2.")
+
+    if daemon_roots is not None:
+        # Every path the daemon will be asked to READ back, checked with the
+        # daemon's own containment semantics (shared helper, D3/D3a). A derived
+        # dir passes trivially — the daemon's output_dir is always a member of
+        # its ref roots — and running it through the same check is what proves
+        # that rather than assuming it.
+        _outside = paths_outside_roots(
+            [output_dir,
+             os.path.join(output_dir, "refs"),
+             os.path.join(output_dir, "candidates")],
+            daemon_roots.ref_image_roots)
+        if _outside:
+            # REFUSAL, never a silent relocation of output the operator named
+            # (D3 normative). The advice must match WHICH path failed: in the
+            # derived case the operator already omitted --output-dir, so
+            # telling them to omit it points at the root that just failed
+            # (code review LOW / security review INFO). That branch is
+            # unreachable against the real server — _resolve_ref_roots always
+            # unions output_dir into ref_image_roots — and reachable only
+            # against a version-skewed or buggy responder, which is exactly the
+            # case the untrusted-input doctrine is defending.
+            _fix = (f"That is a DAEMON-side inconsistency: it reported an "
+                    f"output_dir that is not inside its own ref_image_roots. "
+                    f"Fix the daemon's --output-dir/--ref-root configuration, "
+                    f"or pass an explicit --output-dir inside a reported root."
+                    if derived else
+                    f"Fix it either way: OMIT --output-dir to get a run "
+                    f"directory derived under {daemon_roots.output_dir!r}, or "
+                    f"restart the daemon with --ref-root {output_dir!r} — name "
+                    f"the run directory itself, not a parent, since a broad "
+                    f"root is the breadth exposure ADR-035 Finding 6 warns "
+                    f"about.")
+            print(f"[refine] the run directory {output_dir!r} is outside the "
+                  f"reference roots of the daemon on {args.device!r} "
+                  f"({', '.join(repr(r) for r in daemon_roots.ref_image_roots)}), "
+                  f"so it would refuse the loop's own refs/ and candidates/ "
+                  f"mid-run and the in-process fallback could OOM against its "
+                  f"resident pipeline. {_fix}", file=sys.stderr)
+            return 2
+        if edit_source and paths_outside_roots([edit_source],
+                                               daemon_roots.ref_image_roots):
+            # The seed image is the one reference this slice neither pins nor
+            # refuses. Warn rather than refuse: the in-process latch still
+            # completes the run on a box with VRAM to spare, and D3 makes
+            # refusal normative only for the loop-owned directories above.
+            # The gap — and the reviewers' judgment that the seed BELONGS
+            # pinned like a static ref — is recorded in ADR-040's Changelog
+            # and TECH_DEBT, not left as an implicit "the loop cannot".
+            #
+            # Order the fixes narrow-first: --ref-root cannot name a single
+            # file, so suggesting it over a photo directory grants the daemon
+            # read+VAE-encode across that whole tree for its lifetime — the
+            # breadth ADR-035 Finding 6 warns about and _resolve_ref_roots
+            # warns about at runtime.
+            log(f"[refine] WARNING: --seed-image {edit_source!r} is outside the "
+                f"daemon's reference roots, so iteration 0's edit source will "
+                f"be REFUSED and the whole run latches in-process (ADR-037 D5) "
+                f"— which can OOM while the daemon holds VRAM. Best fix: move "
+                f"or copy the seed under a reported root "
+                f"({daemon_roots.output_dir!r} is one). Broader fallback: "
+                f"restart the daemon with --ref-root "
+                f"{os.path.dirname(edit_source)!r} — that grants the whole "
+                f"directory, so prefer the narrowest one that holds the seed.")
+
+    # D1: the exclusive create is the FIRST filesystem operation on the run dir.
+    # Ordering is normative, not hygiene: pin_static_refs' makedirs(refs_dir,
+    # exist_ok=True) creates PARENTS, so pinning first would materialize the run
+    # dir and this assertion could never fire — restoring silent sharing. And
+    # the derived path comes from a value the DAEMON supplied over the wire, so
+    # a fresh exclusive create is what bounds every later write here — including
+    # pin_static_refs' rmtree — to a directory this invocation provably just
+    # made, even against a buggy ping response.
+    try:
+        if derived:
+            # An assertion, not a suffix-on-collision retry: it can only fire on
+            # a run_id collision (~77k same-stem runs for even odds) or a logic
+            # error, and either deserves a failed run rather than a new name.
+            #
+            # 0o700 on the DERIVED branch only (security review LOW): under D1
+            # the location is no longer the operator's choice, and pinned
+            # verbatim copies of their private reference photos land in it —
+            # inside a tree any same-UID wire client can already ask the daemon
+            # to read. At the default umask those copies would be 0644 in a
+            # path the operator never named. An explicit --output-dir keeps
+            # default modes: they chose that directory.
+            os.makedirs(output_dir, mode=0o700, exist_ok=False)
+        else:
+            os.makedirs(output_dir, exist_ok=True)
+    except OSError as e:
+        print(f"[refine] cannot create the run directory {output_dir!r}: {e}",
+              file=sys.stderr)
+        return 2
+
+    # Loudly echoed (the F4 precedent): under D1 the location is implicit where
+    # it used to be the operator's choice, and pinned copies of their reference
+    # photos land there.
+    log(f"[refine] run directory: {output_dir}"
+        + (" (derived under the daemon's output root — ADR-040 D1)"
+           if derived else ""))
+
+    if not derived and os.path.isdir(os.path.join(output_dir, "refs")):
+        # D1 residual, stated rather than implied closed: uniqueness is
+        # guaranteed for DERIVED dirs only. pin_static_refs opens with an
+        # unconditional rmtree(refs/), so a concurrent sibling handed the same
+        # explicit directory loses its pinned references mid-run.
+        log(f"[refine] WARNING: {output_dir} already holds a refs/ from another "
+            f"run. Pinning will DELETE and repin it — if a sibling run is live "
+            f"there, that destroys the references it is generating and judging "
+            f"against. Omit --output-dir to get a unique derived run directory.")
 
     # Resolve the candidate output format (ADR-034 D7). No caller-authored path
     # to infer from (the loop names candidates), so pass output_path=None; an
@@ -4081,7 +4304,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 args.ref_image,
                 judge_max_images=resolve_judge_max_images(backend_cfg, log),
                 max_refs=_gen_caps._MAX_REF_IMAGES - 1)
-            static_refs = pin_static_refs(static_refs, args.output_dir, log)
+            static_refs = pin_static_refs(static_refs, output_dir, log)
         except RefineError as e:
             print(f"[refine] {e}", file=sys.stderr)
             return 2
@@ -4089,7 +4312,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         result = refine_loop(
             cfg, target_prompt=target_prompt, catalog=catalog, roots=roots,
-            conn=conn, backend_cfg=backend_cfg, output_dir=args.output_dir,
+            conn=conn, backend_cfg=backend_cfg, output_dir=output_dir,
+            daemon_output_dir=(daemon_roots.output_dir
+                               if daemon_roots is not None else None),
             device=args.device, precision=args.precision,
             pass_threshold=args.pass_threshold,
             until_composite=until_composite, max_iterations=max_iterations,

@@ -5152,10 +5152,18 @@ check("D2a: mcp_server.py never emits report_roots",
 # reviewers noted the two-string version was narrower than its own name — the
 # likeliest route is delegation through generate.py, and a hand-rolled client
 # needs neither helper.
+#
+# `query_daemon_roots` joined the set in slice 2b, and the reason is the whole
+# point of this block: that helper is a NAMED WRAPPER around the report_roots
+# literal. Every string-absence check here stays green if mcp_server.py calls
+# it, because the literal lives in generate.py. The set tracks the helper's
+# NAME, not the wire field — a new wrapper means a new entry, or the tripwire
+# silently stops tripping.
 check("D2a premise: mcp_server.py holds no daemon socket-client code",
       "socket_path" not in _d2_src
       and "_send_server_command" not in _d2_src
       and "_delegate_to_server" not in _d2_src
+      and "query_daemon_roots" not in _d2_src
       and "AF_UNIX" not in _d2_src)
 
 # The real slice-2/3 hazard (slice-1 security review MEDIUM): D3a puts the

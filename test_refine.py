@@ -658,7 +658,7 @@ class _FakeGen:
         self.formats_seen = []
 
     def __call__(self, cfg, *, device, output_dir, stem, precision="bf16",
-                 output_format=None, log=print):
+                 output_format=None, daemon_output_dir=None, log=print):
         self.seeds_seen.append(cfg.base.get("seed"))
         self.formats_seen.append(output_format.name if output_format is not None else None)
         os.makedirs(output_dir, exist_ok=True)
@@ -3866,6 +3866,490 @@ with open(os.path.join(_rid_de, "candidates", "candidate_00.json")) as _fh:
     check("load-plane sidecar carries run_id on the RefRefused in-process "
           "fallback path too",
           json.load(_fh).get("run_id") == "beef5678")
+
+
+# ── ADR-040 slice 2b: D1 derived run dir, mirror removal, D3 entry checks ────
+# The live 2026-07-26 failure this closes: a refine edit run whose --output-dir
+# sits outside the daemon's ref roots is broken BY CONSTRUCTION (the loop writes
+# refs/ and candidates/ that the daemon must read BACK), and the operator learns
+# it mid-run, after model load, where the designed degrade — latch in-process —
+# OOMs against a daemon still holding ~67 GiB.
+
+import re as _re  # noqa: E402
+
+print("\n== ADR-040 D3: the shared containment helper ==")
+_pr_base = _tf.mkdtemp(prefix="adr040_within_")
+_pr_out = os.path.join(_pr_base, "out")
+_pr_output = os.path.join(_pr_base, "output")
+os.makedirs(_pr_out)
+os.makedirs(_pr_output)
+check("a path inside a root is contained",
+      _gen.paths_outside_roots([os.path.join(_pr_out, "x")], [_pr_out]) == [])
+check("the root itself is contained (== , not just startswith sep)",
+      _gen.paths_outside_roots([_pr_out], [_pr_out]) == [])
+# The exact divergence D3 names: a plain startswith would call /data/output a
+# child of /data/out, pass entry validation, and be refused mid-run.
+check("a PREFIX SIBLING is outside (/data/out vs /data/output)",
+      _gen.paths_outside_roots([_pr_output], [_pr_out]) == [_pr_output])
+_pr_far = _tf.mkdtemp(prefix="adr040_far_")
+_pr_link = os.path.join(_pr_out, "link")
+os.symlink(_pr_far, _pr_link)
+check("a symlink RESOLVING outside its root is outside (realpath, not lexical)",
+      _gen.paths_outside_roots([_pr_link], [_pr_out]) == [_pr_link])
+check("containment is any-root, not first-root",
+      _gen.paths_outside_roots([_pr_output], [_pr_out, _pr_output]) == [])
+# "Unknown" must never be spelled as "outside": a caller with no validated
+# report has to skip the check entirely, not call it with an empty root set.
+check("no roots contains nothing",
+      _gen.paths_outside_roots([_pr_out], []) == [_pr_out])
+
+print("\n== ADR-040 D2/D3: ping roots are untrusted machine input ==")
+
+
+class _S2BSock:
+    def __init__(self, exists): self._e = exists
+    def exists(self): return self._e
+
+
+def _q_roots(resp):
+    """Drive the REAL query_daemon_roots against a scripted ping response.
+
+    Only _send_server_command is stubbed — query_daemon_roots does not consult
+    socket_path itself, it delegates that to the sender (whose `None` return IS
+    the no-daemon signal)."""
+    msgs = []
+    _sent = []
+    _o = _rg_gen._send_server_command
+    _rg_gen._send_server_command = lambda req, dev: (_sent.append(req) or resp)
+    try:
+        return _gen.query_daemon_roots("cuda", log=msgs.append), msgs, _sent
+    finally:
+        _rg_gen._send_server_command = _o
+
+
+_OK_PING = {"status": "ok", "message": "pong",
+            "output_dir": "/daemon/out", "ref_image_roots": ["/daemon/out",
+                                                             "/photos"]}
+_r, _m, _sent = _q_roots(_OK_PING)
+# Verbatim pass-through is the contract HERE; realpath'ing the reported values
+# is the DAEMON's duty (D2), not this function's — don't read this as coverage
+# for that.
+check("a well-formed report passes the roots through verbatim",
+      _r is not None and _r.output_dir == "/daemon/out"
+      and _r.ref_image_roots == ("/daemon/out", "/photos"))
+# The slice-1 trap: the daemon's report_roots check is PRESENCE-based, so the
+# key on any non-ping request is a hard ValidationError, and a `False` built
+# from a variable would refuse a generation rather than opting out.
+check("the roots request is a ping carrying report_roots=True, nothing else",
+      _sent == [{"type": "ping", "report_roots": True}], detail=repr(_sent))
+
+_r, _m, _ = _q_roots(None)
+check("no daemon → no roots, no noise", _r is None and _m == [])
+_r, _m, _ = _q_roots({"status": "ok", "message": "pong"})
+check("a pre-D2 daemon (no root fields) → no roots, and no error text",
+      _r is None and _m == [])
+_r, _m, _ = _q_roots({"status": "error", "error_type": "ClientRecvError",
+                      "error": "wedged"})
+check("an erroring/wedged daemon → no roots, said out loud",
+      _r is None and len(_m) == 1 and "wedged" in _m[0])
+
+# ADR-012 machine-boundary discipline: these values become the parent of an
+# os.makedirs and of pin_static_refs' rmtree. Every malformed shape must behave
+# EXACTLY as the pre-D2 case — no partial trust, no half-validated root list.
+for _label, _bad in [
+        ("non-str output_dir", {"output_dir": 123,
+                                "ref_image_roots": ["/daemon/out"]}),
+        ("relative output_dir", {"output_dir": "rel/path",
+                                 "ref_image_roots": ["/daemon/out"]}),
+        ("empty output_dir", {"output_dir": "",
+                              "ref_image_roots": ["/daemon/out"]}),
+        ("NUL-bearing output_dir", {"output_dir": "/daemon/\0out",
+                                    "ref_image_roots": ["/daemon/out"]}),
+        ("non-list ref_image_roots", {"output_dir": "/daemon/out",
+                                      "ref_image_roots": "/daemon/out"}),
+        ("empty ref_image_roots", {"output_dir": "/daemon/out",
+                                   "ref_image_roots": []}),
+        ("non-str member", {"output_dir": "/daemon/out",
+                            "ref_image_roots": ["/daemon/out", 7]}),
+        ("relative member", {"output_dir": "/daemon/out",
+                             "ref_image_roots": ["rel"]}),
+        ("NUL-bearing member", {"output_dir": "/daemon/out",
+                                "ref_image_roots": ["/a\0b"]})]:
+    _r, _m, _ = _q_roots({"status": "ok", **_bad})
+    check(f"malformed report ({_label}) → the WHOLE report is ignored",
+          _r is None and len(_m) == 1 and "malformed" in _m[0],
+          detail=f"roots={_r!r} msgs={_m!r}")
+
+print("\n== ADR-040 D1: run_generation savepath — mirror out, rename in ==")
+
+
+def _drive_daemon_savepath(*, report_root, stale_bytes=None,
+                           foreign_root=False):
+    """Drive the REAL run_generation against a daemon stub that reproduces
+    server.py's savepath handling verbatim: lstrip('/'), join under its OWN
+    --output-dir, then _resolve_savepath's UNCONDITIONAL counter suffix.
+
+    STUB DRIFT, named so it is not a surprise: this reimplements the daemon
+    side rather than driving it, so these assertions pin the CLIENT's template
+    only. server.py is untouched by this slice, but a future change to its
+    join would leave these green while the behavior broke."""
+    base = _tf.mkdtemp(prefix="adr040_sp_")
+    dout = os.path.join(base, "daemon_out")
+    cand = os.path.join(dout, "refine-cafe1234", "candidates")
+    os.makedirs(cand)
+    if stale_bytes is not None:
+        _PILImage.new("RGB", (4, 4), stale_bytes).save(
+            os.path.join(cand, "candidate_00.png"))
+    seen = {}
+    _o = (_rg_srv.socket_path, _rg_gen._send_server_command)
+    _rg_srv.socket_path = lambda dev: _S2BSock(True)
+
+    def _send(req, dev):
+        seen["savepath"] = req.get("savepath")
+        target = os.path.join(dout, str(req["savepath"]).lstrip("/"))
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        # The counter is appended from 1 unconditionally — …0001 is the FIRST
+        # slot, not a fired collision. Conflating the two was the HIGH the
+        # 2026-07-27 re-review caught.
+        out = f"{target}0001.png"
+        _PILImage.new("RGB", (4, 4), (1, 2, 3)).save(out)
+        return {"status": "ok", "output_path": out, "metadata": {"seed": 1}}
+
+    _rg_gen._send_server_command = _send
+    try:
+        oc = refine.run_generation(
+            WorkingConfig(prompt="p", loras=[], base={"seed": 1,
+                                                      "model": "/tmp/m"}),
+            device="cpu", output_dir=cand, stem="candidate_00",
+            daemon_output_dir=(os.path.join(base, "elsewhere") if foreign_root
+                               else dout if report_root else None),
+            log=lambda *_a: None)
+    finally:
+        (_rg_srv.socket_path, _rg_gen._send_server_command) = _o
+    return dout, cand, oc, seen
+
+
+_dout, _cand, _oc, _seen = _drive_daemon_savepath(report_root=False)
+check("without a reported root the ABSOLUTE template still goes out "
+      "(unchanged pre-D2 behavior)",
+      _seen["savepath"] == os.path.join(_cand, "candidate_00"))
+check("...and that is exactly what builds the MIRROR tree under the daemon "
+      "root (measured 2026-07-27: 31 shadow dirs)",
+      os.path.isdir(os.path.join(_dout, _cand.lstrip("/"))))
+check("...with the image moved back across trees to the canonical name",
+      _oc.image_path == os.path.join(_cand, "candidate_00.png")
+      and os.path.isfile(_oc.image_path))
+
+_dout, _cand, _oc, _seen = _drive_daemon_savepath(report_root=True)
+check("inside the daemon's root the template goes out RELATIVE",
+      _seen["savepath"] == os.path.join("refine-cafe1234", "candidates",
+                                        "candidate_00"),
+      detail=repr(_seen["savepath"]))
+check("no mirror tree is created (D1's operator-visible half)",
+      not os.path.isdir(os.path.join(_dout, _dout.lstrip("/"))))
+# The rename is NOT dead once the mirror is gone: the daemon still appends its
+# counter, so it never writes the canonical stem<ext> that ADR-034 D7 and the
+# candidate-as-next-edit-source contract depend on.
+check("the daemon's counter-suffixed file is renamed to the canonical stem",
+      _oc.image_path == os.path.join(_cand, "candidate_00.png")
+      and os.path.isfile(_oc.image_path)
+      and not os.path.exists(os.path.join(_cand, "candidate_000001.png")))
+check("the daemon wrote INSIDE our candidates dir, not beside it",
+      sorted(os.listdir(_cand)) == ["candidate_00.png"])
+
+# The divergence dropping the rename would reopen (ADR-038 D5): a stale
+# canonical file in a reused directory judged and pinned as this iteration's
+# candidate. The daemon writes (1,2,3); the stale file is (9,9,9).
+_dout, _cand, _oc, _seen = _drive_daemon_savepath(report_root=True,
+                                                  stale_bytes=(9, 9, 9))
+check("a stale canonical file is REPLACED by this iteration's bytes",
+      _PILImage.open(_oc.image_path).getpixel((0, 0)) == (1, 2, 3))
+
+# The THIRD branch, and the one an implementer is likeliest to get wrong later
+# (code review MEDIUM): a run dir inside a --ref-root but OUTSIDE the daemon's
+# output dir. It passes entry validation and still needs the ABSOLUTE template,
+# because the daemon only ever writes under its own root. D1's mirror removal
+# is scoped to run dirs under that root — it is not universal.
+_dout, _cand, _oc, _seen = _drive_daemon_savepath(report_root=True,
+                                                  foreign_root=True)
+check("a run dir outside the daemon's OUTPUT dir keeps the absolute template",
+      _seen["savepath"] == os.path.join(_cand, "candidate_00"),
+      detail=repr(_seen["savepath"]))
+check("...so the mirror tree is still built there — D1 scopes the fix, "
+      "it does not make mirrors impossible",
+      os.path.isdir(os.path.join(_dout, _cand.lstrip("/"))))
+check("...and the cross-tree move still lands the canonical name",
+      _oc.image_path == os.path.join(_cand, "candidate_00.png")
+      and os.path.isfile(_oc.image_path))
+
+print("\n== ADR-040 D1/D3: refine entry — derive, validate, refuse ==")
+# Full main() plumbing: a real model base holding a t2i-family model, a registry
+# with a pre-set judge model (no autodetect GET), and a stubbed loop.
+_s2b_mb = _tf.mkdtemp(prefix="adr040_mb_")
+_s2b_model = os.path.join(_s2b_mb, "TestFlux")
+os.makedirs(_s2b_model)
+with open(os.path.join(_s2b_model, "model_index.json"), "w") as _f:
+    json.dump({"_class_name": "FluxPipeline"}, _f)
+# An edit-family sibling: --ref-image is edit-mode only, and pinning (the
+# ordering probe below) only runs when there are refs to pin.
+_s2b_edit = os.path.join(_s2b_mb, "TestQwenEdit")
+os.makedirs(_s2b_edit)
+with open(os.path.join(_s2b_edit, "model_index.json"), "w") as _f:
+    json.dump({"_class_name": "QwenImageEditPlusPipeline"}, _f)
+
+
+def _run_main_2b(extra, *, ping=_OK_PING, socket_exists=True, run_id=None,
+                 pin_probe=None, model=None):
+    """Drive the REAL refine.main() to a stubbed refine_loop with a scripted
+    daemon ping, returning (rc, loop kwargs, stdout, stderr). `cap["reqs"]`
+    holds every request that reached the wire."""
+    cap = {}
+    reqs = []
+    cap["reqs"] = reqs
+
+    def _stub_loop(cfg, **kw):
+        cap.update(kw)
+        return refine.LoopOutcome(
+            winner_path=os.path.join(kw.get("output_dir", "."), "w.png"),
+            passed=True, iterations=1, best_composite=8.0)
+
+    _o = (refine.refine_loop, _rg_srv.socket_path,
+          _rg_gen._send_server_command, _rg_gen.mint_run_id,
+          refine.pin_static_refs)
+    refine.refine_loop = _stub_loop
+    _rg_srv.socket_path = lambda dev: _S2BSock(socket_exists)
+    _rg_gen._send_server_command = lambda req, dev: (reqs.append(req) or ping)
+    if run_id is not None:
+        _rg_gen.mint_run_id = lambda: run_id
+    if pin_probe is not None:
+        _orig_pin = refine.pin_static_refs
+
+        def _probing_pin(refs, output_dir, log=print):
+            pin_probe.append(os.path.isdir(output_dir))
+            return _orig_pin(refs, output_dir, log)
+        refine.pin_static_refs = _probing_pin
+    out, err = _io.StringIO(), _io.StringIO()
+    try:
+        with _ctx.redirect_stdout(out), _ctx.redirect_stderr(err):
+            rc = refine.main(["--prompt", "a detailed test scene",
+                              "--model", model or _s2b_model,
+                              "--model-base", _s2b_mb,
+                              "--judge-backend", "judge",
+                              "--judge-config", _reg] + extra)
+    finally:
+        (refine.refine_loop, _rg_srv.socket_path,
+         _rg_gen._send_server_command, _rg_gen.mint_run_id,
+         refine.pin_static_refs) = _o
+    return rc, cap, out.getvalue(), err.getvalue()
+
+
+_dm_base = _tf.mkdtemp(prefix="adr040_daemon_")
+_dm_out = os.path.join(_dm_base, "out")
+os.makedirs(_dm_out)
+_DM_PING = {"status": "ok", "output_dir": _dm_out,
+            "ref_image_roots": [_dm_out]}
+
+_rc, _cap, _o1, _e1 = _run_main_2b([], ping=_DM_PING, run_id="cafe1234")
+check("no --output-dir + a reporting daemon → the run dir is DERIVED",
+      _rc == 0 and _cap.get("output_dir") == os.path.join(_dm_out,
+                                                          "refine-cafe1234"),
+      detail=f"rc={_rc} dir={_cap.get('output_dir')!r} err={_e1[:160]!r}")
+check("the derived dir exists and sits under the daemon's OWN output root",
+      os.path.isdir(os.path.join(_dm_out, "refine-cafe1234")))
+check("it carries the run_id, so the directory names what ties its contents "
+      "together (D1b)", "cafe1234" in _cap.get("output_dir", ""))
+check("the derived location is LOUDLY echoed at entry (the F4 precedent)",
+      "run directory:" in _o1 and "derived" in _o1)
+check("the loop is told the daemon's root, so its savepaths go out relative",
+      _cap.get("daemon_output_dir") == _dm_out)
+
+# D1's whole point: refs/ and candidates/ are inside a ref root BY DEFINITION,
+# so the mid-run refusal class becomes unrepresentable rather than diagnosed.
+check("refs/ and candidates/ of a derived run are inside a daemon ref root",
+      _gen.paths_outside_roots(
+          [os.path.join(_cap["output_dir"], "refs"),
+           os.path.join(_cap["output_dir"], "candidates")], [_dm_out]) == [])
+
+# Uniqueness is structural (a fresh run_id per invocation), not a collision
+# check that appends a suffix.
+_rc2, _cap2, _, _ = _run_main_2b([], ping=_DM_PING)
+_rc3, _cap3, _, _ = _run_main_2b([], ping=_DM_PING)
+check("two derived runs never share a run dir",
+      _rc2 == 0 and _rc3 == 0
+      and _cap2["output_dir"] != _cap3["output_dir"])
+
+# The residual case the exist_ok=False assertion exists for. It must FAIL the
+# run — never suffix, which is what Grant's ruling replaced.
+_rc4, _cap4, _, _e4 = _run_main_2b([], ping=_DM_PING, run_id="cafe1234")
+check("a run_id collision FAILS loudly rather than suffixing",
+      _rc4 == 2 and "cannot create the run directory" in _e4
+      and "refine-cafe1234" in _e4, detail=f"rc={_rc4} err={_e4[:200]!r}")
+check("...and the colliding run never reaches the loop",
+      "output_dir" not in _cap4)
+
+# Ordering is normative: pin_static_refs' makedirs(refs_dir, exist_ok=True)
+# creates PARENTS, so pinning first would materialize the run dir and the
+# assertion above could never fire — restoring silent sharing.
+_pin_seen = []
+_ref_png = os.path.join(_tf.mkdtemp(prefix="adr040_ref_"), "r.png")
+_PILImage.new("RGB", (8, 8), (3, 3, 3)).save(_ref_png)
+_rc5, _cap5, _o5, _e5 = _run_main_2b(
+    ["--ref-image", f"{_ref_png}:both", "--seed-image", _seed_png],
+    ping=_DM_PING, pin_probe=_pin_seen, model=_s2b_edit)
+check("the exclusive create is the FIRST filesystem op on the run dir — "
+      "pin_static_refs finds it already there",
+      _rc5 == 0 and _pin_seen == [True], detail=f"rc={_rc5} err={_e5[:200]!r}")
+check("pinned reference copies land inside the derived run dir",
+      os.path.isdir(os.path.join(_cap5["output_dir"], "refs")))
+# The one operator-typed path the loop CANNOT relocate for them (static refs
+# are pinned; the seed is read from where they put it). Warn, don't refuse —
+# the in-process latch still works on a box with VRAM to spare, and D3 makes
+# refusal normative only for the loop-owned directories.
+check("a --seed-image outside the daemon's roots warns about the latch + OOM",
+      "--seed-image" in _o5 and "latches in-process" in _o5
+      and "--ref-root" in _o5, detail=_o5[-400:])
+
+# D3: REFUSAL, never a silent relocation of output the operator named.
+_far_dir = _tf.mkdtemp(prefix="adr040_far_out_")
+_rc6, _cap6, _o6, _e6 = _run_main_2b(["--output-dir", _far_dir], ping=_DM_PING)
+check("an explicit --output-dir outside the roots is refused AT ENTRY",
+      _rc6 == 2 and "outside the reference roots" in _e6,
+      detail=f"rc={_rc6} err={_e6[:200]!r}")
+check("...before the loop — no model load, no generation",
+      "output_dir" not in _cap6)
+check("...and the refusal names BOTH fixes (derive, or widen --ref-root)",
+      "OMIT --output-dir" in _e6 and "--ref-root" in _e6)
+check("...and it is NOT relocated into the daemon's tree",
+      not os.path.isdir(os.path.join(_dm_out, os.path.basename(_far_dir))))
+
+# The two divergences that would pass a lexical entry check and be refused
+# mid-run anyway.
+_sib_out = os.path.join(_dm_base, "outputs")
+os.makedirs(_sib_out, exist_ok=True)
+_rc7, _, _, _e7 = _run_main_2b(["--output-dir", _sib_out], ping=_DM_PING)
+check("a PREFIX SIBLING of the root is refused at entry (out vs outputs)",
+      _rc7 == 2 and "outside the reference roots" in _e7)
+_lnk = os.path.join(_dm_out, "escape")
+if not os.path.islink(_lnk):
+    os.symlink(_far_dir, _lnk)
+_rc8, _, _, _e8 = _run_main_2b(["--output-dir", _lnk], ping=_DM_PING)
+check("a symlink under the root that RESOLVES outside is refused at entry",
+      _rc8 == 2 and "outside the reference roots" in _e8)
+
+# An explicit dir INSIDE the roots is honored as given — derivation applies
+# ONLY when no --output-dir was passed (D3 normative).
+_in_dir = os.path.join(_dm_out, "operator_named")
+_rc9, _cap9, _o9, _e9 = _run_main_2b(["--output-dir", _in_dir], ping=_DM_PING)
+check("an explicit dir inside the roots is used verbatim, not derived",
+      _rc9 == 0 and _cap9.get("output_dir") == _in_dir
+      and "derived" not in _o9, detail=f"rc={_rc9} err={_e9[:200]!r}")
+
+# The prior review's HIGH surviving on the explicit path: uniqueness is
+# guaranteed for DERIVED dirs only, and pin_static_refs opens with an
+# unconditional rmtree(refs/). Warn — the operator who names the directory owns
+# its concurrency (warn-don't-block).
+os.makedirs(os.path.join(_in_dir, "refs"), exist_ok=True)
+_rc10, _cap10, _o10, _ = _run_main_2b(["--output-dir", _in_dir], ping=_DM_PING)
+check("a shared explicit --output-dir already holding refs/ warns LOUDLY",
+      _rc10 == 0 and "already holds a refs/" in _o10
+      and "DELETE and repin" in _o10, detail=_o10[-300:])
+check("...and proceeds anyway (the operator owns their own concurrency)",
+      _cap10.get("output_dir") == _in_dir)
+# The derived counterpart is NOT "no warning" — a freshly created dir cannot
+# hold refs/ regardless of the `not derived` gate, so asserting the absence
+# proves nothing (code review: that assertion was unfailable). The behavior the
+# gate actually implies is stronger: a derived dir that somehow already exists
+# FAILS on the exclusive create, so the warn-and-proceed path is unreachable
+# there by construction.
+os.makedirs(os.path.join(_dm_out, "refine-deadbeef", "refs"), exist_ok=True)
+_rc13, _cap13, _o13, _e13 = _run_main_2b([], ping=_DM_PING, run_id="deadbeef")
+check("a pre-existing derived dir holding refs/ FAILS the create — it never "
+      "reaches the warn-and-proceed path",
+      _rc13 == 2 and "cannot create the run directory" in _e13
+      and "already holds a refs/" not in _o13,
+      detail=f"rc={_rc13} err={_e13[:200]!r}")
+
+# Pre-D2 and malformed daemons must be INDISTINGUISHABLE from each other, and
+# both must say so — silence is a choice.
+for _label, _p in [("pre-D2", {"status": "ok", "message": "pong"}),
+                   ("malformed", {"status": "ok", "output_dir": 123,
+                                  "ref_image_roots": ["/x"]})]:
+    _rcN, _capN, _oN, _eN = _run_main_2b(["--output-dir", _far_dir], ping=_p)
+    check(f"a {_label} daemon → loud entry notice naming the OOM risk",
+          _rcN == 0 and "reports no roots" in _oN and "OOM" in _oN,
+          detail=_oN[-300:])
+    check(f"...a {_label} daemon leaves the run un-validated, so the ADR-037 "
+          f"D5 latch stays the backstop",
+          _capN.get("daemon_output_dir") is None)
+    _rcN, _capN, _oN, _eN = _run_main_2b([], ping=_p)
+    check(f"...and with nothing to derive under, a {_label} daemon makes "
+          f"--output-dir required",
+          _rcN == 2 and "--output-dir is required" in _eN)
+
+# Daemonless: untouched by all of it.
+_dl_dir = _tf.mkdtemp(prefix="adr040_daemonless_")
+_rc11, _cap11, _o11, _e11 = _run_main_2b(["--output-dir", _dl_dir],
+                                         socket_exists=False, ping=None)
+check("a daemonless run is unaffected — no ping, no notice, no validation",
+      _rc11 == 0 and _cap11.get("output_dir") == _dl_dir
+      and _cap11.get("daemon_output_dir") is None
+      and _cap11["reqs"] == []
+      and "reports no roots" not in _o11, detail=repr(_cap11["reqs"]))
+_rc12, _, _, _e12 = _run_main_2b([], socket_exists=False, ping=None)
+check("...but daemonless with no --output-dir has nothing to derive under",
+      _rc12 == 2 and "--output-dir is required" in _e12)
+
+# D2a: report_roots is a CLI-plane PING field. The daemon's check is
+# presence-based, so it must never ride a generate request — not even as False.
+_ns = refine._daemon_namespace("cuda", "bf16", "out/candidate_00")
+_req = _gen._build_server_request(_ns, {"model": "/m", "prompt": "p"}, [])
+check("a generate request never carries report_roots",
+      "report_roots" not in _req)
+
+# --output-dir "" (an unset shell variable) must not fall silently into the
+# derive branch — it is a mistake, and it says so.
+_rc14, _cap14, _, _e14 = _run_main_2b(["--output-dir", ""], ping=_DM_PING)
+check("--output-dir '' is refused rather than silently derived",
+      _rc14 == 2 and "--output-dir is empty" in _e14
+      and "output_dir" not in _cap14, detail=f"rc={_rc14} err={_e14[:160]!r}")
+
+# The derived dir's name is code-owned end to end. D1 makes the charset
+# normative ([A-Za-z0-9_-], no separators, no operator text); RUN_DIR_STEM is a
+# literal, and this pins the other half at its source.
+check("RUN_DIR_STEM and mint_run_id both satisfy D1's dirname charset",
+      _re.fullmatch(r"[A-Za-z0-9_-]+", refine.RUN_DIR_STEM) is not None
+      and all(_re.fullmatch(r"[A-Za-z0-9_-]+", _gen.mint_run_id())
+              for _ in range(50)))
+
+# A daemon whose reported output_dir is NOT inside its own reported ref roots
+# is impossible for the real server (_resolve_ref_roots always unions it in)
+# and reachable only from a version-skewed or buggy responder — which is the
+# case the untrusted-input doctrine defends. The refusal must not then tell the
+# operator to omit a flag they already omitted.
+_rc15, _cap15, _, _e15 = _run_main_2b(
+    [], ping={"status": "ok", "output_dir": _far_dir,
+              "ref_image_roots": [_dm_out]})
+check("a derived dir outside the reported roots refuses with DAEMON-side "
+      "advice, not 'omit --output-dir'",
+      _rc15 == 2 and "DAEMON-side inconsistency" in _e15
+      and "OMIT --output-dir" not in _e15,
+      detail=f"rc={_rc15} err={_e15[:240]!r}")
+
+# Under D1 the run dir is no longer the operator's choice, and pinned verbatim
+# copies of their private reference photos land in it — inside a tree any
+# same-UID wire client can ask the daemon to read.
+_rc16, _cap16, _, _ = _run_main_2b([], ping=_DM_PING)
+check("a DERIVED run dir is created 0o700, not umask-default",
+      _rc16 == 0
+      and (os.stat(_cap16["output_dir"]).st_mode & 0o777) == 0o700,
+      detail=oct(os.stat(_cap16["output_dir"]).st_mode & 0o777))
+_mode_dir = os.path.join(_dm_out, "operator_modes")
+_rc17, _cap17, _, _ = _run_main_2b(["--output-dir", _mode_dir], ping=_DM_PING)
+_um = os.umask(0)
+os.umask(_um)
+check("an EXPLICIT dir keeps default modes — the operator chose that path",
+      _rc17 == 0 and (os.stat(_mode_dir).st_mode & 0o777) == (0o777 & ~_um),
+      detail=oct(os.stat(_mode_dir).st_mode & 0o777))
 
 
 # ── Summary ──────────────────────────────────────────────────────────────────
