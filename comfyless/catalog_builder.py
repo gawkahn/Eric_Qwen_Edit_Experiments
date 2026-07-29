@@ -172,13 +172,31 @@ def _index_from_parsed(data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
             "duplicate_of": entry.get("duplicate_of"),
             # Family evidence (ADR-022 §5 tier 1): which audit bases this
             # file positively matched.
+            #
+            # For loras this is the union of TWO audit signals. The direct
+            # shape-match verdicts in `verdicts_by_base`, and — since the
+            # ADR-014 amendment (2026-07-28) — the bases a file matched only
+            # after its own family's diffusers converter rewrote the key
+            # layout, recorded in `native_convert.matched_bases`. A
+            # native-convert entry's direct verdicts are ALL `WRONG_ARCH` by
+            # construction, so reading `verdicts_by_base` alone yields an
+            # empty `ok_bases` and silently falls back to the path/sidecar
+            # hint — which is how 138 Kohya-format loras (58 of them with a
+            # family the audit had correctly identified) would have been
+            # tagged by their containing directory instead of by evidence.
             "ok_bases": (
                 sorted(entry.get("matched_bases") or [])
                 if kind == "transformer" else
-                sorted(bn for bn, v in
-                       (entry.get("verdicts_by_base") or {}).items()
-                       if isinstance(v, dict)
-                       and v.get("verdict") in ("OK", "NORM_TARGETING"))
+                sorted(
+                    {bn for bn, v in
+                     (entry.get("verdicts_by_base") or {}).items()
+                     if isinstance(v, dict)
+                     and v.get("verdict") in ("OK", "NORM_TARGETING")}
+                    | {bn for bn in
+                       ((entry.get("native_convert") or {}).get(
+                           "matched_bases") or [])
+                       if isinstance(bn, str)}
+                )
             ),
         }
     return out

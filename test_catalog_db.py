@@ -391,6 +391,17 @@ with tempfile.TemporaryDirectory() as td:
         # review 2026-07-06: the fixture must discriminate the branch
         json.dump({"base_model": "Qwen",
                    "civitai": {"trainedWords": []}}, f)
+    # ADR-014 amendment 2026-07-28: a Kohya-format lora whose DIRECT
+    # verdicts are all WRONG_ARCH but which the family's own diffusers
+    # converter makes loadable. Its family evidence lives ONLY in
+    # native_convert.matched_bases. Sidecar deliberately disagrees so the
+    # test proves the audit evidence is being read, not the sidecar: if
+    # catalog_builder ignores native_convert this file gets ok_bases=[]
+    # and falls back to sidecar/path, which is the bug this pins.
+    _mk(os.path.join(lr, "kohyaflux.safetensors"))
+    with open(os.path.join(lr, "kohyaflux.metadata.json"), "w") as f:
+        json.dump({"base_model": "Flux.2 D",
+                   "civitai": {"trainedWords": []}}, f)
     # duplicate_of beats alphabetical matched_bases order
     _mk(os.path.join(tr, "dupfam.safetensors"))
     # finding-4: sidecar family alone, no audit manifest entry → included
@@ -446,6 +457,20 @@ with tempfile.TemporaryDirectory() as td:
              "classification": "usable", "reason": "prognosis_hi-prec",
              "matched_bases": ["fluxb", "synth"],
              "duplicate_of": "synth"},
+            {"kind": "lora",
+             "relative_path": "kohyaflux.safetensors",
+             "classification": "usable", "reason": "ok_native_convert",
+             # Direct match failed against every base — the production
+             # shape for a Kohya-format file.
+             "verdicts_by_base": {"synth": {"verdict": "WRONG_ARCH"},
+                                  "fluxb": {"verdict": "WRONG_ARCH"}},
+             "native_convert": {"mixin": "QwenImageLoraLoaderMixin",
+                                "base": "synth",
+                                "verdict": {"verdict": "OK",
+                                            "key_match_pct": 100.0},
+                                "source_layers": 10,
+                                "converted_layers": 14,
+                                "matched_bases": ["synth"]}},
         ],
     }
     mpath = os.path.join(td, "lora_audit.json")
@@ -457,7 +482,7 @@ with tempfile.TemporaryDirectory() as td:
                          audit_manifests=(mpath,))
     check("S2 build: families registered from scan models",
           stats["families"] == 2, detail=repr(stats))
-    check("S2 build: sidecars ingested", stats["sidecars"] == 6,
+    check("S2 build: sidecars ingested", stats["sidecars"] == 7,
           detail=repr(stats))
 
     conn = cdb.connect(dbp)
@@ -531,6 +556,23 @@ with tempfile.TemporaryDirectory() as td:
           row["model_family"] == "qwen-image", detail=repr(dict(row)))
     check("S2 pick: agreeing evidence → no conflict recorded",
           row["family_conflict"] is None)
+
+    # ADR-014 amendment: native-convert family evidence must reach the DB.
+    # Direct verdicts are all WRONG_ARCH, so before the 2026-07-28 wiring
+    # ok_bases was empty and family fell back to the DISAGREEING sidecar
+    # (flux2) — 138 real loras were tagged by directory instead of evidence.
+    row = conn.execute(
+        "SELECT * FROM entries WHERE name='kohyaflux'").fetchone()
+    check("S2 native-convert: family comes from native_convert.matched_bases "
+          "(qwen-image via synth), NOT the disagreeing sidecar (flux2)",
+          row["model_family"] == "qwen-image", detail=repr(dict(row)))
+    check("S2 native-convert: disagreeing sidecar still recorded as conflict",
+          row["family_conflict"] is not None
+          and "sidecar=flux2" in row["family_conflict"],
+          detail=repr(row["family_conflict"]))
+    check("S2 native-convert: entry is not excluded",
+          row["excluded"] == 0 and row["reason"] == "ok_native_convert",
+          detail=repr(dict(row)))
     # duplicate_of is definitive family evidence
     row = conn.execute(
         "SELECT * FROM entries WHERE name='dupfam'").fetchone()
