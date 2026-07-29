@@ -198,6 +198,13 @@ def _index_from_parsed(data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                        if isinstance(bn, str)}
                 )
             ),
+            # The audit's RANKED winner among those bases, when the match
+            # came via native conversion. `ok_bases` is an unordered set,
+            # so without this the multi-base tiebreak below falls back to
+            # alphabetical — discarding a measurement the audit already
+            # made (ADR-014: flux 100% vs chroma 84.62%). None for entries
+            # that matched directly.
+            "native_base": (entry.get("native_convert") or {}).get("base"),
         }
     return out
 
@@ -328,10 +335,24 @@ def build(db_path: str,
                     # Multi-base audit matches are REAL (Flux.1 LoRAs
                     # legitimately also pass on Chroma — same arch). Prefer
                     # the ok-base agreeing with the sidecar declaration,
-                    # then the path hint; alphabetical-first only as the
-                    # last resort.
+                    # then the path hint; then the audit's own ranked
+                    # winner, with alphabetical-first only as the true last
+                    # resort.
+                    #
+                    # The native_base rung was added 2026-07-28 after the
+                    # live rebuild: Petite_body_type.safetensors matched
+                    # {chroma, flux}, its sidecar and path both said flux2
+                    # (the folder is misfiled — the file's own metadata
+                    # reads flux-1-dev/lora), so neither heuristic rung
+                    # applied and alphabetical-first chose `chroma`. The
+                    # audit had already measured flux at 100% against
+                    # chroma's 84.62%. Prefer a measurement over a sort.
+                    native_family = base_family.get(
+                        info.get("native_base") or "")
                     ev_audit = (ev_sidecar if ev_sidecar in ok_families
                                 else ev_path if ev_path in ok_families
+                                else native_family
+                                if native_family in ok_families
                                 else ok_families[0])
                 else:
                     ev_audit = None

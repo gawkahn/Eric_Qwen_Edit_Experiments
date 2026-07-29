@@ -402,6 +402,14 @@ with tempfile.TemporaryDirectory() as td:
     with open(os.path.join(lr, "kohyaflux.metadata.json"), "w") as f:
         json.dump({"base_model": "Flux.2 D",
                    "civitai": {"trainedWords": []}}, f)
+    # Live-rebuild shape (Petite_body_type): matches TWO bases via native
+    # convert, but its sidecar/path name a family that is NOT among them
+    # because the file is misfiled. Both heuristic rungs miss, so the
+    # tiebreak must use the audit's ranked winner.
+    _mk(os.path.join(lr, "misfiled.safetensors"))
+    with open(os.path.join(lr, "misfiled.metadata.json"), "w") as f:
+        json.dump({"base_model": "Z-Image",
+                   "civitai": {"trainedWords": []}}, f)
     # duplicate_of beats alphabetical matched_bases order
     _mk(os.path.join(tr, "dupfam.safetensors"))
     # finding-4: sidecar family alone, no audit manifest entry → included
@@ -471,6 +479,22 @@ with tempfile.TemporaryDirectory() as td:
                                 "source_layers": 10,
                                 "converted_layers": 14,
                                 "matched_bases": ["synth"]}},
+            {"kind": "lora",
+             "relative_path": "misfiled.safetensors",
+             "classification": "usable", "reason": "ok_native_convert",
+             "verdicts_by_base": {"synth": {"verdict": "WRONG_ARCH"},
+                                  "fluxb": {"verdict": "WRONG_ARCH"}},
+             # Matches BOTH bases; the audit ranked 'synth' the better fit.
+             # 'fluxb' sorts FIRST, so alphabetical-first would pick flux2 —
+             # the ranked winner must be the alphabetically-LATER base or
+             # this fixture cannot discriminate the tiebreak.
+             "native_convert": {"mixin": "QwenImageLoraLoaderMixin",
+                                "base": "synth",
+                                "verdict": {"verdict": "OK",
+                                            "key_match_pct": 100.0},
+                                "source_layers": 10,
+                                "converted_layers": 14,
+                                "matched_bases": ["fluxb", "synth"]}},
         ],
     }
     mpath = os.path.join(td, "lora_audit.json")
@@ -482,7 +506,7 @@ with tempfile.TemporaryDirectory() as td:
                          audit_manifests=(mpath,))
     check("S2 build: families registered from scan models",
           stats["families"] == 2, detail=repr(stats))
-    check("S2 build: sidecars ingested", stats["sidecars"] == 7,
+    check("S2 build: sidecars ingested", stats["sidecars"] == 8,
           detail=repr(stats))
 
     conn = cdb.connect(dbp)
@@ -573,6 +597,19 @@ with tempfile.TemporaryDirectory() as td:
     check("S2 native-convert: entry is not excluded",
           row["excluded"] == 0 and row["reason"] == "ok_native_convert",
           detail=repr(dict(row)))
+
+    # Multi-base native convert where NEITHER sidecar nor path is among the
+    # matched bases — the Petite_body_type shape found in the live rebuild.
+    # Both heuristic rungs miss, so the tiebreak must fall to the audit's
+    # ranked winner (native_convert.base = synth -> qwen-image), NOT
+    # alphabetical-first (fluxb sorts earlier and yields flux2 on the old
+    # logic — verified by mutation, which is how a first attempt at this
+    # fixture was caught passing vacuously).
+    row = conn.execute(
+        "SELECT * FROM entries WHERE name='misfiled'").fetchone()
+    check("S2 native-convert: audit's ranked base breaks the tie, not "
+          "alphabetical-first",
+          row["model_family"] == "qwen-image", detail=repr(dict(row)))
     # duplicate_of is definitive family evidence
     row = conn.execute(
         "SELECT * FROM entries WHERE name='dupfam'").fetchone()
