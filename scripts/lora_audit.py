@@ -241,9 +241,14 @@ class FileEntry:
     # ADR-014 amendment 2026-07-28. Set only when the on-disk key layout
     # failed the direct shape-match but the base family's own diffusers
     # LoraLoaderMixin converted it into a matching one:
-    #   {"mixin": str, "base": str, "verdict": {<LoRACheckResult dict>}}
-    # Carries the post-conversion verdict so OK / NORM_TARGETING /
-    # DIM_MISMATCH_PARTIAL granularity survives the single reason code.
+    #   {"mixin": str, "base": str, "verdict": {<LoRACheckResult dict>},
+    #    "source_layers": int, "converted_layers": int,
+    #    "matched_bases": [str]}
+    # `verdict` carries the post-conversion result so OK / NORM_TARGETING /
+    # DIM_MISMATCH_PARTIAL granularity survives the single reason code;
+    # source/converted layer counts make the _COVERAGE_FLOOR ratio
+    # auditable; `matched_bases` lists EVERY base that matched, not just
+    # the winner in `base` (family-conflict signal).
     native_convert: Optional[dict[str, Any]] = None
 
     def to_json(self) -> dict[str, Any]:
@@ -829,6 +834,43 @@ def _is_usable_verdict(r) -> tuple[bool, str]:
     return False, ""
 
 
+def _native_hit_rank(record: dict[str, Any]) -> tuple:
+    """Rank a native-convert hit so the BEST-matching base wins, not the
+    alphabetically-first one.
+
+    Coverage outranks the verdict LABEL, deliberately: the motivating case
+    had `flux` at 100% but NORM_TARGETING (a real Flux LoRA that also
+    touches norm layers) versus `chroma` at 84.62% with a clean OK.
+    Ranking the label first re-selects `chroma` — the file is a Flux LoRA,
+    and coverage is the signal that says so.
+
+    `matched` (absolute layers that resolved) is primary, not
+    `key_match_pct`. Percentage is computed over the POST-conversion dict,
+    whose size each mixin decides, so comparing percentages ACROSS mixins
+    divides by different denominators. A converter that drops what it does
+    not recognise can retain half the source layers (passing
+    `_COVERAGE_FLOOR`), match all of that sliver, and score 100% — beating
+    the correct family's fuller conversion at 90%. Absolute matched-layer
+    count is denominator-free and does not invert that way.
+
+    The tradeoff, named rather than hidden: `matched` carries the opposite
+    bias, since a converter that splits fused projections (qkv into
+    to_q/to_k/to_v) inflates the count. That bias is the weaker one —
+    split layers still have to resolve against the base index to be
+    counted, so inflation only helps a base the file genuinely fits.
+    Within a single mixin the two metrics are monotonically equivalent
+    (shared denominator), so this changes nothing for the flux-vs-chroma
+    case that motivated the fix.
+    """
+    v = record.get("verdict") or {}
+    return (
+        v.get("matched", 0),
+        v.get("key_match_pct", 0.0),
+        v.get("dim_ok_pct", 0.0),
+        1 if v.get("verdict") == "OK" else 0,
+    )
+
+
 def _adapter_layer_count(keys) -> int:
     """Count distinct adapter target layers in a LoRA key namespace.
 
@@ -1044,15 +1086,40 @@ def _classify_lora(
     # files (the dominant civitai Flux layout) fail the direct shape-match
     # but `load_lora_weights` converts them natively, so comfyless loads
     # them today. Runs on the state dict already loaded above — no extra
-    # read. Bases are tried in config order so the reported base matches
-    # the direct-match loop's precedence.
+    # read.
+    #
+    # EVERY base is probed, not just up to the first hit. Architecturally
+    # related families match the same file (Chroma is a Flux.1 derivative,
+    # so a Flux LoRA converts and matches both), and `_resolve_bases` hands
+    # us bases ALPHABETICALLY — so returning on first hit reported whichever
+    # family sorted earliest, not the one that actually fit. Measured: a
+    # Kohya Flux LoRA matched `flux` at 100% and `chroma` at 84.62%, and
+    # first-hit reported `chroma`. The catalog's `model_family` tag comes
+    # from this, so that was a live mislabel on 58 of 138 files.
+    native_hits = []
     for base in bases:
         if base.param_dict is None:
             continue
         hit = _try_native_convert_match(path, state_dict, base)
         if hit is not None:
-            reason, native_record = hit
-            return CLASS_USABLE, reason, verdicts, None, native_record
+            native_hits.append(hit[1])
+    if native_hits:
+        # Best match wins. `max` over an alphabetically-ordered list keeps
+        # ties deterministic (Vision invariant 8).
+        best = dict(max(native_hits, key=_native_hit_rank))
+        # Preserve the multi-family signal the direct path keeps in
+        # `verdicts_by_base`; reporting only the winner would discard it.
+        #
+        # CARRIED FOR, NOT YET READ BY, the catalog. `catalog_builder.py`
+        # derives a lora's `ok_bases` solely from `verdicts_by_base`
+        # (OK/NORM_TARGETING) and never looks at `native_convert` — and a
+        # native-convert entry's direct verdicts are all WRONG_ARCH by
+        # construction. So until that consumer is wired, these families
+        # reach the manifest but NOT catalog search / MCP `list_loras` /
+        # refine offers. See TECH_DEBT 2026-07-28 "native_convert families
+        # never reach the catalog" — it blocks ADR-041.
+        best["matched_bases"] = sorted(h["base"] for h in native_hits)
+        return CLASS_USABLE, R_OK_NATIVE_CONVERT, verdicts, None, best
 
     for base in bases:
         if base.param_dict is None:

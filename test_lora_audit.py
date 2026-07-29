@@ -2052,6 +2052,126 @@ class _SliverMixin:
         }
 
 
+def test_native_convert_picks_best_base_not_first() -> None:
+    """Architecturally related families both match; the BEST match must win.
+
+    Regression pin for the live mislabel found on 2026-07-28: `_resolve_bases`
+    hands bases out ALPHABETICALLY, and returning on first hit reported
+    `chroma` (84.62%) for a Kohya Flux LoRA that matched `flux` at 100% —
+    58 of 138 files got the wrong `model_family` tag in the catalog.
+    """
+    mod = _import_script()
+    tmp = Path(tempfile.mkdtemp(prefix="lora_audit_nc_best_"))
+    try:
+        lora = tmp / "tree" / "kohya_flux.safetensors"
+        _write_kohya_flux_lora(lora)
+
+        # Two bases that both convert-and-match. "aaa_partial" sorts FIRST
+        # and matches worse; "zzz_full" sorts LAST and matches fully. The
+        # partial base simply omits some layers from its index.
+        full_dir = _build_flux_like_base(tmp / "Full")
+        partial_root = tmp / "Partial"
+        partial_root.mkdir(parents=True, exist_ok=True)
+        (partial_root / "model_index.json").write_text(
+            json.dumps({"_class_name": "FluxPipeline"}), encoding="utf-8")
+        pdir = partial_root / "transformer"
+        pdir.mkdir(parents=True, exist_ok=True)
+        dropped = {"transformer_blocks.0.ff.net.0.proj.weight",
+                   "transformer_blocks.0.ff.net.2.weight",
+                   "transformer_blocks.0.ff_context.net.0.proj.weight",
+                   "transformer_blocks.0.ff_context.net.2.weight"}
+        safetensors.torch.save_file(
+            {k: torch.zeros(*v) for k, v in _NC_BASE_SHAPES.items()
+             if k not in dropped},
+            str(pdir / "model.safetensors"))
+
+        bases = [_nc_base(mod, pdir, "aaa_partial"),
+                 _nc_base(mod, full_dir, "zzz_full")]
+        # Premise: alphabetical order really does put the worse base first,
+        # which is what _resolve_bases would hand _classify_lora.
+        check("best-match premise: worse base sorts first",
+              [b.name for b in bases] == sorted(b.name for b in bases))
+
+        cls, reason, _v, _p, native = mod._classify_lora(lora, bases)
+        check("multi-base native convert still classifies usable",
+              cls == mod.CLASS_USABLE, f"got {cls}/{reason}")
+        check("best-matching base wins over alphabetically-first",
+              (native or {}).get("base") == "zzz_full",
+              f"got {(native or {}).get('base')}")
+        check("both matching bases are recorded for family_conflict",
+              (native or {}).get("matched_bases") == ["aaa_partial",
+                                                      "zzz_full"],
+              f"got {(native or {}).get('matched_bases')}")
+        # And the winner's coverage really is the higher one.
+        check("winning verdict is the higher key_match_pct",
+              (native or {}).get("verdict", {}).get("key_match_pct") == 100.0,
+              f"got {(native or {}).get('verdict')}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_native_convert_coverage_outranks_verdict_label() -> None:
+    """Coverage must outrank the verdict LABEL in `_native_hit_rank`.
+
+    Miniature of the live 2026-07-28 case: `flux` matched 100% but graded
+    NORM_TARGETING (a real Flux LoRA that also touches norm layers), while
+    `chroma` matched only 84.62% with a clean OK. Ranking the label first
+    re-selects the wrong family — and would leave the whole suite green,
+    which is exactly why this needs its own pin.
+
+    Built by dropping the two norm layers from the alphabetically-first
+    base: with no norm layer matched it grades OK at partial coverage,
+    against the full base's NORM_TARGETING at 100%.
+    """
+    mod = _import_script()
+    tmp = Path(tempfile.mkdtemp(prefix="lora_audit_nc_rank_"))
+    try:
+        lora = tmp / "tree" / "kohya_flux.safetensors"
+        _write_kohya_flux_lora(lora)
+
+        full_dir = _build_flux_like_base(tmp / "Full")
+        clean_root = tmp / "Clean"
+        clean_root.mkdir(parents=True, exist_ok=True)
+        (clean_root / "model_index.json").write_text(
+            json.dumps({"_class_name": "FluxPipeline"}), encoding="utf-8")
+        cdir = clean_root / "transformer"
+        cdir.mkdir(parents=True, exist_ok=True)
+        norm_keys = {"transformer_blocks.0.norm1.linear.weight",
+                     "transformer_blocks.0.norm1_context.linear.weight"}
+        safetensors.torch.save_file(
+            {k: torch.zeros(*v) for k, v in _NC_BASE_SHAPES.items()
+             if k not in norm_keys},
+            str(cdir / "model.safetensors"))
+
+        bases = [_nc_base(mod, cdir, "aaa_clean_partial"),
+                 _nc_base(mod, full_dir, "zzz_full_norm")]
+        sd = mod._load_state_dict(str(lora))
+        hits = [mod._try_native_convert_match(lora, sd, b) for b in bases]
+        recs = [h[1] for h in hits if h]
+        check("rank premise: both bases match", len(recs) == 2,
+              f"got {len(recs)} hits")
+        if len(recs) == 2:
+            partial, full = recs[0]["verdict"], recs[1]["verdict"]
+            # Premise: this fixture really does pit a clean partial against
+            # a norm-targeting full match. If diffusers' grading changes,
+            # this check fails loudly instead of the test quietly passing.
+            check("rank premise: first base grades OK at lower coverage",
+                  partial["verdict"] == "OK"
+                  and partial["key_match_pct"] < full["key_match_pct"],
+                  f"partial={partial} full={full}")
+            check("rank premise: better base grades NORM_TARGETING at 100%",
+                  full["verdict"] == "NORM_TARGETING"
+                  and full["key_match_pct"] == 100.0,
+                  f"full={full}")
+
+        cls, reason, _v, _p, native = mod._classify_lora(lora, bases)
+        check("higher coverage beats the cleaner verdict label",
+              (native or {}).get("base") == "zzz_full_norm",
+              f"got {(native or {}).get('base')}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_native_convert_does_not_mutate_caller_state_dict() -> None:
     """The probe must not corrupt the state dict the later
     `find_matching_plan` convertable probe consumes."""
@@ -2291,6 +2411,8 @@ def main() -> int:
         test_transformer_audit()
         test_native_convert_kohya_flux_usable()
         test_native_convert_wan_still_wrong_arch()
+        test_native_convert_picks_best_base_not_first()
+        test_native_convert_coverage_outranks_verdict_label()
         test_native_convert_does_not_mutate_caller_state_dict()
         test_native_convert_partial_conversion_rejected()
         test_resolve_lora_mixin_fallbacks()
