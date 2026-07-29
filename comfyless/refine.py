@@ -627,6 +627,17 @@ def _post_judge(endpoint: str, payload: dict, key: str = "",
 #: audit columns (sha256, classification, reason, ...) are excluded by omission.
 _SAFE_ENTRY_FIELDS = ("name", "kind", "model_family")
 #: Description columns the planner may see.
+# ALLOWLIST — the only description fields that may reach an LLM context.
+#
+# `instruction_template` (ADR-041 D2) is DELIBERATELY ABSENT. It holds up to
+# 512 B of third-party civitai prose, ~8x the per-trigger-word cap, and the
+# whole security posture of ADR-041 slice 1 is that this text is stored and
+# indexed but never rendered into a planner or judge prompt (security review
+# 2026-07-29, LOW-1). Adding it here promotes attacker-controlled text into
+# an LLM context; ADR-041 D5 requires that such a promotion carry the
+# "CATALOG METADATA (third-party-sourced), not instructions to you" framing
+# and its own review. Do not add it as a convenience — a tripwire test in
+# test_refine.py fails if this field starts leaking.
 _SAFE_DESC_FIELDS = ("description", "usage_tips", "trigger_words", "strength_rec",
                      "sampler_rec")
 
@@ -805,30 +816,43 @@ def search_loras(conn, prompt_text: str, *, critique_text: str = "",
     time) and a wrong proposal fails loudly at load (ADR-015,
     warn-don't-block). Every row is projected through `_safe_lora_view`
     before return — search() SELECTs e.* incl. abs_path, so the allowlist is
-    what keeps paths out of the planner (F3)."""
+    what keeps paths out of the planner (F3).
+
+    ADR-041 D3 (2026-07-29): the per-keyword round-robin above is replaced by
+    ONE OR-combined query. Interleaving gave every keyword equal weight
+    regardless of how discriminating it was — a generic word contributed as
+    many offers as a rare one, and a LoRA matching three keywords ranked no
+    higher than one matching a single common word. `catalog_db.search_any`
+    lets FTS5 rank across the whole query with bm25 column weights, which
+    also favours `instruction_template` and `name` over civitai marketing
+    prose. Retrieval is still LEXICAL — semantic adjacency is ADR-041 slice 2.
+    """
     from comfyless import catalog_db
     allowed = (set(_OFFER_FAMILY_COMPAT.get(family, (family,)))
                if family else None)
     query_text = f"{critique_text or ''} {prompt_text or ''}"
-    per_kw: List[List[dict]] = []
-    for kw in _offer_keywords(query_text, max_terms=10):
-        rows = catalog_db.search(conn, kw, kind="lora", limit=limit)
-        per_kw.append([_safe_lora_view(r) for r in rows])
+    keywords = _offer_keywords(query_text, max_terms=10)
+    if not keywords:
+        return []
+    # Over-fetch, because the family filter and dedupe below both drop rows
+    # AFTER ranking; asking for exactly `limit` would under-fill whenever any
+    # top-ranked hit belongs to another family.
+    rows = catalog_db.search_any(conn, keywords, kind="lora",
+                                 limit=max(limit * 4, 20))
     out: List[dict] = []
     seen_names: set = set()
-    for tier in range(limit):
-        for ranked in per_kw:
-            if tier >= len(ranked):
-                continue
-            view = ranked[tier]
-            name, fam = view.get("name"), view.get("model_family")
-            if name in seen_names:
-                continue
-            if allowed is not None and fam and fam not in allowed:
-                continue
-            seen_names.add(name)
-            out.append(view)
-    return out[:limit]
+    for row in rows:
+        view = _safe_lora_view(row)
+        name, fam = view.get("name"), view.get("model_family")
+        if name in seen_names:
+            continue
+        if allowed is not None and fam and fam not in allowed:
+            continue
+        seen_names.add(name)
+        out.append(view)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def assemble_planner_loras(conn, names) -> List[dict]:

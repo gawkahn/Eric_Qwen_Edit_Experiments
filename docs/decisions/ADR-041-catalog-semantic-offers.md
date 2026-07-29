@@ -1,6 +1,7 @@
 # ADR-041 — Semantic LoRA offers: enrich the content, then the query
 
-Status:   proposed
+Status:   accepted (2026-07-29 — Grant authorised implementation, slice 1 first;
+          slice 1 shipped, slices 2-3 outstanding)
 AI-Disclosure: Claude (Fable 5) authored; Grant reviewed.
 
 ## Context
@@ -198,3 +199,97 @@ context.
   structure or a different query method; this ADR's position is that it is
   primarily NEITHER — the indexed content is marketing prose plus a truncated
   instruction template, and fixing that is the largest lever.
+
+- **2026-07-29 (Status → accepted; slice 1 = D2 + D3 shipped)**: Grant authorised
+  implementation and chose slice 1 first. Two open questions in the ADR text are
+  now decided, and one measurement in the Context section is superseded.
+
+  **D2 open question — dedicated column, not a wider cap.** The ADR offered
+  either a `TRIGGER_TEMPLATE_CAP` inside `trigger_words` or a dedicated
+  `instruction_template` column. Taken: the **column**. D3's bm25 weighting needs
+  the template as its own FTS column to weight it independently, and "at most one
+  512 B entry inside a list of 64 B entries" is an invariant invisible at the
+  call site. `TRIGGER_WORD_CAP` stays 64 B, unchanged.
+
+  **Template detection.** A trained word is a template when it (a) would be
+  truncated by `TRIGGER_WORD_CAP`, (b) carries ≥4 spaces, and (c) has ≤0.3
+  commas per word. Conditions (a)+(b) come straight from the corpus: 395 trained
+  words are 1-15 chars and the 28 at exactly 60-64 are all long text, with
+  nothing between the populations. Condition (c) was **added during
+  implementation** after the first cut caught 12 entries of which 4 were
+  comma-delimited TAG LISTS, not instruction prose — the prose measured 0.00-0.18
+  commas/word against the tag lists' 0.62-3.20, a >3x gap. Tag soup must not land
+  in a column carrying the 6.0 bm25 weight meant for functional description.
+  Result: 8 templates, all genuine prose; the head-swap template is stored at 438
+  chars instead of truncated at 64.
+
+  **Migration, not rebuild.** Schema v1 → v2 migrates in place, because
+  `descriptions` holds civitai enrichment costing a network round-trip per row
+  (310 rows at adoption). FTS is derived and simply rebuilt with the new column
+  and tokenizer. `connect_readonly` (the MCP surface) cannot migrate and
+  fail-closes on v1 — correct, but it means the MCP server needs one writable
+  `catalog_cli` invocation after upgrade.
+
+  **Context correction.** The Context table's "`head swap` → 12 hits" no longer
+  reproduces; re-measured at 310 LoRAs (up from 241 after the ADR-014 Kohya
+  recovery) it is 6 via `search`, 9 counting raw FTS rows. The *shape* of the
+  finding is unchanged and `haircut` → 0 still reproduces exactly.
+
+  **Measured effect of slice 1**, FTS-only hit counts v1 → v2 on the live
+  corpus: `identity` 4→13, `poses` 18→26, `tattoos` 2→7 (all porter stemming);
+  `lighting environment` 0→2 (text past the old 64 B cut). `head swap`,
+  `base image` and `facial details` are UNCHANGED — those words happened to fall
+  inside the truncation, so D2 only helps beyond the cut. **`haircut` 0→0**, which
+  is the ADR's own negative test passing: slice 1 must not deliver semantic
+  adjacency, and it does not.
+
+  **Two defects found and fixed during the slice, both worth recording:**
+  - The v1→v2 migration bumped `user_version` BEFORE `rebuild_fts` and did not
+    commit after. In Python's `sqlite3`, DDL and PRAGMA autocommit while DML does
+    not — so v2 became durable on its own and a crash (or any exception inside
+    `rebuild_fts`) left a DB reading v2 with an EMPTY FTS table, permanently: the
+    migration would never retry and every search silently degraded to name-LIKE.
+    Found first in its deterministic form (a probe returning 2 then 0 across
+    runs), then in its crash form by `code-reviewer`. The version bump now runs
+    after `rebuild_fts` so it joins that transaction; a simulated-crash test pins
+    that a failed migration leaves v1 and retries.
+  - `search_any` initially dropped `search`'s name-SUBSTRING tier. `unicode61`
+    splits on separators only, so a concatenated civitai name like
+    `UltraRealPhoto` is a single token and the term "photo" reached it via
+    `%photo%` alone — a silent recall regression invisible to hyphenated names,
+    which is exactly why the improvement numbers still looked good. All three
+    tiers restored.
+
+  **Security review (Red Zone).** `comfyless/refine.py` is in
+  `_red-zone-paths.sh`, so modifying `search_loras` required `security-auditor` —
+  a gate initially missed when the slice was planned and caught by
+  `code-reviewer`. Verdict **CLEAN**, saved to
+  `docs/security/review-adr041-slice1-2026-07-29.md`. Both LOW findings folded
+  same-day:
+  - `instruction_template` reaches no LLM context, and that posture rested on
+    three independent allowlists omitting the key — with nothing pinning them.
+    Tripwire tests now exist in `test_refine.py` and `test_mcp_server.py`; both
+    fail under mutation when the field is added to an allowlist.
+  - **Accepted bound, recorded so slice 2 inherits it:** the template column
+    widens the hostile-uploader RANKING-STEERING channel. A hostile uploader
+    whose LoRA the operator holds locally can stuff a template-shaped trained
+    word with critique vocabulary, now stemmed and weighted 12x above
+    `description`, to become the top offer for most critiques. Impact is bounded
+    exactly as ADR-037's review bounded the description channel — a bad OFFER
+    the judge scores, image-content steering only, never paths/config/load
+    plane. This is an escalation in steering REACH (previously 64 B per trigger
+    word at weight 3.0), not in AUTHORITY. **D1/slice 2 must re-evaluate this
+    when `concepts` and `function_summary` land**, since LLM-derived text in a
+    high-weight column compounds it.
+
+  **Half-delivered by design, stated so it is not later filed as an oversight:**
+  D2's rationale is that truncation "costs twice" — losing the best search
+  material AND the phrasing the LoRA was trained on. Slice 1 recovers only the
+  first. No surface exposes the template to the planner, deliberately, per the
+  security posture above. Exposing it is an ADR-011/ADR-015 trust-boundary
+  question this ADR already defers.
+
+  Slice 1 proof: `test_catalog_db.py` 164 checks, `test_refine.py` 733,
+  `test_mcp_server.py` 704, `just tests` 29/29, pyright roots unchanged at
+  `comfyless=13 nodes=520 pipelines=454`. Slices 2 (D1+D5) and 3 (D4) remain
+  outstanding; D4 is still contingent on 1+2 leaving a measurable gap.

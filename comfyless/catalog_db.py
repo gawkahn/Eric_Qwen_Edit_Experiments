@@ -34,7 +34,10 @@ import unicodedata
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # 2: ADR-041 slice 1 — instruction_template column +
+#                        porter-stemmed FTS. Migrated in place from 1 by
+#                        _migrate_v1_to_v2 (preserves civitai enrichment;
+#                        FTS is derived and simply rebuilt).
 
 DEFAULT_DB_PATH = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
@@ -48,6 +51,32 @@ DESCRIPTION_SOURCES = ("sidecar", "civitai_api", "web", "ai_authored")
 DESCRIPTION_CAP = 4096
 USAGE_TIPS_CAP = 2048
 TRIGGER_WORD_CAP = 64
+# ADR-041 D2: instruction TEMPLATES are trained-word entries that are whole
+# sentences, not tokens. They are the single best search material an edit
+# LoRA has AND the phrasing it was trained on, so truncating them to 64 B
+# cost twice. They get their own column and their own, larger bound.
+TRIGGER_TEMPLATE_CAP = 512
+_TEMPLATE_MIN_SPACES = 4
+# Long trained-word strings come in two shapes, and only one is a template.
+# Instruction PROSE ("head_swap: start with Picture 1 as the base image,
+# keeping its lighting…") runs 0.00-0.18 commas per word; comma-delimited
+# TAG LISTS ("single braid, completely nude, rock, brown eyes…") run
+# 0.62-3.20. Measured on the live corpus 2026-07-29 — 8 prose against 4 tag
+# lists, with a >3x gap and nothing in between. Tag soup must not land in a
+# column carrying a 6.0 bm25 weight meant for functional description.
+_TEMPLATE_MAX_COMMA_RATIO = 0.3
+
+# ADR-041 D3: bm25 column weights, in catalog_fts declaration order —
+# name, model_name, description, usage_tips, trigger_words,
+# instruction_template. (entry_id is UNINDEXED and takes no weight.)
+# LOWER bm25 output = better match, and weights multiply a column's
+# contribution, so a HIGHER weight here means "matches in this column
+# matter more". `description` is civitai marketing prose — the least
+# functionally informative field in the row (ADR-041 Context) — so it is
+# damped rather than dropped; `instruction_template` and `name` say what
+# the LoRA actually DOES. Note this is a RANKING change only: the same
+# rows match, in a better order.
+_BM25_WEIGHTS = ", 8.0, 2.0, 0.5, 2.0, 3.0, 6.0"
 TRIGGER_WORDS_MAX = 64
 
 
@@ -168,6 +197,57 @@ def sanitize_trigger_words(raw: Any) -> str:
     return json.dumps(words, ensure_ascii=False)
 
 
+def is_instruction_template(raw: Any) -> bool:
+    """Is this trained-word entry a prose INSTRUCTION TEMPLATE rather than a
+    trigger token? (ADR-041 D2)
+
+    Three conditions, all required:
+      * it would be truncated by `TRIGGER_WORD_CAP` — a real trigger token
+        fits comfortably;
+      * it carries at least `_TEMPLATE_MIN_SPACES` spaces — it is a sentence,
+        not a multi-word tag; and
+      * its comma-per-word ratio is at most `_TEMPLATE_MAX_COMMA_RATIO` — it
+        is PROSE, not a comma-delimited tag list.
+
+    Grounded in the live corpus (2026-07-29, 222 enriched entries): 395
+    trained words are 1-15 chars, and the 28 sitting at exactly 60-64 are all
+    long text ("head swap face from Image 1 to Image 2, keep all facial
+    details …") carrying 11-14 spaces. Nothing lands between those
+    populations. The comma gate then splits the long ones: 8 instruction
+    prose at 0.00-0.18 commas/word from 4 tag lists at 0.62-3.20. Both
+    discriminators have a wide margin; neither is a close call.
+    """
+    if not isinstance(raw, str):
+        return False
+    s = _CTRL_ZW_RE.sub("", raw).strip()
+    if len(s) <= TRIGGER_WORD_CAP or s.count(" ") < _TEMPLATE_MIN_SPACES:
+        return False
+    words = len(s.split())
+    return s.count(",") / max(1, words) <= _TEMPLATE_MAX_COMMA_RATIO
+
+
+def extract_instruction_template(raw: Any) -> Optional[str]:
+    """The single longest template-shaped trained word, sanitized and capped
+    at `TRIGGER_TEMPLATE_CAP` (ADR-041 D2), or None.
+
+    At most ONE per entry: this is the phrasing the LoRA was trained on, and
+    a checkpoint with several is choosing between near-identical wordings —
+    the longest is the most complete. Kept in its own column rather than
+    widening `trigger_words`, so bm25 can weight it independently (D3) and
+    so the one-per-entry rule is visible in the schema rather than implied.
+    """
+    if not isinstance(raw, (list, tuple)):
+        return None
+    best: Optional[str] = None
+    for w in raw[:TRIGGER_WORDS_MAX]:
+        if not is_instruction_template(w):
+            continue
+        clean = sanitize_text(w, cap=TRIGGER_TEMPLATE_CAP)
+        if clean and (best is None or len(clean) > len(best)):
+            best = clean
+    return best
+
+
 # ════════════════════════════════════════════════════════════════════════
 #  Schema
 # ════════════════════════════════════════════════════════════════════════
@@ -203,6 +283,7 @@ CREATE TABLE IF NOT EXISTS descriptions (
     description TEXT,
     usage_tips TEXT,
     trigger_words TEXT,
+    instruction_template TEXT,
     strength_rec TEXT,
     sampler_rec TEXT,
     nsfw_level INTEGER,
@@ -233,12 +314,21 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
 );
-CREATE VIRTUAL TABLE IF NOT EXISTS catalog_fts USING fts5(
-    name, model_name, description, usage_tips, trigger_words,
-    entry_id UNINDEXED
-);
 CREATE INDEX IF NOT EXISTS idx_entries_family ON entries(model_family);
 CREATE INDEX IF NOT EXISTS idx_entries_excluded ON entries(excluded, stale);
+"""
+
+# Kept separate from _SCHEMA so the fresh-install path and the v1->v2
+# migration create BYTE-IDENTICAL FTS tables. Two copies of this DDL is
+# exactly how a migrated DB and a fresh one end up silently differing in
+# tokenizer — which would make search results depend on install history.
+_FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS catalog_fts USING fts5(
+    name, model_name, description, usage_tips, trigger_words,
+    instruction_template,
+    entry_id UNINDEXED,
+    tokenize='porter unicode61'
+);
 """
 
 
@@ -273,8 +363,16 @@ def connect(db_path: str = DEFAULT_DB_PATH, *,
     ver = conn.execute("PRAGMA user_version").fetchone()[0]
     if ver == 0:
         conn.executescript(_SCHEMA)
+        conn.executescript(_FTS_SCHEMA)
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
+    elif ver == 1 and SCHEMA_VERSION == 2:
+        # ADR-041 slice 1. Migrate in place rather than asking for a
+        # rebuild: `descriptions` holds civitai enrichment that costs a
+        # network round-trip per row to regenerate (310 rows at adoption).
+        # The FTS table is pure derived data, so it is dropped and rebuilt
+        # with the new column and the porter tokenizer.
+        _migrate_v1_to_v2(conn)
     elif ver != SCHEMA_VERSION:
         conn.close()
         raise CatalogDBError(
@@ -282,6 +380,44 @@ def connect(db_path: str = DEFAULT_DB_PATH, *,
             f"({db_path!r}); migrate or rebuild."
         )
     return conn
+
+
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    """v1 → v2: add `descriptions.instruction_template`, recreate the FTS
+    table with that column and `tokenize='porter unicode61'` (ADR-041 D2/D3).
+
+    Existing rows get a NULL template — the raw trained words were already
+    truncated to 64 B on the way in, so the untruncated text is simply not
+    in the DB. Re-running `catalog_cli build` repopulates it from the source
+    metadata JSON. Callers that need the templates must rebuild; callers
+    that only need search keep working immediately, on stemmed FTS.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(descriptions)")}
+    if "instruction_template" not in cols:
+        conn.execute(
+            "ALTER TABLE descriptions ADD COLUMN instruction_template TEXT")
+    conn.execute("DROP TABLE IF EXISTS catalog_fts")
+    conn.executescript(_FTS_SCHEMA)
+    # ORDER IS LOAD-BEARING: the version bump goes LAST, inside the same
+    # transaction as the FTS rows.
+    #
+    # Under Python sqlite3's legacy transaction control, DDL and PRAGMA run
+    # in autocommit and are durable the instant they execute, while DML only
+    # opens an implicit transaction. Bumping user_version before rebuilding
+    # therefore made v2 durable on its own: a crash — or any exception
+    # inside rebuild_fts — between the two left a DB reading v2 with an
+    # EMPTY catalog_fts. The migration would never re-run (version already
+    # v2) and every search would silently degrade to name-LIKE forever.
+    # `rebuild_fts`'s DELETE opens the transaction, PRAGMA joins it, and the
+    # single commit below makes rows-plus-version atomic. Everything above
+    # is idempotent (guarded ALTER, DROP IF EXISTS, CREATE IF NOT EXISTS),
+    # so a crash before the commit leaves v1 and the migration retries clean.
+    rebuild_fts(conn)
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    conn.commit()
+    print("[catalog-db] migrated schema v1 -> v2 (ADR-041): added "
+          "instruction_template, rebuilt FTS with porter stemming. "
+          "Re-run `catalog_cli build` to populate templates.", flush=True)
 
 
 def connect_readonly(db_path: str) -> sqlite3.Connection:
@@ -401,16 +537,18 @@ def upsert_description(conn: sqlite3.Connection, *, entry_id: int,
     conn.execute(
         """
         INSERT INTO descriptions (entry_id, source, model_name, description,
-                                  usage_tips, trigger_words, strength_rec,
+                                  usage_tips, trigger_words,
+                                  instruction_template, strength_rec,
                                   sampler_rec, nsfw_level, civitai_model_id,
                                   civitai_version_id, provenance_url,
                                   fetched_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (entry_id, source) DO UPDATE SET
             model_name = excluded.model_name,
             description = excluded.description,
             usage_tips = excluded.usage_tips,
             trigger_words = excluded.trigger_words,
+            instruction_template = excluded.instruction_template,
             strength_rec = excluded.strength_rec,
             sampler_rec = excluded.sampler_rec,
             nsfw_level = excluded.nsfw_level,
@@ -424,6 +562,10 @@ def upsert_description(conn: sqlite3.Connection, *, entry_id: int,
          sanitize_text(description) or None,
          sanitize_text(usage_tips, cap=USAGE_TIPS_CAP) or None,
          sanitize_trigger_words(trigger_words),
+         # Derived from the SAME raw list, so a caller cannot supply a
+         # template that disagrees with the trigger words it came from
+         # (ADR-022 §6: sanitization is not bypassable at the call site).
+         extract_instruction_template(trigger_words),
          sanitize_text(strength_rec, cap=128) or None,
          sanitize_text(sampler_rec, cap=128) or None,
          nsfw_level, civitai_model_id, civitai_version_id,
@@ -537,7 +679,7 @@ def search(conn: sqlite3.Connection, term: str, *,
         SELECT id AS entry_id, 0 AS rank_class, 0.0 AS score
           FROM entries WHERE name LIKE ? ESCAPE '\\'
         UNION ALL
-        SELECT CAST(entry_id AS INTEGER), 1, bm25(catalog_fts)
+        SELECT CAST(entry_id AS INTEGER), 1, bm25(catalog_fts{_BM25_WEIGHTS})
           FROM catalog_fts WHERE catalog_fts MATCH ?
         UNION ALL
         SELECT id AS entry_id, 2, 0.0
@@ -555,7 +697,95 @@ def search(conn: sqlite3.Connection, term: str, *,
         d = {k: r[k] for k in r.keys() if k not in ("rank_class", "score")}
         desc = conn.execute(
             """SELECT source, model_name, description, usage_tips,
-                      trigger_words, strength_rec, sampler_rec
+                      trigger_words, instruction_template,
+                      strength_rec, sampler_rec
+               FROM descriptions WHERE entry_id = ?
+               ORDER BY CASE source
+                   WHEN 'sidecar' THEN 0 WHEN 'civitai_api' THEN 1
+                   WHEN 'web' THEN 2 ELSE 3 END LIMIT 1""",
+            (r["id"],)).fetchone()
+        d["best_description"] = dict(desc) if desc else None
+        out.append(d)
+    return out
+
+
+def search_any(conn: sqlite3.Connection, terms: Sequence[str], *,
+               kind: Optional[str] = None, family: Optional[str] = None,
+               limit: int = 20,
+               include_excluded: bool = False) -> List[Dict[str, Any]]:
+    """OR-combine `terms` into ONE ranked FTS query (ADR-041 D3).
+
+    Replaces "run N single-term queries and interleave their top hits
+    tier-by-tier". The interleave gave every keyword equal weight no matter
+    how discriminating it was, so a generic word contributed as many offers
+    as a rare one. FTS5 ranks across the whole query — that is what bm25 is
+    for — and a row matching three of the terms now outranks one matching a
+    single common term.
+
+    Injection posture is UNCHANGED from `search`: each term is individually
+    quoted, so no term can smuggle a MATCH operator. The ` OR ` between them
+    is code-owned, never caller-supplied.
+    """
+    # Fail-closed hygiene for callers outside the offer path (security review
+    # 2026-07-29, INFO-1). A punctuation-only term quotes to an EMPTY FTS5
+    # phrase and makes the whole OR'd MATCH raise — under the old per-keyword
+    # loop only that one keyword was lost. An unbounded term list also blows
+    # SQLite's bind-variable limit. `_offer_keywords` already guarantees both
+    # for `search_loras`; `search_any` is public and must not inherit the
+    # crash from a future caller.
+    cleaned = [t.strip() for t in (terms or []) if t and t.strip()]
+    cleaned = [t for t in cleaned if any(c.isalnum() for c in t)][:32]
+    if not cleaned:
+        return []
+    quoted = " OR ".join('"' + t.replace('"', '""') + '"' for t in cleaned)
+
+    filters = []
+    args_tail: List[Any] = []
+    if not include_excluded:
+        filters.append("e.excluded = 0 AND e.stale = 0")
+    if kind:
+        filters.append("e.kind = ?")
+        args_tail.append(kind)
+    if family:
+        filters.append("e.model_family = ?")
+        args_tail.append(family)
+    where_tail = (" AND " + " AND ".join(filters)) if filters else ""
+
+    # All THREE tiers `search` has, per term. The substring arm is not
+    # optional decoration: `unicode61` splits on separators only, so a
+    # concatenated civitai name like `UltraRealPhoto` is one token and the
+    # term "photo" reaches it ONLY via `%photo%`. Dropping this arm would
+    # have been a silent recall regression on exactly the run-together names
+    # third-party LoRAs favour, invisible to hyphenated ones.
+    like_ors = " OR ".join(["name LIKE ? ESCAPE '\\'"] * len(cleaned))
+    like_pre = [f"{_like_escape(t)}%" for t in cleaned]
+    like_sub = [f"%{_like_escape(t)}%" for t in cleaned]
+
+    sql = f"""
+    SELECT e.*, s.rank_class, s.score FROM entries e JOIN (
+        SELECT id AS entry_id, 0 AS rank_class, 0.0 AS score
+          FROM entries WHERE {like_ors}
+        UNION ALL
+        SELECT CAST(entry_id AS INTEGER), 1, bm25(catalog_fts{_BM25_WEIGHTS})
+          FROM catalog_fts WHERE catalog_fts MATCH ?
+        UNION ALL
+        SELECT id AS entry_id, 2, 0.0
+          FROM entries WHERE {like_ors}
+    ) s ON s.entry_id = e.id
+    WHERE 1=1{where_tail}
+    GROUP BY e.id
+    ORDER BY MIN(s.rank_class), MIN(s.score), e.name
+    LIMIT ?
+    """
+    rows = conn.execute(
+        sql, [*like_pre, quoted, *like_sub, *args_tail, limit]).fetchall()
+    out = []
+    for r in rows:
+        d = {k: r[k] for k in r.keys() if k not in ("rank_class", "score")}
+        desc = conn.execute(
+            """SELECT source, model_name, description, usage_tips,
+                      trigger_words, instruction_template,
+                      strength_rec, sampler_rec
                FROM descriptions WHERE entry_id = ?
                ORDER BY CASE source
                    WHEN 'sidecar' THEN 0 WHEN 'civitai_api' THEN 1
@@ -578,15 +808,18 @@ def rebuild_fts(conn: sqlite3.Connection) -> int:
     rows = conn.execute(
         """
         SELECT e.id AS entry_id, e.name AS name,
-               d.model_name, d.description, d.usage_tips, d.trigger_words
+               d.model_name, d.description, d.usage_tips, d.trigger_words,
+               d.instruction_template
         FROM entries e LEFT JOIN descriptions d ON d.entry_id = e.id
         """).fetchall()
     n = 0
     for r in rows:
         conn.execute(
             "INSERT INTO catalog_fts (name, model_name, description, "
-            "usage_tips, trigger_words, entry_id) VALUES (?, ?, ?, ?, ?, ?)",
+            "usage_tips, trigger_words, instruction_template, entry_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (r["name"], r["model_name"] or "", r["description"] or "",
-             r["usage_tips"] or "", r["trigger_words"] or "", r["entry_id"]))
+             r["usage_tips"] or "", r["trigger_words"] or "",
+             r["instruction_template"] or "", r["entry_id"]))
         n += 1
     return n

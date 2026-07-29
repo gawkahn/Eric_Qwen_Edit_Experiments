@@ -1079,6 +1079,261 @@ for fname in ("comfyless/generate.py", "comfyless/server.py",
 
 
 # ════════════════════════════════════════════════════════════════════════
+print("\n== ADR-041 slice 1: templates, stemming, OR-ranked search ==")
+# ════════════════════════════════════════════════════════════════════════
+
+# ── D2: template detection ─────────────────────────────────────────────
+_HEAD_SWAP = ("head_swap: start with Picture 1 as the base image, keeping "
+              "its lighting and environment, and replace the head with the "
+              "one from Picture 2 while preserving skin tone")
+_TAG_SOUP = ("single braid, completely nude, rock, brown eyes, shirt, "
+             "grabbing own breast, standing, outdoors, blue sky, day")
+
+check("D2: instruction prose is a template",
+      cdb.is_instruction_template(_HEAD_SWAP))
+check("D2: a short trigger token is NOT a template",
+      not cdb.is_instruction_template("head_swap"))
+check("D2: a long COMMA-DELIMITED tag list is NOT a template "
+      "(would otherwise get the 6.0 bm25 weight meant for prose)",
+      not cdb.is_instruction_template(_TAG_SOUP))
+check("D2: a long string with too few spaces is NOT a template",
+      not cdb.is_instruction_template("a" * 100))
+check("D2: non-str input is NOT a template",
+      not cdb.is_instruction_template(["head swap from Image 1 to Image 2"]))
+
+check("D2: extract picks the template out of a mixed trained-word list",
+      cdb.extract_instruction_template(
+          ["head_swap", "swap", _HEAD_SWAP]) == _HEAD_SWAP)
+check("D2: extract returns None when there is no template",
+      cdb.extract_instruction_template(["head_swap", "swap"]) is None)
+check("D2: extract returns None for a non-list",
+      cdb.extract_instruction_template("not-a-list") is None)
+_LONGER = _HEAD_SWAP + " and matching the original hair colour exactly"
+check("D2: extract keeps the LONGEST template when several are present",
+      cdb.extract_instruction_template([_HEAD_SWAP, _LONGER]) == _LONGER)
+check("D2: template is capped at TRIGGER_TEMPLATE_CAP, not TRIGGER_WORD_CAP",
+      len(cdb.extract_instruction_template(
+          ["word " * 400])or "") <= cdb.TRIGGER_TEMPLATE_CAP)
+check("D2: the cap is bigger than the trigger-word cap (the whole point)",
+      cdb.TRIGGER_TEMPLATE_CAP > cdb.TRIGGER_WORD_CAP)
+
+with tempfile.TemporaryDirectory() as td:
+    conn = cdb.connect(os.path.join(td, "cat.sqlite"))
+    eid = cdb.upsert_entry(conn, name="headswapper", kind="lora",
+                           abs_path="/x/headswapper.safetensors")
+    cdb.upsert_description(conn, entry_id=eid, source="sidecar",
+                           description="A model.",
+                           trigger_words=["head_swap", _HEAD_SWAP])
+    row = conn.execute("SELECT trigger_words, instruction_template "
+                       "FROM descriptions WHERE entry_id = ?",
+                       (eid,)).fetchone()
+    stored = json.loads(row["trigger_words"])
+    check("D2: trigger_words still capped at 64 B each (unchanged)",
+          all(len(w) <= cdb.TRIGGER_WORD_CAP for w in stored),
+          detail=repr([len(w) for w in stored]))
+    check("D2: the untruncated template lands in its own column",
+          row["instruction_template"] == _HEAD_SWAP,
+          detail=repr(row["instruction_template"])[:90])
+    check("D2: the template is LONGER than the trigger-word cap "
+          "(i.e. text that used to be lost is now stored)",
+          len(row["instruction_template"]) > cdb.TRIGGER_WORD_CAP)
+
+    cdb.rebuild_fts(conn)
+    # Text from PAST the old 64 B cut is now findable.
+    hits = cdb.search(conn, "preserving skin tone")
+    check("D2: text beyond the old 64 B truncation is now searchable",
+          any(h["name"] == "headswapper" for h in hits), detail=repr(hits)[:120])
+
+    # ── D3: porter stemming ────────────────────────────────────────────
+    e2 = cdb.upsert_entry(conn, name="poser", kind="lora",
+                          abs_path="/x/poser.safetensors")
+    cdb.upsert_description(conn, entry_id=e2, source="sidecar",
+                           description="Improves dynamic poses and posing.")
+    cdb.rebuild_fts(conn)
+    sing = [h["name"] for h in cdb.search(conn, "pose")]
+    plur = [h["name"] for h in cdb.search(conn, "poses")]
+    check("D3: porter stemming links singular and plural",
+          "poser" in sing and "poser" in plur and sing == plur,
+          detail=f"pose={sing} poses={plur}")
+
+    # ── D3: OR-combined ranked search ──────────────────────────────────
+    rows = cdb.search_any(conn, ["preserving", "posing"], kind="lora")
+    names = {r["name"] for r in rows}
+    check("D3: search_any ORs terms into one result set",
+          {"headswapper", "poser"} <= names, detail=repr(names))
+    check("D3: search_any with no usable terms returns []",
+          cdb.search_any(conn, ["", "   "]) == []
+          and cdb.search_any(conn, []) == [])
+    # search_any must keep ALL THREE tiers `search` has. unicode61 splits on
+    # separators only, so a run-together civitai name is a single token and
+    # a mid-name term reaches it via the %substring% arm alone. Dropping
+    # that arm is a silent recall loss on exactly those names.
+    e_cat = cdb.upsert_entry(conn, name="UltraRealPhotoV2", kind="lora",
+                             abs_path="/x/urp.safetensors")
+    cdb.upsert_description(conn, entry_id=e_cat, source="sidecar",
+                           description="no useful words here")
+    cdb.rebuild_fts(conn)
+    check("D3: search_any keeps the name-SUBSTRING tier "
+          "(concatenated names stay reachable)",
+          any(r["name"] == "UltraRealPhotoV2"
+              for r in cdb.search_any(conn, ["photo"], kind="lora")),
+          detail="term 'photo' must reach UltraRealPhotoV2")
+    check("D3: search_any still ranks an exact name-PREFIX hit first",
+          cdb.search_any(conn, ["ultrareal"], kind="lora")[0]["name"]
+          == "UltraRealPhotoV2")
+    # The injection posture must survive the OR construction.
+    for hostile in ('pose OR headswapper', 'pose" OR "headswapper',
+                    'NEAR(pose posing)', 'pose*'):
+        try:
+            got = cdb.search_any(conn, [hostile], kind="lora")
+            ok = not any(r["name"] == "headswapper" for r in got)
+        except Exception as e:  # noqa: BLE001
+            ok = False
+            hostile = f"{hostile} (raised {type(e).__name__})"
+        check(f"D3: term {hostile!r} cannot inject FTS operators", ok)
+    # A row matching BOTH terms must outrank one matching only one — the
+    # whole point of ranking across the query instead of interleaving.
+    e3 = cdb.upsert_entry(conn, name="bothterms", kind="lora",
+                          abs_path="/x/bothterms.safetensors")
+    cdb.upsert_description(conn, entry_id=e3, source="sidecar",
+                           description="zebrafish and quokka together")
+    e4 = cdb.upsert_entry(conn, name="oneterm", kind="lora",
+                          abs_path="/x/oneterm.safetensors")
+    cdb.upsert_description(conn, entry_id=e4, source="sidecar",
+                           description="zebrafish alone")
+    cdb.rebuild_fts(conn)
+    ranked = [r["name"] for r in
+              cdb.search_any(conn, ["zebrafish", "quokka"], kind="lora")]
+    check("D3: a row matching BOTH terms outranks one matching one",
+          ranked.index("bothterms") < ranked.index("oneterm"),
+          detail=repr(ranked))
+
+# ── Migration v1 -> v2, and that it PERSISTS ──────────────────────────
+with tempfile.TemporaryDirectory() as td:
+    dbp = os.path.join(td, "old.sqlite")
+    raw = sqlite3.connect(dbp)
+    raw.executescript("""
+        CREATE TABLE entries (
+            id INTEGER PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
+            abs_path TEXT, root TEXT, relative_path TEXT, size_bytes INTEGER,
+            sha256 TEXT, model_family TEXT, classification TEXT, reason TEXT,
+            duplicate_of TEXT, excluded INTEGER DEFAULT 0,
+            excluded_reason TEXT, stale INTEGER DEFAULT 0,
+            family_conflict TEXT, first_seen TEXT, last_seen TEXT);
+        CREATE TABLE descriptions (
+            id INTEGER PRIMARY KEY, entry_id INTEGER NOT NULL,
+            source TEXT NOT NULL, model_name TEXT, description TEXT,
+            usage_tips TEXT, trigger_words TEXT, strength_rec TEXT,
+            sampler_rec TEXT, nsfw_level INTEGER, civitai_model_id INTEGER,
+            civitai_version_id INTEGER, provenance_url TEXT,
+            fetched_at TEXT NOT NULL, UNIQUE (entry_id, source));
+        CREATE VIRTUAL TABLE catalog_fts USING fts5(
+            name, model_name, description, usage_tips, trigger_words,
+            entry_id UNINDEXED);
+        INSERT INTO entries (name, kind, abs_path, excluded, stale)
+             VALUES ('legacy', 'lora', '/x/legacy.safetensors', 0, 0);
+        INSERT INTO descriptions (entry_id, source, description, fetched_at)
+             VALUES (1, 'civitai_api', 'a legacy zebrafish description',
+                     '2026-07-01T00:00:00Z');
+        PRAGMA user_version = 1;
+    """)
+    raw.commit()
+    raw.close()
+
+    conn = cdb.connect(dbp)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(descriptions)")}
+    check("migration: instruction_template column added",
+          "instruction_template" in cols)
+    check("migration: user_version bumped to 2",
+          conn.execute("PRAGMA user_version").fetchone()[0] == 2)
+    check("migration: civitai enrichment PRESERVED (not a rebuild)",
+          conn.execute("SELECT description FROM descriptions WHERE "
+                       "source='civitai_api'").fetchone()[0]
+          == "a legacy zebrafish description")
+    ddl = conn.execute("SELECT sql FROM sqlite_master WHERE "
+                       "name='catalog_fts'").fetchone()[0]
+    check("migration: FTS recreated with porter tokenizer", "porter" in ddl)
+    conn.close()
+
+    # THE regression that bit during development: the migration committed
+    # the version bump BEFORE rebuild_fts and never committed after, so
+    # user_version said v2 (migration never re-runs) while catalog_fts was
+    # empty — every search silently degraded to name-LIKE only. Reopening
+    # is the only thing that catches it.
+    conn = cdb.connect(dbp)
+    check("migration: FTS rows COMMITTED (survive reconnect)",
+          conn.execute("SELECT COUNT(*) FROM catalog_fts").fetchone()[0] > 0)
+    check("migration: search works after reconnect",
+          any(h["name"] == "legacy"
+              for h in cdb.search(conn, "zebrafish")))
+    check("migration: is idempotent (second connect is a no-op)",
+          cdb.connect(dbp).execute(
+              "PRAGMA user_version").fetchone()[0] == 2)
+    conn.close()
+
+# Crash-safety: a migration that dies partway must leave the DB at v1 so it
+# RETRIES, never at v2 with an empty FTS. PRAGMA/DDL autocommit in Python's
+# sqlite3 while DML does not, so bumping the version before rebuild_fts made
+# v2 durable on its own — the same silent-degradation failure the ordering
+# fix exists to prevent, reachable by crash rather than by never committing.
+with tempfile.TemporaryDirectory() as td:
+    dbp = os.path.join(td, "crash.sqlite")
+    raw = sqlite3.connect(dbp)
+    raw.executescript("""
+        CREATE TABLE entries (
+            id INTEGER PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
+            abs_path TEXT, model_family TEXT, classification TEXT,
+            reason TEXT, duplicate_of TEXT, excluded INTEGER DEFAULT 0,
+            excluded_reason TEXT, stale INTEGER DEFAULT 0,
+            family_conflict TEXT, first_seen TEXT, last_seen TEXT);
+        CREATE TABLE descriptions (
+            id INTEGER PRIMARY KEY, entry_id INTEGER NOT NULL,
+            source TEXT NOT NULL, model_name TEXT, description TEXT,
+            usage_tips TEXT, trigger_words TEXT,
+            fetched_at TEXT NOT NULL, UNIQUE (entry_id, source));
+        CREATE VIRTUAL TABLE catalog_fts USING fts5(
+            name, model_name, description, usage_tips, trigger_words,
+            entry_id UNINDEXED);
+        INSERT INTO entries (name, kind, abs_path, excluded, stale)
+             VALUES ('crashy', 'lora', '/x/crashy.safetensors', 0, 0);
+        INSERT INTO descriptions (entry_id, source, description, fetched_at)
+             VALUES (1, 'civitai_api', 'quokka', '2026-07-01T00:00:00Z');
+        PRAGMA user_version = 1;
+    """)
+    raw.commit()
+    raw.close()
+
+    _real_rebuild = cdb.rebuild_fts
+
+    def _boom(conn):
+        raise RuntimeError("simulated crash mid-migration")
+
+    cdb.rebuild_fts = _boom
+    try:
+        cdb.connect(dbp)
+        crashed = False
+    except Exception:
+        crashed = True
+    finally:
+        cdb.rebuild_fts = _real_rebuild
+    check("migration: an exception mid-rebuild propagates", crashed)
+
+    probe = sqlite3.connect(dbp)
+    ver_after = probe.execute("PRAGMA user_version").fetchone()[0]
+    probe.close()
+    check("migration: a crashed migration leaves v1 so it RETRIES "
+          "(never v2 with an empty FTS)",
+          ver_after == 1, detail=f"user_version={ver_after}")
+
+    conn = cdb.connect(dbp)   # the retry
+    check("migration: the retry completes and populates FTS",
+          conn.execute("PRAGMA user_version").fetchone()[0] == 2
+          and conn.execute(
+              "SELECT COUNT(*) FROM catalog_fts").fetchone()[0] > 0)
+    conn.close()
+
+
+# ════════════════════════════════════════════════════════════════════════
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print("──────────────────────────────────────────────────")
