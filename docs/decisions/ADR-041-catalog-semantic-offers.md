@@ -526,6 +526,70 @@ context.
   and "lora" is noise in an indexed field), and one entry returned no concepts
   where its text supported three.
 
+- **2026-07-30 (slice 2c = the live corpus run, and a correction to this
+  ADR's own headline example)**: `enrich-concepts` over the full catalog —
+  **307 of 308 enriched, 0 failures, 1 unparseable, 2 dropped tags, 3.09
+  concepts per entry, every one of the 38 vocabulary concepts used at least
+  once.** Two dropped tags in 307 entries (`age`, `dark fantasy`) is the
+  vocabulary-fit measurement: the frozen list covers this corpus, and the two
+  misses are real gaps worth considering at the next deliberate vocabulary
+  edit rather than evidence of a wrong approach.
+
+  **Measured effect** (`search()` hits, non-excluded LoRAs, before → after):
+
+  | query | before | after |
+  |---|---|---|
+  | `identity` | 12 | **36** |
+  | `poses` | 20 | **43** |
+  | `skin texture` | 10 | **34** |
+  | `clothing` | 20 | **34** |
+  | `accelerator` | 10 | **23** |
+  | `cinematic` | 16 | **19** |
+  | `anime` | 12 | **15** |
+  | `facial details` | 2 | **7** |
+  | `head swap` | 6 | **7** |
+  | `haircut` | 0 | **1** |
+
+  **And the correction, which matters more than the table.** This ADR's
+  motivating example was "`haircut` reaches 0 of the 12 indexed head-swap
+  LoRAs, and after enrichment both should map to the same concept." It now
+  reaches 1. Investigating why rather than declaring victory produced a better
+  answer than the ADR's: **the example was wrong.**
+
+  Of the 8 head-swap LoRAs, exactly one was tagged `hair` — and reading their
+  summaries, the model's restraint is correct. A head-swap LoRA transplants a
+  head; it does not give a subject a haircut. Tagging it `hair` so that
+  "haircut" retrieves it would produce precisely the kind of loosely-related
+  offer the planner already fails on. Further, the 14 entries `hair` reaches by
+  TEXT are almost entirely **pubic hair** (three explicit sliders, correctly
+  tagged `genitalia`/`body`) or incidental scene prose ("brown hair", "a little
+  bit of hair, so it should be safe to use"). **This corpus contains no
+  hairstyle LoRA.** `haircut` returned 0 partly because retrieval was literal —
+  the real finding, still valid and now fixed — and partly because there was
+  nothing to find.
+
+  So: the mechanism is proven by the queries that HAVE a population, not by
+  the one that never did. `hair` stays in the vocabulary (it costs nothing and
+  the corpus will grow), but **`haircut` is retired as this ADR's success
+  metric** — it was a canary chosen before the corpus was characterised, and
+  keeping it would have meant either declaring a 0→1 a win or tuning the
+  prompt until the model made an association it was right to refuse. The
+  honest metric is the table above.
+
+  **One unparseable entry** (`dickiss_v1b`): the model degenerated into
+  repeating `"sex-act"` until it hit `max_tokens`, truncating the JSON before
+  its closing brace. It is NOT stored, so every later run retries it — and
+  will fail identically, since repetition loops do not resolve with more
+  tokens. A permanent one-entry cost, recorded rather than papered over; if
+  this class grows, the fix is a repetition guard on the reply, not a bigger
+  budget.
+
+  **Concept distribution** confirms the corpus's actual shape: `body` 106,
+  `skin` 83, `sex-act` 76, `genitalia` 61, `photorealism` 59, `breasts` 54,
+  `lighting` 45, `composition` 42 — with a long thin tail (`upscale` 2,
+  `text-render` 1, `anti-slop` 1, `inpaint` 1). Thin tags are corpus facts,
+  not tagging failures.
+
   **Still outstanding for slice 2b-ii (the exposure half, Red Zone):** adding
   `concepts`/`function_summary` to `refine._SAFE_DESC_FIELDS` and the two
   `mcp_server` projection tuples, with the provenance framing D5 requires,
