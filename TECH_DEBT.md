@@ -2129,3 +2129,36 @@ Trigger: audit runtime becoming a complaint, or the base count growing well
 past 9.
 Fix: resolve once in `_prepare_bases` and cache the mixin on `BaseSpec`
 alongside `param_dict`, which is already populated there lazily.
+
+## 2026-07-29 — the unpinned-tool guard covers `npx` but not `uvx`
+
+`start-mcpo.sh:60` ran `exec uvx mcpo` for months. `uvx` resolves the tool AND
+its dependency closure at LATEST on every invocation — structurally the same
+floating-version footgun as `npx <tool>`, which §14 of the global constitution
+already forbids and enforces with a T1 PreToolUse hook
+(`~/.claude/hooks/block-unpinned-gitnexus.sh`, added 2026-07-22).
+It bit on 2026-07-29: mcp 2.0.0 removed the `streamablehttp_client` symbol that
+mcpo 0.0.20 imports, so a bridge that had worked for weeks failed at startup
+with an ImportError after a reboot, having silently pulled an artifact nobody
+reviewed. Exactly the supply-chain surface §11 exists to close.
+Grant's read, and it is correct: "the fact it broke at all indicates a problem
+we let slide before." The npx instance got a hook; the uvx instance did not,
+because the hook was written around the specific TOOL (gitnexus) rather than
+the PATTERN (unpinned ephemeral-environment runners).
+Fixed in this repo: `start-mcpo.sh` now pins both sides —
+`uvx --from "mcpo==$MCPO_VERSION" --with "mcp==$MCP_VERSION"`. Note that
+pinning only the transitive (the first fix attempted) leaves the tool floating
+and is NOT sufficient.
+Why the remaining gap is not now: widening
+`block-unpinned-gitnexus.sh` to cover `uvx`/`pipx run`/bare `npx` is a
+user-scope T1 hook change that affects EVERY project and every session, and a
+too-broad matcher would block legitimate one-off invocations. That needs its
+own deliberate slice with its own negative tests, not a drive-by widening
+during an unrelated feature.
+Trigger: the next unpinned-runner surprise in ANY repo, or the next time
+`~/.claude/hooks/` is touched. Repo-local scan is currently clean —
+`start-mcpo.sh:60` was the only `uvx`/`npx`/`pipx run` call site here.
+Fix: generalise the hook to a pattern matcher over ephemeral-runner commands
+(`uvx`, `npx`, `pipx run`, `bunx`, `dlx`) that requires a version specifier in
+the tool token, with an explicit allowlist escape; then re-scan every indexed
+repo for call sites.

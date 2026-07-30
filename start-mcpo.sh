@@ -57,7 +57,23 @@ else
   echo "[start-mcpo] catalog-db absent (${CATALOG_DB}) — search tool disabled"
 fi
 
-exec uvx mcpo --host "$HOST" --port "$PORT" -- \
+# PINNED (§11). `uvx mcpo` resolves mcpo AND its deps at LATEST on every run —
+# the same floating-version footgun as `npx <tool>`, which §14 already blocks
+# for gitnexus. It bit on 2026-07-29: mcp 2.0.0 dropped the
+# `streamablehttp_client` symbol that mcpo 0.0.20 imports, so a machine that
+# had worked for weeks failed at startup with an ImportError after a reboot,
+# having pulled an artifact nobody reviewed.
+#
+# BOTH are pinned deliberately: `--from` fixes the tool, `--with` fixes the
+# transitive that actually broke. Pinning only the transitive still leaves the
+# tool floating. Bumping either is its own commit — verify the pair starts and
+# serves /openapi.json before changing these numbers.
+MCPO_VERSION="${MCPO_VERSION:-0.0.20}"
+MCP_VERSION="${MCP_VERSION:-1.28.1}"   # NOT 2.x — see above
+echo "[start-mcpo] pinned mcpo==${MCPO_VERSION} with mcp==${MCP_VERSION}"
+
+exec uvx --from "mcpo==${MCPO_VERSION}" --with "mcp==${MCP_VERSION}" \
+  mcpo --host "$HOST" --port "$PORT" -- \
   "$REPO/.venv/bin/python3" -m comfyless.mcp_server \
     --model-base "$MODEL_BASE" \
     --lora-path "$LORA_PATH" \
