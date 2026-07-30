@@ -436,4 +436,100 @@ context.
   `connect_readonly` fail-closes on a version mismatch, so v3 requires one
   writable `catalog_cli` invocation AND a restart of the running mcpo/MCP
   server — the same coupling slice 1 recorded. Migration preserves civitai
-  enrichment; entries are simply UNENRICHED until 2b runs.
+  enrichment; entries are simply UNENRICHED until 2b runs. **Done same day:**
+  the live DB migrated cleanly (1023 entries, 1137 descriptions, all 8
+  templates preserved, 0 enrichment rows), mcpo was restarted against v3, and
+  a live POST confirmed the slice-1 leak tripwire still holds in the real
+  payload. `haircut` measured 0 hits on the migrated v3 DB — the attribution
+  test passing live, not just in fixtures.
+
+- **2026-07-30 (slice 2b = the enrichment pass itself)**: `catalog_cli
+  enrich-concepts` — reads each LoRA's catalog metadata, asks a local Gemma
+  for concepts + one functional line, validates through slice 2a's boundary,
+  and stores the result. New module `comfyless/catalog_enrich_concepts.py`;
+  no Red Zone path touched (verified independently by the reviewer against
+  `_red-zone-paths.sh`).
+
+  **The client is REUSED, not rewritten.** `enhance.py` already owns an
+  `openai-endpoint` client — `load_backends`, `_post_chat`,
+  `_resolve_endpoint_model`, stdlib urllib, no new dependency. Enrichment
+  borrows all three, so `enhancers.toml` stays the single source of truth for
+  ports and there is one HTTP path in the codebase rather than two. Sampling
+  is code-owned and deliberately NOT inherited from the backend entry:
+  temperature 0 and a token cap, because this is constrained extraction, and
+  the registry's `top_k`/`repetition_penalty` are tuned there for creative
+  prompt enhancement. A test pins that those knobs never reach the wire.
+
+  **Incremental by content, not by version integers.** `source_hash` covers
+  the projected metadata, the vocabulary version, AND a digest of the rendered
+  system prompt. The first cut used a `PROMPT_VERSION` integer and the
+  reviewer found the hole: the prompt splices the vocabulary block, which
+  contains the ALIASES, but `VOCAB_VERSION`'s documented bump rule covers
+  concept IDS only. Adding an alias was therefore a documented no-bump edit
+  that silently changed what the model saw while invalidating nothing — every
+  affected entry would keep a stale enrichment forever (retrieval heals, since
+  FTS regenerates aliases from stored ids; SELECTION does not). **Slice 2a's
+  own review dropped four aliases and touched no id**, which is the proof that
+  alias-only edits are the common case. `PROMPT_VERSION` was deleted rather
+  than documented harder: content hashing is strictly stronger and retires two
+  manual disciplines at once.
+
+  **Failure semantics.** Per-entry commit (kill-safe resume), isolated
+  failures counted and skipped, abort after 5 CONSECUTIVE endpoint failures
+  with an FTS rebuild BEFORE raising so committed work is searchable rather
+  than stranded until some later completing run. Both of those last two were
+  shipped untested in the first cut and the reviewer caught it: the
+  isolated-failure test injected a single failure, so the consecutive-counter
+  RESET could be deleted with the suite still green (a flaky endpoint failing
+  every other call would then abort a healthy run while claiming the failures
+  were consecutive); and the abort test used an always-failing model, so
+  nothing was ever committed whose searchability could be checked. Both now
+  have tests that fail when the guard is removed.
+
+  **Corpus-level scope:** LoRAs only, non-excluded and non-stale (308 of 1023
+  entries). Transformers stay out per Grant — their descriptions are "almost
+  decorative".
+
+  **`code-reviewer` (Fable, no model fallback — transcript checked): no
+  boundary violation, no Red Zone touch, no fail-open path.** It confirmed the
+  trust story holds — it could not construct a path from a hostile description
+  to a stored `concepts` id, the FTS concepts column, a path, or config; it
+  verified the candidate SQL's provenance subquery matches the canonical read
+  path token-for-token so the hash cannot flap; and it confirmed a SIGKILLed
+  run leaves the corpus incomplete but never inconsistent. Findings folded:
+  the `source_hash` gap above (MEDIUM), the two untested guards (MEDIUM), raw
+  hostile-influenced text reaching the operator's terminal un-repr'd — an
+  ANSI/OSC escape in a dropped tag (LOW, now the module's only such channel
+  and repr'd with its own test), a `startswith` folder check that turned a
+  sibling root sharing a prefix into a `..`-bearing path handed to the model
+  (LOW), and two weak/missing test assertions. Two INFO items were also taken:
+  the prompt now states the hard cap of 8 so benign overflow stops polluting
+  the dropped-tag log that exists as the injection signal, and a reply MISSING
+  the `concepts` key is now `unparseable` (retryable) rather than stored as an
+  honest empty answer it is indistinguishable from afterwards.
+
+  Also removed: a `_sleep` parameter called as `_sleep(0)`, copied from the
+  civitai path where rate-limiting is a courtesy to a public API. A local
+  endpoint needs none.
+
+  **Slice 2b proof:** `test_catalog_enrich_concepts.py` 84 checks (new, every
+  endpoint call injected — the suite is fully offline), `just tests` 31/31,
+  pyright roots unchanged at `comfyless=13 nodes=520 pipelines=454`. **16
+  guards mutation-tested** across two rounds; one mutation was itself
+  ill-formed (a dead assignment before a `continue`) and was re-run correctly
+  rather than counted as coverage.
+
+  **Live behaviour, dry-run against the real catalog:** 12/12 entries
+  parseable, 0 dropped tags, 0 empty, on `gemma-moe-nvfp4` (26B MoE, port
+  8019, `cuda:1`). Two prompt defects were fixed from that first live look —
+  every summary opened with the boilerplate "This LoRA is…" (wasted budget,
+  and "lora" is noise in an indexed field), and one entry returned no concepts
+  where its text supported three.
+
+  **Still outstanding for slice 2b-ii (the exposure half, Red Zone):** adding
+  `concepts`/`function_summary` to `refine._SAFE_DESC_FIELDS` and the two
+  `mcp_server` projection tuples, with the provenance framing D5 requires,
+  under `security-auditor` — which must dispose of the concept-stuffing
+  successor constraint named above, now with real enrichment output to reason
+  about. Until then these fields are stored and indexed but reach no LLM
+  context, and a test pins that.
