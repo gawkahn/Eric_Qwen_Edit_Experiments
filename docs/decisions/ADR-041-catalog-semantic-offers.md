@@ -293,3 +293,147 @@ context.
   `test_mcp_server.py` 704, `just tests` 29/29, pyright roots unchanged at
   `comfyless=13 nodes=520 pipelines=454`. Slices 2 (D1+D5) and 3 (D4) remain
   outstanding; D4 is still contingent on 1+2 leaving a measurable gap.
+
+- **2026-07-30 (slice 2a = the closed vocabulary + storage + the D5 parse
+  boundary; ZERO LLM calls)**: slice 2 was split 2a/2b/2c on Grant's
+  instruction — parse boundary first, because it is the security-critical half
+  and it is entirely testable offline. 2a is that half. The Gemma client and
+  the incremental build wiring are 2b; the live run and the `haircut`
+  measurement are 2c.
+
+  **The vocabulary is 38 concepts, derived then frozen** in
+  `comfyless/catalog_concepts.py` (`VOCAB_VERSION = 1`, `MAX_CONCEPTS = 8`).
+  Derivation was measured BEFORE the list was written, against the
+  post-slice-1 catalog (308 searchable LoRAs, 244 with description text): every
+  concept has textual support, from `inpaint` at 8 entries to `accelerator` at
+  104. Three sources agreed — the operator's own LoRA folder taxonomy
+  (`style/`, `concept/anatomy/…`, `action/nsfw`, `tool/faceswap`,
+  `accelerators/`), the functional tokens surviving a stopword +
+  process-boilerplate + model-family strip, and the verbs the 8 instruction
+  templates expose. **The corpus pass also re-confirmed this ADR's thesis in
+  data:** after stripping boilerplate, the top tokens are still English filler
+  and MODEL-FAMILY names (`flux` 74, `qwen` 61, `krea` 42, `klein` 36); the
+  genuinely functional ones appear in only 25-57 entries each. There is almost
+  no functional vocabulary to match against, which is why a vocabulary has to
+  be supplied rather than mined.
+
+  **Folder taxonomy — deliberately NOT an authoritative tag feed.** Grant's
+  read, taken as written: those hierarchies "aren't worthless, but they are
+  inconsistent." So they are a derivation source, and in 2b one low-weight hint
+  among several in the enrichment prompt. A direct folder→concept mapping was
+  offered and declined; it would also have blurred the attribution test below.
+
+  **D1 open question — a dedicated `enrichment` TABLE, not columns on
+  `descriptions`.** This ADR's D1 said "columns"; the shape taken is a table
+  keyed `entry_id PRIMARY KEY`. Reason, and it is not cosmetic: `descriptions`
+  is keyed `(entry_id, source)` and every read path resolves it with
+  `ORDER BY sidecar > civitai_api > web > ai_authored LIMIT 1`, so an
+  `ai_authored` row's `function_summary` would have been INVISIBLE on every
+  entry that already has a civitai row — which is all 310 of them. Writing
+  enrichment into the civitai row instead would have forged that row's
+  provenance. The table also gives 2b's incremental re-enrichment its natural
+  home (`source_hash`, `model`, `vocab_version` alongside the content).
+
+  **`concepts` is structurally clean, not merely validated.** The security
+  property has two halves and both are load-bearing: `normalize()` reduces
+  model output to a set-membership decision (unknown AND ambiguous tags
+  dropped, returned to the caller for logging, never stored), and
+  `expand_for_index()` — which produces the text that actually lands in the FTS
+  column — emits ONLY bytes originating in `catalog_concepts.py`. A caller that
+  skips validation entirely, or a hand-edited hostile row, still cannot put
+  third-party text in the column the planner searches. `security-auditor` was
+  NOT run this slice and did not need to be: on Grant's decision the planner
+  and MCP surfaces do not see these fields in 2a, so no Red Zone path
+  (`_red-zone-paths.sh`) is touched. **Exposure is 2b's deliberate D5 decision,
+  with the provenance framing and its own security review** — storing is not
+  exposing, and a test pins that `search()` rows carry neither field today.
+
+  **The retrieval bridge, and why it is a bridge.** Each concept carries
+  query-side aliases; the FTS column holds the expansion, so an entry tagged
+  `hair` is findable by "haircut" though no third party wrote that word
+  anywhere. Ambiguity is split by consumer rather than resolved once: "swap"
+  fits both `face-swap` and `head-swap`, so `normalize()` refuses to guess and
+  drops it on input, while the index emits it under both for maximum reach.
+
+  **LOW-2 DISCHARGED, and its successor named.** Slice 1's review left the
+  ranking-steering channel for slice 2 to re-evaluate. bm25 weights now sort by
+  who authored the bytes: `name` 8.0, `concepts` 5.0, `instruction_template`
+  **4.0 (lowered from 6.0)**, `function_summary` 3.0 = `trigger_words` 3.0,
+  `model_name`/`usage_tips` 2.0, `description` 0.5. The top text column is now
+  one an uploader cannot write into, and the template's reach is REDUCED rather
+  than merely matched — recall is untouched, since slice 1's measured gains came
+  from stemming and un-truncation, not from the weight. A test, not a comment,
+  pins that no uploader-controlled column outranks `concepts`.
+
+  **The successor constraint, for 2b's security review:** *byte authorship is
+  not selection authority* (`code-reviewer`, finding 4). From 2b on, the
+  uploader's prose is what the enrichment model reads, so a hostile uploader
+  steers WHICH concepts an entry receives — and each accepted concept expands
+  to ~8-12 query tokens at weight 5.0, i.e. MORE reach than the channel just
+  demoted, across vocabulary the uploader never had to guess. Bounded by
+  `MAX_CONCEPTS`, bm25 IDF, dropped-tag logging, and D6 (bad OFFER only, never
+  a path/config/load). NOT bounded by any weight choice, because the steering
+  happens upstream of ranking. **2b must dispose of "concept-stuffing via a
+  cooperative enrichment model" explicitly.**
+
+  **Two migration defects found and fixed, one of them latent and severe:**
+  - `connect()` now walks a `_MIGRATIONS` chain. Slice 1's `_migrate_v1_to_v2`
+    wrote `PRAGMA user_version = SCHEMA_VERSION`, correct only while the newest
+    schema WAS 2 — the moment 3 landed, a v1 DB would have jumped straight to
+    reading "v3" with a v2-shaped FTS and no `enrichment` table, permanently and
+    silently, since the migration never re-runs. Each step now writes its own
+    TARGET version, and a step that fails to advance raises rather than looping.
+  - The v1→v2 step called the SHARED `rebuild_fts`, which had since grown an
+    `enrichment` join — so migrating a real v1 DB crashed with `no such table:
+    enrichment`. Historical FTS shapes and populates are now FROZEN
+    (`_FTS_SCHEMA_V2` / `_rebuild_fts_v2`) with a stated convention for the next
+    bump. A step that reads current-schema constants is a step whose meaning
+    changes every time the schema moves. **Only the chain test found this; every
+    unit fixture started at v2 or later.**
+
+  Crash semantics were re-derived rather than assumed: a failure in v2→v3
+  strands the DB at v2 with an EMPTY FTS, because `DROP TABLE` is DDL and
+  autocommits (the same hazard slice 1 found on the PRAGMA). That is safe
+  because the version is BELOW `SCHEMA_VERSION` — writable connects retry,
+  `connect_readonly` fails closed — and all three facts are now asserted
+  together, since "it self-heals" is only true while they all hold.
+
+  **`code-reviewer` (Fable, no model fallback — transcript checked): no
+  boundary violations, no security regression, no scope creep. Four LOW
+  PROMISE DRIFT findings, all folded same-session:**
+  - the corrupt-blob guard covered unparseable JSON but not valid JSON of the
+    wrong TYPE (`'42'` → `for cid in 42`; `'[["x"]]'` → unhashable), and its
+    test passed for the wrong reason by exercising only the guarded branch.
+    Fixed one layer down in `expand_for_index` so every caller inherits it —
+    then the duplicate DB-level check was DELETED after a mutation test proved
+    nothing could detect its removal;
+  - a vocabulary test asserting "no alias is unreachable" was structurally
+    vacuous (built from the very aliases it iterated). Replaced with the real
+    hazard: an alias colliding with a DIFFERENT concept's id, which id-priority
+    silently shadows;
+  - the weight test hand-copied the FTS column order, so reordering the DDL
+    would have remapped every weight while all assertions still passed. It now
+    reads the live `PRAGMA table_info`;
+  - the weight comment's "uploader cannot write into it" framing — corrected to
+    bytes-vs-selection, per the successor constraint above.
+
+  Vocabulary advisories applied: `bokeh`, bare `blur` and bare `flat` dropped
+  from `anti-slop` (all name qualities a prompt might REQUEST — they would have
+  surfaced slop-removal LoRAs to someone asking for the opposite), and `same`
+  dropped from `identity` as filler that would have made every identity LoRA a
+  magnet.
+
+  **Slice 2a proof:** `test_catalog_concepts.py` 46 checks (new),
+  `test_catalog_db.py` 164 → 222, `just tests` 30/30, pyright roots unchanged at
+  `comfyless=13 nodes=520 pipelines=454`. **13 guards mutation-tested** — 9
+  pre-review, 4 post-review — each mutation confirmed to turn a specific test
+  red; the one that did not (the redundant DB-level type check) was deleted
+  rather than kept. Unit-level attribution holds: `haircut` reaches nothing
+  before enrichment and reaches the head-swap LoRA after it is tagged `hair`,
+  so 2c's live measurement stays attributable to the enrichment pass alone.
+
+  **Operator sequencing note:** the live DB is v2 with 1023 entries.
+  `connect_readonly` fail-closes on a version mismatch, so v3 requires one
+  writable `catalog_cli` invocation AND a restart of the running mcpo/MCP
+  server — the same coupling slice 1 recorded. Migration preserves civitai
+  enrichment; entries are simply UNENRICHED until 2b runs.
