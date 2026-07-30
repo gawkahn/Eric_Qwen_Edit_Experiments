@@ -72,6 +72,69 @@ def build_cmd(db_path: str, model_base: str, lora_paths, transformer_paths,
         f"-> {db_path}")
 
 
+@cli.command(name="enrich-concepts")
+@click.option("--db", "db_path", default=catalog_db.DEFAULT_DB_PATH,
+              show_default=True)
+@click.option("--backend", default="gemma-moe-nvfp4", show_default=True,
+              help="enhancers.toml backend to use (must be openai-endpoint). "
+                   "The registry is the source of truth for ports.")
+@click.option("--enhancers", "registry_path", default=None,
+              help="Path to enhancers.toml (default: the enhance.py search "
+                   "order — $COMFYLESS_ENHANCERS, ./enhancers.toml, "
+                   "~/.config/comfyless/enhancers.toml).")
+@click.option("--limit", default=None, type=click.IntRange(min=1),
+              help="Max entries enriched this run (resumable).")
+@click.option("--refresh", is_flag=True,
+              help="Re-enrich even when the source hash is unchanged.")
+@click.option("--include-excluded", is_flag=True,
+              help="Also enrich excluded entries (default: candidates only).")
+@click.option("--dry-run", is_flag=True,
+              help="Call the model and print what WOULD be stored, without "
+                   "writing anything. Use this to eyeball output quality "
+                   "before committing a corpus-wide run.")
+@click.option("--verbose", is_flag=True,
+              help="Print each entry's accepted concepts and summary.")
+@click.option("--force-fs", is_flag=True)
+def enrich_concepts_cmd(db_path: str, backend: str, registry_path,
+                        limit, refresh: bool, include_excluded: bool,
+                        dry_run: bool, verbose: bool,
+                        force_fs: bool) -> None:
+    """Tier-5 enrichment: local-LLM concept tags + function summaries.
+
+    Offline and incremental (ADR-041 D1): entries whose metadata, vocabulary
+    version and prompt version are unchanged are skipped without a model
+    call. Nothing here touches the generation or offer path.
+
+    Exit codes: 0 clean · 2 partial (some entries failed or were unparseable;
+    run again to resume).
+    """
+    from .catalog_enrich_concepts import (enrich_concepts,
+                                          ConceptEnrichError)
+    try:
+        stats = enrich_concepts(
+            db_path, backend=backend, registry_path=registry_path,
+            limit=limit, refresh=refresh, include_excluded=include_excluded,
+            dry_run=dry_run, force_fs=force_fs, verbose=verbose)
+    except catalog_db.CatalogDBError as e:
+        click.echo(f"[catalog] ERROR: {e}", err=True)
+        sys.exit(1)
+    except ConceptEnrichError as e:
+        click.echo(f"[catalog] enrich-concepts aborted: {e}", err=True)
+        sys.exit(2)
+    examples = stats.pop("dropped_examples", [])
+    click.echo(f"[catalog] enrich-concepts: {stats}")
+    if examples:
+        # Dropped tags are a prompt-quality signal AND the visible trace of a
+        # description that tried to invent one — never silent (ADR-041 D5).
+        click.echo(f"[catalog] dropped tags (first {len(examples)}):")
+        for ex in examples:
+            click.echo(f"    {ex}")
+    if dry_run:
+        click.echo("[catalog] --dry-run: nothing was written")
+    sys.exit(0 if (stats["failures"] == 0
+                   and stats["unparseable"] == 0) else 2)
+
+
 @cli.command(name="enrich")
 @click.option("--db", "db_path", default=catalog_db.DEFAULT_DB_PATH,
               show_default=True)
