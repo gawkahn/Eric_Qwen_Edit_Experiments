@@ -34,10 +34,13 @@ import unicodedata
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-SCHEMA_VERSION = 2  # 2: ADR-041 slice 1 — instruction_template column +
+SCHEMA_VERSION = 3  # 2: ADR-041 slice 1 — instruction_template column +
 #                        porter-stemmed FTS. Migrated in place from 1 by
 #                        _migrate_v1_to_v2 (preserves civitai enrichment;
 #                        FTS is derived and simply rebuilt).
+#                     3: ADR-041 slice 2a — `enrichment` table (closed-vocab
+#                        concepts + function_summary) and the two FTS columns
+#                        that index them. Migrated from 2 by _migrate_v2_to_v3.
 
 DEFAULT_DB_PATH = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
@@ -65,18 +68,73 @@ _TEMPLATE_MIN_SPACES = 4
 # lists, with a >3x gap and nothing in between. Tag soup must not land in a
 # column carrying a 6.0 bm25 weight meant for functional description.
 _TEMPLATE_MAX_COMMA_RATIO = 0.3
+# ADR-041 D1/D5: `function_summary` is ONE functional line ("what does this
+# LoRA do"), not prose. It is free text and gets a free-text cap, but a much
+# tighter one than `description` (4096) — a summary that runs long has stopped
+# summarizing, and every byte of it is third-party-DERIVED text in a
+# high-weight indexed column.
+FUNCTION_SUMMARY_CAP = 400
 
-# ADR-041 D3: bm25 column weights, in catalog_fts declaration order —
-# name, model_name, description, usage_tips, trigger_words,
-# instruction_template. (entry_id is UNINDEXED and takes no weight.)
+# ADR-041 D3 + slice 2a: bm25 column weights, in catalog_fts declaration
+# order — name, model_name, description, usage_tips, trigger_words,
+# instruction_template, concepts, function_summary. (entry_id is UNINDEXED;
+# FTS5 defaults unspecified trailing weights to 1.0, and an unindexed column
+# never matches, so it takes none.)
+#
 # LOWER bm25 output = better match, and weights multiply a column's
-# contribution, so a HIGHER weight here means "matches in this column
-# matter more". `description` is civitai marketing prose — the least
-# functionally informative field in the row (ADR-041 Context) — so it is
-# damped rather than dropped; `instruction_template` and `name` say what
-# the LoRA actually DOES. Note this is a RANKING change only: the same
-# rows match, in a better order.
-_BM25_WEIGHTS = ", 8.0, 2.0, 0.5, 2.0, 3.0, 6.0"
+# contribution, so a HIGHER weight here means "matches in this column matter
+# more". `description` is civitai marketing prose — the least functionally
+# informative field in the row (ADR-041 Context) — so it is damped rather
+# than dropped. This is a RANKING change only: the same rows match, in a
+# better order.
+#
+# SLICE 2a RE-EVALUATION, discharging the constraint slice 1's security review
+# left behind (LOW-2, recorded in ADR-041's Changelog). Slice 1 put
+# `instruction_template` — fully uploader-controlled text — at 6.0, twelve
+# times `description`, and flagged that adding LLM-derived text to a
+# high-weight column would compound the hostile-uploader ranking-steering
+# channel. The weights now sort by WHO AUTHORED THE BYTES:
+#
+#   name 8.0                  operator-held (the filename on Grant's disk)
+#   concepts 5.0              repo-owned (expand_for_index emits only text
+#                             from catalog_concepts.py — see below)
+#   instruction_template 4.0  uploader-controlled  ← LOWERED from 6.0
+#   function_summary 3.0      third-party-DERIVED (an LLM paraphrase of
+#                             uploader text is not promoted to a higher
+#                             trust class by having been paraphrased — D5)
+#   trigger_words 3.0         uploader-controlled, 64 B per word
+#   model_name / usage_tips 2.0
+#   description 0.5           uploader marketing prose
+#
+# So the top TEXT column is now the one whose BYTES an uploader cannot write
+# into at all, and the template's reach is reduced rather than merely matched.
+# That is a deliberate, small ranking demotion of a slice-1 gain: the template
+# still outranks everything an uploader controls, but no longer outranks the
+# repo-owned functional layer that was built to replace it. `concepts` sits
+# below `name` because expansion text is broad by construction (one tag emits
+# up to a dozen alias tokens) and should not outrank an exact name hit.
+#
+# ── AND THE HONEST LIMIT OF THAT ARGUMENT ───────────────────────────────
+# Byte authorship is NOT selection authority (code-review 2026-07-30, finding
+# 4). From slice 2b on, the uploader's prose is exactly what the enrichment
+# model reads, so a hostile uploader steers WHICH concepts an entry receives —
+# and each accepted concept then expands to ~8-12 repo-owned query tokens at
+# weight 5.0, i.e. MORE ranking reach than the 4.0 template channel this slice
+# demoted, across query vocabulary the uploader never had to guess. That is the
+# feature working, aimed the wrong way.
+#
+# What bounds it: MAX_CONCEPTS caps tags per entry; bm25 IDF erodes a broad
+# tag's discriminative power as more entries carry it; dropped tags are logged;
+# and impact stays exactly where ADR-041 D6 puts it — a bad OFFER the judge
+# scores, never a path, a config, or the load plane. What does NOT bound it is
+# this weight table, and no weight choice can: the steering happens upstream of
+# ranking. LOW-2's successor is therefore "concept-stuffing via a cooperative
+# enrichment model", handed to slice 2b's security review the same way slice 1
+# handed LOW-2 to this one.
+#
+# The ordering is pinned by a test, not just by this comment: no
+# uploader-controlled column may outrank `concepts`.
+_BM25_WEIGHTS = ", 8.0, 2.0, 0.5, 2.0, 3.0, 4.0, 5.0, 3.0"
 TRIGGER_WORDS_MAX = 64
 
 
@@ -197,6 +255,24 @@ def sanitize_trigger_words(raw: Any) -> str:
     return json.dumps(words, ensure_ascii=False)
 
 
+def sanitize_function_summary(raw: Any) -> Optional[str]:
+    """LLM-authored functional summary → ONE bounded line, or None.
+
+    Runs the same sanitizer as every other externally-sourced field (ADR-022
+    §6) and then collapses newlines, because this field is contracted to be a
+    single line and a model that returns a bulleted essay must not get one
+    stored. The cap is `FUNCTION_SUMMARY_CAP`, an eighth of `description`'s.
+
+    Provenance framing is NOT applied here — it belongs at the point of
+    rendering into an LLM context, alongside `description`'s, and this field
+    reaches no LLM context until ADR-041 slice 2b adds it to the planner
+    allowlist deliberately (D5). Storing it is not exposing it.
+    """
+    s = sanitize_text(raw, cap=FUNCTION_SUMMARY_CAP)
+    s = _WS_RE.sub(" ", s.replace("\n", " ").replace("\r", " ")).strip()
+    return s or None
+
+
 def is_instruction_template(raw: Any) -> bool:
     """Is this trained-word entry a prose INSTRUCTION TEMPLATE rather than a
     trigger token? (ADR-041 D2)
@@ -293,6 +369,16 @@ CREATE TABLE IF NOT EXISTS descriptions (
     fetched_at TEXT NOT NULL,
     UNIQUE (entry_id, source)
 );
+CREATE TABLE IF NOT EXISTS enrichment (
+    entry_id INTEGER PRIMARY KEY
+        REFERENCES entries(id) ON DELETE CASCADE,
+    concepts TEXT NOT NULL DEFAULT '[]',
+    function_summary TEXT,
+    vocab_version INTEGER NOT NULL,
+    source_hash TEXT,
+    model TEXT,
+    enriched_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS families (
     name TEXT PRIMARY KEY,
     hf_local_path TEXT NOT NULL,
@@ -318,11 +404,30 @@ CREATE INDEX IF NOT EXISTS idx_entries_family ON entries(model_family);
 CREATE INDEX IF NOT EXISTS idx_entries_excluded ON entries(excluded, stale);
 """
 
-# Kept separate from _SCHEMA so the fresh-install path and the v1->v2
-# migration create BYTE-IDENTICAL FTS tables. Two copies of this DDL is
-# exactly how a migrated DB and a fresh one end up silently differing in
-# tokenizer — which would make search results depend on install history.
-_FTS_SCHEMA = """
+# FTS DDL lives outside _SCHEMA so the fresh-install path and the NEWEST
+# migration step create BYTE-IDENTICAL FTS tables from one constant. Two
+# editable copies of this DDL is exactly how a migrated DB and a fresh one end
+# up silently differing in tokenizer — which would make search results depend
+# on install history.
+#
+# Column ORDER is load-bearing twice over: `_BM25_WEIGHTS` is positional, and
+# a migrated DB must end up with the same layout as a fresh install. New
+# columns are therefore APPENDED before the UNINDEXED `entry_id`, never
+# inserted among the existing ones.
+#
+# ── HISTORICAL SHAPES ARE FROZEN ────────────────────────────────────────
+# Each migration step must build the FTS table as it existed AT ITS OWN
+# TARGET VERSION, not as it exists today. Slice 2a found this the direct
+# way: `_migrate_v1_to_v2` called the shared `rebuild_fts`, which had grown an
+# `enrichment` join — so migrating a v1 DB crashed with "no such table:
+# enrichment", a table that by definition does not exist until v3. A step that
+# reads current-schema constants is a step whose meaning silently changes every
+# time the schema moves.
+#
+# CONVENTION when adding v(N+1): freeze the current pair as `_FTS_SCHEMA_V<N>`
+# / `_rebuild_fts_v<N>`, write the new pair, and re-point the `_FTS_SCHEMA` /
+# `rebuild_fts` aliases at it. Old steps are then never edited again.
+_FTS_SCHEMA_V2 = """
 CREATE VIRTUAL TABLE IF NOT EXISTS catalog_fts USING fts5(
     name, model_name, description, usage_tips, trigger_words,
     instruction_template,
@@ -330,6 +435,18 @@ CREATE VIRTUAL TABLE IF NOT EXISTS catalog_fts USING fts5(
     tokenize='porter unicode61'
 );
 """
+
+_FTS_SCHEMA_V3 = """
+CREATE VIRTUAL TABLE IF NOT EXISTS catalog_fts USING fts5(
+    name, model_name, description, usage_tips, trigger_words,
+    instruction_template, concepts, function_summary,
+    entry_id UNINDEXED,
+    tokenize='porter unicode61'
+);
+"""
+
+#: The CURRENT shape — what a fresh install and the newest migration step use.
+_FTS_SCHEMA = _FTS_SCHEMA_V3
 
 
 def _utcnow() -> str:
@@ -366,20 +483,55 @@ def connect(db_path: str = DEFAULT_DB_PATH, *,
         conn.executescript(_FTS_SCHEMA)
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
-    elif ver == 1 and SCHEMA_VERSION == 2:
-        # ADR-041 slice 1. Migrate in place rather than asking for a
-        # rebuild: `descriptions` holds civitai enrichment that costs a
-        # network round-trip per row to regenerate (310 rows at adoption).
-        # The FTS table is pure derived data, so it is dropped and rebuilt
-        # with the new column and the porter tokenizer.
-        _migrate_v1_to_v2(conn)
     elif ver != SCHEMA_VERSION:
-        conn.close()
-        raise CatalogDBError(
-            f"catalog DB schema version {ver} != supported {SCHEMA_VERSION} "
-            f"({db_path!r}); migrate or rebuild."
-        )
+        try:
+            _migrate(conn)
+        except CatalogDBError as e:
+            conn.close()
+            # Carry the specific diagnostic through: "no migration path from
+            # v4" and "did not advance the version" are different operator
+            # problems, and the outer message alone cannot tell them apart.
+            raise CatalogDBError(
+                f"catalog DB schema version {ver} != supported "
+                f"{SCHEMA_VERSION} ({db_path!r}); migrate or rebuild. ({e})"
+            ) from None
     return conn
+
+
+#: Migration steps, keyed by the version they migrate FROM. Each step must be
+#: idempotent up to its own commit and must set user_version to its own TARGET
+#: — never to SCHEMA_VERSION. (That distinction is not pedantry: slice 1's
+#: v1->v2 step wrote `SCHEMA_VERSION`, which was correct only while the newest
+#: schema WAS 2. The moment 3 landed, a v1 DB would have jumped straight to
+#: reading "v3" with no enrichment table — a silent, permanent corruption of
+#: exactly the kind slice 1's other migration defect already taught us to
+#: fear. Caught here rather than in the field.)
+_MIGRATIONS: Dict[int, Any] = {}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Walk `_MIGRATIONS` from the DB's version up to SCHEMA_VERSION.
+
+    Raises CatalogDBError if the chain has no step for the current version
+    (a DB from the future, or a version we deliberately refuse to migrate).
+    A step that fails to advance the version raises rather than looping —
+    a bug in a migration must stop the process, not spin it.
+    """
+    ver = conn.execute("PRAGMA user_version").fetchone()[0]
+    while ver < SCHEMA_VERSION:
+        step = _MIGRATIONS.get(ver)
+        if step is None:
+            raise CatalogDBError(f"no migration path from schema v{ver}")
+        step(conn)
+        after = conn.execute("PRAGMA user_version").fetchone()[0]
+        if after <= ver:
+            raise CatalogDBError(
+                f"migration from v{ver} did not advance the version "
+                f"(still v{after}) — refusing to loop")
+        ver = after
+    if ver != SCHEMA_VERSION:
+        raise CatalogDBError(
+            f"schema v{ver} is newer than supported v{SCHEMA_VERSION}")
 
 
 def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
@@ -397,7 +549,7 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE descriptions ADD COLUMN instruction_template TEXT")
     conn.execute("DROP TABLE IF EXISTS catalog_fts")
-    conn.executescript(_FTS_SCHEMA)
+    conn.executescript(_FTS_SCHEMA_V2)
     # ORDER IS LOAD-BEARING: the version bump goes LAST, inside the same
     # transaction as the FTS rows.
     #
@@ -408,16 +560,60 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
     # inside rebuild_fts — between the two left a DB reading v2 with an
     # EMPTY catalog_fts. The migration would never re-run (version already
     # v2) and every search would silently degrade to name-LIKE forever.
-    # `rebuild_fts`'s DELETE opens the transaction, PRAGMA joins it, and the
+    # the populate's DELETE opens the transaction, PRAGMA joins it, and the
     # single commit below makes rows-plus-version atomic. Everything above
     # is idempotent (guarded ALTER, DROP IF EXISTS, CREATE IF NOT EXISTS),
     # so a crash before the commit leaves v1 and the migration retries clean.
-    rebuild_fts(conn)
-    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    _rebuild_fts_v2(conn)
+    conn.execute("PRAGMA user_version = 2")
     conn.commit()
     print("[catalog-db] migrated schema v1 -> v2 (ADR-041): added "
           "instruction_template, rebuilt FTS with porter stemming. "
           "Re-run `catalog_cli build` to populate templates.", flush=True)
+
+
+def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+    """v2 → v3: add the `enrichment` table and the two FTS columns that index
+    it (ADR-041 slice 2a, D1/D5).
+
+    Existing rows get NO enrichment row at all, which is the correct starting
+    state and not a gap to paper over: an entry with no enrichment row searches
+    exactly as it did under v2 (ADR-041 negative test 3). Enrichment arrives in
+    slice 2b, per entry, and only for entries whose source metadata changed.
+
+    Same shape as v1->v2 and for the same reasons: `descriptions` holds civitai
+    enrichment that costs a network round-trip per row, so this migrates in
+    place; `catalog_fts` is pure derived data, so it is dropped and rebuilt
+    against the new column list; and the version bump goes LAST so it lands in
+    the same transaction as the rebuilt rows (see the long note in
+    _migrate_v1_to_v2 — DDL/PRAGMA autocommit while DML does not, so bumping
+    first would let a crash strand a v3 DB with an empty FTS forever).
+    """
+    conn.executescript("""
+CREATE TABLE IF NOT EXISTS enrichment (
+    entry_id INTEGER PRIMARY KEY
+        REFERENCES entries(id) ON DELETE CASCADE,
+    concepts TEXT NOT NULL DEFAULT '[]',
+    function_summary TEXT,
+    vocab_version INTEGER NOT NULL,
+    source_hash TEXT,
+    model TEXT,
+    enriched_at TEXT NOT NULL
+);
+""")
+    conn.execute("DROP TABLE IF EXISTS catalog_fts")
+    conn.executescript(_FTS_SCHEMA)
+    rebuild_fts(conn)
+    conn.execute("PRAGMA user_version = 3")
+    conn.commit()
+    print("[catalog-db] migrated schema v2 -> v3 (ADR-041 slice 2a): added "
+          "the enrichment table (closed-vocab concepts + function_summary) "
+          "and rebuilt FTS with the two columns that index them. Entries are "
+          "UNENRICHED until a build runs enrichment.", flush=True)
+
+
+_MIGRATIONS[1] = _migrate_v1_to_v2
+_MIGRATIONS[2] = _migrate_v2_to_v3
 
 
 def connect_readonly(db_path: str) -> sqlite3.Connection:
@@ -571,6 +767,58 @@ def upsert_description(conn: sqlite3.Connection, *, entry_id: int,
          nsfw_level, civitai_model_id, civitai_version_id,
          sanitize_url(provenance_url), now or _utcnow()),
     )
+
+
+def upsert_enrichment(conn: sqlite3.Connection, *, entry_id: int,
+                      concepts: Any = None,
+                      function_summary: Any = None,
+                      model: Optional[str] = None,
+                      source_hash: Optional[str] = None,
+                      now: Optional[str] = None) -> List[str]:
+    """Insert or refresh one entry's enrichment row. Returns DROPPED tags.
+
+    THE PARSE BOUNDARY (ADR-041 D5). This is the only way enrichment reaches
+    storage, and it validates rather than trusts:
+
+    * `concepts` goes through `catalog_concepts.normalize()` — unknown and
+      ambiguous tags are DROPPED, not stored, so third-party text cannot land
+      in the field the planner searches. What is stored is a JSON array of ids
+      from the frozen repo-owned vocabulary, in canonical order.
+    * `function_summary` is free text and is treated as such: sanitized and
+      capped like every other external field.
+    * `vocab_version` is stamped from the vocabulary module, not from the
+      caller — a row cannot claim to have been tagged under a vocabulary it
+      wasn't.
+
+    Dropped tags are RETURNED so the build tool can log them (a description
+    trying to inject tags is an event an operator should see). `source_hash`
+    and `model` are bookkeeping for slice 2b's incremental re-enrichment: the
+    hash of the metadata the model was shown, and which model produced this.
+    """
+    from comfyless import catalog_concepts
+    accepted, dropped = catalog_concepts.normalize(concepts)
+    conn.execute(
+        """
+        INSERT INTO enrichment (entry_id, concepts, function_summary,
+                                vocab_version, source_hash, model,
+                                enriched_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (entry_id) DO UPDATE SET
+            concepts = excluded.concepts,
+            function_summary = excluded.function_summary,
+            vocab_version = excluded.vocab_version,
+            source_hash = excluded.source_hash,
+            model = excluded.model,
+            enriched_at = excluded.enriched_at
+        """,
+        (entry_id, json.dumps(accepted, ensure_ascii=False),
+         sanitize_function_summary(function_summary),
+         catalog_concepts.VOCAB_VERSION,
+         sanitize_text(source_hash, cap=128) or None,
+         sanitize_text(model, cap=128) or None,
+         now or _utcnow()),
+    )
+    return dropped
 
 
 def upsert_family(conn: sqlite3.Connection, *, name: str, hf_local_path: str,
@@ -800,10 +1048,16 @@ def search_any(conn: sqlite3.Connection, terms: Sequence[str], *,
 #  FTS (full rebuild — ~1-2k rows, milliseconds; ADR-022 §8)
 # ════════════════════════════════════════════════════════════════════════
 
-def rebuild_fts(conn: sqlite3.Connection) -> int:
-    """Rebuild the FTS index from entries × best-available description rows.
-    Every description source is indexed (an ai_authored tip is findable even
-    when a sidecar description exists). Returns row count."""
+def _rebuild_fts_v2(conn: sqlite3.Connection) -> int:
+    """FROZEN populate for the v2 FTS shape — do not edit, do not "improve".
+
+    Exists only so `_migrate_v1_to_v2` builds the table that existed at v2
+    rather than whatever `rebuild_fts` has since become. See the FROZEN SHAPES
+    note above `_FTS_SCHEMA_V2`. The v2->v3 step immediately drops and rebuilds
+    this table with the v3 shape, so in a full v1->v3 chain this work is
+    thrown away — a few hundred rows of wasted milliseconds buys each step
+    independent correctness, which is the trade every time.
+    """
     conn.execute("DELETE FROM catalog_fts")
     rows = conn.execute(
         """
@@ -821,5 +1075,67 @@ def rebuild_fts(conn: sqlite3.Connection) -> int:
             (r["name"], r["model_name"] or "", r["description"] or "",
              r["usage_tips"] or "", r["trigger_words"] or "",
              r["instruction_template"] or "", r["entry_id"]))
+        n += 1
+    return n
+
+
+def rebuild_fts(conn: sqlite3.Connection) -> int:
+    """Rebuild the FTS index from entries × description rows × enrichment.
+    Every description source is indexed (an ai_authored tip is findable even
+    when a sidecar description exists). Returns row count.
+
+    The `enrichment` join is one-to-at-most-one (entry_id is its PRIMARY KEY),
+    so an entry's concepts/summary repeat across its description rows rather
+    than multiplying them — `search` already collapses an entry's rows with
+    GROUP BY + MIN(score), so repetition costs nothing and an entry with NO
+    description row still gets its enrichment indexed via the LEFT JOIN.
+
+    The `concepts` column is NOT the stored id list: it is
+    `expand_for_index()`'s repo-owned alias TEXT (ADR-041 D1). That is both
+    the retrieval mechanism — an entry tagged `hair` becomes findable by
+    "haircut" — and the security property, since every byte in that column
+    originates in `catalog_concepts.py` and none of it in a third-party
+    description.
+    """
+    from comfyless import catalog_concepts
+    conn.execute("DELETE FROM catalog_fts")
+    rows = conn.execute(
+        """
+        SELECT e.id AS entry_id, e.name AS name,
+               d.model_name, d.description, d.usage_tips, d.trigger_words,
+               d.instruction_template,
+               n.concepts AS concept_ids, n.function_summary
+        FROM entries e
+        LEFT JOIN descriptions d ON d.entry_id = e.id
+        LEFT JOIN enrichment n ON n.entry_id = e.id
+        """).fetchall()
+    n = 0
+    for r in rows:
+        try:
+            ids = json.loads(r["concept_ids"]) if r["concept_ids"] else []
+        except (TypeError, ValueError):
+            # A hand-edited or corrupted row indexes as UNENRICHED rather than
+            # failing the rebuild — the metadata plane degrades, it does not
+            # take the catalog down with it.
+            ids = []
+        # VALID JSON of the WRONG TYPE is the other half of that promise and
+        # the half the first cut missed: `concepts = '42'` parses fine, and
+        # then `for cid in 42` raises. That case is handled ONE layer down, in
+        # `expand_for_index`, which rejects a non-list outright and skips
+        # non-string elements — so a duplicate isinstance check here would be
+        # dead code. It was written, then deleted when a mutation test proved
+        # nothing could detect its removal (code-review 2026-07-30, finding 1).
+        # Keeping the guard in the module every caller goes through beats
+        # keeping it in each caller.
+        conn.execute(
+            "INSERT INTO catalog_fts (name, model_name, description, "
+            "usage_tips, trigger_words, instruction_template, concepts, "
+            "function_summary, entry_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (r["name"], r["model_name"] or "", r["description"] or "",
+             r["usage_tips"] or "", r["trigger_words"] or "",
+             r["instruction_template"] or "",
+             catalog_concepts.expand_for_index(ids),
+             r["function_summary"] or "", r["entry_id"]))
         n += 1
     return n
