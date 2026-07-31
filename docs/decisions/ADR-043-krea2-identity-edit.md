@@ -105,6 +105,60 @@ Three constraints are load-bearing and are the reason this ADR exists:
 
 **Changelog:**
 
+- 2026-07-31 — **First GPU run. Parity reached; two Part A defects found, and
+  constraint 1 amended.** Both defects were invisible to 57 CPU tests because
+  each lived in an interface the CPU tests stubbed:
+
+  1. **`__call__` dispatched subclass methods through `self`.** Under
+     `identity_edit_pipe_call` `self` IS a stock `Krea2Pipeline`, so
+     `self._normalize_sources(...)` raised `AttributeError` through diffusers'
+     `ConfigMixin.__getattr__`. Every CPU test had exercised the BOUND path,
+     where `self.` resolves fine — so no behavioural test on a real subclass
+     instance could have caught it. Fixed by class-qualifying all six sites;
+     `test_krea2_identity.py` now AST-guards both directions (no `self.`
+     dispatch of an own method, and the six ARE class-qualified).
+  2. **The grounded encode owned half of a contract it should not have.**
+     Stock Krea-2 text2img drives this encoder **text-only**; the identity edit
+     drives the same encoder **multimodally**, and that mode requires image
+     placeholders expanded to one token per merged vision patch plus an
+     `mm_token_type_ids` modality mask for M-RoPE. Building only the IMAGE
+     processor and tokenizing separately made this repo the owner of that
+     text-side contract — which is versioned with **transformers**, not with
+     our checkpoint. Two of its requirements failed in succession on the first
+     live run, and a third could arrive with any bump.
+
+  **Constraint 1 is amended, not weakened.** Its point was that the processor
+  must describe the LIVE encoder, never a checkpoint directory — that still
+  holds exactly. What was wrong was inferring from it that we should build only
+  an image processor. `build_vl_processor` now COMPOSES HF's real
+  `Qwen3VLProcessor` from (a) the image processor still built from the live
+  encoder's `vision_config` and (b) the pipeline's own tokenizer. No second
+  repo, no `preprocessor_config.json` (Krea-2 ships none), no
+  `AutoProcessor.from_pretrained` — and the text side belongs to HF again.
+  Notably this is what the validated reference harness did all along
+  (`run_two.py:80` calls `self.vl_processor(text=..., images=...)`); the
+  image-processor-only reading was Part A's divergence from the thing the
+  2026-07-31 validation actually proved.
+
+  Also added: `strip_vision_control_tokens` removes vision control tokens from
+  the USER's instruction before templating, so an instruction containing
+  `<|image_pad|>` cannot crash the run on a placeholder-count mismatch it did
+  not cause. Processor memoization is now keyed on `(encoder, tokenizer)`
+  identity, since a tokenizer swap moves the vision token IDs.
+
+  **Results.** Parity against the port golden (`port_rb4_gp768_s1234.png`, same
+  source / prompt / `ref_boost` 4.0 / `grounding_px` 768 / seed 1234 / 10
+  steps): mean abs diff **0.53/255**, RMSE 1.93, ~96% of pixels within 2/255 —
+  kernel-ordering noise, not a semantic difference. Run-to-run **bit-identical**.
+  Two-source (`n_src=2`) runs and honours the frame-order invariant. All four
+  Part B gates fire live (no-LoRA warn, `--rebalance` skip, NAG skip, 3-ref
+  hard error), `vl`/`ref` MODE hard-errors, and `edit_warnings` rides the
+  daemon wire into a delegated sidecar (invariant N1 confirmed end-to-end).
+  Delegation gate confirmed both ways: default tuning delegates, non-default
+  stays in-process with the loud reason. Non-krea reference paths re-verified
+  unchanged live (qwen-edit and flux2-klein), as was plain krea text2img.
+  **Epic risk 3 is resolved** — the cuDNN-pinned attention backend accepts our
+  float additive mask; no fallback, no error.
 - 2026-07-31 — **Part B landed** (comfyless routing + params). The seven items
   the epic's Part B decomposition named are in, within its declared edit scope
   (`generate.py`, `params_schema.py`, `params_validation.py`, `test_ref_edit.py`,

@@ -3,9 +3,13 @@
 **Date:** 2026-07-25 · **Revised:** 2026-07-31 (live validation) · **ADR:**
 `docs/decisions/ADR-043-krea2-identity-edit.md` (written at Part A, per
 "Numbering decisions") · **Risk:** L2 · **Status:** **Parts A + B complete and
-CPU-green; never GPU-run.** Part C (daemon + MCP) deferred, Red Zone. The four
-gates Part B added beyond this doc's decomposition, and the review finding that
-corrected one of them, are recorded in the ADR's Changelog.
+LIVE-VALIDATED on GPU (2026-07-31).** Parity with the reference port: mean abs
+diff 0.53/255, run-to-run bit-identical. **Risk 3 resolved** — the cuDNN pin
+accepts our float additive mask. Part C (daemon + MCP) deferred, Red Zone. The
+four gates Part B added beyond this doc's decomposition, the review finding that
+corrected one of them, and the two Part A defects the first GPU run exposed
+(self.-dispatched subclass methods; owning the VL text-side contract) are all
+recorded in the ADR's Changelog.
 
 > **Posture:** No new boundary. Entry is the existing ADR-035 `--ref-image`
 > surface; ingestion reuses `comfyless/ref_image.py` unchanged, so there is no

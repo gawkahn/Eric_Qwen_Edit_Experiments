@@ -320,6 +320,54 @@ check("defaults match the model card (4.0 / 768)",
       kie.DEFAULT_REF_BOOST == 4.0 and kie.DEFAULT_GROUNDING_PX == 768)
 
 
+# ---------------------------------------------------------------------------
+print("\n── unbound-call safety: no self.-dispatched subclass methods ───")
+# ---------------------------------------------------------------------------
+# The defect this pins cost the first GPU run (2026-07-31): `__call__` ran
+# `self._normalize_sources(image)`, but under identity_edit_pipe_call `self` is
+# a STOCK Krea2Pipeline, so diffusers' ConfigMixin.__getattr__ raised
+# AttributeError. Every CPU test before this one exercised the BOUND path,
+# where `self.` resolves fine — so no amount of behavioural testing on a real
+# subclass instance could have caught it. This is a structural guard instead:
+# any subclass-defined METHOD reached through `self` is a latent crash.
+import ast  # noqa: E402
+
+_src = Path(kie.__file__).read_text()
+_tree = ast.parse(_src)
+_cls = next(n for n in ast.walk(_tree)
+            if isinstance(n, ast.ClassDef)
+            and n.name == "Krea2IdentityEditPipeline")
+_own_methods = {n.name for n in _cls.body
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+check("guard found the subclass's own methods",
+      len(_own_methods) >= 6, f"found {sorted(_own_methods)}")
+
+_violations = [
+    f"{node.attr} (line {node.lineno})"
+    for node in ast.walk(_cls)
+    if isinstance(node, ast.Attribute)
+    and isinstance(node.value, ast.Name) and node.value.id == "self"
+    and node.attr in _own_methods
+]
+check("no subclass method is called via self. (unbound-call safe)",
+      not _violations,
+      "self.-dispatched: " + ", ".join(_violations) if _violations else "")
+
+# ...and the positive: they ARE reached class-qualified. Pins the fix's shape,
+# so a "helpful" refactor back to self. fails both legs, not neither.
+_qualified = {
+    node.attr
+    for node in ast.walk(_cls)
+    if isinstance(node, ast.Attribute)
+    and isinstance(node.value, ast.Name)
+    and node.value.id == "Krea2IdentityEditPipeline"
+}
+for _m in ("_normalize_sources", "_target_size_for", "_grounded_encode",
+           "_encode_source_latents", "_identity_vl_processor",
+           "_cap_longest_side"):
+    check(f"{_m} is called class-qualified", _m in _qualified)
+
+
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print("──────────────────────────────────────────────────")

@@ -79,7 +79,14 @@ _GROUNDED_SYSTEM = (
     "background:<|im_end|>\n<|im_start|>user\n"
 )
 _GROUNDED_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n"
-_VISION_BLOCK = "<|vision_start|><|image_pad|><|vision_end|>"
+_IMAGE_PAD = "<|image_pad|>"
+_VISION_BLOCK = f"<|vision_start|>{_IMAGE_PAD}<|vision_end|>"
+#: Vision control tokens stripped from the USER's instruction before it is
+#: pasted into the template. The processor expands one placeholder per supplied
+#: image and raises once the grids run out, so an instruction that happens to
+#: contain one would crash on a count mismatch it did not cause.
+_VISION_CONTROL_TOKENS = (_IMAGE_PAD, "<|vision_start|>", "<|vision_end|>",
+                          "<|video_pad|>")
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +133,58 @@ def build_vl_image_processor(text_encoder):
         temporal_patch_size=vision.temporal_patch_size,
         merge_size=vision.spatial_merge_size,
     )
+
+
+def build_vl_processor(text_encoder, tokenizer):
+    """Compose the FULL ``Qwen3VLProcessor`` for the grounded encode.
+
+    Stock Krea-2 text2img drives this encoder **text-only**. The identity edit
+    drives the same encoder **multimodally** — the source pixels go through its
+    vision tower — and that mode has an input contract the text-only path never
+    touches: image placeholders expanded to one token per merged vision patch,
+    and an ``mm_token_type_ids`` modality mask for multimodal RoPE, both of
+    which the encoder hard-asserts on.
+
+    Building only the IMAGE processor and tokenizing separately (the first cut,
+    2026-07-31) silently made THIS repo the owner of that text-side contract,
+    which is versioned with transformers rather than with our checkpoint — so
+    each transformers bump could add another required field, discoverable only
+    on a GPU. Two of them bit in a row on the first live run. Handing the
+    pieces to HF's own processor instead keeps that half where it belongs.
+
+    ADR-043 constraint 1 is unchanged and is the reason this is COMPOSED rather
+    than loaded: the geometry still comes from the live encoder's
+    ``vision_config`` via :func:`build_vl_image_processor`, and the tokenizer is
+    the loaded pipeline's own. Nothing reads a checkpoint directory, so a
+    ``--te1`` substitution cannot leave the processor describing an encoder that
+    is not in the slot. ``AutoProcessor.from_pretrained`` is not an option
+    regardless: Krea-2 ships no ``preprocessor_config.json``.
+
+    The video processor is stock and unused — ``Qwen3VLProcessor`` requires the
+    slot to be filled, and no video path exists here.
+    """
+    from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
+    from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
+        Qwen3VLVideoProcessor)
+
+    return Qwen3VLProcessor(
+        image_processor=build_vl_image_processor(text_encoder),
+        tokenizer=tokenizer,
+        video_processor=Qwen3VLVideoProcessor(),
+    )
+
+
+def strip_vision_control_tokens(instruction: str) -> str:
+    """Remove vision control tokens from USER text before templating.
+
+    The processor expands one placeholder per supplied image and raises when the
+    grids run out, so an instruction containing ``<|image_pad|>`` would fail on
+    a count mismatch the user did not cause and could not diagnose. Repo-owned
+    template text is added AFTER this, so the real placeholders are unaffected.
+    """
+    for token in _VISION_CONTROL_TOKENS:
+        instruction = instruction.replace(token, "")
+    return instruction
 
 
 def token_id_consistency_warnings(tokenizer, text_encoder_config) -> List[str]:
@@ -324,19 +383,33 @@ class Krea2IdentityEditPipeline(Krea2Pipeline):
     UNBOUND on a stock ``Krea2Pipeline`` instance (see
     :func:`identity_edit_pipe_call`) — it adds no durable instance state, which
     is what lets the daemon's pipeline cache stay class-agnostic.
+
+    **Consequence — every method defined HERE must be called class-qualified**
+    (``Krea2IdentityEditPipeline._foo(self, ...)``), never ``self._foo(...)``.
+    Under the unbound call ``self`` IS a stock ``Krea2Pipeline``, so a
+    ``self.``-dispatched subclass method raises ``AttributeError`` through
+    diffusers' ``ConfigMixin.__getattr__``. Stock attributes (``self.vae``,
+    ``self.prepare_latents``, ``self._execution_device``) and plain assignment
+    (``self._guidance_scale = ...``) are fine — only subclass-defined *methods*
+    need qualifying. Found on the first GPU run, 2026-07-31: CPU tests had only
+    ever exercised the bound path, where ``self.`` resolves fine.
+    ``test_krea2_identity.py`` now AST-guards this.
     """
 
     # -- grounded encode ----------------------------------------------------
     def _identity_vl_processor(self):
-        """Build (and memoize on the instance) the D10 image processor."""
+        """Build (and memoize on the instance) the D10 VL processor."""
         cached = getattr(self, "_krea2_identity_vl_processor", None)
-        encoder_ref = getattr(self, "_krea2_identity_vl_encoder_id", None)
-        if cached is not None and encoder_ref == id(self.text_encoder):
+        ref = getattr(self, "_krea2_identity_vl_encoder_id", None)
+        # Keyed on BOTH components it is composed from: --te1 swaps the encoder
+        # (geometry) and a tokenizer swap moves the vision token IDS, either of
+        # which invalidates the processor.
+        current = (id(self.text_encoder), id(self.tokenizer))
+        if cached is not None and ref == current:
             return cached
-        processor = build_vl_image_processor(self.text_encoder)
-        # Memoized against the encoder's identity so a --te1 swap rebuilds it.
+        processor = build_vl_processor(self.text_encoder, self.tokenizer)
         self._krea2_identity_vl_processor = processor
-        self._krea2_identity_vl_encoder_id = id(self.text_encoder)
+        self._krea2_identity_vl_encoder_id = current
         return processor
 
     @staticmethod
@@ -361,28 +434,43 @@ class Krea2IdentityEditPipeline(Krea2Pipeline):
         """
         device = self._execution_device
         prefix_idx = self.prompt_template_encode_start_idx
-        processor = self._identity_vl_processor()
+        # Class-qualified, not self.-dispatched: see the __call__ note — `self`
+        # here is a STOCK Krea2Pipeline, which has no subclass methods.
+        processor = Krea2IdentityEditPipeline._identity_vl_processor(self)
 
-        images = [self._cap_longest_side(img, grounding_px) for img in sources]
+        images = [Krea2IdentityEditPipeline._cap_longest_side(img, grounding_px)
+                  for img in sources]
         if len(images) == 1:
             body = _VISION_BLOCK
         else:
             # The multi-image convention labels each slot so the VLM can refer
             # to them; order is semantic (frame 1 = scene, frame 2 = identity).
             body = "".join(f"Picture {i + 1}: {_VISION_BLOCK}" for i in range(len(images)))
-        text = _GROUNDED_SYSTEM + body + (instruction or "") + _GROUNDED_SUFFIX
 
-        inputs = processor(images=images, return_tensors="pt")
-        text_inputs = self.tokenizer([text], return_tensors="pt")
-        input_ids = text_inputs["input_ids"].to(device)
-        attention_mask = text_inputs["attention_mask"].to(device).bool()
+        text = (_GROUNDED_SYSTEM + body
+                + strip_vision_control_tokens(instruction or "")
+                + _GROUNDED_SUFFIX)
+
+        # ONE call with text AND images: the processor expands each placeholder
+        # to one token per merged vision patch and returns the mm_token_type_ids
+        # modality mask alongside input_ids. Both are hard requirements of the
+        # encoder's multimodal path, and both are HF's to own — see
+        # build_vl_processor.
+        # NOTE: ProcessorMixin.__call__ funnels its kwargs through a TypedDict
+        # it does not re-declare, so a type checker reads `return_tensors` as
+        # unknown. It is the documented HF idiom and is exercised live.
+        inputs = processor(
+            text=[text], images=images,
+            return_tensors="pt")  # pyright: ignore[reportCallIssue]
+        input_ids = inputs["input_ids"].to(device)
+        attention_mask = inputs["attention_mask"].to(device).bool()
 
         encoder_kwargs: Dict[str, Any] = dict(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
         )
-        for key in ("pixel_values", "image_grid_thw"):
+        for key in ("pixel_values", "image_grid_thw", "mm_token_type_ids"):
             value = inputs.get(key)
             if value is None:
                 continue
@@ -488,7 +576,7 @@ class Krea2IdentityEditPipeline(Krea2Pipeline):
                 **kwargs,
             )
 
-        sources = self._normalize_sources(image)
+        sources = Krea2IdentityEditPipeline._normalize_sources(image)
         device = self._execution_device
         self._attention_kwargs = attention_kwargs
         self._interrupt = False
@@ -498,7 +586,8 @@ class Krea2IdentityEditPipeline(Krea2Pipeline):
         for message in token_id_consistency_warnings(self.tokenizer, self.text_encoder.config):
             print(f"[comfyless] {message}")
 
-        auto_height, auto_width = self._target_size_for(sources[0])
+        auto_height, auto_width = Krea2IdentityEditPipeline._target_size_for(
+            self, sources[0])
         out_height = int(height) if height is not None else auto_height
         out_width = int(width) if width is not None else auto_width
         multiple = self.vae_scale_factor * self.patch_size
@@ -509,7 +598,8 @@ class Krea2IdentityEditPipeline(Krea2Pipeline):
             )
 
         # 1. Grounded prompt encode (both conditioning paths are co-active).
-        prompt_embeds, prompt_embeds_mask = self._grounded_encode(
+        prompt_embeds, prompt_embeds_mask = Krea2IdentityEditPipeline._grounded_encode(
+            self,
             prompt if isinstance(prompt, str) else (prompt[0] if prompt else ""),
             sources,
             int(grounding_px),
@@ -527,7 +617,8 @@ class Krea2IdentityEditPipeline(Krea2Pipeline):
             generator,
             latents,
         )
-        source_packed = self._encode_source_latents(sources, out_height, out_width)
+        source_packed = Krea2IdentityEditPipeline._encode_source_latents(
+            self, sources, out_height, out_width)
 
         grid_height = out_height // multiple
         grid_width = out_width // multiple
