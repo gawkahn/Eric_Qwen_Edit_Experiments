@@ -32,6 +32,25 @@ conditioning, not because the model is architecturally exotic. In comfyless it
 is `--ref-image portrait.png` on a Krea-2 checkpoint with the identity LoRA
 loaded, plus one new pipeline module and two tuning params.
 
+## What must be true when done
+
+1. `python -m comfyless.generate --model $MB/Krea-2-Turbo --lora
+   krea2_identity_edit_v1_2:1.0 --prompt "<instruction>" --ref-image
+   portrait.png` produces an edited image with the subject's likeness intact.
+2. A second `--ref-image` engages the two-source path with the documented
+   order (#1 = scene / frame 1, #2 = identity / frame 2); a third is a hard
+   error naming the maximum.
+3. No new dispatch mode, no new family string, no new module under
+   `comfyless/`. The only comfyless-side change is routing + two params.
+4. `ref_boost` and `grounding_px` are sidecar-recorded and `--params`-replayable
+   like every other schema key, and the reference→frame mapping replays
+   faithfully.
+5. A `--ref-image` run on a non-krea, non-edit family behaves exactly as it does
+   today (loud drop under lenient, hard error under strict).
+6. A text2img krea run with no `--ref-image` is byte-identical to today.
+7. `local_files_only=True` holds — nothing in the grounded-encode path reaches
+   the network — and `--te1` continues to work in this mode (D10).
+
 ## Live validation — 2026-07-31
 
 The whole design was exercised end-to-end **before** any comfyless code, by
@@ -149,7 +168,7 @@ already ride the existing `ref_images` wire field, so parts A+B need **no**
 change to `server.py`, `mcp_server.py`, or `ref_image.py` — all three Red Zone
 paths. If part B starts needing `server.py`, stop and re-scope.
 
-**D8 — Single source image in v1. `[REVISED 2026-07-31 — the reason changed.]`**
+**D8 — Two source images ARE in v1. `[REVISED TWICE, 2026-07-31.]`**
 
 The original rationale was *cost*: that two-input needs "multi-frame position ids
 and, in the reference port, a per-block reference-KV precompute
@@ -179,22 +198,43 @@ that scene." It structurally cannot do "give him the haircut from image 1",
 because the slot carrying the reference also carries identity, so hair follows
 the person in slot 2.
 
-**So two-input stays out of v1 — on value, not cost.** Grant's verdict on the
-live results: *"consistently preserving neither identity nor haircut in either
-ordering"* — it blended the two faces. **Honest caveat: this does not disprove
-the trained capability.** The card's layout is *scene* + person (its own example
-is "next to the tractor" — frame 1 is a tractor, not a face). Our test put two
-competing faces into a layout trained for one, which is the pathological case.
-The trained scene+person use case is **untested here**. Revisit if a
-put-this-person-in-that-scene need appears; it is cheap to add when it does.
+**Two-input ships IN v1, with its limitations documented.** *(Grant's call,
+2026-07-31, reversing the original deferral.)* The cost is three seams; the
+capability is the card's headline mode; and the one live test we ran was
+**outside its stated boundary**, so deferring on that evidence would be
+deferring on a measurement that doesn't apply.
+
+What the live test does establish, and what must be documented for users:
+
+- Frame 1 = scene/context, frame 2 = identity. **Order is fixed**; swapping
+  inverts which face you get.
+- It is **compositing, not attribute transfer**. It cannot "give him the
+  haircut from image 1" — hair follows the person in slot 2.
+- With a **prominent face in frame 1** it blends the two identities. Grant's
+  verdict on that run: *"consistently preserving neither identity nor haircut
+  in either ordering."* Frame 1 is meant to be a *scene* (the card's own
+  example is a tractor). **Warn when frame 1 appears to be a portrait?** —
+  no; we cannot detect that reliably, so this is a documentation matter, not
+  a runtime check (house rule: warn on what we know, don't guess).
+- The trained scene+person case is **still untested here.** Ship it, document
+  the boundary, let real use decide.
+
+**The composition insight worth building toward (Grant, 2026-07-31):** feed the
+**single-image path's output** in as the frame-2 person — an image that already
+has good identity *and* the desired characteristics in place — rather than
+asking one pass to do two jobs. Single-image edit establishes the subject;
+two-input then only has to place that subject in a scene. Each pass does one
+thing. This is a natural `--iterate`/refine chaining, needs no new mechanism,
+and is the most promising use of two-input on the evidence we have.
 
 **D9 — Ingestion reuses `comfyless/ref_image.py` unchanged.** The single decode
 site is preserved; `load_ref_image_capped`, never `load_seed_image_capped`
 (ADR-038 D5 records why). Provenance is already family-agnostic, so sidecar
 recording and the ADR-035 slice-5 replay trust gate come for free.
 
-**D10 — The VL image processor is code-owned, built from the checkpoint's own
-`vision_config`. `[NEW 2026-07-31 — closes the epic's largest unknown.]`**
+**D10 — The VL image processor is constructed at runtime from the LIVE text
+encoder's `vision_config` — never hard-coded, never read from the checkpoint
+directory. `[NEW 2026-07-31 — closes the epic's largest unknown.]`**
 
 Krea-2's `text_encoder` is architecturally **Qwen3-VL-4B exactly**: all 15
 `vision_config` fields, all four special-token ids, and the text dims match the
@@ -203,14 +243,33 @@ local `Huihui-Qwen3-VL-4B-Instruct-abliterated`, and the tokenizer vocabs are
 
 So we construct `Qwen2VLImageProcessor` in code, reading the shape-critical
 values (`patch_size`, `temporal_patch_size`, `spatial_merge_size`) from
-**Krea-2's own config**, with only mean/std/rescale as code constants. Verified
-byte-parity against the donor's on-disk config at 384/768/1024 px, with
-`image_pad` expansion matching the token grid in every case.
+`pipe.text_encoder.config.vision_config`, with only mean/std/rescale as code
+constants. Verified byte-parity against a donor's on-disk `preprocessor_config`
+at 384/768/1024 px, with `image_pad` expansion matching the token grid in every
+case.
+
+**Read the config off the loaded encoder INSTANCE, not off
+`<model_path>/text_encoder/config.json`.** `--te1` (`generate.py:2460` →
+`text_encoder_path`, loaded at `:1144-1150`) lets the user substitute the text
+encoder — Grant already runs the abliterated Qwen3-VL-4B against Krea this way
+and it works. A processor built from the checkpoint directory would silently
+describe an encoder that is not loaded. Sourcing from the live instance makes
+`--te1` work in this mode for free, and makes the processor correct by
+construction for any future encoder whose vision geometry differs.
+`AutoConfig` exposes this as a `Qwen3VLVisionConfig` on both encoders
+(verified 2026-07-31; both report patch 16 / temporal 2 / merge 2, so today's
+overrides agree — the design must not depend on that coincidence).
+
+Consistency check, warn-don't-block (D5's house rule): if the tokenizer's
+`<|image_pad|>` / `<|vision_start|>` / `<|vision_end|>` ids disagree with the
+encoder config's `image_token_id` / `vision_start_token_id` /
+`vision_end_token_id`, warn loudly and proceed — that combination is a user
+choice, and the failure it produces is legible.
 
 This **deletes** both options the epic originally proposed — the
 `--vl-processor` path param and the ship-a-config-as-package-data fallback — and
-is strictly better than either: no donor-model dependency, no network, and the
-values that must not drift come from the checkpoint being loaded.
+is strictly better than either: no donor-model dependency, no network, and no
+second place for the geometry to drift out of sync.
 `local_files_only=True` holds trivially because nothing is fetched.
 
 **D11 — Tuning params ride the catalog, not the CLI defaults. `[NEW
@@ -248,24 +307,37 @@ New `pipelines/krea2_identity_edit.py` (~500 lines): a
 
 - grounded prompt encode — VL chat template with the vision block, tapping the
   same 12 `text_encoder_select_layers` the checkpoint declares
-- the **code-owned image processor** (D10)
-- source VAE encode + pack into the transformer's token layout
-- `position_ids` builder for `[text | source(frame 1) | target(frame 0)]`,
-  written `n_src`-generic from the start so D8 is a call-site change later
-- the `ref_boost` additive attention-logit bias
+- the **runtime-constructed image processor** off the live encoder (D10)
+- grounded encode over **one or two** images, using the `Picture N:`
+  convention when there are two
+- source VAE encode + pack into the transformer's token layout, for each source
+- `position_ids` builder for `[text | source(frame 1..N) | target(frame 0)]`,
+  written `n_src`-generic (N ∈ {1,2}) — this is the D8 shape, not a later
+  retrofit
+- the `ref_boost` additive attention-logit bias — unchanged for two sources,
+  since it slices every source column as one range
 - per-call processor install with `finally`-restore, inheriting
   `_attention_backend` from the cuDNN pin (risk 3)
 
-New `test_krea2_identity.py` (~250 lines) on a tiny synthetic transformer,
-following `test_nag.py`'s shape.
+New `test_krea2_identity.py` (~300 lines) on a tiny synthetic transformer,
+following `test_nag.py`'s shape. Two-source raises the token count by one
+grid, so the layout assertions must cover `n_src=2` explicitly — including the
+**frame-order** invariant, which is the one a refactor could silently invert.
 
 ### Part B — comfyless routing + params
 
 `_REF_FAMILY_KINDS` rows (D1); a `"krea2-identity"` execution branch beside
 `_run_qwen_edit_refs` and `_apply_flux2_native_refs`; MODE validation (D3); the
 two params through the D4 checklist; the no-LoRA warning (D5); the NAG pre-gate
-(D6). ~200 lines in `generate.py`. Tests extend `test_ref_edit.py` and
+(D6). ~250 lines in `generate.py`. Tests extend `test_ref_edit.py` and
 `test_params_schema.py`.
+
+Two-source arrives through the existing multi-`--ref-image` surface, so the
+routing already carries a list. What Part B must add is **order** (D8): the
+first `--ref-image` is frame 1 / scene, the second is frame 2 / identity, and
+that mapping is recorded in the sidecar so replay is faithful. A third or later
+reference is a hard error naming the two-source maximum — not a silent drop,
+because a silently ignored reference looks like a model failure.
 
 ### Part C — daemon + MCP (deferred; Red Zone)
 
@@ -286,8 +358,13 @@ ever written for this work, it is written here.
 - **MODE `vl` or `ref` on a krea family is a hard error** naming the family and
   the valid mode — never a silent coercion to `both`.
 - **Every reference still decodes through `comfyless/ref_image.py`.**
+- **Reference order is load-bearing and never reordered**: `--ref-image` #1 →
+  RoPE frame 1 (scene), #2 → frame 2 (identity). A third reference is a hard
+  error, never a silent drop.
 - **`local_files_only=True` holds through the grounded encode** — trivially, by
   D10, since the processor is constructed rather than fetched.
+- **The image processor tracks the loaded text encoder, not the checkpoint
+  path** — a `--te1` override drives the processor geometry (D10).
 - **A krea run with no `--ref-image` is unchanged.**
 - **Non-krea `--ref-image` behaviour is untouched.**
 
@@ -302,10 +379,13 @@ loud drop under lenient, `ValueError` under strict.
 
 ## Out of scope
 
-Two-image scene + person compositing (D8); daemon and MCP carriage (part C);
-ComfyUI nodes for this path; any `FAMILY_DEFAULTS` change (D5);
-Krea-2-Raw-specific tuning; reconciling with ADR-038's identity-judging rubric
-(risk 5); **any hand-painted mask UI (D11, permanently)**.
+Daemon and MCP carriage (part C); ComfyUI nodes for this path; any
+`FAMILY_DEFAULTS` change (D5); Krea-2-Raw-specific tuning; reconciling with
+ADR-038's identity-judging rubric (risk 5); **any hand-painted mask UI (D11,
+permanently)**; three or more source frames (the layout generalises to `n_src`,
+but nothing trained or tested supports it — two is the documented maximum);
+automating the single-image → two-input chaining described in D8 (the manual
+two-step works with no new mechanism; a `refine` integration is its own slice).
 
 ## Risks
 
@@ -350,11 +430,16 @@ That is the whole argument for this epic existing alongside ADR-038.
 ## Proof hooks
 
 - `./.venv/bin/python3 test_krea2_identity.py` (new, part A) — position-id
-  layout for `[text | source | target]`, `ref_boost` bias placement and the
-  `ref_boost == 1.0` no-op, processor install/restore, output-slice shape, and
-  **D10's processor built from a stub `vision_config`**.
+  layout for `[text | source(1..N) | target]` at **both** `n_src=1` and
+  `n_src=2`, the frame-order invariant (frame 1 = scene, frame 2 = identity),
+  `ref_boost` bias placement across a two-block source span and the
+  `ref_boost == 1.0` no-op, processor install/restore, output-slice shape,
+  **D10's processor built from a stub `vision_config`**, and a negative case
+  proving a stub encoder with *different* geometry produces a *different*
+  processor (the assertion that would have caught the `--te1` defect).
 - `./.venv/bin/python3 test_ref_edit.py` — krea routing, MODE `vl`/`ref`
-  rejection, the no-LoRA warning, NAG pre-gate.
+  rejection, the no-LoRA warning, NAG pre-gate, reference-order mapping, and
+  the three-reference hard error.
 - `./.venv/bin/python3 test_params_schema.py` — the two params' schema
   round-trip and `--params` replay.
 - `just tests` — full battery, 0 failures.
