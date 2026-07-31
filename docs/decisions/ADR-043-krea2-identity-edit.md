@@ -105,6 +105,50 @@ Three constraints are load-bearing and are the reason this ADR exists:
 
 **Changelog:**
 
+- 2026-07-31 — **Part B landed** (comfyless routing + params). The seven items
+  the epic's Part B decomposition named are in, within its declared edit scope
+  (`generate.py`, `params_schema.py`, `params_validation.py`, `test_ref_edit.py`,
+  `test_params_schema.py`). Four gates were added beyond that list, each closing
+  a silent drop found while wiring — this is the substantive part of the record,
+  because none of them were foreseen by the epic:
+
+  1. **`--rebalance` is pre-gated off on this path.** `_apply_krea_rebalance`
+     pops `prompt` and substitutes `prompt_embeds`, which the identity call
+     swallows through `**kwargs` while its grounded encode receives an empty
+     instruction. Running both would have discarded the prompt entirely.
+  2. **`cfg_scale` / `negative_prompt` / `max_sequence_length` are named by
+     `Krea2IdentityEditPipeline.__call__` but consumed only on its
+     no-reference branch**, so they are inert on the edit path. This is not
+     hypothetical: `FAMILY_DEFAULTS["krea"]` sets `cfg_scale: 3.5`, so on
+     Krea-2-**Raw** a user who typed nothing still lost CFG and any negative
+     prompt. Now a loud skip in `edit_warnings` (invariant N1). The 2026-07-31
+     live validation ran on **Turbo** (cfg 0.0), which is exactly why this was
+     invisible to it. The requested values stay recorded in the sidecar —
+     they are replay inputs, and the warning carries the truth.
+  3. **Range warnings** for the two scalars, warn-never-block per D5.
+  4. **A daemon-delegation gate.** Both keys are now `SCHEMA_KIND` members, so
+     the canonical validator would ACCEPT them on the wire while `server.py`
+     ignores them — accepted-and-dropped. A reference run whose tuning diverges
+     from the schema defaults therefore runs in-process (epic D7).
+
+  Gate 4's first implementation keyed on **presence** in `explicit_keys` and was
+  wrong; `code-reviewer` (Fable) caught it. `generate()` records both keys in
+  every sidecar and `--params` treats every sidecar key as explicit, so presence
+  forced **every** ref-bearing replay in-process — on qwen-edit and flux2 too.
+  That broke the epic invariant *"Non-krea `--ref-image` behaviour is
+  untouched"* and re-armed the 2026-07-26 warm-daemon failure (an in-process
+  model load while the daemon still holds its pipeline's VRAM is a crash on a
+  single-GPU box, not a degrade). The gate now tests **value divergence from the
+  schema default**, with the replay case pinned as an explicit negative test.
+  The same review also found the metadata block recording a `rebalance` entry
+  for runs gate 1 had skipped — untruthful provenance, now mirrored.
+
+  Verification: `just tests` 32/32 suites (test_ref_edit 196, test_params_schema
+  349); pyright per-root exactly at baseline (`comfyless=13`, `nodes=520`,
+  `pipelines=454`); `just policy-test` 43/43; gitleaks, semgrep, `deps-cve`
+  clean. **Part B has still never run on a GPU** — the live parity smoke against
+  `krea-identity-eval/` is the next step, and epic risk 3 (the cuDNN attention
+  pin vs. our float bias) remains unpinned by anything but a CPU-shaped test.
 - 2026-07-31 — accepted. Written at Part A, as
   `docs/vision/epic-krea2-identity-edit.md` ("Numbering decisions") committed to
   doing. Supersedes nothing. Live validation preceding this ADR is recorded in

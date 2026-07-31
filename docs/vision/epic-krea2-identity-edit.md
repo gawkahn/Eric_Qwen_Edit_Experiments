@@ -1,8 +1,11 @@
 # Vision (epic): Krea 2 Identity Edit in comfyless
 
-**Date:** 2026-07-25 · **Revised:** 2026-07-31 (live validation) · **ADR:** none
-yet (deliberate — see "Numbering decisions") · **Risk:** L2 · **Status:**
-**validated live; not started**
+**Date:** 2026-07-25 · **Revised:** 2026-07-31 (live validation) · **ADR:**
+`docs/decisions/ADR-043-krea2-identity-edit.md` (written at Part A, per
+"Numbering decisions") · **Risk:** L2 · **Status:** **Parts A + B complete and
+CPU-green; never GPU-run.** Part C (daemon + MCP) deferred, Red Zone. The four
+gates Part B added beyond this doc's decomposition, and the review finding that
+corrected one of them, are recorded in the ADR's Changelog.
 
 > **Posture:** No new boundary. Entry is the existing ADR-035 `--ref-image`
 > surface; ingestion reuses `comfyless/ref_image.py` unchanged, so there is no

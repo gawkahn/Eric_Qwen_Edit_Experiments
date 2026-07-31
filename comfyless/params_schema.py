@@ -89,6 +89,13 @@ _FIELD_DEFAULTS: Dict[str, object] = {
     "nag_tau":              2.5,
     "nag_alpha":            0.25,
     "nag_end":              1.0,
+    # Krea-2 identity edit (ADR-043) — the model card's own defaults. NOTE
+    # the measured caveat (epic D4): 4.0 suits edits spatially SEPARATE from
+    # the identity (a jacket) and suppresses face-adjacent ones outright,
+    # which measured best near 1.25. No single default serves both, so tuned
+    # values ride the catalog suggestion language (epic D11), not this line.
+    "ref_boost":            4.0,
+    "grounding_px":         768,
     # Hunyuan-Image refiner chain (ADR-016 §(d)). Tencent refiner README
     # authoritative (cfg=3.5, steps=4). No-ops when refiner_path is unset.
     "refiner_path":         "",

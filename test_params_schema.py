@@ -1356,6 +1356,75 @@ check("gate table and dispatch map cover the same families",
       set(g._NAG_CFG_OWNS_NEGATIVE) == set(g._NAG_MODULES))
 
 
+# ── Krea-2 identity edit pair is sidecar-replayable (ADR-043) ──────────
+# ref_boost/grounding_px follow the NAG precedent verbatim: they change output
+# CONTENT on the krea reference path, so --params replay must reproduce them.
+# Same four legs.
+print("\n── ADR-043 sidecar round-trip (ref_boost / grounding_px) ───────")
+
+# Leg 0: schema defaults are the model card's, and the kinds are canonical.
+# NOTE the caveat these numbers carry (epic D4): 4.0 suits edits spatially
+# separate from the identity and SUPPRESSES face-adjacent ones, which measured
+# best near 1.25. The default is upstream-matching, not universally good.
+check("krea2-identity schema defaults are the card's 4.0 / 768",
+      (schema["ref_boost"][1], schema["grounding_px"][1]) == (4.0, 768))
+check("ref_boost is canonical float, grounding_px canonical int",
+      schema["ref_boost"][0] is float and schema["grounding_px"][0] is int)
+
+# Leg 1: a sidecar carrying the pair survives _load_params intact.
+_k2d = _qtf.mkdtemp(prefix="krea2_sidecar_test_")
+_k2p = _qos.path.join(_k2d, "s.json")
+with open(_k2p, "w") as _k2f:
+    json.dump({"model": "/m", "prompt": "p",
+               "ref_boost": 1.25, "grounding_px": 384}, _k2f)
+_k2l = g._load_params(_k2p)
+check("sidecar ref_boost/grounding_px survive _load_params",
+      (_k2l.get("ref_boost"), _k2l.get("grounding_px")) == (1.25, 384),
+      f"got {(_k2l.get('ref_boost'), _k2l.get('grounding_px'))!r}")
+
+# Leg 2: argparse defaults are None SENTINELS — an omitted --ref-boost must not
+# clobber a sidecar's tuned value in the CLI merge. This is the leg that makes
+# a measured 1.25 replay as 1.25 rather than silently reverting to the card's
+# 4.0, which would suppress the very edit the sidecar recorded.
+_k2argv, sys.argv = sys.argv, ["comfyless"]
+try:
+    _k2args = g._parse_args()
+finally:
+    sys.argv = _k2argv
+check("krea2-identity argparse defaults are None sentinels",
+      _k2args.ref_boost is None and _k2args.grounding_px is None)
+check("_cli_value_for treats unset ref_boost/grounding_px as not-explicit",
+      g._cli_value_for(_k2args, "ref_boost") is None
+      and g._cli_value_for(_k2args, "grounding_px") is None)
+
+# Positive precedence leg: an EXPLICIT --ref-boost 1.0 (the processor no-op) is
+# non-None, so it wins the merge over a sidecar's 4.0 — the flag can turn the
+# bias OFF on replay, which a falsy-not-None check would break.
+_k2argv, sys.argv = sys.argv, ["comfyless", "--ref-boost", "1.0",
+                               "--grounding-px", "384"]
+try:
+    _k2args2 = g._parse_args()
+finally:
+    sys.argv = _k2argv
+check("explicit --ref-boost 1.0 is non-None and wins the merge",
+      g._cli_value_for(_k2args2, "ref_boost") == 1.0)
+check("explicit --grounding-px 384 reaches the merge as an int",
+      g._cli_value_for(_k2args2, "grounding_px") == 384
+      and isinstance(_k2args2.grounding_px, int))
+
+# The argparse attr names ARE the canonical keys, so no _CLI_TO_CANONICAL row
+# is needed — pin that, because adding a spurious alias would silently shadow
+# the fallback path _cli_value_for relies on.
+check("ref_boost/grounding_px need no _CLI_TO_CANONICAL alias",
+      "ref_boost" not in g._CLI_TO_CANONICAL.values()
+      and "grounding_px" not in g._CLI_TO_CANONICAL.values())
+
+# Leg 3: they are params, not skip-set provenance — sidecar load must NOT drop
+# them the way it drops timestamp/elapsed.
+check("ref_boost/grounding_px are NOT in _SKIP_SIDECAR_KEYS",
+      not ({"ref_boost", "grounding_px"} & g._SKIP_SIDECAR_KEYS))
+
+
 # ── ADR-035 slice 1: --ref-image parsing + schema key ────────────────────────
 import os as _os        # noqa: E402
 import tempfile as _tf  # noqa: E402

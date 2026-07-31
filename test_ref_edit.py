@@ -581,8 +581,12 @@ check("nag pre-gate: dormant nag_scale stays silent even with refs",
 # sidecar records the truth. Source-text pin (the test_nag.py idiom) — the
 # full generate() path needs a GPU; end-to-end dims are the live smoke.
 _gen_src = Path(__file__).parent.joinpath("comfyless", "generate.py").read_text()
-check("dims read-back: final_pil.size gated on flux2-native + derived dims",
-      'if ref_kind == "flux2-native" and not ref_dims_explicit:' in _gen_src
+# The kind list generalized when ADR-043 joined (krea2-identity derives dims
+# from its first reference the same way); the GATE is what this pins — the
+# read-back must stay conditional on derived dims, never unconditional.
+check("dims read-back: final_pil.size gated on ref kind + derived dims",
+      'ref_kind in ("flux2-native", "krea2-identity")' in _gen_src
+      and "and not ref_dims_explicit):" in _gen_src
       and "width, height = final_pil.size" in _gen_src)
 check("dims read-back precedes metadata build (sidecar records the truth)",
       _gen_src.index("width, height = final_pil.size")
@@ -880,6 +884,288 @@ finally:
     cg._send_server_command = _orig_send
     import shutil as _rid_sh
     _rid_sh.rmtree(_rid_dir, ignore_errors=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ADR-043 Part B — krea2-identity routing + params
+# ═══════════════════════════════════════════════════════════════════════════
+print("\n── ADR-043 Part B: krea2-identity routing ─────────────────────")
+
+_k1 = [{"path": _p_both, "mode": "both"}]
+_k2 = [{"path": _p_both, "mode": "both"}, {"path": _p_vl, "mode": "both"}]
+_k3 = _k2 + [{"path": _p_both, "mode": "both"}]
+
+# Routing: both krea families resolve to the identity-edit kind, in BOTH
+# strictness modes — the family SUPPORTS references, so there is no drop path.
+for _fam in ("krea", "krea-turbo"):
+    for _strict in (True, False):
+        _kind, _warn = cg._resolve_ref_family_support(_k1, _fam, _strict)
+        check(f"krea2-identity: {_fam} + 1 ref (strict={_strict}) → "
+              f"('krea2-identity', None)",
+              _kind == "krea2-identity" and _warn is None,
+              f"got {(_kind, _warn)!r}")
+_kind, _warn = cg._resolve_ref_family_support(_k2, "krea-turbo", True)
+check("krea2-identity: two refs are the supported two-source path",
+      _kind == "krea2-identity" and _warn is None)
+
+# A krea run with NO refs is untouched — the routing table must not make a
+# text2img krea run look like an edit (epic "what must be true" item 6).
+check("krea2-identity: no refs → (None, None), krea text2img unchanged",
+      cg._resolve_ref_family_support([], "krea-turbo", True) == (None, None))
+
+# MODE vl/ref is a hard error in BOTH strictness modes (epic D3): Krea's two
+# conditioning paths are always co-active, so selecting one is meaningless.
+for _bad in ("vl", "ref"):
+    for _strict in (True, False):
+        _raised = None
+        try:
+            cg._resolve_ref_family_support(
+                [{"path": _p_both, "mode": _bad}], "krea", _strict)
+        except ValueError as e:
+            _raised = str(e)
+        check(f"krea2-identity: MODE {_bad} → hard ValueError (strict={_strict})",
+              _raised is not None and "krea" in _raised and _bad in _raised
+              and "both" in _raised, f"got {_raised!r}")
+
+# ...and MODE gating is scoped to the kinds that lack the dual path: qwen-edit
+# still accepts vl/ref (NEGATIVE case — proves the table did not over-reach).
+check("_REF_KINDS_MODE_BOTH_ONLY excludes qwen-edit (dual path is real there)",
+      "qwen-edit" not in cg._REF_KINDS_MODE_BOTH_ONLY
+      and set(cg._REF_KINDS_MODE_BOTH_ONLY) == {"flux2-native", "krea2-identity"})
+check("qwen-edit + MODE vl still routes (not caught by the both-only gate)",
+      cg._resolve_ref_family_support(
+          [{"path": _p_both, "mode": "vl"}], "qwen-edit", True)
+      == ("qwen-edit", None))
+
+# A third reference is a HARD error naming the maximum, never a silent drop —
+# a dropped reference reads to the user as a model failure (ADR-043 c2).
+_raised = None
+try:
+    cg._resolve_ref_family_support(_k3, "krea-turbo", True)
+except ValueError as e:
+    _raised = str(e)
+check("krea2-identity: 3 refs → ValueError naming the 2-source max + slots",
+      _raised is not None and "2" in _raised and "scene" in _raised
+      and "identity" in _raised and "3" in _raised, f"got {_raised!r}")
+_raised = None
+try:
+    cg._resolve_ref_family_support(_k3, "krea-turbo", False)
+except ValueError as e:
+    _raised = str(e)
+check("krea2-identity: 3 refs is hard even under LENIENT (not a droppable extra)",
+      _raised is not None, f"got {_raised!r}")
+# The cap does NOT leak onto other kinds: flux2-native takes many references.
+check("3 refs on flux2-native still routes (cap is krea2-identity-scoped)",
+      cg._resolve_ref_family_support(_k3, "flux2", True)
+      == ("flux2-native", None))
+
+# Drift guard: generate.py's local cap must equal the pipeline's MAX_SOURCES.
+# They are deliberately duplicated so the CLI's validation path stays free of
+# diffusers (the QUANT_MODES precedent) — this is what keeps them honest.
+import pipelines.krea2_identity_edit as _k2mod  # noqa: E402
+check("_KREA2_IDENTITY_MAX_REFS mirrors pipelines MAX_SOURCES",
+      cg._KREA2_IDENTITY_MAX_REFS == _k2mod.MAX_SOURCES,
+      f"{cg._KREA2_IDENTITY_MAX_REFS} vs {_k2mod.MAX_SOURCES}")
+
+# ── _apply_krea2_identity_refs call-kwargs threading ─────────────────────────
+print("\n── ADR-043 Part B: call-kwargs threading ──────────────────────")
+
+_kck = {"prompt": "give him an undercut", "height": 1024, "width": 1024,
+        "guidance_scale": 0.0}
+_kprov = cg._apply_krea2_identity_refs(_kck, _k2, False, 1.25, 384)
+check("krea refs: image= gets the PIL list in the TYPED order (#1 scene first)",
+      isinstance(_kck.get("image"), list) and len(_kck["image"]) == 2
+      and _kck["image"][0].size == (32, 48) and _kck["image"][1].size == (16, 16),
+      f"got {_kck.get('image')!r}")
+check("krea refs: ref_boost/grounding_px land in call_kwargs, coerced",
+      _kck["ref_boost"] == 1.25 and isinstance(_kck["ref_boost"], float)
+      and _kck["grounding_px"] == 384 and isinstance(_kck["grounding_px"], int))
+check("krea refs: dims NOT explicit → height/width dropped (pipeline derives)",
+      "height" not in _kck and "width" not in _kck)
+check("krea refs: other call kwargs untouched",
+      _kck["prompt"] == "give him an undercut" and _kck["guidance_scale"] == 0.0)
+check("krea refs: provenance is the shared shape (path/mode/sha256/applied)",
+      len(_kprov) == 2 and _kprov[0]["path"] == _p_both
+      and _kprov[0]["sha256"] == _sha_both and all(e["applied"] for e in _kprov))
+# Order invariant, stated as its own assertion: provenance order == typed order,
+# which is what makes the sidecar's replay land the same face in the same slot.
+check("krea refs: provenance order matches the typed reference order",
+      [e["path"] for e in _kprov] == [_p_both, _p_vl])
+
+_kck2 = {"prompt": "p", "height": 768, "width": 512}
+cg._apply_krea2_identity_refs(_kck2, _k1, True, 4.0, 768)
+check("krea refs: dims explicit → height/width forwarded verbatim",
+      _kck2["height"] == 768 and _kck2["width"] == 512)
+
+# ── Range warnings: warn, never block (D5's house rule) ──────────────────────
+print("\n── ADR-043 Part B: ref_boost / grounding_px warnings ───────────")
+
+check("ref_boost 1.25 + grounding 384 are silent (the measured sweet spot)",
+      cg._krea2_identity_param_warnings(1.25, 384) == [])
+check("ref_boost 1.0 (processor no-op) is silent",
+      cg._krea2_identity_param_warnings(1.0, 768) == [])
+_w0 = cg._krea2_identity_param_warnings(0.0, 768)
+check("ref_boost 0 warns (log(0) is meaningless) and does not raise",
+      len(_w0) == 1 and "log(ref_boost)" in _w0[0])
+_w4 = cg._krea2_identity_param_warnings(4.0, 768)
+check("ref_boost 4.0 (the card default) warns about face-adjacent suppression",
+      len(_w4) == 1 and "SUPPRESSED" in _w4[0] and "1.25" in _w4[0])
+_wg = cg._krea2_identity_param_warnings(1.25, 2048)
+check("grounding_px outside 384-1024 warns",
+      len(_wg) == 1 and "2048" in _wg[0])
+_wb = cg._krea2_identity_param_warnings(8.0, 128)
+check("both out of band → both warnings, still no exception", len(_wb) == 2)
+
+# ── Accepted-but-unapplied knobs (invariant N1) ──────────────────────────────
+# Krea2IdentityEditPipeline.__call__ NAMES guidance_scale / negative_prompt /
+# max_sequence_length but consumes them only on its no-reference passthrough
+# branch, so on the edit branch they are silently inert. That is not
+# hypothetical: FAMILY_DEFAULTS["krea"] (Raw) sets cfg_scale 3.5, so a user who
+# types nothing still loses CFG.
+print("\n── ADR-043 Part B: accepted-but-unapplied knobs ───────────────")
+
+import comfyless.family_defaults as _kfd  # noqa: E402
+check("premise: Krea-2-Raw's family default really does set cfg_scale > 0",
+      _kfd.FAMILY_DEFAULTS["krea"]["cfg_scale"] > 0,
+      f"got {_kfd.FAMILY_DEFAULTS['krea']!r}")
+check("premise: krea-turbo's family default is cfg 0 (the silent case)",
+      _kfd.FAMILY_DEFAULTS["krea-turbo"]["cfg_scale"] == 0.0)
+
+_ik_raw = cg._krea2_identity_ignored_knob_warnings(3.5, None, 512)
+check("krea-Raw's default cfg 3.5 warns that CFG is not applied",
+      len(_ik_raw) == 1 and "3.5" in _ik_raw[0]
+      and "WITHOUT classifier-free guidance" in _ik_raw[0], f"got {_ik_raw!r}")
+check("krea-turbo's cfg 0 + no negative + default msl is SILENT (NEGATIVE)",
+      cg._krea2_identity_ignored_knob_warnings(0.0, None, 512) == [])
+_ik_neg = cg._krea2_identity_ignored_knob_warnings(0.0, "blurry, low quality", 512)
+check("a negative prompt warns that the edit path has no negative lane",
+      len(_ik_neg) == 1 and "negative-prompt" in _ik_neg[0])
+check("an EMPTY negative prompt does not warn (NEGATIVE)",
+      cg._krea2_identity_ignored_knob_warnings(0.0, "", 512) == [])
+check("max_sequence_length at the schema default is silent (not noise)",
+      cg._krea2_identity_ignored_knob_warnings(0.0, None, 512) == [])
+_ik_msl = cg._krea2_identity_ignored_knob_warnings(0.0, None, 1024)
+check("a non-default max_sequence_length warns it is not applied",
+      len(_ik_msl) == 1 and "1024" in _ik_msl[0])
+check("all three at once → three warnings, still no exception",
+      len(cg._krea2_identity_ignored_knob_warnings(3.5, "x", 1024)) == 3)
+check("ignored-knob notices are wired into the identity block's edit_warnings",
+      "_krea2_identity_ignored_knob_warnings(" in _gen_src
+      and "cfg_scale, neg, max_sequence_length)" in _gen_src)
+
+# ── NAG pre-gate on the krea2-identity path (epic D6) ────────────────────────
+print("\n── ADR-043 Part B: NAG pre-gate (D6) ──────────────────────────")
+_active, _nwarn = cg._nag_gate("krea-turbo", 5.0, 0.0, ref_kind="krea2-identity")
+check("nag pre-gate: krea2-identity refs → inactive + loud warning",
+      _active is False and _nwarn is not None
+      and "attention processor" in _nwarn
+      and "WITHOUT negative guidance" in _nwarn, f"got {_nwarn!r}")
+check("nag pre-gate: no refs → NAG still activates on krea-turbo at cfg 0",
+      cg._nag_gate("krea-turbo", 5.0, 0.0) == (True, None))
+check("nag pre-gate: dormant nag_scale stays silent even with refs (NEGATIVE)",
+      cg._nag_gate("krea", None, 0.0, ref_kind="krea2-identity") == (False, None))
+
+# ── Delegation gate: Part B is CLI-foreground (epic D7) ──────────────────────
+print("\n── ADR-043 Part B: daemon delegation gate (D7) ────────────────")
+
+
+def _kargs(ref_image=()):
+    return _ap.Namespace(ref_image=list(ref_image))
+
+
+_KRB_DEF = cg.COMFYLESS_SCHEMA["ref_boost"][1]
+_KGP_DEF = cg.COMFYLESS_SCHEMA["grounding_px"][1]
+
+check("delegation gate: no refs → None even at non-default tuning "
+      "(text2img cannot consume these; it must keep delegating)",
+      cg._krea2_identity_forces_in_process(
+          _kargs(), {"ref_boost": 1.25, "grounding_px": 384}) is None)
+check("delegation gate: refs at SCHEMA DEFAULTS → None (daemon resolves same)",
+      cg._krea2_identity_forces_in_process(
+          _kargs(["a.png"]),
+          {"ref_boost": _KRB_DEF, "grounding_px": _KGP_DEF}) is None)
+check("delegation gate: refs with the keys ABSENT → None (defaults implied)",
+      cg._krea2_identity_forces_in_process(
+          _kargs(["a.png"]), {"seed": 1, "steps": 8}) is None)
+_kreason = cg._krea2_identity_forces_in_process(
+    _kargs(["a.png"]), {"ref_boost": 1.25, "grounding_px": _KGP_DEF})
+check("delegation gate: refs + non-default ref_boost → reason naming the flag",
+      _kreason is not None and "--ref-boost" in _kreason
+      and "--grounding-px" not in _kreason and "Part C" in _kreason,
+      f"got {_kreason!r}")
+_kreason2 = cg._krea2_identity_forces_in_process(
+    _kargs(["a.png"]), {"ref_boost": 1.25, "grounding_px": 384})
+check("delegation gate: both non-default → both flags named, in key order",
+      _kreason2 is not None and _kreason2.index("--ref-boost")
+      < _kreason2.index("--grounding-px"), f"got {_kreason2!r}")
+
+# THE REGRESSION THIS GATE ALMOST SHIPPED (code review 2026-07-31, finding 1).
+# generate() records ref_boost/grounding_px in EVERY sidecar, and --params puts
+# every sidecar key into explicit_keys — so a presence-based gate forced every
+# ref-bearing replay in-process, on qwen-edit and flux2 too. That breaks the
+# epic invariant "Non-krea --ref-image behaviour is untouched" AND re-arms the
+# 2026-07-26 warm-daemon crash (in-process load while the daemon holds VRAM).
+# A replayed sidecar carries the keys at their DEFAULTS; it must still delegate.
+_replayed_flux2_sidecar = {
+    "model": "/m", "prompt": "p", "seed": 7, "steps": 8, "cfg_scale": 4.0,
+    "ref_boost": _KRB_DEF, "grounding_px": _KGP_DEF,   # recorded, not chosen
+}
+check("delegation gate: REPLAY of a non-krea ref sidecar still delegates "
+      "(presence of the keys is not intent — the regression negative)",
+      cg._krea2_identity_forces_in_process(
+          _kargs(["kf.png"]), _replayed_flux2_sidecar) is None)
+# ...and the gate is not vacuous: the same replay WITH a tuned value holds back.
+check("delegation gate: a replay carrying a TUNED ref_boost does hold back",
+      cg._krea2_identity_forces_in_process(
+          _kargs(["kf.png"]), {**_replayed_flux2_sidecar, "ref_boost": 1.25})
+      is not None)
+# The gate must read the merged params, never explicit_keys — pin the wiring so
+# a future refactor cannot quietly reintroduce the presence test.
+check("delegation gate is called with the merged params, not explicit_keys",
+      "_krea2_identity_forces_in_process(args, p_cur)" in _gen_src
+      and "_krea2_identity_forces_in_process(args, explicit_keys)"
+          not in _gen_src)
+
+# ── Source pins: the generate() seams a GPU-free test cannot execute ─────────
+# Same idiom as the flux2 dims read-back above (test_nag.py's pattern).
+print("\n── ADR-043 Part B: generate() source pins ─────────────────────")
+check("dispatch: krea2-identity runs identity_edit_pipe_call, not pipe(...)",
+      'if ref_kind == "krea2-identity":' in _gen_src
+      and "result = cast(Any, identity_edit_pipe_call(" in _gen_src)
+check("dispatch: the identity signature drives sigint_pause (no swallowed hook)",
+      "with sigint_pause(Krea2IdentityEditPipeline.__call__," in _gen_src)
+check("dims read-back covers krea2-identity (sidecar records derived dims)",
+      'ref_kind in ("flux2-native", "krea2-identity")' in _gen_src)
+check("no-LoRA warning is gated on the identity kind and rides edit_warnings",
+      'if ref_kind == "krea2-identity" and not loras:' in _gen_src
+      and "edit_warnings.append(_no_lora)" in _gen_src)
+check("--rebalance is pre-gated OFF on the identity path (prompt would be lost)",
+      'if rebalance and ref_kind == "krea2-identity":' in _gen_src
+      and "edit_warnings.append(_rb_skip)" in _gen_src)
+# ...and the METADATA condition mirrors the apply-site skip. Without this the
+# sidecar recorded a rebalance block for a run that deliberately did not
+# rebalance — untruthful provenance (code review 2026-07-31, finding 3).
+check("metadata rebalance block mirrors the identity-path skip",
+      'if (rebalance and model_family in ("krea", "krea-turbo")\n'
+      '            and ref_kind != "krea2-identity"):' in _gen_src)
+# Non-vacuous: the apply-site and metadata conditions must BOTH carry the
+# exclusion, so count the occurrences rather than trusting one substring.
+check("the identity-path rebalance exclusion appears at apply AND record sites",
+      _gen_src.count('ref_kind == "krea2-identity"') >= 2
+      and _gen_src.count('ref_kind != "krea2-identity"') == 1)
+check("the identity-edit import is LAZY (a text2img run must not pay it)",
+      "from pipelines.krea2_identity_edit import (" in _gen_src
+      and "from pipelines.krea2_identity_edit import" not in
+          _gen_src[:_gen_src.index("def generate(")])
+check("ref_boost/grounding_px are recorded in the metadata dict",
+      '"ref_boost": ref_boost,' in _gen_src
+      and '"grounding_px": grounding_px,' in _gen_src)
+# NEGATIVE: the two scalars must NOT reach the daemon wire in Part B — the
+# validator would accept them and server.py would drop them silently.
+import inspect as _k2insp  # noqa: E402
+_wire_src = _k2insp.getsource(cg._build_server_request)
+check("NEGATIVE: _build_server_request does not send ref_boost/grounding_px",
+      "ref_boost" not in _wire_src and "grounding_px" not in _wire_src)
 
 
 # ── Summary ──────────────────────────────────────────────────────────────────

@@ -41,7 +41,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Sequence,
-                    Tuple, TypeGuard)
+                    Tuple, TypeGuard, cast)
 
 import torch
 
@@ -771,6 +771,13 @@ def _nag_gate(model_family: str, nag_scale: Optional[float],
     surfaces on the daemon's stderr, invisible to a delegated client. Gating
     in this function puts the skip into nag_warnings, which rides the wire
     metadata (invariant N1); the in-pipeline guard stays as defense in depth.
+
+    ADR-043 epic D6 extends that to krea2-identity, where the reason is
+    stronger than a missing guard: BOTH features swap the same Krea-2 attention
+    processor, and ADR-023 hazard H1 is precisely about processor-install
+    ordering on this family. There is no in-pipeline fallback here — this gate
+    is the only thing standing between the two, so it must not be relaxed
+    without an ADR.
     """
     if nag_scale is None or nag_scale <= 1.0:
         return False, None
@@ -787,6 +794,13 @@ def _nag_gate(model_family: str, nag_scale: Optional[float],
             f"nag_scale {nag_scale} skipped — NAG does not support the "
             f"reference-image path on {model_family} (nag_flux2 HF2-1). "
             f"Generation proceeds WITHOUT negative guidance."
+        )
+    if ref_kind == "krea2-identity":
+        return False, (
+            f"nag_scale {nag_scale} skipped — NAG and the identity edit both "
+            f"swap the {model_family} attention processor and cannot be "
+            f"co-active (ADR-043 epic D6; ADR-023 hazard H1). Generation "
+            f"proceeds WITHOUT negative guidance."
         )
     if cfg_owns and cfg_scale > 0:
         return False, (
@@ -1691,6 +1705,126 @@ def _apply_flux2_native_refs(
     return provenance
 
 
+def _apply_krea2_identity_refs(
+    call_kwargs: Dict[str, Any],
+    ref_images: List[Dict[str, str]],
+    ref_dims_explicit: bool,
+    ref_boost: float,
+    grounding_px: int,
+) -> List[Dict[str, Any]]:
+    """Thread validated refs + the two tuning scalars into the krea call (ADR-043).
+
+    Shaped exactly like :func:`_apply_flux2_native_refs` — the references ride
+    the same ``image=`` kwarg and the same single decode site — and the dispatch
+    site swaps the callable rather than the kwargs: with ``image`` present,
+    ``krea2_identity_edit.identity_edit_pipe_call`` runs the identity edit on
+    the stock cached pipeline instead of ``pipe(**call_kwargs)``. No fork, no
+    class swap, no new dispatch mode (epic D1/D2).
+
+    **Order is semantic and never reordered**: reference #1 becomes RoPE frame 1
+    (scene/context) and #2 frame 2 (identity) — proven by a swapped-order
+    positive control, which produced the other subject's face in the first
+    image's setting (epic D8). ``_load_ref_pils`` preserves list order, and the
+    count is already bounded at two by ``_resolve_ref_family_support``.
+
+    Dims follow the flux2-native convention (ADR-036 decision 5): dropped unless
+    the user set BOTH --width and --height, so the pipeline derives them from
+    the FIRST reference (≤1 MP, snapped to the token grid) and the caller reads
+    the resolved size back off the output image for a truthful sidecar. Returns
+    the provenance records (ADR-036 decision 7)."""
+    pils, provenance = _load_ref_pils(ref_images)
+    call_kwargs["image"] = pils
+    call_kwargs["ref_boost"] = float(ref_boost)
+    call_kwargs["grounding_px"] = int(grounding_px)
+    if not ref_dims_explicit:
+        call_kwargs.pop("height", None)
+        call_kwargs.pop("width", None)
+    return provenance
+
+
+def _krea2_identity_param_warnings(
+    ref_boost: float, grounding_px: int,
+) -> List[str]:
+    """Range sanity for the two ADR-043 scalars — warn, never block (D5's rule).
+
+    Neither value is structurally invalid at any magnitude (the bias builder
+    clamps ``ref_boost`` away from ``log(0)``), but both have measured useful
+    bands and a value outside them produces a legible non-result the user would
+    otherwise blame on the model:
+
+    - ``ref_boost <= 0`` is meaningless — the bias is ``log(ref_boost)``.
+    - ``ref_boost >= 1.5`` suppresses face-adjacent edits (at the card's own
+      default of 4.0 the edit is essentially absent); 1.0-1.25 is the measured
+      band for those (epic D4). Clothing-style edits DO want the high end, so
+      this is a warning, not a clamp.
+    - ``grounding_px`` outside 384-1024 leaves the range the vision tower was
+      exercised over.
+    """
+    warnings: List[str] = []
+    if ref_boost <= 0:
+        warnings.append(
+            f"ref_boost {ref_boost} <= 0 — the bias is log(ref_boost), so this "
+            f"is clamped to a large negative and effectively erases the source "
+            f"conditioning. Use > 0 (measured band 1.0-1.25 for face-adjacent "
+            f"edits; the model card's default is 4.0).")
+    elif ref_boost >= 1.5:
+        warnings.append(
+            f"ref_boost {ref_boost} copies harder from the region the edit is "
+            f"changing. Measured: face-adjacent edits (hair) are SUPPRESSED at "
+            f"1.5+ and essentially absent at 4.0; 1.25 was best. High values "
+            f"suit edits spatially separate from the identity, e.g. clothing "
+            f"(ADR-043 constraint 3).")
+    if not (384 <= grounding_px <= 1024):
+        warnings.append(
+            f"grounding_px {grounding_px} is outside the useful 384-1024 range "
+            f"(default 768); it caps the longest side fed to the VL tower.")
+    return warnings
+
+
+def _krea2_identity_ignored_knob_warnings(
+    cfg_scale: float, negative_prompt: Optional[str], max_sequence_length: int,
+) -> List[str]:
+    """Name the call kwargs the identity edit ACCEPTS but never applies.
+
+    ``Krea2IdentityEditPipeline.__call__`` declares ``guidance_scale``,
+    ``negative_prompt`` and ``max_sequence_length`` — the stock Krea-2
+    signature — but consumes them only on its no-reference passthrough branch.
+    The edit branch runs ONE forward per step with no negative lane (the model
+    card specifies CFG 1.0 for this mode) and encodes the instruction through
+    its own grounded encode, which does not truncate. So all three are inert
+    here, and a named-but-unused parameter is exactly the silent drop invariant
+    N1 forbids.
+
+    This is not hypothetical on Krea-2-**Raw**: `FAMILY_DEFAULTS["krea"]` sets
+    ``cfg_scale: 3.5``, so a user who types nothing at all still loses CFG and
+    any negative prompt. Warn (never block) so the loss is legible rather than
+    read as a model failure. krea-turbo defaults to cfg 0.0 and stays silent.
+
+    ``max_sequence_length`` is reported only when it differs from the schema
+    default — at 512 it is a value nobody chose, and warning about it every run
+    would be noise that trains the reader to skip these lines.
+    """
+    warnings: List[str] = []
+    if cfg_scale > 0:
+        warnings.append(
+            f"cfg_scale {cfg_scale} is NOT applied on the identity-edit path — "
+            f"it runs one forward per step with no negative lane (the model "
+            f"card specifies CFG 1.0 for this mode). Generation proceeds "
+            f"WITHOUT classifier-free guidance.")
+    if negative_prompt:
+        warnings.append(
+            "--negative-prompt is NOT applied on the identity-edit path — the "
+            "instruction is encoded through the grounded VL path, which has no "
+            "negative lane. Express the constraint in the instruction instead.")
+    _default_msl = COMFYLESS_SCHEMA["max_sequence_length"][1]
+    if max_sequence_length != _default_msl:
+        warnings.append(
+            f"max_sequence_length {max_sequence_length} is NOT applied on the "
+            f"identity-edit path — the grounded encode does not truncate the "
+            f"instruction.")
+    return warnings
+
+
 def _run_qwen_edit_refs(
     pipe, prompt: str, negative_prompt: Optional[str],
     ref_images: List[Dict[str, str]], *,
@@ -1739,15 +1873,35 @@ def _run_qwen_edit_refs(
 
 
 #: family → ref-execution kind (ADR-035 decision 2 routing table, executed by
-#: ADR-036). "qwen-edit" runs the manual edit loop; "flux2-native" threads the
-#: refs into the stock pipeline's `image=` kwarg (Flux2Pipeline and
-#: Flux2KleinPipeline share the signature and semantics — ADR-036 finding 4).
+#: ADR-036, extended by ADR-043). "qwen-edit" runs the manual edit loop;
+#: "flux2-native" threads the refs into the stock pipeline's `image=` kwarg
+#: (Flux2Pipeline and Flux2KleinPipeline share the signature and semantics —
+#: ADR-036 finding 4); "krea2-identity" runs the identity-preserving
+#: instruction edit through `pipelines.krea2_identity_edit` (ADR-043 / epic D1
+#: — no new mode, no new family string, entry stays `--ref-image`).
 _REF_FAMILY_KINDS: Dict[str, str] = {
     "qwen-edit":       "qwen-edit",
     "flux2klein":      "flux2-native",
     "flux2klein-base": "flux2-native",
     "flux2":           "flux2-native",
+    "krea":            "krea2-identity",
+    "krea-turbo":      "krea2-identity",
 }
+
+#: Execution kinds whose conditioning has no VL/Ref dual path, so MODE `vl` /
+#: `ref` is a hard error in BOTH strictness modes rather than a droppable extra
+#: (ADR-036 decision 3, reused by ADR-043 / epic D3: Krea's two conditioning
+#: paths — the grounded encode and the in-context source prepend — are always
+#: co-active, so selecting one of them is meaningless, never coerced to "both").
+_REF_KINDS_MODE_BOTH_ONLY = ("flux2-native", "krea2-identity")
+
+#: Krea-2 identity edit takes at most two sources, in the fixed semantic order
+#: #1 = scene (RoPE frame 1) / #2 = identity (frame 2) — epic D8, proven by a
+#: swapped-order positive control. Deliberately duplicated from
+#: `pipelines.krea2_identity_edit.MAX_SOURCES` (the QUANT_MODES precedent): this
+#: predicate must stay importable without pulling diffusers into the CLI's
+#: validation path. test_ref_edit.py asserts the two stay in sync.
+_KREA2_IDENTITY_MAX_REFS = 2
 
 
 def _resolve_ref_family_support(
@@ -1757,7 +1911,8 @@ def _resolve_ref_family_support(
     Finding 4; generalized to execution kinds by ADR-036).
 
     Returns ``(ref_kind, drop_warning)`` — ``ref_kind`` is ``"qwen-edit"``,
-    ``"flux2-native"``, or ``None`` (no refs, or the drop path).
+    ``"flux2-native"``, ``"krea2-identity"``, or ``None`` (no refs, or the
+    drop path).
     ``drop_warning`` is a loud message to BOTH record in ``edit_warnings`` (so
     it rides the wire metadata and is visible to a delegated interactive
     client — invariant N1) and print, when an unsupported family is handed
@@ -1766,16 +1921,21 @@ def _resolve_ref_family_support(
     Raises ``ValueError`` (a) when references are handed to an unsupported
     family under STRICT mode — machine clients and scripted CLI runs — because
     a silent keyframe drop in an unattended chain is the exact failure Finding
-    4 prevents; and (b) when a flux2-native family is handed a ``vl``/``ref``
-    MODE — those select qwen-edit's dual conditioning paths, which Flux.2's
-    reference conditioning does not have. (b) is hard in BOTH strictness modes
-    (ADR-036 decision 3): a typed ``:vl`` suffix is deliberate, never stumbled
-    into — the decision-2a unknown-suffix reasoning, not a droppable extra.
+    4 prevents; (b) when a flux2-native or krea2-identity family is handed a
+    ``vl``/``ref`` MODE — those select qwen-edit's dual conditioning paths,
+    which neither Flux.2's reference conditioning nor Krea-2's (always
+    co-active) pair has. (b) is hard in BOTH strictness modes (ADR-036
+    decision 3 / ADR-043 epic D3): a typed ``:vl`` suffix is deliberate, never
+    stumbled into — the decision-2a unknown-suffix reasoning, not a droppable
+    extra; and (c) when a krea2-identity run is handed more than two
+    references — the slots are semantic (#1 scene, #2 identity) and there is no
+    third, so a silent drop would read to the user as a model failure (ADR-043
+    constraint 2).
     Extracted as a predicate so all branches are unit-testable without a GPU."""
     if not ref_images:
         return None, None
     ref_kind = _REF_FAMILY_KINDS.get(model_family)
-    if ref_kind == "flux2-native":
+    if ref_kind in _REF_KINDS_MODE_BOTH_ONLY:
         bad_modes = sorted({s["mode"] for s in ref_images} - {"both"})
         if bad_modes:
             raise ValueError(
@@ -1783,6 +1943,13 @@ def _resolve_ref_family_support(
                 f"for model family {model_family!r} — its reference "
                 f"conditioning has no VL/Ref dual path; only 'both' (the "
                 f"default) is valid (ADR-036 decision 3).")
+    if (ref_kind == "krea2-identity"
+            and len(ref_images) > _KREA2_IDENTITY_MAX_REFS):
+        raise ValueError(
+            f"--ref-image: {model_family} identity edit accepts at most "
+            f"{_KREA2_IDENTITY_MAX_REFS} references (#1 = scene/context, "
+            f"#2 = identity); got {len(ref_images)}. Refusing rather than "
+            f"silently dropping the extras (ADR-043 constraint 2).")
     if ref_kind is not None:
         return ref_kind, None
     msg = (f"--ref-image not supported for model family {model_family!r} "
@@ -1848,6 +2015,12 @@ def generate(
     ref_images: Optional[List[Dict[str, str]]] = None,
     ref_dims_explicit: bool = False,
     ref_drop_strict: bool = False,
+    # Krea-2 identity edit tuning (ADR-043). Consumed ONLY on the
+    # krea2-identity reference path; a loud skip elsewhere, like the NAG
+    # quadruple. Defaults mirror the model card — see params_schema for why
+    # the useful ref_boost is task-dependent rather than this number.
+    ref_boost: float = 4.0,
+    grounding_px: int = 768,
 ) -> Dict[str, Any]:
     """Generate a single image and save it.
 
@@ -2022,6 +2195,21 @@ def generate(
     if _cached_pipeline is None:
         lora_outcomes = _apply_loras(pipe, loras)
 
+    # ADR-043 epic D5: the identity behaviour lives ENTIRELY in the LoRA, and
+    # nothing in model_index.json can detect its presence — a krea checkpoint
+    # with no LoRA runs this path happily and returns a plain re-render, which
+    # reads as "the feature doesn't work". Warn loudly and proceed (house rule:
+    # warn, don't block); the message rides edit_warnings so a delegated client
+    # sees it too (invariant N1). No FAMILY_DEFAULTS row is added for this.
+    if ref_kind == "krea2-identity" and not loras:
+        _no_lora = (
+            f"--ref-image on {model_family} runs the identity edit (ADR-043), "
+            f"whose behaviour lives in the krea2-identity-edit LoRA — and no "
+            f"--lora is loaded. Expect a plain re-render rather than an "
+            f"identity-preserving edit. Proceeding.")
+        edit_warnings.append(_no_lora)
+        print(f"[comfyless] WARNING: {_no_lora}", file=sys.stderr)
+
     # ── Build generator ───────────────────────────────────────────────
     exec_device = getattr(pipe, "_execution_device", None) or device
     generator = torch.Generator(device=exec_device).manual_seed(seed)
@@ -2048,6 +2236,29 @@ def generate(
             call_kwargs, ref_images, ref_dims_explicit)
         _log(f"[comfyless] {model_family} reference conditioning: "
              f"{len(ref_images)} ref(s)"
+             + ("" if ref_dims_explicit else ", dims derived from reference"))
+
+    # ── krea2-identity reference conditioning (ADR-043) ───────────────
+    # Same shape as flux2-native — refs ride `image=` through the generic call
+    # path, decoded at the single decode site — with the two tuning scalars
+    # alongside. The dispatch site swaps the CALLABLE (identity_edit_pipe_call)
+    # rather than the kwargs, so the cached pipeline object is never mutated.
+    if ref_kind == "krea2-identity":
+        ref_provenance = _apply_krea2_identity_refs(
+            call_kwargs, ref_images, ref_dims_explicit, ref_boost, grounding_px)
+        # Range warnings, plus the knobs this path ACCEPTS but never applies.
+        # Both ride edit_warnings for the same invariant-N1 reason as the
+        # no-LoRA notice: on a delegated run this stderr is the daemon's log.
+        for _kw in (_krea2_identity_param_warnings(ref_boost, grounding_px)
+                    + _krea2_identity_ignored_knob_warnings(
+                        cfg_scale, neg, max_sequence_length)):
+            edit_warnings.append(_kw)
+            print(f"[comfyless] WARNING: {_kw}", file=sys.stderr)
+        _slots = ("scene" if len(ref_images) == 1
+                  else "#1 scene / #2 identity")
+        _log(f"[comfyless] {model_family} identity edit: {len(ref_images)} "
+             f"ref(s) ({_slots}), ref_boost={ref_boost}, "
+             f"grounding_px={grounding_px}"
              + ("" if ref_dims_explicit else ", dims derived from reference"))
 
     # ── NAG negative guidance (ADR-023; krea family only) ────────────
@@ -2119,7 +2330,23 @@ def generate(
         print(f"[comfyless] WARNING: NAG — {_w}", file=sys.stderr)
 
     # ── Krea conditioning rebalance (optional) ────────────────────────
-    if rebalance and model_family in ("krea", "krea-turbo"):
+    # Pre-gated OFF on the identity-edit path, for the same reason NAG is:
+    # _apply_krea_rebalance POPS `prompt` and substitutes prompt_embeds, but
+    # the identity edit runs its OWN grounded encode (the instruction must go
+    # through the VL tower with the source pixels). Letting both run would swap
+    # in embeds the identity call ignores while destroying the instruction —
+    # a silent, total loss of the prompt. Loud skip instead (ADR-043 epic D6's
+    # reasoning, applied to the other krea-family processor consumer).
+    if rebalance and ref_kind == "krea2-identity":
+        _rb_skip = (
+            f"--rebalance skipped — it replaces the prompt with pre-encoded "
+            f"embeds, but the {model_family} identity edit encodes the "
+            f"instruction itself, grounded on the reference pixels (ADR-043). "
+            f"Running both would discard the prompt. Generation proceeds "
+            f"WITHOUT rebalance.")
+        edit_warnings.append(_rb_skip)
+        print(f"[comfyless] WARNING: {_rb_skip}", file=sys.stderr)
+    elif rebalance and model_family in ("krea", "krea-turbo"):
         weights = rebalance_weights if rebalance_weights is not None \
             else KREA_REBALANCE_DEFAULT_WEIGHTS
         _log(f"[comfyless] Krea rebalance: mult={rebalance_mult}, weights={weights}")
@@ -2136,7 +2363,8 @@ def generate(
         # site below; width/height here are the unused text2img defaults. A
         # flux2-native ref run without explicit dims likewise derives them in
         # the pipeline, so the defaults would be a lie in the log.
-        _dims = ("ref-derived" if ref_kind == "flux2-native"
+        _dims = ("ref-derived"
+                 if ref_kind in ("flux2-native", "krea2-identity")
                  and not ref_dims_explicit else f"{width}x{height}")
         _log(f"[comfyless] Generating: {_dims}, "
              f"steps={steps}, cfg={cfg_scale}, seed={seed}, sampler={sampler}")
@@ -2237,7 +2465,26 @@ def generate(
         # proxy for the NAG wrappers (all four accept the callback).
         from comfyless.pause import sigint_pause
         with swap_sampler(pipe, effective_sampler, log_prefix="[comfyless]"):
-            if nag_active:
+            if ref_kind == "krea2-identity":
+                # ADR-043: unbound Krea2IdentityEditPipeline.__call__ on the
+                # (possibly cached) stock pipeline — the NAG precedent exactly.
+                # ref_boost processors install per call and restore in a
+                # finally, so the cached object's class and shape never change
+                # and the two scalars stay out of any cache key. The import is
+                # lazy: a text2img run must not pay it.
+                # sigint_pause is handed the IDENTITY signature, not
+                # pipe.__call__ — that call has no callback_on_step_end, so the
+                # hook correctly no-ops here rather than injecting a callback
+                # the edit loop would silently swallow through **kwargs.
+                from pipelines.krea2_identity_edit import (
+                    Krea2IdentityEditPipeline, identity_edit_pipe_call)
+                with sigint_pause(Krea2IdentityEditPipeline.__call__,
+                                  call_kwargs, enabled=interactive_pause):
+                    # cast: the unbound __call__ is annotated with the
+                    # return_dict=False tuple in its union; we never pass it.
+                    result = cast(Any, identity_edit_pipe_call(
+                        pipe, **call_kwargs))
+            elif nag_active:
                 # Unbound Krea2NAGPipeline.__call__ on the (possibly cached)
                 # stock pipeline: NAG processors are installed per-call and
                 # restored in a finally, so the cached object's class and
@@ -2254,10 +2501,12 @@ def generate(
                 result.images, pipe, upscale_vae, height, width, device)
         else:
             final_pil = result.images[0]
-    if ref_kind == "flux2-native" and not ref_dims_explicit:
-        # ADR-036 decision 5: dims were pipeline-derived from the first
-        # reference — read the resolved size back so the sidecar records the
-        # truth (upscale never coexists: it is Qwen/Wan-gated above).
+    if (ref_kind in ("flux2-native", "krea2-identity")
+            and not ref_dims_explicit):
+        # ADR-036 decision 5 (ADR-043 inherits it): dims were pipeline-derived
+        # from the first reference — read the resolved size back so the sidecar
+        # records the truth (upscale never coexists: it is Qwen/Wan-gated
+        # above, which excludes both flux2 and krea).
         width, height = final_pil.size
     elapsed = time.monotonic() - t0
     _log(f"[comfyless] Generated in {elapsed:.1f}s")
@@ -2303,6 +2552,13 @@ def generate(
         "nag_tau": nag_tau,
         "nag_alpha": nag_alpha,
         "nag_end": nag_end,
+        # Krea-2 identity edit pair (ADR-043) — sidecar-replayable like the NAG
+        # quadruple, and for the same reason: they change output CONTENT. Both
+        # are recorded UNCONDITIONALLY (not gated on ref_kind), matching how
+        # nag_* records on every run: a schema key that appears only sometimes
+        # makes --params replay depend on which family produced the sidecar.
+        "ref_boost": ref_boost,
+        "grounding_px": grounding_px,
         # ADR-030: 2× upscale-VAE decode. width/height above are the GEN
         # (pre-upscale) resolution; when active the saved PNG is 2× each.
         # Canonical schema keys → sidecar-replayable: re-pass --upscale-vae /
@@ -2339,7 +2595,12 @@ def generate(
         metadata["ref_images"] = ref_provenance
     if edit_warnings:
         metadata["edit_warnings"] = edit_warnings
-    if rebalance and model_family in ("krea", "krea-turbo"):
+    # The condition MIRRORS the apply-site branch above, including its
+    # identity-path skip: recording a rebalance block for a run the pre-gate
+    # skipped would make the sidecar claim conditioning that never ran (code
+    # review 2026-07-31). The skip itself is already in edit_warnings.
+    if (rebalance and model_family in ("krea", "krea-turbo")
+            and ref_kind != "krea2-identity"):
         metadata["rebalance"] = {
             "mult": rebalance_mult,
             "weights": rebalance_weights if rebalance_weights is not None
@@ -2513,6 +2774,25 @@ def _parse_args() -> argparse.Namespace:
                    help="[--nag-scale] Fraction of steps NAG applies to "
                         "(default 1.0 = full window; 0.5-0.75 trades "
                         "guidance strength for speed).")
+    # Krea-2 identity edit (ADR-043). None SENTINELS, same reason as the NAG
+    # quadruple: a sidecar's values survive --params replay unless the CLI
+    # explicitly overrides them.
+    p.add_argument("--ref-boost", type=float, default=None,
+                   help="[krea + --ref-image] Identity-edit reference strength "
+                        "(ADR-043). Adds log(ref_boost) to the attention logits "
+                        "where the target attends to the prepended source, so "
+                        "HIGHER copies harder from the region the edit is "
+                        "changing. Measured: hair/face-adjacent edits work near "
+                        "1.25 and are suppressed at the card's default 4.0, "
+                        "which suits edits spatially separate from the identity "
+                        "(clothing). 1.0 is a no-op (stock attention). Recorded "
+                        "in the sidecar and replayed by --params.")
+    p.add_argument("--grounding-px", type=int, default=None,
+                   help="[krea + --ref-image] Longest side fed to the Qwen3-VL "
+                        "vision tower for the grounded instruction encode "
+                        "(default 768, useful 384-1024). The weaker of the two "
+                        "levers; 384 retained slightly more skin texture than "
+                        "768 in measurement.")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--offload-vae", action="store_true")
     p.add_argument("--attention-slicing", action="store_true",
@@ -3392,6 +3672,58 @@ def _should_delegate_to_server(args: argparse.Namespace,
     is unchanged either way: it still depends only on savepath / default-output
     / explicit --output, and it is what the D3a gate consults for scope."""
     return bool(args.savepath) or using_default_output
+
+
+#: The two ADR-043 tuning keys, in the order they are reported to the user.
+_KREA2_TUNING_KEYS = ("ref_boost", "grounding_px")
+
+
+def _krea2_identity_forces_in_process(
+    args: argparse.Namespace, params: Dict[str, Any],
+) -> Optional[str]:
+    """Reason to keep a run in-process for ADR-043, or None (ADR-043 Part B).
+
+    Part B is CLI-foreground only (epic D7): `ref_boost` / `grounding_px` do NOT
+    ride the daemon wire, and `server.py` does not forward them to `generate()`
+    — that is Part C, which is Red Zone and carries its own review. Because both
+    keys are now SCHEMA_KIND members the canonical validator WOULD accept them
+    on the wire, and the daemon would then ignore them: an accepted-and-dropped
+    parameter, the exact silent failure invariant N1 exists to prevent.
+
+    So a reference run whose tuning was deliberately chosen runs in-process
+    instead of delegating.
+
+    "Deliberately chosen" is measured by the VALUE diverging from the schema
+    default, never by the key's presence. Key-presence was the first
+    implementation and it was wrong (code review 2026-07-31): `generate()`
+    records both keys in EVERY sidecar, and `--params` puts every sidecar key
+    into ``explicit_keys``, so presence-testing forced every ref-bearing replay
+    in-process — on qwen-edit and flux2 too. That broke the epic invariant
+    "Non-krea --ref-image behaviour is untouched" and re-armed the 2026-07-26
+    warm-daemon failure: a forced in-process model load while the daemon still
+    holds its pipeline's VRAM is a crash on a single-GPU box, not a degrade.
+
+    At the default values the two planes agree by construction — client and
+    daemon resolve the same schema defaults and the recorded sidecar is
+    truthful — so a defaults-valued run delegates whether or not it is a replay.
+    The gate additionally requires `--ref-image`, the only path that consumes
+    these at all, so plain text2img is untouched in every case.
+
+    Returns the loud user-facing reason so the caller can print it, or None when
+    delegation may proceed. A pure predicate, so it is unit-testable without a
+    daemon."""
+    if not getattr(args, "ref_image", None):
+        return None
+    tuned = [k for k in _KREA2_TUNING_KEYS
+             if params.get(k, COMFYLESS_SCHEMA[k][1]) != COMFYLESS_SCHEMA[k][1]]
+    if not tuned:
+        return None
+    flags = ", ".join("--" + k.replace("_", "-") for k in tuned)
+    return (
+        f"--ref-image run with non-default {flags} — running in-process rather "
+        f"than delegating to the daemon, which does not carry the krea "
+        f"identity-edit tuning yet (ADR-043 Part C). Delegating would silently "
+        f"apply the defaults instead.")
 
 
 def refuse_out_of_roots_refs(args: argparse.Namespace,
@@ -4290,7 +4622,15 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
         # is the authoritative ref-containment gate; a reference it refuses comes
         # back as RefPathError and _delegate_to_server falls back to in-process
         # with a warning (no client-side ref-root gate).
-        if _should_delegate_to_server(args, using_default_output):
+        # ADR-043 Part B: an identity-edit run with deliberately-chosen tuning
+        # stays in-process — the wire cannot carry ref_boost/grounding_px yet,
+        # so delegating would apply the defaults without saying so.
+        _krea2_local = _krea2_identity_forces_in_process(args, p_cur)
+        _may_delegate = _should_delegate_to_server(args, using_default_output)
+        if _krea2_local and _may_delegate:
+            print(f"[comfyless] {_krea2_local}", file=sys.stderr)
+            _may_delegate = False
+        if _may_delegate:
             # Pre-expand iteration tokens client-side so the daemon receives a
             # template it can finish resolving (%seed%, %model%, etc.) without
             # needing to know about iteration at all.
@@ -4405,6 +4745,11 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                 # a detached stdin fails toward strict.
                 ref_drop_strict=not (sys.stdin is not None
                                      and sys.stdin.isatty()),
+                # ADR-043: krea identity-edit tuning. Sourced from the merged
+                # params (like the NAG quadruple), so a --params sidecar's
+                # values replay; inert with a loud skip on every other family.
+                ref_boost=p_cur.get("ref_boost", 4.0),
+                grounding_px=p_cur.get("grounding_px", 768),
             )
             if iterate_batch_id:
                 metadata["iterate_batch_id"] = iterate_batch_id
