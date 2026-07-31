@@ -163,6 +163,15 @@ _generate_canonical = {
         # strict on the daemon), not sidecar-shaped — a dropped-vs-applied
         # record is provenance, but the strictness knob itself does not replay.
         "ref_drop_strict",
+        # ADR-043: the identity-edit OPT-IN. Entry mode, not a generation
+        # parameter — deliberately schema-less so it is never recorded in a
+        # sidecar nor replayed by --params (Grant, 2026-07-31: "a sidecar
+        # consumer doesn't care that the image was generated with --identity,
+        # it's going to do something going forward with that image"). Same
+        # shape as the two above: it selects HOW the run is dispatched, while
+        # what it produces is already described by ref_images + ref_boost +
+        # grounding_px, which ARE schema keys.
+        "identity",
     }
 }
 _missing_from_schema = _generate_canonical - set(schema.keys())

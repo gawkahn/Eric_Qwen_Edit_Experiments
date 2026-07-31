@@ -895,16 +895,19 @@ _k1 = [{"path": _p_both, "mode": "both"}]
 _k2 = [{"path": _p_both, "mode": "both"}, {"path": _p_vl, "mode": "both"}]
 _k3 = _k2 + [{"path": _p_both, "mode": "both"}]
 
-# Routing: both krea families resolve to the identity-edit kind, in BOTH
-# strictness modes — the family SUPPORTS references, so there is no drop path.
+# Routing: both krea families resolve to the identity-edit kind WHEN OPTED IN,
+# in BOTH strictness modes — with --identity the family supports references, so
+# there is no drop path.
 for _fam in ("krea", "krea-turbo"):
     for _strict in (True, False):
-        _kind, _warn = cg._resolve_ref_family_support(_k1, _fam, _strict)
-        check(f"krea2-identity: {_fam} + 1 ref (strict={_strict}) → "
-              f"('krea2-identity', None)",
+        _kind, _warn = cg._resolve_ref_family_support(
+            _k1, _fam, _strict, identity=True)
+        check(f"krea2-identity: {_fam} + 1 ref + --identity (strict={_strict}) "
+              f"→ ('krea2-identity', None)",
               _kind == "krea2-identity" and _warn is None,
               f"got {(_kind, _warn)!r}")
-_kind, _warn = cg._resolve_ref_family_support(_k2, "krea-turbo", True)
+_kind, _warn = cg._resolve_ref_family_support(
+    _k2, "krea-turbo", True, identity=True)
 check("krea2-identity: two refs are the supported two-source path",
       _kind == "krea2-identity" and _warn is None)
 
@@ -913,6 +916,55 @@ check("krea2-identity: two refs are the supported two-source path",
 check("krea2-identity: no refs → (None, None), krea text2img unchanged",
       cg._resolve_ref_family_support([], "krea-turbo", True) == (None, None))
 
+# ---------------------------------------------------------------------------
+# ADR-043 --identity OPT-IN. The identity edit is one reading of "reference
+# image on a krea checkpoint", not the only conceivable one, so it must not
+# claim the surface implicitly (Grant, 2026-07-31). Without the flag the refs
+# take the ordinary drop path — the pre-routing-row behaviour exactly.
+# ---------------------------------------------------------------------------
+for _fam in ("krea", "krea-turbo"):
+    # Lenient: dropped with a loud warning that NAMES the flag. "not supported
+    # for krea" would be a lie — the user is one word away from what they want.
+    _kind, _warn = cg._resolve_ref_family_support(_k1, _fam, False)
+    check(f"--identity opt-in: {_fam} + refs WITHOUT the flag → dropped, "
+          f"not routed",
+          _kind is None and _warn is not None and "--identity" in _warn,
+          f"got {(_kind, _warn)!r}")
+    # Strict: a machine/scripted run fails closed rather than silently
+    # generating something that ignores the references (Finding 4).
+    _raised = None
+    try:
+        cg._resolve_ref_family_support(_k1, _fam, True)
+    except ValueError as e:
+        _raised = str(e)
+    check(f"--identity opt-in: {_fam} STRICT without the flag → ValueError "
+          f"naming the flag",
+          _raised is not None and "--identity" in _raised
+          and "Refusing" in _raised, f"got {_raised!r}")
+
+# The opt-in is scoped to krea: it must not gate the families that already
+# routed before ADR-043 existed (the epic's "non-krea --ref-image is
+# untouched" invariant). NEGATIVE case — proves the gate did not over-reach.
+for _fam, _expect in (("qwen-edit", "qwen-edit"), ("flux2", "flux2-native"),
+                      ("flux2klein", "flux2-native")):
+    check(f"--identity opt-in does NOT gate {_fam} (routes with identity=False)",
+          cg._resolve_ref_family_support(_k1, _fam, True) == (_expect, None))
+    check(f"--identity is inert for {_fam} (identity=True changes nothing)",
+          cg._resolve_ref_family_support(_k1, _fam, True, identity=True)
+          == (_expect, None))
+
+# The flag is ENTRY MODE, not a generation parameter (Grant, 2026-07-31): a
+# sidecar consumer does something FORWARD with the image and does not care how
+# it was made. So it must have no schema key, and therefore no sidecar record
+# and no --params replay. Pin all three, or it drifts into the schema later.
+check("--identity has NO COMFYLESS_SCHEMA key (entry mode, not a gen param)",
+      "identity" not in cg.COMFYLESS_SCHEMA)
+import inspect as _inspect  # noqa: E402
+check("generate() takes identity as a call parameter, like ref_drop_strict",
+      "identity" in _inspect.signature(cg.generate).parameters)
+check("the CLI sources identity from args, NOT from the merged params",
+      "identity=bool(getattr(args, \"identity\", False))" in _gen_src)
+
 # MODE vl/ref is a hard error in BOTH strictness modes (epic D3): Krea's two
 # conditioning paths are always co-active, so selecting one is meaningless.
 for _bad in ("vl", "ref"):
@@ -920,7 +972,8 @@ for _bad in ("vl", "ref"):
         _raised = None
         try:
             cg._resolve_ref_family_support(
-                [{"path": _p_both, "mode": _bad}], "krea", _strict)
+                [{"path": _p_both, "mode": _bad}], "krea", _strict,
+                identity=True)
         except ValueError as e:
             _raised = str(e)
         check(f"krea2-identity: MODE {_bad} → hard ValueError (strict={_strict})",
@@ -941,7 +994,7 @@ check("qwen-edit + MODE vl still routes (not caught by the both-only gate)",
 # a dropped reference reads to the user as a model failure (ADR-043 c2).
 _raised = None
 try:
-    cg._resolve_ref_family_support(_k3, "krea-turbo", True)
+    cg._resolve_ref_family_support(_k3, "krea-turbo", True, identity=True)
 except ValueError as e:
     _raised = str(e)
 check("krea2-identity: 3 refs → ValueError naming the 2-source max + slots",
@@ -949,7 +1002,7 @@ check("krea2-identity: 3 refs → ValueError naming the 2-source max + slots",
       and "identity" in _raised and "3" in _raised, f"got {_raised!r}")
 _raised = None
 try:
-    cg._resolve_ref_family_support(_k3, "krea-turbo", False)
+    cg._resolve_ref_family_support(_k3, "krea-turbo", False, identity=True)
 except ValueError as e:
     _raised = str(e)
 check("krea2-identity: 3 refs is hard even under LENIENT (not a droppable extra)",
@@ -1069,8 +1122,8 @@ check("nag pre-gate: dormant nag_scale stays silent even with refs (NEGATIVE)",
 print("\n── ADR-043 Part B: daemon delegation gate (D7) ────────────────")
 
 
-def _kargs(ref_image=()):
-    return _ap.Namespace(ref_image=list(ref_image))
+def _kargs(ref_image=(), identity=False):
+    return _ap.Namespace(ref_image=list(ref_image), identity=identity)
 
 
 _KRB_DEF = cg.COMFYLESS_SCHEMA["ref_boost"][1]
@@ -1098,6 +1151,38 @@ _kreason2 = cg._krea2_identity_forces_in_process(
 check("delegation gate: both non-default → both flags named, in key order",
       _kreason2 is not None and _kreason2.index("--ref-boost")
       < _kreason2.index("--grounding-px"), f"got {_kreason2!r}")
+
+# --identity forces in-process on its own, at ANY tuning. It has no schema key
+# (by design — entry mode), so it cannot ride the wire at all; delegating would
+# put server.py on the identity path having never seen the opt-in. Wire
+# carriage is Part C, where server.py gets its Red Zone review.
+_kid = cg._krea2_identity_forces_in_process(
+    _kargs(["a.png"], identity=True),
+    {"ref_boost": _KRB_DEF, "grounding_px": _KGP_DEF})
+check("delegation gate: --identity forces in-process even at DEFAULT tuning",
+      _kid is not None and "--identity" in _kid and "Part C" in _kid,
+      f"got {_kid!r}")
+# --identity with NO refs is a plain text2img run, so it still delegates —
+# forcing a model load in-process for a no-op would trade a warm daemon's VRAM
+# for nothing. But the NOTICE is still owed, and generate()'s no-op warning
+# cannot deliver it here: the daemon runs generate() with identity=False and
+# its stderr is not the user's terminal. So the CLI must warn CLIENT-side
+# before delegating. The original version of this test asserted the delegation
+# and claimed "the no-op warning covers it" — it did not, and the test
+# enshrined a fully silent drop (code review 2026-07-31, findings 1 + 2).
+check("delegation gate: --identity WITHOUT refs still delegates "
+      "(plain text2img — no reason to force a load)",
+      cg._krea2_identity_forces_in_process(
+          _kargs(identity=True),
+          {"ref_boost": _KRB_DEF, "grounding_px": _KGP_DEF}) is None)
+check("...and the CLI warns CLIENT-side before that delegation, so the "
+      "notice does not depend on whether a daemon is up",
+      'if _may_delegate and getattr(args, "identity", False) \\\n'
+      '                and not args.ref_image:' in _gen_src
+      and "_identity_noop_message(_IDENTITY_NOOP_NO_REFS)" in _gen_src)
+check("the client-side and generate()-side notices share ONE builder "
+      "(they cannot drift into differently-worded versions)",
+      _gen_src.count("_identity_noop_message(") >= 3)  # def + 2 call sites
 
 # THE REGRESSION THIS GATE ALMOST SHIPPED (code review 2026-07-31, finding 1).
 # generate() records ref_boost/grounding_px in EVERY sidecar, and --params puts
@@ -1139,6 +1224,25 @@ check("dims read-back covers krea2-identity (sidecar records derived dims)",
 check("no-LoRA warning is gated on the identity kind and rides edit_warnings",
       'if ref_kind == "krea2-identity" and not loras:' in _gen_src
       and "edit_warnings.append(_no_lora)" in _gen_src)
+# The --identity no-op warning is the load-bearing implementation of the
+# warn-never-fail decision, and until this pin existed deleting the whole block
+# passed every suite (code review 2026-07-31, finding 4).
+check("--identity no-op warning exists and rides edit_warnings",
+      'if identity and ref_kind != "krea2-identity":' in _gen_src
+      and "edit_warnings.append(_id_noop)" in _gen_src)
+check("--identity no-op covers BOTH arms (no refs, and wrong family)",
+      "_IDENTITY_NOOP_NO_REFS if not ref_images else" in _gen_src
+      and "has no identity edit" in _gen_src)
+# ref_boost/grounding_px on a non-identity run: accepted, RECORDED in the
+# sidecar, never applied. Silent until this warning existed, while the
+# delegation gate's own message implied in-process would apply them
+# (code review 2026-07-31, finding 3).
+check("non-identity runs warn that ref_boost/grounding_px are NOT applied",
+      'if ref_kind != "krea2-identity":' in _gen_src
+      and "edit_warnings.append(_inert_msg)" in _gen_src)
+check("...and only when the user actually diverged from the schema default "
+      "(the default is nobody's choice — warning on it would be noise)",
+      "if _v != COMFYLESS_SCHEMA[_k][1]" in _gen_src)
 check("--rebalance is pre-gated OFF on the identity path (prompt would be lost)",
       'if rebalance and ref_kind == "krea2-identity":' in _gen_src
       and "edit_warnings.append(_rb_skip)" in _gen_src)
@@ -1152,7 +1256,12 @@ check("metadata rebalance block mirrors the identity-path skip",
 # exclusion, so count the occurrences rather than trusting one substring.
 check("the identity-path rebalance exclusion appears at apply AND record sites",
       _gen_src.count('ref_kind == "krea2-identity"') >= 2
-      and _gen_src.count('ref_kind != "krea2-identity"') == 1)
+      # Pin the RECORD-site condition verbatim rather than counting `!=`
+      # globally: --identity's no-op warning legitimately uses the same
+      # comparison, so a bare count stopped measuring what it claimed to.
+      and _gen_src.count(
+          'if (rebalance and model_family in ("krea", "krea-turbo")\n'
+          '            and ref_kind != "krea2-identity"):') == 1)
 check("the identity-edit import is LAZY (a text2img run must not pay it)",
       "from pipelines.krea2_identity_edit import (" in _gen_src
       and "from pipelines.krea2_identity_edit import" not in

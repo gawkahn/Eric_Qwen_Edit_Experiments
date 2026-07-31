@@ -105,6 +105,69 @@ Three constraints are load-bearing and are the reason this ADR exists:
 
 **Changelog:**
 
+- 2026-07-31 — **`--identity` opt-in added; the mode no longer claims
+  `--ref-image` on krea implicitly.** Grant raised this on review of Part B:
+  the trigger was `--ref-image` + krea family with no flag, and "Krea can
+  almost certainly take a non-identity-focused reference image conditioning
+  too." Two facts bounded the concern — diffusers 0.39.0 exports only
+  `Krea2Pipeline` (whose `__call__` has **no `image` parameter**) and
+  `Krea2Transformer2DModel`, and before Part B `--ref-image` on krea hit the
+  drop path, so nothing that worked stopped working. But the objection is
+  right forward-looking: the identity edit is one reading of "reference image
+  on a krea checkpoint," its behaviour lives ENTIRELY in a LoRA nothing can
+  detect (D5), and a surface claimed implicitly cannot be shared later without
+  a retroactive second dispatch axis.
+
+  **Not gated on LoRA detection**, though that is the true precondition: a
+  LoRA's identity is a user-chosen catalog name with no structural marker, so a
+  filename heuristic would silently mis-route a renamed file in both
+  directions. That argument justifies not *blocking* (D5's warn-don't-block
+  stands) — it does not justify refusing an explicit opt-in.
+
+  Shape, per Grant's decisions: `--identity` is **entry mode, not a generation
+  parameter** — no `COMFYLESS_SCHEMA` key, no sidecar record, no `--params`
+  replay ("a sidecar consumer doesn't care that the image was generated with
+  --identity, it's going to do something going forward with that image"). It
+  sits beside `ref_drop_strict` / `ref_dims_explicit`, which are call
+  parameters for the same reason. On a family with no identity edit, or with no
+  `--ref-image`, it **warns and proceeds** rather than failing.
+
+  **Consequence, accepted deliberately:** having no schema key means it cannot
+  ride the daemon wire, and `server.py` would otherwise enter the identity path
+  never having seen the opt-in. So an `--identity` run is forced in-process
+  until Part C carries it (server.py is Red Zone). Practical cost is near zero
+  — the measured-best `ref_boost` is 1.25, already non-default, so those runs
+  were staying in-process on the tuning branch anyway.
+
+  Without the flag, krea references take the ordinary drop path: hard
+  `ValueError` under strict (machine/scripted), loud warn-and-drop when
+  lenient. Both messages NAME `--identity` rather than claiming krea is
+  unsupported, which would be a lie. A `--params` replay of an identity
+  sidecar therefore does not silently re-enter the mode — it hits that same
+  loud path, and the flag must be re-typed.
+
+  `code-reviewer` (Fable, 46/46 model records, no fallback) found that the
+  no-op warning was a **fully silent drop on the delegated path**:
+  `--identity` with no `--ref-image` and a warm daemon delegated, the daemon ran
+  `generate()` with `identity=False`, and the warning fired nowhere — so
+  whether the user was told depended on whether a daemon happened to be up. The
+  CLI now also warns client-side before delegating (the run itself is plain
+  text2img and still delegates — only the notice was owed), both sites share one
+  message builder, and the test that had asserted "the no-op warning covers it"
+  was corrected: it had enshrined the silent drop. Two further gaps closed in
+  the same pass — the no-op block had no test at all (deleting it passed every
+  suite), and `ref_boost`/`grounding_px` on a NON-identity family were accepted,
+  recorded in the sidecar, and never applied with no warning, while the
+  delegation gate's own message implied running in-process would apply them.
+  That last one predates this slice (Part B), but this slice's own comment
+  claimed the skip existed, so it is closed here rather than deferred.
+
+  Verified live: with the flag, output is **bit-identical** to the pre-flag run
+  (entry changed, generation did not) and still 0.53/255 from the port golden;
+  the sidecar carries no `identity` key; wrong-family and no-refs both warn and
+  proceed; qwen-edit's reference edit still runs normally under a stray
+  `--identity`; with a daemon up the run stays in-process with the loud reason
+  while plain krea keeps delegating.
 - 2026-07-31 — **First GPU run. Parity reached; two Part A defects found, and
   constraint 1 amended.** Both defects were invisible to 57 CPU tests because
   each lived in an interface the CPU tests stubbed:

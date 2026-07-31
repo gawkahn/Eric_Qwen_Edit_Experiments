@@ -1904,8 +1904,31 @@ _REF_KINDS_MODE_BOTH_ONLY = ("flux2-native", "krea2-identity")
 _KREA2_IDENTITY_MAX_REFS = 2
 
 
+#: Reason string for the one --identity no-op the CLI can detect WITHOUT a
+#: loaded pipeline. The other arm (wrong family) needs `model_family`, which
+#: only exists after the model loads.
+_IDENTITY_NOOP_NO_REFS = "no --ref-image was given"
+
+
+def _identity_noop_message(why: str) -> str:
+    """The single wording for "--identity does nothing on this run" (ADR-043).
+
+    Shared because the warning has to be emitted from TWO places. `generate()`
+    covers the in-process run, but a delegated run executes `generate()` inside
+    the daemon with ``identity=False`` (the flag has no schema key and so
+    cannot ride the wire), where the warning would never fire at all and the
+    daemon's stderr is not the user's terminal anyway. So the CLI also warns
+    client-side before delegating. One builder keeps the two from drifting into
+    differently-worded versions of the same notice (code review 2026-07-31,
+    finding 1: without the client-side half, `--identity` with no --ref-image
+    was a fully silent drop whenever a daemon happened to be up)."""
+    return (f"--identity has no effect here: {why} (ADR-043). "
+            f"Generation proceeds normally.")
+
+
 def _resolve_ref_family_support(
     ref_images: List[Dict[str, str]], model_family: str, ref_drop_strict: bool,
+    identity: bool = False,
 ) -> Tuple[Optional[str], Optional[str]]:
     """Decide how a family executes reference images (ADR-035 decision 2 /
     Finding 4; generalized to execution kinds by ADR-036).
@@ -1931,10 +1954,34 @@ def _resolve_ref_family_support(
     references — the slots are semantic (#1 scene, #2 identity) and there is no
     third, so a silent drop would read to the user as a model failure (ADR-043
     constraint 2).
+
+    ``identity`` is the ADR-043 OPT-IN. A krea family reaches
+    ``"krea2-identity"`` only when the caller asked for it; without the flag the
+    references take the ordinary drop path, exactly as they did before the
+    routing rows existed. The identity edit is one interpretation of "reference
+    image on a krea checkpoint", not the only conceivable one, so it does not
+    get to claim the surface implicitly — and the behaviour lives ENTIRELY in a
+    LoRA that nothing in ``model_index.json`` can detect (epic D5), which makes
+    an explicit request the only honest signal. Keeping the surface unclaimed
+    also leaves room for a native krea reference mode if diffusers ships one
+    (today ``Krea2Pipeline.__call__`` has no ``image`` parameter at all).
+
     Extracted as a predicate so all branches are unit-testable without a GPU."""
     if not ref_images:
         return None, None
     ref_kind = _REF_FAMILY_KINDS.get(model_family)
+    if ref_kind == "krea2-identity" and not identity:
+        # Opt-in absent: fall through to the drop path, but name the flag —
+        # "not supported for krea" would be a lie, and the user is one word
+        # away from what they wanted.
+        msg = (f"--ref-image on model family {model_family!r} runs the "
+               f"identity-preserving instruction edit, which is opt-in: pass "
+               f"--identity to enable it (ADR-043).")
+        if ref_drop_strict:
+            raise ValueError(
+                msg + " Refusing rather than silently dropping the "
+                      "reference(s).")
+        return None, msg + " Generated without references."
     if ref_kind in _REF_KINDS_MODE_BOTH_ONLY:
         bad_modes = sorted({s["mode"] for s in ref_images} - {"both"})
         if bad_modes:
@@ -2021,6 +2068,14 @@ def generate(
     # the useful ref_boost is task-dependent rather than this number.
     ref_boost: float = 4.0,
     grounding_px: int = 768,
+    # ADR-043 opt-in. ENTRY MODE, not a generation parameter: no
+    # COMFYLESS_SCHEMA key, no sidecar record, no --params replay (Grant,
+    # 2026-07-31 — "a sidecar consumer doesn't care that the image was
+    # generated with --identity, it's going to do something going forward with
+    # that image"). Shaped like ref_drop_strict / ref_dims_explicit, which are
+    # call parameters for the same reason. Wire carriage is Part C; until then
+    # the CLI keeps an --identity run in-process.
+    identity: bool = False,
 ) -> Dict[str, Any]:
     """Generate a single image and save it.
 
@@ -2180,11 +2235,45 @@ def generate(
     # N1, the nag/lora pattern) — otherwise the interactive user gets a silent
     # drop, which is exactly what the "loud warn-and-proceed" promise forbids.
     ref_kind, _ref_drop_warn = _resolve_ref_family_support(
-        ref_images, model_family, ref_drop_strict)
+        ref_images, model_family, ref_drop_strict, identity=identity)
     is_qwen_edit = ref_kind == "qwen-edit"
     if _ref_drop_warn:
         edit_warnings.append(_ref_drop_warn)
         print(f"[comfyless] WARNING: {_ref_drop_warn}", file=sys.stderr)
+
+    # --identity asked for on a run that cannot honour it. WARN, never fail
+    # (Grant, 2026-07-31): the flag is a request for a mode, and asking for a
+    # mode this run does not have is a user mistake to report, not a reason to
+    # throw away the generation — the house "warn, don't block" rule. Rides
+    # edit_warnings so a delegated client sees it too (invariant N1).
+    if identity and ref_kind != "krea2-identity":
+        _id_noop = _identity_noop_message(
+            _IDENTITY_NOOP_NO_REFS if not ref_images else
+            f"model family {model_family!r} has no identity edit "
+            f"(krea/krea-turbo only)")
+        edit_warnings.append(_id_noop)
+        print(f"[comfyless] WARNING: {_id_noop}", file=sys.stderr)
+
+    # ref_boost / grounding_px are consumed ONLY on the identity path. On any
+    # other run they are accepted, RECORDED IN THE SIDECAR, and never applied —
+    # the silent drop invariant N1 forbids, and the delegation gate's own
+    # message ("delegating would silently apply the defaults instead") reads as
+    # a promise that running in-process WILL apply them. Warn only when the
+    # user actually chose a value; the schema default is nobody's choice
+    # (code review 2026-07-31, finding 3).
+    if ref_kind != "krea2-identity":
+        _inert = [f"--{_k.replace('_', '-')} {_v}"
+                  for _k, _v in (("ref_boost", ref_boost),
+                                 ("grounding_px", grounding_px))
+                  if _v != COMFYLESS_SCHEMA[_k][1]]
+        if _inert:
+            _inert_msg = (
+                f"{', '.join(_inert)} NOT applied — the Krea-2 identity edit "
+                f"(ADR-043) is its only consumer and this run is not on it. "
+                f"The requested value is still recorded in the sidecar, "
+                f"because it is a replay input.")
+            edit_warnings.append(_inert_msg)
+            print(f"[comfyless] WARNING: {_inert_msg}", file=sys.stderr)
 
     # ── Load LoRAs ────────────────────────────────────────────────────
     lora_outcomes: List[Dict[str, Any]] = []
@@ -2787,6 +2876,17 @@ def _parse_args() -> argparse.Namespace:
                         "which suits edits spatially separate from the identity "
                         "(clothing). 1.0 is a no-op (stock attention). Recorded "
                         "in the sidecar and replayed by --params.")
+    p.add_argument("--identity", action="store_true",
+                   help="[krea + --ref-image] Run the Krea-2 "
+                        "identity-preserving instruction edit (ADR-043). "
+                        "Opt-in: without it, --ref-image on a krea checkpoint "
+                        "is dropped (or refused, when strict) as it was before "
+                        "the mode existed. Needs the krea2-identity-edit LoRA "
+                        "via --lora — the behaviour lives entirely there. "
+                        "ENTRY MODE ONLY: not recorded in the sidecar and NOT "
+                        "replayed by --params, so re-pass it on a replay. "
+                        "Forces the run in-process (the daemon cannot carry it "
+                        "until ADR-043 Part C).")
     p.add_argument("--grounding-px", type=int, default=None,
                    help="[krea + --ref-image] Longest side fed to the Qwen3-VL "
                         "vision tower for the grounded instruction encode "
@@ -3714,6 +3814,16 @@ def _krea2_identity_forces_in_process(
     daemon."""
     if not getattr(args, "ref_image", None):
         return None
+    # --identity is entry mode with no schema key, so it cannot ride the wire
+    # at all; server.py would enter the identity path without ever seeing the
+    # opt-in, which defeats the flag. Adding the field is Part C (server.py is
+    # Red Zone). Practical cost is near zero: the measured-best ref_boost is
+    # 1.25, already non-default, so the runs that matter were staying
+    # in-process anyway on the tuning branch below.
+    if getattr(args, "identity", False):
+        return ("--identity is a CLI entry mode the daemon cannot carry yet "
+                "(ADR-043 Part C) — running in-process. Delegating would "
+                "silently ignore the opt-in.")
     tuned = [k for k in _KREA2_TUNING_KEYS
              if params.get(k, COMFYLESS_SCHEMA[k][1]) != COMFYLESS_SCHEMA[k][1]]
     if not tuned:
@@ -4630,6 +4740,19 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
         if _krea2_local and _may_delegate:
             print(f"[comfyless] {_krea2_local}", file=sys.stderr)
             _may_delegate = False
+        if _may_delegate and getattr(args, "identity", False) \
+                and not args.ref_image:
+            # generate()'s no-op warning cannot fire for this case on a
+            # delegated run: the daemon runs it with identity=False (no schema
+            # key ⇒ no wire field), and its stderr is not the user's terminal
+            # regardless. Without this the flag was a fully SILENT drop
+            # whenever a daemon happened to be up, making the behaviour depend
+            # on daemon availability (code review 2026-07-31, finding 1). The
+            # run itself is a plain text2img and delegates normally — only the
+            # notice is owed here.
+            print(f"[comfyless] WARNING: "
+                  f"{_identity_noop_message(_IDENTITY_NOOP_NO_REFS)}",
+                  file=sys.stderr)
         if _may_delegate:
             # Pre-expand iteration tokens client-side so the daemon receives a
             # template it can finish resolving (%seed%, %model%, etc.) without
@@ -4750,6 +4873,10 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                 # values replay; inert with a loud skip on every other family.
                 ref_boost=p_cur.get("ref_boost", 4.0),
                 grounding_px=p_cur.get("grounding_px", 768),
+                # Straight off args, NOT p_cur: --identity is entry mode, so it
+                # is deliberately absent from the schema and from the sidecar,
+                # and a --params replay must re-state it.
+                identity=bool(getattr(args, "identity", False)),
             )
             if iterate_batch_id:
                 metadata["iterate_batch_id"] = iterate_batch_id
