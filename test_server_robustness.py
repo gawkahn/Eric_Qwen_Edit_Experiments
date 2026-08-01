@@ -1636,6 +1636,168 @@ check("the disclosure gate uses `is True`, not truthiness",
       'req.get("report_roots") is True' in _hc_src)
 
 
+# ══════════════════════════════════════════════════════════════════════
+print("\n── ADR-044: identity-edit residue never survives in the cache ──")
+# ══════════════════════════════════════════════════════════════════════
+# THE invariant the whole Part C cache-key decision rests on (security review
+# Finding 2 / code review 2026-08-01 advisory 4). ref_boost/grounding_px/identity
+# are deliberately OUT of _request_cache_key because they select output, not
+# pipeline shape — which is only true if a per-call mode provably leaves nothing
+# on the cached pipeline.
+#
+# pipelines/krea2_identity_edit.py restores its attention processors in a
+# finally, but a finally is not a proof: if the RESTORE ITSELF raises, the
+# identity processors stay installed on a pipeline this daemon caches and hands
+# to the next request. That failure is silent at the same resolution — stale
+# processors carry frozen text_len/src_len/tgt_len, so an --iterate sweep just
+# gets a wrong attention bias. So the daemon verifies rather than assumes.
+import contextlib  # noqa: E402
+import io  # noqa: E402
+
+from pipelines.krea2_identity_edit import (                        # noqa: E402
+    Krea2IdentityEditAttnProcessor)
+
+
+class _ResidueTransformer:
+    def __init__(self, procs):
+        self.attn_processors = procs
+
+
+class _ResiduePipe:
+    def __init__(self, procs):
+        self.transformer = _ResidueTransformer(procs)
+
+
+def _residue_run(*, identity, procs):
+    """Drive _handle_generate to its except: branch and report the cache state.
+
+    The cache key must MATCH so the fake pipeline is the one served: a mismatch
+    evicts and reloads via _fake_load, replacing it with a bare object() that
+    has no .transformer — and then the residue check finds nothing and the test
+    passes for the wrong reason. (It did exactly that on the first run.)
+    """
+    _req = {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "p"}
+    if identity:
+        _req["identity"] = True
+    _state = {"pipeline": _ResiduePipe(procs), "model_family": "krea-turbo",
+              "guidance_embeds": False, "loaded_loras": [],
+              "cache_key": srv._request_cache_key(_req, "bf16", "cuda")}
+
+    def _boom(**kw):
+        raise RuntimeError("simulated generation failure")
+
+    _saved_load, _saved_gen = _gen._load_pipeline, _gen.generate
+    _gen._load_pipeline, _gen.generate = _fake_load, _boom
+    try:
+        _d = tempfile.mkdtemp()
+        _r = srv._handle_generate(_req, _d, _d, "cuda", "bf16", _state)
+    finally:
+        _gen._load_pipeline, _gen.generate = _saved_load, _saved_gen
+    return _r, _state
+
+
+# Premise for the whole block: the fake pipeline must actually be SERVED from
+# cache, not reloaded. If this fails, every check below is vacuous.
+_r_premise, _s_premise = _residue_run(
+    identity=False, procs={"transformer_blocks.0": object()})
+check("residue premise: the cached fake pipeline is served, not reloaded",
+      isinstance(_s_premise.get("pipeline"), _ResiduePipe),
+      f"got {type(_s_premise.get('pipeline')).__name__}")
+
+
+_id_proc = Krea2IdentityEditAttnProcessor(
+    text_len=4, src_len=8, tgt_len=8, ref_boost=4.0)
+
+# 1. identity run + residue present -> the cache entry is dropped.
+_r, _s = _residue_run(identity=True, procs={"transformer_blocks.0": _id_proc})
+check("residue: a FAILED identity run still returns InferenceError",
+      _r.get("error_type") == "InferenceError", f"resp={_r!r}")
+check("residue: identity processors surviving a failure EVICT the pipeline",
+      "pipeline" not in _s, f"state keys: {sorted(_s)}")
+
+# 2. NEGATIVE — identity run, NO residue (the restore worked, the normal case).
+#    Must NOT evict: an ordinary OOM should not cost a ~30 GB reload.
+_r, _s = _residue_run(identity=True, procs={"transformer_blocks.0": object()})
+check("residue: a clean identity failure does NOT evict (no reload tax)",
+      _s.get("pipeline") is not None)
+
+# 3. NEGATIVE — the check is gated on the request, not run for every family.
+#    Residue cannot exist here (identity never ran), and paying an
+#    attn_processors walk on every failed flux/qwen run would be pure cost.
+_r, _s = _residue_run(identity=False, procs={"transformer_blocks.0": _id_proc})
+check("residue: a NON-identity request does not run the residue check",
+      _s.get("pipeline") is not None)
+
+# 4. The check must never mask the real error nor wedge the accept loop — a
+#    pipeline with no transformer at all (or a torn-down one) must still yield
+#    a clean InferenceError rather than an exception out of the handler.
+_r, _s = _residue_run(identity=True, procs={})
+check("residue: an empty processor map is handled, not raised on",
+      _r.get("error_type") == "InferenceError")
+
+
+class _RaisingTransformer:
+    """A transformer whose attn_processors walk itself throws."""
+    @property
+    def attn_processors(self):
+        raise RuntimeError("exotic wrapper: attn_processors unavailable")
+
+
+class _RaisingPipe:
+    def __init__(self):
+        self.transformer = _RaisingTransformer()
+
+
+# The fail-OPEN branch: the check swallows its own failure so it can never mask
+# the real InferenceError, but it must log rather than vanish — what it fails
+# open INTO is the silent-wrong-bias case it exists to prevent (security review
+# 2026-08-01, MEDIUM). Exercised with an inspection that RAISES; the legs above
+# only cover absent/empty.
+_state_raise = {"pipeline": _RaisingPipe(), "model_family": "krea-turbo",
+                "guidance_embeds": False, "loaded_loras": []}
+_req_raise = {"type": "generate", "model": "/fake/Krea-2-Turbo",
+              "prompt": "p", "identity": True}
+_state_raise["cache_key"] = srv._request_cache_key(_req_raise, "bf16", "cuda")
+_saved_load, _saved_gen = _gen._load_pipeline, _gen.generate
+_gen._load_pipeline = _fake_load
+
+
+def _boom3(**kw):
+    raise RuntimeError("simulated generation failure")
+
+
+_gen.generate = _boom3
+_res_log = io.StringIO()
+try:
+    _d3 = tempfile.mkdtemp()
+    with contextlib.redirect_stderr(_res_log):
+        _r_raise = srv._handle_generate(
+            _req_raise, _d3, _d3, "cuda", "bf16", _state_raise)
+finally:
+    _gen._load_pipeline, _gen.generate = _saved_load, _saved_gen
+check("residue: an inspection that RAISES does not mask the InferenceError",
+      _r_raise.get("error_type") == "InferenceError", f"resp={_r_raise!r}")
+check("residue: ...and the swallowed failure is LOGGED, not silent",
+      "residue check failed" in _res_log.getvalue(),
+      f"stderr={_res_log.getvalue()!r}")
+_state_no_pipe: dict = {}
+try:
+    _saved_load, _saved_gen = _gen._load_pipeline, _gen.generate
+    _gen._load_pipeline = _fake_load
+
+    def _boom2(**kw):
+        raise RuntimeError("boom")
+    _gen.generate = _boom2
+    _d2 = tempfile.mkdtemp()
+    _r_np = srv._handle_generate(
+        {"type": "generate", "model": "/fake/Krea-2-Turbo", "prompt": "p",
+         "identity": True}, _d2, _d2, "cuda", "bf16", _state_no_pipe)
+finally:
+    _gen._load_pipeline, _gen.generate = _saved_load, _saved_gen
+check("residue: a state with no cached pipeline is handled, not raised on",
+      _r_np.get("error_type") == "InferenceError", f"resp={_r_np!r}")
+
+
 # ──────────────────────────────────────────────────────────────────────
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")

@@ -1118,98 +1118,105 @@ check("nag pre-gate: no refs → NAG still activates on krea-turbo at cfg 0",
 check("nag pre-gate: dormant nag_scale stays silent even with refs (NEGATIVE)",
       cg._nag_gate("krea", None, 0.0, ref_kind="krea2-identity") == (False, None))
 
-# ── Delegation gate: Part B is CLI-foreground (epic D7) ──────────────────────
-print("\n── ADR-043 Part B: daemon delegation gate (D7) ────────────────")
-
-
-def _kargs(ref_image=(), identity=False):
-    return _ap.Namespace(ref_image=list(ref_image), identity=identity)
-
+# ── ADR-044 (Part C): the wire carries it; the forcings are gone ─────────────
+print("\n── ADR-044 Part C: identity + tuning ride the daemon wire ─────")
 
 _KRB_DEF = cg.COMFYLESS_SCHEMA["ref_boost"][1]
 _KGP_DEF = cg.COMFYLESS_SCHEMA["grounding_px"][1]
 
-check("delegation gate: no refs → None even at non-default tuning "
-      "(text2img cannot consume these; it must keep delegating)",
-      cg._krea2_identity_forces_in_process(
-          _kargs(), {"ref_boost": 1.25, "grounding_px": 384}) is None)
-check("delegation gate: refs at SCHEMA DEFAULTS → None (daemon resolves same)",
-      cg._krea2_identity_forces_in_process(
-          _kargs(["a.png"]),
-          {"ref_boost": _KRB_DEF, "grounding_px": _KGP_DEF}) is None)
-check("delegation gate: refs with the keys ABSENT → None (defaults implied)",
-      cg._krea2_identity_forces_in_process(
-          _kargs(["a.png"]), {"seed": 1, "steps": 8}) is None)
-_kreason = cg._krea2_identity_forces_in_process(
-    _kargs(["a.png"]), {"ref_boost": 1.25, "grounding_px": _KGP_DEF})
-check("delegation gate: refs + non-default ref_boost → reason naming the flag",
-      _kreason is not None and "--ref-boost" in _kreason
-      and "--grounding-px" not in _kreason and "Part C" in _kreason,
-      f"got {_kreason!r}")
-_kreason2 = cg._krea2_identity_forces_in_process(
-    _kargs(["a.png"]), {"ref_boost": 1.25, "grounding_px": 384})
-check("delegation gate: both non-default → both flags named, in key order",
-      _kreason2 is not None and _kreason2.index("--ref-boost")
-      < _kreason2.index("--grounding-px"), f"got {_kreason2!r}")
+# Part B kept these runs in-process because the wire could not carry the tuning
+# or the opt-in. Part C carries all three, so BOTH forcings retire — and the
+# whole predicate with them. Pinned as an absence: re-introducing it would mean
+# the wire regressed, and the cost is the 2026-07-26 warm-daemon crash shape (an
+# in-process ~30 GB load while the daemon still holds its own pipeline's VRAM).
+check("the Part B in-process forcing is GONE (identity runs delegate)",
+      not hasattr(cg, "_krea2_identity_forces_in_process"))
+check("...and so is its tuning-keys constant (no dead scaffolding)",
+      not hasattr(cg, "_KREA2_TUNING_KEYS"))
+check("main() no longer consults a forcing predicate before delegating",
+      "_krea2_identity_forces_in_process" not in _gen_src
+      and "_krea2_local" not in _gen_src)
 
-# --identity forces in-process on its own, at ANY tuning. It has no schema key
-# (by design — entry mode), so it cannot ride the wire at all; delegating would
-# put server.py on the identity path having never seen the opt-in. Wire
-# carriage is Part C, where server.py gets its Red Zone review.
-_kid = cg._krea2_identity_forces_in_process(
-    _kargs(["a.png"], identity=True),
-    {"ref_boost": _KRB_DEF, "grounding_px": _KGP_DEF})
-check("delegation gate: --identity forces in-process even at DEFAULT tuning",
-      _kid is not None and "--identity" in _kid and "Part C" in _kid,
-      f"got {_kid!r}")
-# --identity with NO refs is a plain text2img run, so it still delegates —
-# forcing a model load in-process for a no-op would trade a warm daemon's VRAM
-# for nothing. But the NOTICE is still owed, and generate()'s no-op warning
-# cannot deliver it here: the daemon runs generate() with identity=False and
-# its stderr is not the user's terminal. So the CLI must warn CLIENT-side
-# before delegating. The original version of this test asserted the delegation
-# and claimed "the no-op warning covers it" — it did not, and the test
-# enshrined a fully silent drop (code review 2026-07-31, findings 1 + 2).
-check("delegation gate: --identity WITHOUT refs still delegates "
-      "(plain text2img — no reason to force a load)",
-      cg._krea2_identity_forces_in_process(
-          _kargs(identity=True),
-          {"ref_boost": _KRB_DEF, "grounding_px": _KGP_DEF}) is None)
-check("...and the CLI warns CLIENT-side before that delegation, so the "
-      "notice does not depend on whether a daemon is up",
+
+def _wire(ref_image=(), identity=None, params=None, loras=()):
+    """Build a daemon wire request the way main() does, minimally."""
+    ns_kw = dict(
+        ref_image=list(ref_image), precision="bf16", device="cuda:0",
+        offload_vae=False, attention_slicing=False, sequential_offload=False,
+        vae_tiling="auto", rebalance=False, rebalance_mult=0.0,
+        rebalance_weights=None, savepath="", output_format=None, quality=None,
+    )
+    # `identity` OMITTED entirely when None — that is the refine shape below.
+    if identity is not None:
+        ns_kw["identity"] = identity
+    p = {"model": "/m", "prompt": "p", **(params or {})}
+    return cg._build_server_request(_ap.Namespace(**ns_kw), p, list(loras))
+
+
+_w_plain = _wire()
+check("wire: ref_boost rides the request (was accepted-and-dropped)",
+      _w_plain.get("ref_boost") == _KRB_DEF)
+check("wire: grounding_px rides the request",
+      _w_plain.get("grounding_px") == _KGP_DEF)
+_w_tuned = _wire(params={"ref_boost": 1.25, "grounding_px": 384})
+check("wire: a TUNED ref_boost is what crosses, not the default",
+      _w_tuned["ref_boost"] == 1.25)
+check("wire: a TUNED grounding_px is what crosses, not the default",
+      _w_tuned["grounding_px"] == 384)
+
+# `identity` is sent ONLY when asked for, so a plain request stays byte-identical
+# to pre-Part-C. Absence is the fail-closed signal the daemon reads.
+check("wire: `identity` is ABSENT when the flag is not set (fail-closed)",
+      "identity" not in _wire(identity=False))
+check("wire: `identity` is absent when the attribute is missing entirely",
+      "identity" not in _w_plain)
+check("wire: `identity` is True on the wire when the flag IS set",
+      _wire(["a.png"], identity=True).get("identity") is True)
+
+# THE refine TRAP (ADR-044 security review, Finding 4). refine._daemon_namespace
+# builds a Namespace carrying "just the attributes _build_server_request reads"
+# and has no `identity`. Reading args.identity directly AttributeErrors on every
+# refine daemon generation — the identical break ADR-034 slice 5 shipped on this
+# exact path. Exercised against the REAL namespace, not a hand-rolled stand-in.
+from comfyless import refine as _cr                                # noqa: E402
+from comfyless.output_format import resolve_output_format          # noqa: E402
+
+_refine_ns = _cr._daemon_namespace(
+    device="cuda:0", precision="bf16", savepath="/tmp/x.png",
+    output_format=resolve_output_format(None, None, None),
+    ref_images=[])
+check("refine: the real _daemon_namespace genuinely has no `identity` attr "
+      "(premise — if this fails the trap moved, not that it is fixed)",
+      not hasattr(_refine_ns, "identity"))
+_refine_req = cg._build_server_request(_refine_ns, {"model": "/m", "prompt": "p"}, [])
+check("refine: _build_server_request survives that namespace (no AttributeError)",
+      isinstance(_refine_req, dict))
+check("refine: and sends no `identity` — it cannot express the flag, so its "
+      "krea refs take the daemon's drop path, never a silent identity edit",
+      "identity" not in _refine_req)
+# Code lines only — the surrounding comment NAMES `args.identity` to explain
+# why it is forbidden, and a naive substring search flags its own rationale.
+_gen_code_lines = [ln for ln in _gen_src.splitlines()
+                   if not ln.lstrip().startswith("#")]
+check("the read is getattr-with-default, not args.identity",
+      'getattr(args, "identity", False)' in _gen_src
+      and not [ln for ln in _gen_code_lines
+               if "args.identity" in ln.replace(
+                   'getattr(args, "identity", False)', "")])
+
+# N1 without new plumbing: the client-side no-op print is DELETED, because the
+# daemon now receives the flag, records the notice in edit_warnings, and
+# surface_wire_warnings prints it here. Re-adding a client-side copy would
+# double-print (security review, Finding 3) — pinned as an absence.
+check("the client-side --identity no-op print is gone (edit_warnings covers it)",
       'if _may_delegate and getattr(args, "identity", False) \\\n'
-      '                and not args.ref_image:' in _gen_src
-      and "_identity_noop_message(_IDENTITY_NOOP_NO_REFS)" in _gen_src)
-check("the client-side and generate()-side notices share ONE builder "
-      "(they cannot drift into differently-worded versions)",
-      _gen_src.count("_identity_noop_message(") >= 3)  # def + 2 call sites
-
-# THE REGRESSION THIS GATE ALMOST SHIPPED (code review 2026-07-31, finding 1).
-# generate() records ref_boost/grounding_px in EVERY sidecar, and --params puts
-# every sidecar key into explicit_keys — so a presence-based gate forced every
-# ref-bearing replay in-process, on qwen-edit and flux2 too. That breaks the
-# epic invariant "Non-krea --ref-image behaviour is untouched" AND re-arms the
-# 2026-07-26 warm-daemon crash (in-process load while the daemon holds VRAM).
-# A replayed sidecar carries the keys at their DEFAULTS; it must still delegate.
-_replayed_flux2_sidecar = {
-    "model": "/m", "prompt": "p", "seed": 7, "steps": 8, "cfg_scale": 4.0,
-    "ref_boost": _KRB_DEF, "grounding_px": _KGP_DEF,   # recorded, not chosen
-}
-check("delegation gate: REPLAY of a non-krea ref sidecar still delegates "
-      "(presence of the keys is not intent — the regression negative)",
-      cg._krea2_identity_forces_in_process(
-          _kargs(["kf.png"]), _replayed_flux2_sidecar) is None)
-# ...and the gate is not vacuous: the same replay WITH a tuned value holds back.
-check("delegation gate: a replay carrying a TUNED ref_boost does hold back",
-      cg._krea2_identity_forces_in_process(
-          _kargs(["kf.png"]), {**_replayed_flux2_sidecar, "ref_boost": 1.25})
-      is not None)
-# The gate must read the merged params, never explicit_keys — pin the wiring so
-# a future refactor cannot quietly reintroduce the presence test.
-check("delegation gate is called with the merged params, not explicit_keys",
-      "_krea2_identity_forces_in_process(args, p_cur)" in _gen_src
-      and "_krea2_identity_forces_in_process(args, explicit_keys)"
-          not in _gen_src)
+      '                and not args.ref_image:' not in _gen_src)
+check("_identity_noop_message now has exactly ONE call site (def + 1 use)",
+      _gen_src.count("_identity_noop_message(") == 2,
+      f"count={_gen_src.count('_identity_noop_message(')}")
+check("...and that call site is inside generate(), riding edit_warnings",
+      'if identity and ref_kind != "krea2-identity":' in _gen_src
+      and "edit_warnings.append(_id_noop)" in _gen_src)
 
 # ── Source pins: the generate() seams a GPU-free test cannot execute ─────────
 # Same idiom as the flux2 dims read-back above (test_nag.py's pattern).
@@ -1269,12 +1276,47 @@ check("the identity-edit import is LAZY (a text2img run must not pay it)",
 check("ref_boost/grounding_px are recorded in the metadata dict",
       '"ref_boost": ref_boost,' in _gen_src
       and '"grounding_px": grounding_px,' in _gen_src)
-# NEGATIVE: the two scalars must NOT reach the daemon wire in Part B — the
-# validator would accept them and server.py would drop them silently.
+# Part B asserted the INVERSE here — that the two scalars must NOT reach the
+# wire, because the validator accepted them and server.py dropped them silently.
+# ADR-044 closes that accepted-and-dropped gap, so the assertion flips: they must
+# now reach the daemon, and server.py must forward them to generate().
 import inspect as _k2insp  # noqa: E402
-_wire_src = _k2insp.getsource(cg._build_server_request)
-check("NEGATIVE: _build_server_request does not send ref_boost/grounding_px",
-      "ref_boost" not in _wire_src and "grounding_px" not in _wire_src)
+
+from comfyless import server as _k2srv  # noqa: E402
+_srv_gen_src = _k2insp.getsource(_k2srv._handle_generate)
+for _fwd in ('identity=req.get("identity", False) is True',
+             'ref_boost=req.get("ref_boost"',
+             'grounding_px=req.get("grounding_px"'):
+    check(f"server.py forwards {_fwd.split('=')[0]} to generate()",
+          _fwd in _srv_gen_src)
+# `is True`, not bool(): the ONLY thing making the field bool-only is its
+# _RUNTIME_KIND registration, and validate_machine_request passes unknown keys
+# through unchanged — so de-registering it would let `identity: "no"` ENABLE the
+# mode under a truthiness gate. Same reasoning (and same pin) as report_roots.
+check("server.py's identity gate is `is True`, not truthiness",
+      'req.get("identity", False) is True' in _srv_gen_src
+      and 'bool(req.get("identity"' not in _srv_gen_src)
+# ...and the three stay OUT of the pipeline cache key: they select output, not
+# weights. Keying on them would evict and reload ~30 GB per --ref-boost tweak,
+# which is exactly what an --iterate sweep does (ADR-044 decision 4).
+_ck_src = _k2insp.getsource(_k2srv._request_cache_key)
+for _k in ("identity", "ref_boost", "grounding_px"):
+    check(f"NEGATIVE: {_k} is NOT in the daemon's pipeline cache key",
+          _k not in _ck_src)
+# ...and FUNCTIONALLY, not just textually — the source pin fails safe (a comment
+# naming a field trips it) but proves nothing about the value the daemon
+# computes. This is the assertion that actually means "no 30 GB reload per tweak".
+_ck_base = {"type": "generate", "model": "/m", "prompt": "p"}
+_ck_ref = _k2srv._request_cache_key(_ck_base, "bf16", "cuda:0")
+for _tweak in ({"ref_boost": 1.25}, {"grounding_px": 384}, {"identity": True},
+               {"ref_boost": 1.25, "grounding_px": 384, "identity": True}):
+    check(f"cache key is byte-equal across {sorted(_tweak)} (no evict/reload)",
+          _k2srv._request_cache_key({**_ck_base, **_tweak}, "bf16", "cuda:0")
+          == _ck_ref)
+# The key is not vacuously constant — a real shape change still discriminates.
+check("...and the key DOES change on a genuine pipeline-shape change",
+      _k2srv._request_cache_key({**_ck_base, "quant": "fp8"}, "bf16", "cuda:0")
+      != _ck_ref)
 
 
 # ── Summary ──────────────────────────────────────────────────────────────────

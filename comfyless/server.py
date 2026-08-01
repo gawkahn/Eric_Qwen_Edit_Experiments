@@ -1080,6 +1080,30 @@ def _handle_generate(
             ref_images=req.get("ref_images") or [],
             ref_dims_explicit=bool(req.get("ref_dims_explicit")),
             ref_drop_strict=bool(req.get("ref_drop_strict", True)),
+            # ADR-044 (ADR-043 Part C): the Krea-2 identity edit over the wire.
+            # Before this, all three were accepted-and-dropped here — ref_boost
+            # and grounding_px are COMFYLESS_SCHEMA members so the canonical
+            # validator took them and this call ignored them, and `identity` had
+            # no wire representation at all. Deliberately NOT in
+            # _request_cache_key: all three select OUTPUT, not pipeline shape
+            # (the NAG / output_format precedent), so a cached pipeline serves
+            # any tuning. `identity` in particular changes which __call__ runs,
+            # not what is loaded — the object stays a stock Krea2Pipeline
+            # because the subclass __call__ runs UNBOUND on it.
+            #
+            # identity defaults False (fail-closed): a request that omits it —
+            # every MCP call, every refine generation, any pre-Part-C client —
+            # takes the loud drop path rather than silently running an edit
+            # nobody opted into.
+            # `is True`, not bool(), mirroring the report_roots gate above and
+            # for the same reason: the ONLY thing making this bool-only is the
+            # _RUNTIME_KIND registration, and validate_machine_request passes
+            # UNKNOWN keys through unchanged — so de-registering or renaming
+            # that entry would silently let `identity: "no"` ENABLE the mode.
+            # Identity comparison fails closed regardless of registration state.
+            identity=req.get("identity", False) is True,
+            ref_boost=req.get("ref_boost", 4.0),
+            grounding_px=req.get("grounding_px", 768),
             _cached_pipeline=cached,
             # Explicit pause opt-out (slice PAUSE, 2026-07-17): the daemon
             # runs generation on its MAIN thread, usually in a foreground
@@ -1099,6 +1123,50 @@ def _handle_generate(
                     os.unlink(_p)
                 except OSError:
                     pass
+        # ADR-044: fail closed on identity-edit residue. The identity path swaps
+        # the transformer's attention processors and restores them in a finally
+        # (pipelines/krea2_identity_edit.py), but a finally is not a proof — if
+        # the restore ITSELF raises, the identity processors stay installed on a
+        # pipeline this daemon keeps cached and hands to the next request. That
+        # failure is not loud: the stale processors carry frozen text_len /
+        # src_len / tgt_len, so a follow-up at a DIFFERENT resolution crashes,
+        # while one at the SAME resolution (the --iterate sweep case) silently
+        # gets a wrong attention bias. Wrong output, no error, and it would
+        # persist for the daemon's lifetime.
+        #
+        # The whole cache-key design rests on "a per-call mode leaves nothing
+        # behind" (ADR-044 decision 4, security review Finding 2), so verify it
+        # here rather than assume it. A residue CHECK, not an unconditional
+        # evict: an ordinary OOM should not cost a 30 GB reload.
+        if req.get("identity", False) is True:
+            try:
+                from pipelines.krea2_identity_edit import (
+                    Krea2IdentityEditAttnProcessor)
+                _pipe = server_state.get("pipeline")
+                _tf = getattr(_pipe, "transformer", None) if _pipe else None
+                if _tf is not None and any(
+                    isinstance(_proc, Krea2IdentityEditAttnProcessor)
+                    for _proc in _tf.attn_processors.values()
+                ):
+                    print("[comfyless] identity-edit attention processors "
+                          "survived a failed request — evicting the cached "
+                          "pipeline rather than serving it (ADR-044).",
+                          file=sys.stderr, flush=True)
+                    _evict_chain(server_state)
+            except Exception as _res_err:
+                # The check must never mask the real InferenceError below, and
+                # it must never wedge the accept loop. An import that fails
+                # (diffusers missing the Krea classes) or a transformer without
+                # attn_processors means the identity path could not have run.
+                #
+                # But swallowing SILENTLY would make this a fail-open backstop
+                # with no trace when it misfires — and the thing it fails open
+                # INTO is the silent-wrong-bias case it exists to prevent. This
+                # daemon's own precedent (the report_roots residual above) is
+                # that an accepted residual is only tolerable if observable, so
+                # log and continue.
+                _log(f"identity residue check failed ({_res_err!r}) — cached "
+                     f"pipeline NOT verified; returning the original error")
         return {
             "status":     "error",
             "error_type": "InferenceError",

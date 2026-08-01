@@ -316,6 +316,27 @@ check("the finally restores from `origin`, not from some other binding",
       f"restore args: {[ast.dump(a) for a in _c1_removes[0].args]}"
       if _c1_removes else "no restore call found")
 
+# ...and the restore must be allowed to RAISE. This closes the one regression
+# the layered residue design cannot otherwise see (code review 2026-08-01).
+#
+# The daemon's residue check (server._handle_generate) runs only in its EXCEPT
+# branch, so it depends on a failed restore propagating out of __call__. Wrap
+# this call in `try/except Exception: pass` — a plausible hardening edit, since
+# an exception raised in a finally masks the in-flight original error — and a
+# successful body with a FAILED restore returns a SUCCESS response with the
+# identity processors still installed on the daemon's cached pipeline. Nothing
+# inspects the success path, so every suite in this repo stays green while the
+# invariant ADR-044's cache-key decision rests on is silently broken.
+#
+# `ast.walk` in the guard above would still find the call nested inside that
+# new Try, which is exactly why this leg checks NESTING rather than presence.
+_c1_fin_tries = [t for gt in _c1_guarded for s in gt.finalbody
+                 for t in ast.walk(s) if isinstance(t, ast.Try)]
+check("NEGATIVE: the restore is not wrapped in a nested try (it must raise, "
+      "so the daemon's residue check can see the failure)",
+      not _c1_fin_tries,
+      f"{len(_c1_fin_tries)} nested try block(s) in the finally")
+
 # ...and the capture precedes it. `origin` must come from attn_processors, not
 # from the apply's return value.
 _c1_origin_assigns = [

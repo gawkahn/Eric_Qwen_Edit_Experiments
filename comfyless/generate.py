@@ -1904,24 +1904,34 @@ _REF_KINDS_MODE_BOTH_ONLY = ("flux2-native", "krea2-identity")
 _KREA2_IDENTITY_MAX_REFS = 2
 
 
-#: Reason string for the one --identity no-op the CLI can detect WITHOUT a
-#: loaded pipeline. The other arm (wrong family) needs `model_family`, which
-#: only exists after the model loads.
+#: Reason string for the --identity no-op that needs no loaded pipeline. The
+#: other arm (wrong family) needs `model_family`, which only exists after the
+#: model loads.
 _IDENTITY_NOOP_NO_REFS = "no --ref-image was given"
 
 
 def _identity_noop_message(why: str) -> str:
     """The single wording for "--identity does nothing on this run" (ADR-043).
 
-    Shared because the warning has to be emitted from TWO places. `generate()`
-    covers the in-process run, but a delegated run executes `generate()` inside
-    the daemon with ``identity=False`` (the flag has no schema key and so
-    cannot ride the wire), where the warning would never fire at all and the
-    daemon's stderr is not the user's terminal anyway. So the CLI also warns
-    client-side before delegating. One builder keeps the two from drifting into
-    differently-worded versions of the same notice (code review 2026-07-31,
-    finding 1: without the client-side half, `--identity` with no --ref-image
-    was a fully silent drop whenever a daemon happened to be up)."""
+    ONE call site, in `generate()` — which is the whole point of ADR-044. Under
+    Part B this builder was shared with a second, client-side emission in
+    `main()`, because `identity` had no wire representation: a delegated run
+    executed `generate()` inside the daemon with ``identity=False``, so the
+    notice never fired, and the daemon's stderr is not the user's terminal
+    anyway. That made the flag a silent drop whenever a daemon happened to be up
+    (code review 2026-07-31, finding 1).
+
+    Part C put `identity` on the wire, so the daemon now runs with the flag set,
+    appends this notice to ``edit_warnings``, and `surface_wire_warnings` prints
+    it on the client's terminal — the same channel every other family's notices
+    use. The client-side copy was removed rather than kept: keeping it would
+    double-print (ADR-044 security review, Finding 3).
+
+    **Do not re-add a client-side emission for this.** If a delegated identity
+    notice ever appears to go missing, the cause is that the run ERRORED — error
+    responses carry no metadata, so `edit_warnings` does not ride back. That gap
+    is family-wide, recorded in TECH_DEBT, and its fix is a notices channel on
+    the error path, not a second copy of this message."""
     return (f"--identity has no effect here: {why} (ADR-043). "
             f"Generation proceeds normally.")
 
@@ -2073,8 +2083,9 @@ def generate(
     # 2026-07-31 — "a sidecar consumer doesn't care that the image was
     # generated with --identity, it's going to do something going forward with
     # that image"). Shaped like ref_drop_strict / ref_dims_explicit, which are
-    # call parameters for the same reason. Wire carriage is Part C; until then
-    # the CLI keeps an --identity run in-process.
+    # call parameters for the same reason — and, since ADR-044, ride the daemon
+    # wire the same way too: registered in _RUNTIME_KIND, never SCHEMA_KIND.
+    # Default False is the fail-closed contract every non-CLI caller leans on.
     identity: bool = False,
 ) -> Dict[str, Any]:
     """Generate a single image and save it.
@@ -3710,7 +3721,27 @@ def _build_server_request(
         "nag_tau":             p.get("nag_tau", 2.5),
         "nag_alpha":           p.get("nag_alpha", 0.25),
         "nag_end":             p.get("nag_end", 1.0),
+        # Krea-2 identity-edit tuning (ADR-043, on the wire since ADR-044).
+        # Sidecar-replayable schema params sourced from the merged params, like
+        # the NAG quadruple above and for the same reason — they change output
+        # CONTENT. Also like NAG, deliberately NOT in the daemon's pipeline
+        # cache key: they select output, not weights, so a cached pipeline
+        # serves any tuning (see server._request_cache_key). Keying on them
+        # would evict and reload ~30 GB on every --ref-boost tweak, which is
+        # exactly what an --iterate sweep does.
+        "ref_boost":           p.get("ref_boost", 4.0),
+        "grounding_px":        p.get("grounding_px", 768),
     }
+    # ADR-044: `--identity` is entry mode, not a param — it has no schema key, so
+    # it is not in the dict above and is sent only when actually asked for (a
+    # plain request stays byte-identical to pre-Part-C). getattr-with-default is
+    # required, NOT defensive: refine.py builds a synthetic Namespace carrying
+    # "just the attributes _build_server_request reads" (refine._daemon_namespace)
+    # and has no `identity`. Reading args.identity directly would AttributeError
+    # on every refine daemon generation — the identical break ADR-034 slice 5
+    # shipped and had to patch on this exact path.
+    if getattr(args, "identity", False):
+        req["identity"] = True
     # ADR-035 slice 4: reference-image edit over the wire. Paths absolutized so
     # the daemon's _check_ref_paths (realpath containment) and decode see them
     # absolute. Re-validating the specs is idempotent (main() already did, and
@@ -3772,68 +3803,6 @@ def _should_delegate_to_server(args: argparse.Namespace,
     is unchanged either way: it still depends only on savepath / default-output
     / explicit --output, and it is what the D3a gate consults for scope."""
     return bool(args.savepath) or using_default_output
-
-
-#: The two ADR-043 tuning keys, in the order they are reported to the user.
-_KREA2_TUNING_KEYS = ("ref_boost", "grounding_px")
-
-
-def _krea2_identity_forces_in_process(
-    args: argparse.Namespace, params: Dict[str, Any],
-) -> Optional[str]:
-    """Reason to keep a run in-process for ADR-043, or None (ADR-043 Part B).
-
-    Part B is CLI-foreground only (epic D7): `ref_boost` / `grounding_px` do NOT
-    ride the daemon wire, and `server.py` does not forward them to `generate()`
-    — that is Part C, which is Red Zone and carries its own review. Because both
-    keys are now SCHEMA_KIND members the canonical validator WOULD accept them
-    on the wire, and the daemon would then ignore them: an accepted-and-dropped
-    parameter, the exact silent failure invariant N1 exists to prevent.
-
-    So a reference run whose tuning was deliberately chosen runs in-process
-    instead of delegating.
-
-    "Deliberately chosen" is measured by the VALUE diverging from the schema
-    default, never by the key's presence. Key-presence was the first
-    implementation and it was wrong (code review 2026-07-31): `generate()`
-    records both keys in EVERY sidecar, and `--params` puts every sidecar key
-    into ``explicit_keys``, so presence-testing forced every ref-bearing replay
-    in-process — on qwen-edit and flux2 too. That broke the epic invariant
-    "Non-krea --ref-image behaviour is untouched" and re-armed the 2026-07-26
-    warm-daemon failure: a forced in-process model load while the daemon still
-    holds its pipeline's VRAM is a crash on a single-GPU box, not a degrade.
-
-    At the default values the two planes agree by construction — client and
-    daemon resolve the same schema defaults and the recorded sidecar is
-    truthful — so a defaults-valued run delegates whether or not it is a replay.
-    The gate additionally requires `--ref-image`, the only path that consumes
-    these at all, so plain text2img is untouched in every case.
-
-    Returns the loud user-facing reason so the caller can print it, or None when
-    delegation may proceed. A pure predicate, so it is unit-testable without a
-    daemon."""
-    if not getattr(args, "ref_image", None):
-        return None
-    # --identity is entry mode with no schema key, so it cannot ride the wire
-    # at all; server.py would enter the identity path without ever seeing the
-    # opt-in, which defeats the flag. Adding the field is Part C (server.py is
-    # Red Zone). Practical cost is near zero: the measured-best ref_boost is
-    # 1.25, already non-default, so the runs that matter were staying
-    # in-process anyway on the tuning branch below.
-    if getattr(args, "identity", False):
-        return ("--identity is a CLI entry mode the daemon cannot carry yet "
-                "(ADR-043 Part C) — running in-process. Delegating would "
-                "silently ignore the opt-in.")
-    tuned = [k for k in _KREA2_TUNING_KEYS
-             if params.get(k, COMFYLESS_SCHEMA[k][1]) != COMFYLESS_SCHEMA[k][1]]
-    if not tuned:
-        return None
-    flags = ", ".join("--" + k.replace("_", "-") for k in tuned)
-    return (
-        f"--ref-image run with non-default {flags} — running in-process rather "
-        f"than delegating to the daemon, which does not carry the krea "
-        f"identity-edit tuning yet (ADR-043 Part C). Delegating would silently "
-        f"apply the defaults instead.")
 
 
 def refuse_out_of_roots_refs(args: argparse.Namespace,
@@ -4732,27 +4701,23 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
         # is the authoritative ref-containment gate; a reference it refuses comes
         # back as RefPathError and _delegate_to_server falls back to in-process
         # with a warning (no client-side ref-root gate).
-        # ADR-043 Part B: an identity-edit run with deliberately-chosen tuning
-        # stays in-process — the wire cannot carry ref_boost/grounding_px yet,
-        # so delegating would apply the defaults without saying so.
-        _krea2_local = _krea2_identity_forces_in_process(args, p_cur)
+        # ADR-044 (Part C): an identity-edit run delegates like any other. Both
+        # ADR-043 Part B forcings are gone — the wire now carries ref_boost,
+        # grounding_px AND identity, so there is nothing left to silently drop.
+        # Keeping them would have made the most valuable configuration (identity
+        # edit + warm daemon) the one that loads a second ~30 GB pipeline beside
+        # the daemon's: the 2026-07-26 warm-daemon crash on a single-GPU box.
+        #
+        # The client-side `--identity`-with-no-refs warning that used to live
+        # here is gone too, and its removal is the POINT rather than a loss. It
+        # existed only because `identity` could not reach the daemon at all, so
+        # generate()'s own notice ran with identity=False and never fired. Now
+        # the daemon receives the flag, generate() appends the notice to
+        # edit_warnings, and surface_wire_warnings prints it on THIS terminal
+        # after the response — the one mechanism, for every family. Re-adding a
+        # client-side copy would double-print it (ADR-044 security review,
+        # Finding 3).
         _may_delegate = _should_delegate_to_server(args, using_default_output)
-        if _krea2_local and _may_delegate:
-            print(f"[comfyless] {_krea2_local}", file=sys.stderr)
-            _may_delegate = False
-        if _may_delegate and getattr(args, "identity", False) \
-                and not args.ref_image:
-            # generate()'s no-op warning cannot fire for this case on a
-            # delegated run: the daemon runs it with identity=False (no schema
-            # key ⇒ no wire field), and its stderr is not the user's terminal
-            # regardless. Without this the flag was a fully SILENT drop
-            # whenever a daemon happened to be up, making the behaviour depend
-            # on daemon availability (code review 2026-07-31, finding 1). The
-            # run itself is a plain text2img and delegates normally — only the
-            # notice is owed here.
-            print(f"[comfyless] WARNING: "
-                  f"{_identity_noop_message(_IDENTITY_NOOP_NO_REFS)}",
-                  file=sys.stderr)
         if _may_delegate:
             # Pre-expand iteration tokens client-side so the daemon receives a
             # template it can finish resolving (%seed%, %model%, etc.) without

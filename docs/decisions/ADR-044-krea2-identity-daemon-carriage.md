@@ -283,6 +283,43 @@ ADR.
   swap, and the proposed client-side warning relocation duplicated the existing
   `edit_warnings` channel — that decision was replaced by a deletion. No finding
   was rejected.
+- 2026-08-01 — **Commit 2 landed; review findings folded in.** Reviews:
+  `docs/security/review-adr-044-commit2-wire-carriage-2026-08-01.md`
+  (`security-auditor`, Fable, no fallback) plus a parallel `code-reviewer`
+  (Fable, no fallback). Four changes to what this ADR specified:
+
+  1. **`server.py` gates `identity` with `is True`, not `bool()`.** The
+     `_RUNTIME_KIND` registration is the only thing making the field bool-only,
+     and `validate_machine_request` passes unknown keys through unchanged — so
+     de-registering or renaming that entry would let `identity: "no"` ENABLE the
+     mode under a truthiness gate. Identity comparison fails closed regardless of
+     registration state. This is the `report_roots` precedent in the same file.
+  2. **The residue check LOGS its own failure** instead of swallowing silently.
+     It is a fail-open backstop, and what it fails open *into* is the
+     silent-wrong-bias case it exists to prevent; this daemon's own precedent is
+     that an accepted residual is tolerable only if observable.
+  3. **Success-path residue checking was considered and NOT taken.** The
+     `code-reviewer` found a regression the error-path check cannot see: wrapping
+     `remove_identity_processors` in `try/except` inside the pipeline's `finally`
+     — a plausible hardening edit — turns a failed restore into a SUCCESS
+     response with residue installed, and every suite stays green. Checking
+     residue on the success path too would close it structurally for ~3 lines.
+     Rejected anyway: adding un-reviewed code to a Red Zone path *after* its
+     security review is the thing to avoid, and an AST guard (the restore must
+     not sit inside a nested `try`, so it can still raise) closes the named
+     regression at zero Red Zone cost. Mutation-verified — the refactor leaves
+     every pre-existing guard leg passing and trips only the new one. Revisit if
+     a second reason to inspect the success path ever appears.
+  4. **Test-file scope substitution.** This ADR declared `test_params_schema.py`;
+     the validator negatives went to `test_machine_boundary_validator.py`
+     instead — the natural home for `validate_machine_request` contracts — and
+     `test_params_schema.py` is untouched, its Part-B `identity` allowlist entry
+     standing unchanged exactly as promised above.
+
+  Also noted by the auditor and adopted: **commits 2 and 3 push as ONE batch**,
+  so the interim window where the MCP surface still accept-and-drops the three
+  fields never exists on the remote.
+
 - 2026-08-01 — **Grant accepted the `mcp_server.py` scope extension in commit 3**
   (reject-at-entry over hold-scope-with-tests), making Part C a two-Red-Zone-file
   slice rather than one. The deciding argument was Finding 5's shape: it is an

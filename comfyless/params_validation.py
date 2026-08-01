@@ -168,6 +168,26 @@ _RUNTIME_KIND = types.MappingProxyType({
     #     only the interactive CLI on a TTY sends False.
     "ref_dims_explicit":  _KIND_BOOL,
     "ref_drop_strict":    _KIND_BOOL,
+    # ADR-043 `--identity`, on the wire since ADR-044 (Part C). Lives HERE and
+    # deliberately NOT in SCHEMA_KIND/COMFYLESS_SCHEMA: it is an ENTRY MODE, not
+    # a generation parameter (Grant, 2026-07-31) — "a sidecar consumer doesn't
+    # care that the image was generated with --identity, it's going to do
+    # something going forward with that image." So: no sidecar record, no
+    # --params replay, and a replay cannot re-enter the mode. It sits beside
+    # ref_drop_strict / ref_dims_explicit for the same reason.
+    #
+    # What registration actually buys is the BOOL TYPE CHECK, not the crossing —
+    # validate_machine_request passes unknown keys through unchanged, so the
+    # field would reach server.py either way. That check is load-bearing rather
+    # than decorative: without it a hostile `identity: "no"` is a truthy string.
+    # server.py additionally gates with `is True` so it fails closed even if
+    # this entry is ever removed or renamed (the report_roots precedent).
+    #
+    # Absent = False (fail-closed), matching generate()'s own default: a daemon
+    # that predates Part C ignores the field, the run enters generate() with
+    # identity=False, and a krea reference takes the loud drop path rather than
+    # silently running an edit nobody asked for.
+    "identity":           _KIND_BOOL,
     # Opt-in root disclosure on `ping` (ADR-040 D2). Registered here so the
     # canonical validator type-rejects a non-bool before server._validate_request
     # applies the request-type value check (honored ONLY on type='ping';

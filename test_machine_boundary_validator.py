@@ -574,6 +574,46 @@ check("rebalance_weights='x' (non-list) rejected",
 
 
 # ──────────────────────────────────────────────────────────────────────
+print("\n── ADR-044: `identity` is a RUNTIME wire field, not a param ────")
+# ──────────────────────────────────────────────────────────────────────
+# The tension ADR-044 had to resolve: `identity` must cross the IPC boundary,
+# but giving it a COMFYLESS_SCHEMA key would reverse a deliberate decision
+# (entry mode, not a generation parameter — so no sidecar record, no --params
+# replay). _RUNTIME_KIND is the existing home for exactly that shape, beside
+# ref_drop_strict / ref_dims_explicit / report_roots.
+check("identity is registered in _RUNTIME_KIND", "identity" in pv._RUNTIME_KIND)
+check("NEGATIVE: identity is NOT in SCHEMA_KIND (never sidecar-shaped)",
+      "identity" not in pv.SCHEMA_KIND)
+check("NEGATIVE: identity is NOT a COMFYLESS_SCHEMA key (not a param)",
+      "identity" not in gen_mod.COMFYLESS_SCHEMA)
+check("identity=True accepted at the boundary",
+      validate_machine_request(base_payload(identity=True)).ok)
+check("identity=False accepted at the boundary",
+      validate_machine_request(base_payload(identity=False)).ok)
+check("identity='yes' (non-bool) REJECTED — a truthy string must not enable "
+      "an edit mode by accident",
+      not validate_machine_request(base_payload(identity="yes")).ok)
+check("identity=1 (int, not bool) rejected",
+      not validate_machine_request(base_payload(identity=1)).ok)
+# Absence is the fail-closed signal every non-CLI caller relies on: MCP, refine,
+# and any pre-Part-C client all omit it, and each must reach the drop path.
+check("identity ABSENT is valid (absence = off, not a validation error)",
+      validate_machine_request(base_payload()).ok)
+
+# The two tuning scalars were ALREADY accepted here before ADR-044 — that was
+# the accepted-and-dropped gap Part C closes on the server side. Pin the type
+# contract so the wire values stay well-formed now that they are consumed.
+check("ref_boost accepts a float", validate_machine_request(
+    base_payload(ref_boost=1.25)).ok)
+check("ref_boost='4.0' (string) rejected", not validate_machine_request(
+    base_payload(ref_boost="4.0")).ok)
+check("grounding_px accepts an int", validate_machine_request(
+    base_payload(grounding_px=512)).ok)
+check("grounding_px=512.5 (float) rejected", not validate_machine_request(
+    base_payload(grounding_px=512.5)).ok)
+
+
+# ──────────────────────────────────────────────────────────────────────
 print("\n──────────────────────────────────────────────────")
 print(f"  {passed} passed, {failed} failed")
 print("──────────────────────────────────────────────────")
