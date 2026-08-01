@@ -2162,3 +2162,65 @@ Fix: generalise the hook to a pattern matcher over ephemeral-runner commands
 (`uvx`, `npx`, `pipx run`, `bunx`, `dlx`) that requires a version specifier in
 the tool token, with an explicit allowlist escape; then re-scan every indexed
 repo for call sites.
+
+## 2026-08-01 — a delegated run that ERRORS loses its `edit_warnings`
+
+**What:** `edit_warnings` is the wire channel that carries daemon-side notices
+back to the client (`generate.py:1390-1395`), surfaced by
+`surface_wire_warnings` (`generate.py:4030`). It rides in the response
+`metadata` — and error responses carry no `metadata` at all
+(`server.py:1103-1105`). So every warning raised before the failure point is
+lost on a delegated run that raises.
+
+Surfaced by the ADR-044 security review (Finding 3) while checking whether the
+Krea-2 identity edit's warnings survive delegation. On the SUCCESS path they do,
+which is why ADR-044 deletes its draft's client-side emission rather than adding
+more of it.
+
+**Why not now:** the complete fix is a general daemon→client notices channel
+that is populated independently of success. That widens a Red Zone wire schema
+(`comfyless/server.py`), and every family's warnings would then need auditing
+for path disclosure — the daemon knows absolute paths the client may not, so a
+warning that is safe in a daemon log is not automatically safe on the wire. Not
+a rider on a feature slice.
+
+**Trigger:** the second family that needs a warning to survive a FAILED
+delegated run. Today an errored run surfaces its error, so the lost warning is
+never the user's only signal.
+
+## 2026-08-01 — `NaN` `ref_boost` / `nag_scale` reach the bias math unguarded
+
+**What:** `json.loads` accepts the bare token `NaN`, and the canonical validator
+type-checks floats without checking finiteness. A `NaN` `ref_boost` flows into
+`math.log(max(ref_boost, 1e-4))` (`pipelines/krea2_identity_edit.py:280`) and
+propagates through the attention bias: corrupted output for that one request, no
+crash, no message. The `nag_*` quadruple has the same shape.
+
+**Why not now:** this is pre-existing and family-wide, not an identity-edit
+defect — fixing it properly means a finiteness predicate in the canonical
+validator (ADR-012's owner of machine-boundary type predicates) applied to every
+float field, which is its own slice with its own negative tests. Doing it inside
+an identity slice would fix one call site and leave the pattern.
+
+Related and still open: the nonfinite-weight boundary gate noted under the Qwen
+LoRA work. Same root — float fields typed but not range-checked at the boundary.
+
+**Trigger:** the finiteness slice for `--lora` weights; fold both in together.
+
+## 2026-08-01 — the >2-source identity refusal fires AFTER the ~30 GB load
+
+**What:** `_resolve_ref_family_support` (`comfyless/generate.py:1993-1999`)
+refuses a third `--ref-image` on the krea identity path with an `InferenceError`
+— correct, but it runs inside `generate()`, so on a delegated run the daemon has
+already loaded the pipeline before refusing. The reference count is knowable
+client-side for free.
+
+**Why not now:** a latency nicety, not a safety property. The daemon must remain
+the authoritative gate regardless (a client-side check can go stale, exactly as
+documented for `refuse_out_of_roots_refs`), so any client-side version is a
+second spelling of a rule that already exists — ADR-040 D3a's shape, and that
+one was justified by converting a *crash* into a clean refusal, which this is
+not.
+
+**Trigger:** if a user hits it often enough to complain, or if a client-side
+entry-gate slice is opened for another reason and this can ride along.
