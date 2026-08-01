@@ -341,11 +341,17 @@ class Krea2IdentityEditAttnProcessor:
 def apply_identity_processors(
     transformer, *, text_len: int, src_len: int, tgt_len: int, ref_boost: float
 ) -> dict:
-    """Install the ref_boost processors; return the ORIGINALS for restore.
+    """Install the ref_boost processors; return the pre-swap originals.
 
     Only ``transformer_blocks.`` entries are replaced, and each replacement
     copies the original's ``_attention_backend`` / ``_parallel_config`` so the
     Krea cuDNN pin survives the swap (ADR-023 hazard H1).
+
+    The returned dict is a convenience for direct callers and tests. ``__call__``
+    does NOT rely on it: it captures ``attn_processors`` before calling this, so
+    that a failure part-way through ``set_attn_processor`` still has an origin to
+    restore from (ADR-044 commit 1). A caller that takes the return value instead
+    has no restore path on exactly the failure that needs one.
     """
     origin = dict(transformer.attn_processors)
     replacement = {}
@@ -381,8 +387,20 @@ class Krea2IdentityEditPipeline(Krea2Pipeline):
     With no ``image`` the stock ``__call__`` runs untouched, so a krea text2img
     run is byte-identical to today. The ``__call__`` body may also be invoked
     UNBOUND on a stock ``Krea2Pipeline`` instance (see
-    :func:`identity_edit_pipe_call`) — it adds no durable instance state, which
-    is what lets the daemon's pipeline cache stay class-agnostic.
+    :func:`identity_edit_pipe_call`), which is what lets the daemon's pipeline
+    cache stay class-agnostic.
+
+    **Durable instance state — one deliberate exception.** This used to claim
+    "adds no durable instance state," and that was false (ADR-044 security
+    review, Finding 6): :meth:`_identity_vl_processor` memoizes onto
+    ``self._krea2_identity_vl_processor`` / ``_krea2_identity_vl_encoder_id``,
+    and under the unbound call ``self`` is the daemon's CACHED
+    ``Krea2Pipeline`` — so those attributes outlive the request. They are inert
+    (stock code never reads them, and the memo is keyed on
+    ``(id(text_encoder), id(tokenizer))``, both pinned by the daemon's cache
+    key), but ADR-044's cache-key argument leans on knowing exactly what
+    survives a call, so the exception is named rather than denied. Attention
+    processors are the state that must NOT survive — see ``__call__`` step 4.
 
     **Consequence — every method defined HERE must be called class-qualified**
     (``Krea2IdentityEditPipeline._foo(self, ...)``), never ``self._foo(...)``.
@@ -657,16 +675,33 @@ class Krea2IdentityEditPipeline(Krea2Pipeline):
 
         # 4. Denoise with the source prepended. ref_boost == 1.0 keeps the stock
         # processors and the maskless fast path.
-        origin = None
-        if float(ref_boost) != 1.0:
-            origin = apply_identity_processors(
-                self.transformer,
-                text_len=text_len,
-                src_len=src_len,
-                tgt_len=tgt_len,
-                ref_boost=float(ref_boost),
-            )
+        #
+        # Capture the stock processors BEFORE any swap, and apply INSIDE the try,
+        # so the finally below restores even from a partially-applied
+        # set_attn_processor — the nag_krea2.py mold (ADR-023), which this module
+        # claimed to follow and did not until ADR-044 commit 1. The install used
+        # to sit outside the try with `origin` assigned only from the return
+        # value, so a mid-apply failure left the identity processors installed
+        # with nothing to restore them.
+        #
+        # This is load-bearing ONLY because the pipeline object outlives the
+        # call: under `identity_edit_pipe_call` this body runs unbound on the
+        # daemon's CACHED Krea2Pipeline. Residue there is not a lost run, it is a
+        # silently wrong one — stale processors carry frozen text_len/src_len/
+        # tgt_len, so a follow-up at a DIFFERENT resolution crashes loudly but one
+        # at the SAME resolution (the --iterate sweep case) just gets a wrong
+        # attention bias. See ADR-044 and its security review, Finding 2.
+        origin = dict(self.transformer.attn_processors) \
+            if float(ref_boost) != 1.0 else None
         try:
+            if origin is not None:
+                apply_identity_processors(
+                    self.transformer,
+                    text_len=text_len,
+                    src_len=src_len,
+                    tgt_len=tgt_len,
+                    ref_boost=float(ref_boost),
+                )
             self.scheduler.set_begin_index(0)
             for t in step_list:
                 if self.interrupt:

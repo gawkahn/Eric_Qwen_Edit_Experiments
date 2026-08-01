@@ -194,6 +194,162 @@ check("restore is repeatable (origin dict is not consumed)",
 
 
 # ---------------------------------------------------------------------------
+print("\n── ADR-044 commit 1: restore survives a PARTIAL apply ─────────")
+# ---------------------------------------------------------------------------
+# The hazard (ADR-044 security review, Finding 2). `apply_identity_processors`
+# used to run OUTSIDE the try, with `origin` assigned only from its return
+# value. If set_attn_processor raised part-way through, `origin` was never
+# bound, the finally had nothing to restore from, and the identity processors
+# stayed installed.
+#
+# In-process that residue dies with the CLI. Once Part C delegates, it lives in
+# the DAEMON's cached pipeline: the stale processors carry frozen
+# text_len/src_len/tgt_len, so the next request at a DIFFERENT resolution
+# crashes loudly — but one at the SAME resolution (the --iterate sweep case)
+# silently gets a wrong attention bias. Wrong output, no error.
+_pa_stock = dict(tiny.attn_processors)
+_pa_real_set = tiny.set_attn_processor
+
+
+def _exploding_set(procs):
+    """Apply the swap, THEN raise — the partial-application shape."""
+    _pa_real_set(procs)
+    raise RuntimeError("simulated mid-apply failure")
+
+
+# The FIXED shape: capture first, apply inside the try, restore in the finally.
+_pa_origin = dict(tiny.attn_processors)          # captured BEFORE any swap
+try:
+    tiny.set_attn_processor = _exploding_set     # type: ignore[method-assign]
+    try:
+        kie.apply_identity_processors(
+            tiny, text_len=T_LEN, src_len=S_LEN, tgt_len=G_LEN, ref_boost=4.0)
+    except RuntimeError:
+        pass
+    check("premise: the simulated failure DID leave residue installed",
+          any(isinstance(p, kie.Krea2IdentityEditAttnProcessor)
+              for p in dict(tiny.attn_processors).values()))
+finally:
+    tiny.set_attn_processor = _pa_real_set       # type: ignore[method-assign]
+    kie.remove_identity_processors(tiny, _pa_origin)
+
+check("a pre-captured origin restores from a PARTIAL apply",
+      not any(isinstance(p, kie.Krea2IdentityEditAttnProcessor)
+              for p in dict(tiny.attn_processors).values()))
+check("the partial-apply restore preserves the cuDNN pin (hazard H1)",
+      all(p._attention_backend == "_native_cudnn"
+          for p in dict(tiny.attn_processors).values()))
+check("the partial-apply restore returns the SAME processor set",
+      set(dict(tiny.attn_processors)) == set(_pa_stock))
+
+# The negative that pins WHY the capture must be separate: taking `origin` from
+# the return value — the pre-ADR-044 shape — leaves nothing bound when the
+# apply raises, so there is no restore path on exactly the failure needing one.
+_pa_returned = None
+try:
+    tiny.set_attn_processor = _exploding_set     # type: ignore[method-assign]
+    try:
+        _pa_returned = kie.apply_identity_processors(
+            tiny, text_len=T_LEN, src_len=S_LEN, tgt_len=G_LEN, ref_boost=4.0)
+    except RuntimeError:
+        pass
+finally:
+    tiny.set_attn_processor = _pa_real_set       # type: ignore[method-assign]
+    kie.remove_identity_processors(tiny, _pa_origin)
+check("NEGATIVE: the return value is unbound when apply raises "
+      "(why __call__ must not depend on it)",
+      _pa_returned is None)
+
+
+# ---------------------------------------------------------------------------
+print("\n── ADR-044 commit 1: __call__ install/restore STRUCTURE ────────")
+# ---------------------------------------------------------------------------
+# Structural, not behavioural, for the same reason as the unbound-call guard
+# below: the defect is a statement's POSITION relative to a try block, and
+# reproducing it behaviourally needs a real GPU generation. A refactor that
+# hoists the apply back out of the try must fail a test.
+import ast  # noqa: E402
+
+_c1_src = Path(kie.__file__).read_text()
+# Scope to the PIPELINE's __call__ — `Krea2IdentityEditAttnProcessor.__call__`
+# is defined earlier in the module and a bare module-level search finds that one
+# instead, which silently passes every check below with zero matches.
+_c1_cls = next(n for n in ast.walk(ast.parse(_c1_src))
+               if isinstance(n, ast.ClassDef)
+               and n.name == "Krea2IdentityEditPipeline")
+_c1_call = next(n for n in _c1_cls.body
+                if isinstance(n, ast.FunctionDef) and n.name == "__call__")
+
+
+def _c1_calls_to(node, name):
+    return [c for c in ast.walk(node)
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+            and c.func.id == name]
+
+
+_c1_all_applies = _c1_calls_to(_c1_call, "apply_identity_processors")
+check("guard premise: __call__ installs the processors exactly once",
+      len(_c1_all_applies) == 1, f"found {len(_c1_all_applies)}")
+
+# A qualifying Try: applies inside its BODY, restores in its FINALLY.
+_c1_guarded = [
+    t for t in ast.walk(_c1_call)
+    if isinstance(t, ast.Try)
+    and any(_c1_calls_to(s, "apply_identity_processors") for s in t.body)
+    and any(_c1_calls_to(s, "remove_identity_processors") for s in t.finalbody)
+]
+check("the apply is INSIDE a try whose finally restores",
+      len(_c1_guarded) == 1,
+      f"{len(_c1_guarded)} qualifying try blocks")
+
+# ...restoring from `origin` SPECIFICALLY. Without this leg, a refactor that
+# leaves the (now dead) capture in place but restores from a variable bound to
+# apply's return value passes every other check while reinstating the defect
+# (code review 2026-08-01, advisory 1).
+_c1_removes = [c for t in _c1_guarded for s in t.finalbody
+               for c in _c1_calls_to(s, "remove_identity_processors")]
+check("the finally restores from `origin`, not from some other binding",
+      len(_c1_removes) == 1
+      and len(_c1_removes[0].args) >= 2
+      and isinstance(_c1_removes[0].args[1], ast.Name)
+      and _c1_removes[0].args[1].id == "origin",
+      f"restore args: {[ast.dump(a) for a in _c1_removes[0].args]}"
+      if _c1_removes else "no restore call found")
+
+# ...and the capture precedes it. `origin` must come from attn_processors, not
+# from the apply's return value.
+_c1_origin_assigns = [
+    n for n in ast.walk(_c1_call)
+    if isinstance(n, ast.Assign)
+    and any(isinstance(t, ast.Name) and t.id == "origin" for t in n.targets)
+    and "attn_processors" in ast.dump(n.value)
+]
+check("origin is captured from attn_processors, not from apply's return",
+      len(_c1_origin_assigns) == 1,
+      f"found {len(_c1_origin_assigns)}")
+check("the capture happens BEFORE the apply",
+      bool(_c1_origin_assigns)
+      and _c1_origin_assigns[0].lineno < _c1_all_applies[0].lineno)
+check("NEGATIVE: origin is never assigned from apply_identity_processors(...)",
+      not [n for n in ast.walk(_c1_call)
+           if isinstance(n, ast.Assign)
+           and any(isinstance(t, ast.Name) and t.id == "origin"
+                   for t in n.targets)
+           and _c1_calls_to(n.value, "apply_identity_processors")])
+
+# The ref_boost == 1.0 fast path must stay CONDITIONAL. Making the capture and
+# install unconditional passes every other leg here and every behavioural check,
+# yet kills the maskless path: an all-zero float attn_mask still changes SDPA
+# dispatch, so the 1.0 case would stop being stock-identical. The zero-BIAS is
+# pinned elsewhere; this pins never-INSTALLED (code review 2026-08-01,
+# advisory 2).
+check("the capture/install is gated on ref_boost (1.0 stays maskless)",
+      bool(_c1_origin_assigns)
+      and isinstance(_c1_origin_assigns[0].value, ast.IfExp)
+      and "ref_boost" in ast.dump(_c1_origin_assigns[0].value.test))
+
+
+# ---------------------------------------------------------------------------
 print("\n── D10: image processor built from the LIVE encoder ───────────")
 # ---------------------------------------------------------------------------
 def _encoder(patch=16, temporal=2, merge=2, with_vision=True):
