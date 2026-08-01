@@ -1686,16 +1686,57 @@ check(
 print("── Step 3 / Inv 12 — MCP server still does NOT thread refiner (re-affirm)")
 
 # Re-affirms the Step-2 Inv 12 lock from the comfyless side: this slice
-# does NOT plumb refiner_* through the MCP `generate` tool. The structural
-# test already asserted no `refiner` token in mcp_server.py above; restate
-# here at the Step 3 boundary so any future engineer running just the
-# Step 3 subset sees the lock.
-with open("comfyless/mcp_server.py") as f:
-    mcp_src_step3 = f.read()
+# does NOT plumb refiner_* through the MCP `generate` tool.
+#
+# TIGHTENED 2026-08-01 (ADR-044 commit 4). This was `"refiner" not in
+# <entire mcp_server.py source>` — a bare substring standing in for the
+# real invariant "the MCP server does not THREAD refiner_* into generate()".
+# The proxy broke when the security review of ADR-044 commit 3 found that
+# `refiner_path` was reaching gen_params validated and leaking back out through
+# extract_params as a verbatim absolute path, and the fix was to REJECT it at
+# entry and DROP it outbound. Rejecting is the opposite of threading, so the
+# invariant is more strongly held than before — but the token now appears.
+#
+# So assert the invariant itself rather than the proxy: no refiner kwarg at the
+# generate() call site (structural, via AST), plus the two closed-list
+# memberships that are the ONLY reason the token is allowed to appear at all.
+# Weakening a lock deserves this much noise; this is a tightening dressed as a
+# relaxation, and the next reader should be able to tell which it was.
+import ast as _hy_ast
+import inspect as _hy_insp
+import textwrap as _hy_tw
+import comfyless.mcp_server as _hy_mcps
+
+# MODULE level, not just _handle_generate: a second generate(refiner_path=...)
+# call site elsewhere in mcp_server.py would have tripped the old token lock,
+# and scoping the replacement to one function would have let it through
+# (security review 2026-08-01, narrowing 1).
+_hy_mod = _hy_ast.parse(
+    _hy_tw.dedent(_hy_insp.getsource(_hy_mcps)))
+_hy_gen_calls = [
+    n for n in _hy_ast.walk(_hy_mod)
+    if isinstance(n, _hy_ast.Call)
+    and ((isinstance(n.func, _hy_ast.Name) and n.func.id == "generate")
+         or (isinstance(n.func, _hy_ast.Attribute) and n.func.attr == "generate"))]
+_hy_kwnames = {kw.arg for c in _hy_gen_calls for kw in c.keywords}
 check(
-    "mcp_server.py does NOT thread refiner_path / --refiner (Vision Inv 12)",
-    "refiner" not in mcp_src_step3,
+    "mcp_server.py does NOT thread refiner_* into generate() (Vision Inv 12)",
+    _hy_gen_calls and not any(
+        (k or "").startswith("refiner") for k in _hy_kwnames),
+    f"kwargs={sorted(k for k in _hy_kwnames if k)}",
 )
+check(
+    "...and the call does not **splat gen_params (which would thread it)",
+    not [c for c in _hy_gen_calls if any(kw.arg is None for kw in c.keywords)],
+)
+check(
+    "Inv 12: refiner_path is REJECTED at the MCP boundary, not merely absent",
+    "refiner_path" in _hy_mcps._GENERATE_REMOVED_FIELDS,
+)
+# The outbound half (refiner_path dropped from extract_params) is asserted in
+# test_mcp_server.py, behaviourally and end-to-end. It cannot be checked here:
+# this suite stubs the `nodes` package, and _render_extracted_params reaches
+# _resolve_sidecar_ref -> nodes.eric_diffusion_utils on any model-bearing blob.
 
 
 # ══════════════════════════════════════════════════════════════════════

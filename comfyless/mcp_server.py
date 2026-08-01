@@ -67,6 +67,13 @@ _MCP_PATH_TYPED_FIELDS = (
     "upscale_vae_path",
     "text_encoder_path",
     "text_encoder_2_path",
+    # ADR-016 refiner chain. Latent today — the MCP surface cannot activate the
+    # refiner (the field is rejected inbound and the MCP cache never sets
+    # refiner_pipeline) and the agent-facing base64 copy carries no text chunks,
+    # so this only matters for a PNG the OPERATOR shares. Listed anyway: the
+    # drop-list comment says a path-typed key belongs in BOTH sinks, and this
+    # was the sink it was missing from.
+    "refiner_path",
 )
 
 # Cascade-specific path-typed fields nested under cascade_config (step 3).
@@ -92,6 +99,18 @@ _GENERATE_REMOVED_FIELDS = (
     "vae_path",
     "text_encoder_path",
     "text_encoder_2_path",
+    # Added 2026-08-01 (security review of ADR-044 commit 3, MEDIUM). These are
+    # caller-supplied WEIGHT paths and COMFYLESS_SCHEMA members, so they passed
+    # validate_machine_request and the set(COMFYLESS_SCHEMA) payload filter into
+    # gen_params, silently dropped only by the explicit-kwargs generate() call —
+    # the identical latent hazard as ref_images. Step 6's _check_paths covers
+    # only model/transformer/loras, so a generate(**gen_params) refactor would
+    # forward an agent-supplied absolute path into a weight LOAD with nothing to
+    # contain it. The rationale in the comment above applies verbatim; these
+    # were simply missed when it was written.
+    "upscale_vae_path",
+    "upscale_vae_subfolder",
+    "refiner_path",
 )
 
 # Reference-image / identity-edit fields, rejected at entry since ADR-044
@@ -243,6 +262,32 @@ def _resolved_params_as_names(
     # MEDIUM-1, 2026-06-02; reaffirmed 2026-06-27, 2026-07-06.) The path-
     # bearing warnings remain on the operator's PNG metadata / stderr only.
     out.pop("lora_warnings", None)
+    # Every field the generate tool REJECTS on presence must also be absent
+    # here, or the response becomes a trap: `resolved_params` is documented as
+    # the agent's authoritative record, so echoing it back into `generate` is
+    # the obvious replay loop — and a presence-based rejection does not spare an
+    # empty string. generate() records all of these UNCONDITIONALLY (see the
+    # ADR-043/ADR-030 metadata block in generate.py, which says so explicitly),
+    # so they are present on EVERY response, not just runs that used them.
+    #
+    # Added 2026-08-01 with the inbound rejections that create the trap.
+    # ref_boost/grounding_px had been trapped since ADR-044 commit 3; a prior
+    # review asserted they could not appear here because recording was
+    # "non-default only" — that was simply wrong, and the second review caught
+    # it. ref_images/refiner_path are unreachable on this surface today and are
+    # popped defensively: this renderer's docstring promises no abs_path
+    # crosses, and it would pass them through verbatim if they ever appeared.
+    #
+    # RULE: adding a field to _GENERATE_REMOVED_FIELDS or
+    # _GENERATE_UNSUPPORTED_REF_FIELDS means adding it here too.
+    # Sourced from the rejection tuples themselves, not a hand-copied list, so
+    # the rule above cannot drift: a field added to either tuple is popped here
+    # automatically. (Hand-copying it first omitted `identity` — harmless today
+    # since generate() never records it, but the set-relation test in
+    # test_mcp_server.py caught the inconsistency, which is the point.)
+    for _closed in (*_GENERATE_REMOVED_FIELDS, *_GENERATE_UNSUPPORTED_REF_FIELDS,
+                    "ref_boost", "grounding_px"):
+        out.pop(_closed, None)
     src_loras = metadata.get("loras") or []
     out["loras"] = [
         {"name": lora_names[i], "weight": src_loras[i].get("weight")}
@@ -430,9 +475,25 @@ def _render_extracted_params(normalized: dict, *, model_family,
     # Emitting a key the sibling tool refuses turns an innocent replay loop
     # (extract_params -> echo to generate) into a hard error, so the outbound
     # strip is what makes the inbound rejection coherent rather than a trap.
+    #
+    # upscale_vae_path / upscale_vae_subfolder / refiner_path joined on
+    # 2026-08-01, closing a leak that predated ADR-044 and had nothing to do
+    # with the identity edit (security review of that commit, HIGH). Both are
+    # path-typed COMFYLESS_SCHEMA str members, so they survive _validate_params
+    # normalization; neither was resolved to a catalog name nor popped, so the
+    # operator's absolute filesystem paths were returned to the agent verbatim —
+    # exactly the invariant this docstring claims, and exactly the shape ADR-035
+    # slice-1b treated as a regression when the field was ref_images.
+    #
+    # The intent was already on record for half of it: upscale_vae_path sits in
+    # _MCP_PATH_TYPED_FIELDS and IS basenamed in the PNG-metadata sink, with a
+    # comment saying "so it cannot leak the host filesystem layout to an MCP
+    # agent." Two outbound sinks, one implemented. refiner_path was in neither.
+    # If a future path-typed schema key is added, it belongs in BOTH places.
     for k in ("vae_path", "text_encoder_path", "text_encoder_2_path",
               "output_path", "savepath", "lora_warnings", "ref_images",
-              "ref_boost", "grounding_px"):
+              "ref_boost", "grounding_px",
+              "upscale_vae_path", "upscale_vae_subfolder", "refiner_path"):
         out.pop(k, None)
 
     if model_family:

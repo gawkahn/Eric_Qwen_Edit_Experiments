@@ -311,14 +311,34 @@ ADR.
      tuple. It now walks the AST for a `**` starred kwarg and for each closed
      name, with a premise check that exactly one `generate()` call exists.
 
-  **Left open, deliberately, and NOT part of this ADR:** the same review found
-  that `upscale_vae_path` / `upscale_vae_subfolder` / `refiner_path` — path-typed
-  `COMFYLESS_SCHEMA` members with no relation to the identity edit — take the
-  identical accept-and-drop route inbound AND survive `_render_extracted_params`
-  outbound as verbatim absolute paths, contradicting that function's own "no
-  absolute path survives" docstring. Different fields, different ADR lineage
-  (ADR-030 / ADR-016), pre-existing. Raised with Grant as its own decision
-  rather than folded in here.
+  **Left open by commit 3, and NOT part of this ADR's decision:** the same
+  review found that `upscale_vae_path` / `upscale_vae_subfolder` /
+  `refiner_path` — path-typed `COMFYLESS_SCHEMA` members with no relation to the
+  identity edit — take the identical accept-and-drop route inbound AND survive
+  `_render_extracted_params` outbound as verbatim absolute paths, contradicting
+  that function's own "no absolute path survives" docstring. Different fields,
+  different lineage (ADR-030 / ADR-016), pre-existing.
+
+- 2026-08-01 — **Grant decided to close that leak immediately, in its own
+  commit** rather than defer it, after the disclosure was measured (two
+  `/home/gawkahn/...` paths crossed the agent boundary on a sidecar recording
+  either field). Shipped alongside this ADR's three commits and pushed in the
+  same batch. Not an ADR-044 decision — recorded here only because this
+  Changelog is where the deferral was written down, so this is where its
+  resolution belongs. Full detail:
+  `docs/security/review-mcp-path-leak-close-2026-08-01.md`.
+
+  Two things from that fix are worth carrying forward into any future work on
+  this surface, because both are general:
+  - **A field rejected on PRESENCE must also be absent from the generate
+    RESPONSE.** `resolved_params` is the agent's authoritative record, so
+    echoing it back is the obvious replay loop, and an empty string does not
+    spare a presence check. The pop list is now sourced from the rejection
+    tuples themselves so the two cannot drift apart.
+  - **`generate()` records `ref_boost` / `grounding_px` / `upscale_vae_*`
+    UNCONDITIONALLY**, not only when non-default. An earlier review asserted the
+    opposite and reasoned from it; the code comment says otherwise in as many
+    words. Verify this class of claim against the metadata block, not a review.
 
 - 2026-08-01 — **Commit 2 landed; review findings folded in.** Reviews:
   `docs/security/review-adr-044-commit2-wire-carriage-2026-08-01.md`

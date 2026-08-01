@@ -2254,3 +2254,37 @@ are against its own convention.
 **Trigger:** the next `mcp_server.py` slice that touches the cascade branch.
 The clean fix is hoisting both rejection loops above the cascade/non-cascade
 split rather than duplicating a second copy.
+
+## 2026-08-01 — cascade-bypass field list, corrected and completed
+
+**Amends the entry above** ("the cascade branch still accept-and-drops the
+WEIGHT-PATH fields"), which named only four fields. `_GENERATE_REMOVED_FIELDS`
+grew to seven the same day, so the recorded gap was narrower than the real one.
+Flagged by `security-auditor` with the point that matters: the whole reason that
+commit existed is that a previous list was incomplete, so leaving the paper
+trail incomplete repeats the failure in the register rather than the code.
+
+**The complete set of fields the cascade branch still accept-and-drops:**
+`transformer_path`, `vae_path`, `text_encoder_path`, `text_encoder_2_path`,
+`upscale_vae_path`, `upscale_vae_subfolder`, `refiner_path`.
+(`ref_images` / `ref_boost` / `grounding_px` / `identity` ARE closed on the
+cascade branch — that half shipped in ADR-044 commit 3.)
+
+**Plus two fields that accept-and-drop on BOTH branches:** `refiner_steps` and
+`refiner_cfg`. They are COMFYLESS_SCHEMA members that pass the payload filter
+into `gen_params`, are never forwarded, are never rejected, and SURVIVE
+`extract_params` outbound — so extracting a CLI refiner sidecar hands the agent
+orphaned numerics a replay silently ignores. Non-path (int/float), and a
+`generate(**gen_params)` refactor would forward them into a guaranteed no-op
+because `refiner_path` is rejected and `generate()` gates the chain on it. Low
+risk, same silent-drop pattern.
+
+**Why not now:** unchanged from the entry above — closing the cascade half
+changes behaviour for a caller shape ADR-044 never touched, after Grant approved
+a narrower scope. `refiner_steps`/`refiner_cfg` are recorded here so the
+deferral is a decision rather than an omission.
+
+**Trigger:** the next `mcp_server.py` slice touching the cascade branch. Fix
+shape: hoist both rejection loops above the cascade/non-cascade split rather
+than adding a third copy, and add the two refiner numerics to both the removed
+tuple and the extract pop list at the same time.

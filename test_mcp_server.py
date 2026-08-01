@@ -4751,6 +4751,37 @@ with tempfile.TemporaryDirectory() as _tp_out, \
     check("ADR-044 (e2e) premise: the body is otherwise a real params blob",
           "steps" in _rb_body, f"body={_rb_body[:300]!r}")
 
+    # 2026-08-01 path-leak close (security review of ADR-044 commit 3, HIGH).
+    # upscale_vae_path (ADR-030) and refiner_path (ADR-016) are path-typed
+    # COMFYLESS_SCHEMA str members: they SURVIVE _validate_params normalization,
+    # were never catalog-resolved, and were never popped — so the operator's
+    # absolute paths went back to the agent verbatim, breaking this function's
+    # own "no absolute path survives" invariant. Unrelated to the identity edit;
+    # it predated ADR-044 entirely.
+    #
+    # Half the intent was already on record: upscale_vae_path is basenamed in
+    # the PNG-metadata sink (_MCP_PATH_TYPED_FIELDS) with a comment about not
+    # leaking host layout to an MCP agent. Two sinks, one implemented.
+    _uv_sc = _write_sidecar("uv_leak.json", {
+        "model": "/models/checkpoints/My-Model", "prompt": "p", "seed": 5,
+        "upscale_vae_path": "/home/gawkahn/secret/wan_vae",
+        "upscale_vae_subfolder": "vae",
+        "refiner_path": "/home/gawkahn/secret/hunyuan-refiner"})
+    _uv_out, _, _ = mcps._render_extracted_params(
+        json.load(open(_uv_sc)), model_family=None, index={}, catalog={})
+    for _f in ("upscale_vae_path", "upscale_vae_subfolder", "refiner_path"):
+        check(f"path-leak: _render_extracted_params drops `{_f}`",
+              _f not in _uv_out)
+    check("path-leak: no /home/ abs path survives the render blob",
+          not any("/home/" in str(v) for v in _uv_out.values()),
+          f"leaked: {_uv_out!r}")
+    _uv_res = _run(mcps._call_tool_impl(_cfg4, "extract_params", {"path": _uv_sc}))
+    _uv_body = _uv_res[0].text if _uv_res else ""
+    check("path-leak (e2e): the extract_params BODY leaks no operator path",
+          "/home/gawkahn/secret" not in _uv_body, f"body={_uv_body[:300]!r}")
+    check("path-leak (e2e) premise: the body is otherwise a real params blob",
+          "seed" in _uv_body, f"body={_uv_body[:300]!r}")
+
     # ── N22/N23: audit on stderr only; path echoed, params blob NOT ──
     _cap_err = io.StringIO()
     _cap_out = io.StringIO()
@@ -5424,6 +5455,61 @@ for _f in _ref_closed_fields:
 for _f in _ref_closed_fields:
     check(f"ADR-044: `{_f}` is not advertised in the generate input schema",
           _f not in mcps._GENERATE_INPUT_SCHEMA["properties"])
+
+# 6. INBOUND half of the 2026-08-01 path-leak close. upscale_vae_path /
+#    upscale_vae_subfolder / refiner_path are caller-supplied WEIGHT paths that
+#    reached gen_params validated and were dropped only by the call site — the
+#    same latent hazard as ref_images, and covered by the same rationale the
+#    _GENERATE_REMOVED_FIELDS comment already stated for vae_path.
+for _f in ("upscale_vae_path", "upscale_vae_subfolder", "refiner_path"):
+    check(f"path-leak: `{_f}` is not advertised in the generate input schema",
+          _f not in mcps._GENERATE_INPUT_SCHEMA["properties"])
+    _pl_r, _pl_raised, _ = _call(_d2_cfg, {
+        "prompt": "p", "model": "qwen-image", _f: "/home/gawkahn/secret/w"})
+    check(f"path-leak: `{_f}` is REJECTED inbound, not accept-and-dropped",
+          _pl_raised is not None and _f in _pl_raised
+          and "not supported" in _pl_raised, f"raised={_pl_raised!r}")
+    check(f"path-leak: the `{_f}` rejection discloses no path VALUE",
+          _pl_raised is not None and "secret" not in _pl_raised)
+    check(f"path-leak: the MCP generate() call passes no `{_f}` kwarg",
+          _f not in _rc_kwnames)
+
+# 7. THE REPLAY TRAP. Every field rejected on PRESENCE must be absent from the
+#    generate RESPONSE, or `resolved_params` — documented as the agent's
+#    authoritative record — becomes a payload that hard-errors when echoed back.
+#    generate() records these UNCONDITIONALLY (its own metadata comment says so),
+#    so they ride EVERY response, and an empty string does not spare a
+#    presence-based check. ref_boost/grounding_px were trapped from ADR-044
+#    commit 3; upscale_vae_* were trapped by the commit that closed the leak.
+#    Caught by security review 2026-08-01 — a prior review had asserted the
+#    opposite ("recorded only when non-default"), which was simply wrong.
+_rt_meta = {
+    "model": "/models/checkpoints/My-Model", "prompt": "p", "seed": 1,
+    "ref_boost": 4.0, "grounding_px": 768,
+    "upscale_vae_path": "", "upscale_vae_subfolder": "",
+    "refiner_path": "/home/gawkahn/secret/refiner", "loras": [],
+}
+_rt_out = mcps._resolved_params_as_names(
+    _rt_meta, model_name="My-Model", transformer_name=None, lora_names=[])
+for _f in ("ref_boost", "grounding_px", "upscale_vae_path",
+           "upscale_vae_subfolder", "refiner_path"):
+    check(f"replay trap: the generate RESPONSE omits `{_f}` (rejected on echo)",
+          _f not in _rt_out, f"out={_rt_out!r}")
+check("replay trap: no /home/ path survives the response renderer",
+      not any("/home/" in str(v) for v in _rt_out.values()),
+      f"out={_rt_out!r}")
+check("replay trap premise: the response is otherwise a real params blob",
+      _rt_out.get("seed") == 1 and _rt_out.get("model") == "My-Model")
+# The invariant, stated as a set relation so a future field added to either
+# rejection tuple without a matching pop fails HERE rather than in the field.
+_rt_closed = set(mcps._GENERATE_REMOVED_FIELDS) | set(
+    mcps._GENERATE_UNSUPPORTED_REF_FIELDS)
+_rt_all_closed = mcps._resolved_params_as_names(
+    {**_rt_meta, **{k: "x" for k in _rt_closed}, "loras": []},
+    model_name="My-Model", transformer_name=None, lora_names=[])
+_rt_echoed = {k for k in _rt_closed if k in _rt_all_closed}
+check("replay trap: NO rejected field can appear in a generate response",
+      not _rt_echoed, f"still echoed: {sorted(_rt_echoed)}")
 
 
 # ════════════════════════════════════════════════════════════════════════
