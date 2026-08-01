@@ -283,6 +283,43 @@ ADR.
   swap, and the proposed client-side warning relocation duplicated the existing
   `edit_warnings` channel — that decision was replaced by a deletion. No finding
   was rejected.
+- 2026-08-01 — **Commit 3 landed; three deviations from the text above.**
+  Reviews: `docs/security/review-adr-044-commit3-mcp-hardening-2026-08-01.md`
+  (`security-auditor`, Fable, no fallback) plus a parallel `code-reviewer`
+  (Fable, no fallback).
+
+  1. **A NEW constant, not an extension of `_GENERATE_REMOVED_FIELDS`.** Clause
+     1 above says "add … to `_GENERATE_REMOVED_FIELDS`" — **do not do that; the
+     implementation is `_GENERATE_UNSUPPORTED_REF_FIELDS`.** That tuple's
+     rejection message reads "reference weights by catalog name (see list_models
+     / list_transformers)", which for `ref_boost=1.25` is actively wrong
+     guidance on an agent surface: there is no catalog name to reach for, the
+     surface simply does not exist. Two tuples with honest messages beat one
+     tuple with a misleading one. Consolidate to a field→reason mapping only if
+     a THIRD rejection category ever appears.
+  2. **The cascade branch is closed too** — not in the text above, and it had to
+     be. The `generate` tool routes to `_handle_generate_cascade` on
+     `cascade_config` presence BEFORE `_handle_generate`'s guards, so this ADR's
+     own proof hook ("a payload carrying them is REJECTED, not dropped") was
+     false on half the surface it claims. `_GENERATE_UNSUPPORTED_REF_FIELDS` is
+     now checked at cascade entry as well. `_GENERATE_REMOVED_FIELDS` shares the
+     same bypass and was deliberately NOT hoisted — that is a behaviour change
+     for a caller shape this ADR never touched, so it is TECH_DEBT.
+  3. **The call-site tripwire is an AST guard, not a substring.** The first cut
+     (`"generate(**" not in <source slice>`) is defeated by a line wrap, and it
+     is the only automated barrier protecting fields that are NOT in a rejection
+     tuple. It now walks the AST for a `**` starred kwarg and for each closed
+     name, with a premise check that exactly one `generate()` call exists.
+
+  **Left open, deliberately, and NOT part of this ADR:** the same review found
+  that `upscale_vae_path` / `upscale_vae_subfolder` / `refiner_path` — path-typed
+  `COMFYLESS_SCHEMA` members with no relation to the identity edit — take the
+  identical accept-and-drop route inbound AND survive `_render_extracted_params`
+  outbound as verbatim absolute paths, contradicting that function's own "no
+  absolute path survives" docstring. Different fields, different ADR lineage
+  (ADR-030 / ADR-016), pre-existing. Raised with Grant as its own decision
+  rather than folded in here.
+
 - 2026-08-01 — **Commit 2 landed; review findings folded in.** Reviews:
   `docs/security/review-adr-044-commit2-wire-carriage-2026-08-01.md`
   (`security-auditor`, Fable, no fallback) plus a parallel `code-reviewer`

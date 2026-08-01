@@ -94,6 +94,42 @@ _GENERATE_REMOVED_FIELDS = (
     "text_encoder_2_path",
 )
 
+# Reference-image / identity-edit fields, rejected at entry since ADR-044
+# commit 3. Separate from the tuple above because the REASON differs — these are
+# not weight paths, so the "reference weights by catalog name" message would be
+# a lie — and the fix is not "use a catalog name," it is that the surface does
+# not exist yet.
+#
+# Why reject rather than keep ignoring: the MCP input schema is ADVISORY, not
+# enforced. `call_tool` is registered `validate_input=False` (deliberately —
+# invariant 5 needs every invocation to emit an audit line, and the framework's
+# default short-circuits before our handler runs), so `additionalProperties:
+# False` stops nothing at runtime. `ref_boost`/`grounding_px`/`ref_images` are
+# all COMFYLESS_SCHEMA members, so they pass validate_machine_request AND the
+# `set(COMFYLESS_SCHEMA)` payload filter into gen_params. The only thing that
+# stopped them was the explicit-kwargs generate() call happening not to forward
+# those names — one unpinned layer, and a silent accept-and-drop on an agent
+# surface, which is the N1 failure this codebase condemns on the daemon wire.
+#
+# `ref_images` is the sharp one: it reached gen_params fully validated, and this
+# plane has NO counterpart to the daemon's _check_ref_paths containment, because
+# it was never meant to accept references. A future maintainer converting that
+# call to generate(**gen_params) — a natural cleanup — would open agent-supplied
+# absolute paths to in-process decode and VAE-encode of any readable file, with
+# no test to fail. See ADR-044 decision 6 and its security review (Findings 1, 5).
+#
+# Opening this surface properly needs a reference-image HANDLE scheme first:
+# ADR-015's rule is catalog NAMES, never absolute paths, in both directions, and
+# reference images are arbitrary user files with no catalog to launder through —
+# which is exactly why _render_extracted_params drops ref_images on the way OUT.
+# That is its own ADR, not a formality to bolt on here.
+_GENERATE_UNSUPPORTED_REF_FIELDS = (
+    "ref_images",
+    "ref_boost",
+    "grounding_px",
+    "identity",
+)
+
 # Fields dropped entirely from audit lines per invariant 5.
 _AUDIT_DROPPED_FIELDS = frozenset({"prompt", "negative_prompt"})
 
@@ -387,8 +423,16 @@ def _render_extracted_params(normalized: dict, *, model_family,
     # launder through (reference images are arbitrary files, not weights), so it
     # is dropped outright like vae_path — no absolute path or directory survives
     # this boundary (slice-1b close of the slice-1 extract_params regression).
+    # ref_boost/grounding_px join the drop list in ADR-044 commit 3, and they
+    # ship WITH the inbound rejection, not after it. They are COMFYLESS_SCHEMA
+    # members, so they survive normalization and were being handed to the agent
+    # as replayable params — while the generate tool now rejects them outright.
+    # Emitting a key the sibling tool refuses turns an innocent replay loop
+    # (extract_params -> echo to generate) into a hard error, so the outbound
+    # strip is what makes the inbound rejection coherent rather than a trap.
     for k in ("vae_path", "text_encoder_path", "text_encoder_2_path",
-              "output_path", "savepath", "lora_warnings", "ref_images"):
+              "output_path", "savepath", "lora_warnings", "ref_images",
+              "ref_boost", "grounding_px"):
         out.pop(k, None)
 
     if model_family:
@@ -1938,6 +1982,21 @@ async def _handle_generate(
                 f"MCP surface; reference weights by catalog name (see "
                 f"list_models / list_transformers)",
             )
+    # Reference-image / identity-edit fields (ADR-044 commit 3). Rejected, not
+    # ignored: the input schema is advisory under validate_input=False, so
+    # without this these reach gen_params validated and are dropped in silence
+    # at the generate() call site — and ref_images would be an uncontained
+    # caller-supplied path one refactor away from being consumed. Distinct
+    # message from the weight-path fields above: these are not paths to
+    # re-express as catalog names, the surface simply does not exist yet.
+    for _unsupported in _GENERATE_UNSUPPORTED_REF_FIELDS:
+        if _unsupported in arguments:
+            raise _MCPHandlerError(
+                "ValidationError",
+                f"validation failed: {_unsupported}: reference-image editing "
+                f"is not available on the MCP surface; it is CLI-only "
+                f"(comfyless generate --ref-image / --identity). See ADR-044.",
+            )
 
     # 1 — Canonical type validation (ADR-012), MINUS `loras`. The MCP loras
     # entry shape is {name, weight}; the SHARED canonical validator hard-
@@ -2245,6 +2304,27 @@ async def _handle_generate_cascade(
     The response renders cascade_config.stage_* as catalog names and drops
     scaffolding_repo; path-discard INFO notices ride alongside.
     """
+    # 0 — Reference/identity fields are rejected on THIS branch too (ADR-044
+    # commit 3). The `generate` tool routes to cascade purely on the presence of
+    # `cascade_config`, and that routing happens BEFORE _handle_generate's field
+    # guards — so without this, `{prompt, cascade_config, ref_images: [...]}`
+    # was accepted, type-validated and silently dropped, making the ADR proof
+    # hook "a payload carrying them is REJECTED, not dropped" false on half of
+    # the surface it claims to cover (security review 2026-08-01, Finding 3).
+    #
+    # Scoped to THIS tuple deliberately. `_GENERATE_REMOVED_FIELDS` (the weight
+    # paths) has always shared the same cascade bypass; closing that one is a
+    # behaviour change for a caller shape this commit never touched, so it is a
+    # TECH_DEBT entry rather than a rider here.
+    for _unsupported in _GENERATE_UNSUPPORTED_REF_FIELDS:
+        if _unsupported in arguments:
+            raise _MCPHandlerError(
+                "ValidationError",
+                f"validation failed: {_unsupported}: reference-image editing "
+                f"is not available on the MCP surface; it is CLI-only "
+                f"(comfyless generate --ref-image / --identity). See ADR-044.",
+            )
+
     # 1 — Canonical type validation (top-level types only; cascade_config
     # passes through as a generic object).
     from comfyless.params_validation import validate_machine_request

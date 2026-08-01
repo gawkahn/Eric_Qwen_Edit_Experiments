@@ -2224,3 +2224,33 @@ not.
 
 **Trigger:** if a user hits it often enough to complain, or if a client-side
 entry-gate slice is opened for another reason and this can ride along.
+
+## 2026-08-01 — the cascade branch still accept-and-drops the WEIGHT-PATH fields
+
+**What:** the MCP `generate` tool routes to `_handle_generate_cascade` purely on
+`cascade_config` presence, and that routing happens BEFORE `_handle_generate`'s
+field guards. ADR-044 commit 3 closed the reference/identity tuple on both
+branches (`_GENERATE_UNSUPPORTED_REF_FIELDS` is now checked at cascade entry
+too), but `_GENERATE_REMOVED_FIELDS` — the weight paths `transformer_path` /
+`vae_path` / `text_encoder_path` / `text_encoder_2_path` — is still only checked
+on the non-cascade branch. A payload `{prompt, cascade_config, vae_path: ...}`
+is accepted, type-validated and silently dropped.
+
+Found by `security-auditor` during the commit-3 review (Finding 3). The half
+that made ADR-044's own proof hook false was fixed in that commit; this half is
+pre-existing and predates it.
+
+**Why not now:** closing it changes behaviour for a caller shape ADR-044 never
+touched, on a Red Zone file whose scope extension Grant approved specifically as
+"the reference/identity fields on the generate surface." Widening that after the
+approval is the wrong order. It is also inert rather than dangerous today:
+cascade dispatches to `comfyless.cascade`, never `generate()`, so a dropped
+`vae_path` reaches no loader — this is an N1 consistency gap, not an exposure.
+
+Related, same review, and the reason to do them together: `generate_cascade`
+already emits INFO notices for dropped `quant` / `nag_scale`, so silent drops
+are against its own convention.
+
+**Trigger:** the next `mcp_server.py` slice that touches the cascade branch.
+The clean fix is hoisting both rejection loops above the cascade/non-cascade
+split rather than duplicating a second copy.

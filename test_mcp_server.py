@@ -4734,6 +4734,23 @@ with tempfile.TemporaryDirectory() as _tp_out, \
     check("ADR-035 1b (e2e): extract_params body drops ref_images + its abs path",
           "ref_images" not in _ri_body and "/home/gawkahn/secret" not in _ri_body)
 
+    # ADR-044 commit 3, same shape for the two identity-tuning scalars. A
+    # separate e2e leg from the pure-renderer ones because these are
+    # COMFYLESS_SCHEMA members and therefore SURVIVE _validate_params
+    # normalization — the drop list is the only barrier between a recorded
+    # sidecar and the agent, and the generate tool now REJECTS both, so emitting
+    # them would hand an agent keys its sibling tool refuses.
+    _rb_sc = _write_sidecar("rb_leak.json", {
+        "model": "/models/checkpoints/My-Model", "prompt": "p", "steps": 20,
+        "ref_boost": 1.25, "grounding_px": 512})
+    _rb_res = _run(mcps._call_tool_impl(_cfg4, "extract_params", {"path": _rb_sc}))
+    _rb_body = _rb_res[0].text if _rb_res else ""
+    check("ADR-044 (e2e): extract_params body drops ref_boost/grounding_px",
+          "ref_boost" not in _rb_body and "grounding_px" not in _rb_body,
+          f"body={_rb_body[:300]!r}")
+    check("ADR-044 (e2e) premise: the body is otherwise a real params blob",
+          "steps" in _rb_body, f"body={_rb_body[:300]!r}")
+
     # ── N22/N23: audit on stderr only; path echoed, params blob NOT ──
     _cap_err = io.StringIO()
     _cap_out = io.StringIO()
@@ -5288,6 +5305,125 @@ check("D1b: iterate_batch_id never appears either (the sibling key)",
 # are the filter working rather than extract_params having failed outright.
 check("negative control: a genuine param survives extract_params",
       "steps" in _rid_text, f"text={_rid_text[:300]!r}")
+
+
+# ════════════════════════════════════════════════════════════════════════
+print("\n── ADR-044: reference-image editing is CLOSED on the MCP plane ──")
+# ════════════════════════════════════════════════════════════════════════
+# ADR-044 decision 6, revised after its security review found the original claim
+# FALSE. The draft said the surface was "closed by construction" via
+# _GENERATE_INPUT_SCHEMA's additionalProperties:False. It is not — call_tool is
+# registered validate_input=False (deliberately; invariant 5 needs the audit
+# line), so the schema is ADVISORY. ref_images/ref_boost/grounding_px are all
+# COMFYLESS_SCHEMA members and passed both the canonical validator and the
+# set(COMFYLESS_SCHEMA) payload filter into gen_params; the ONLY thing stopping
+# them was the explicit-kwargs generate() call not forwarding those names.
+#
+# So these tests pin the CALL SITE, not schema-key absence. The draft's proposed
+# test (four names absent from the input schema) would have passed green while
+# the surface stayed reachable — the exact vacuous pin this block replaces.
+_ref_closed_fields = ("ref_images", "ref_boost", "grounding_px", "identity")
+
+# 1. BEHAVIORAL: each field is REJECTED at entry, not silently dropped. Silent
+#    drop is the N1 shape this codebase condemns on the daemon wire; it has no
+#    business on an agent surface either.
+for _f in _ref_closed_fields:
+    _v = [{"path": "/etc/passwd", "mode": "ref"}] if _f == "ref_images" else (
+        True if _f == "identity" else (1.25 if _f == "ref_boost" else 512))
+    _rc_r, _rc_raised, _rc_audit = _call(_d2_cfg, {
+        "prompt": "a test image", "model": "qwen-image", _f: _v})
+    check(f"ADR-044: `{_f}` in generate arguments is REJECTED, not dropped",
+          _rc_raised is not None and _f in _rc_raised
+          and ("not supported" in _rc_raised or "not available" in _rc_raised),
+          f"raised={_rc_raised!r}")
+
+# 2. The AGENT-FACING rejection must not become a path oracle. ref_images
+#    carried a real filesystem path above; the error may name the FIELD (public
+#    schema knowledge) but never the VALUE — the rule the weight-path rejections
+#    follow. Scoped to the agent-visible error deliberately: the server-side
+#    audit line DOES record the caller's own input (invariant 5), which is an
+#    operator log, not disclosure — the caller already knows what it sent.
+_rc_r, _rc_raised, _rc_audit = _call(_d2_cfg, {
+    "prompt": "p", "model": "qwen-image",
+    "ref_images": [{"path": "/etc/passwd", "mode": "ref"}]})
+check("ADR-044: the agent-facing rejection discloses no reference VALUE",
+      _rc_raised is not None and "passwd" not in _rc_raised,
+      f"raised={_rc_raised!r}")
+check("ADR-044: ...and it does name the FIELD, so the agent can correct itself",
+      _rc_raised is not None and "ref_images" in _rc_raised)
+
+# 3. STRUCTURAL: the generate() call site forwards none of the four. This is the
+#    layer that was actually load-bearing and unpinned. A maintainer converting
+#    the explicit kwargs to generate(**gen_params) — a natural cleanup — would
+#    open agent-supplied absolute paths to in-process decode/VAE-encode, with no
+#    _check_ref_paths counterpart on this plane (security review, Finding 5).
+# AST, not substring. The first cut used `f"{_f}=" not in <source slice>` and
+# `"generate(**" not in ...`, which trivial reformatting defeats —
+# `generate(\n    **gen_params`, `generate( **kw)`, or binding the dict first.
+# That fragility matters because for any field NOT in the entry-rejection
+# tuples this is the only automated barrier (security review 2026-08-01,
+# Findings 2 + 5). House precedent for structural guards: test_krea2_identity.py.
+import ast as _rc_ast  # noqa: E402
+import inspect as _rc_insp  # noqa: E402
+import textwrap as _rc_tw  # noqa: E402
+
+_rc_fn = _rc_ast.parse(
+    _rc_tw.dedent(_rc_insp.getsource(mcps._handle_generate))).body[0]
+_rc_gen_calls = [
+    n for n in _rc_ast.walk(_rc_fn)
+    if isinstance(n, _rc_ast.Call)
+    and ((isinstance(n.func, _rc_ast.Name) and n.func.id == "generate")
+         or (isinstance(n.func, _rc_ast.Attribute) and n.func.attr == "generate"))]
+check("ADR-044 premise: _handle_generate calls generate() exactly once",
+      len(_rc_gen_calls) == 1, f"found {len(_rc_gen_calls)}")
+_rc_kwnames = {kw.arg for c in _rc_gen_calls for kw in c.keywords}
+for _f in _ref_closed_fields:
+    check(f"ADR-044: the MCP generate() call passes no `{_f}` kwarg",
+          _f not in _rc_kwnames)
+# `kw.arg is None` IS the `**splat` node — the refactor that would forward every
+# validated gen_params key, including any future one nobody thought to reject.
+check("ADR-044: the MCP generate() call does not **splat (the refactor that "
+      "would reopen this surface)",
+      not [c for c in _rc_gen_calls if any(kw.arg is None for kw in c.keywords)])
+
+# 4. OUTBOUND: extract_params must not hand the agent keys the generate tool now
+#    rejects. These two ship together — rejecting inbound while still emitting
+#    them outbound turns an innocent replay loop into a hard error.
+_rc_sidecar = {"model": "qwen-image", "prompt": "p", "steps": 20,
+               "ref_boost": 1.25, "grounding_px": 512,
+               "ref_images": [{"path": "/srv/secret/face.png", "mode": "ref"}]}
+_rc_out, _, _ = mcps._render_extracted_params(
+    _rc_sidecar, model_family=None, index={}, catalog={})
+for _f in ("ref_boost", "grounding_px", "ref_images"):
+    check(f"ADR-044: extract_params does not emit `{_f}` (nothing to replay)",
+          _f not in _rc_out)
+check("ADR-044: ...and extract_params still returns the ordinary params",
+      _rc_out.get("steps") == 20 and _rc_out.get("prompt") == "p")
+
+# (The end-to-end outbound leg lives beside the ADR-035 `ref_images` one, in the
+# extract_params block that already has the sidecar-writing fixture.)
+
+# 4b. CASCADE branch. The `generate` tool routes to cascade on cascade_config
+# presence, BEFORE _handle_generate's guards — so without an equivalent gate
+# there, the proof hook "a payload carrying them is REJECTED" was false on half
+# the surface (security review 2026-08-01, Finding 3).
+for _f in _ref_closed_fields:
+    _v = [{"path": "/etc/passwd", "mode": "ref"}] if _f == "ref_images" else (
+        True if _f == "identity" else (1.25 if _f == "ref_boost" else 512))
+    _cc_r, _cc_raised, _ = _call_cascade(_d2_cfg, {
+        "prompt": "p", "cascade_config": {"stage_c": "x", "stage_b": "y"},
+        _f: _v})
+    check(f"ADR-044: `{_f}` is REJECTED on the CASCADE branch too",
+          _cc_raised is not None and _f in _cc_raised
+          and ("not supported" in _cc_raised or "not available" in _cc_raised),
+          f"raised={_cc_raised!r}")
+
+# 5. The schema does not advertise them either, so an agent reading the tool
+#    definition is never told the fields exist. This is the WEAK pin — kept as
+#    documentation-of-intent, explicitly not relied on (see the header).
+for _f in _ref_closed_fields:
+    check(f"ADR-044: `{_f}` is not advertised in the generate input schema",
+          _f not in mcps._GENERATE_INPUT_SCHEMA["properties"])
 
 
 # ════════════════════════════════════════════════════════════════════════
