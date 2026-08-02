@@ -2288,3 +2288,44 @@ deferral is a decision rather than an omission.
 shape: hoist both rejection loops above the cascade/non-cascade split rather
 than adding a third copy, and add the two refiner numerics to both the removed
 tuple and the extract pop list at the same time.
+
+## 2026-08-01 — two daemons per device can silently evict each other's socket
+
+**What:** `comfyless --serve` binds one socket per device
+(`/run/user/1000/comfyless-cuda<N>.sock`) with no ownership check in either
+direction, so a second daemon on the same device silently takes over:
+
+1. **Startup steals.** `server.py` does `if sock_path.exists(): sock_path.unlink()`
+   before `bind()`. A second `--serve` on the same device unlinks the first
+   daemon's socket and binds its own. The first process keeps running, holding a
+   deleted inode and its VRAM, and never receives another connection. Nothing is
+   logged on either side.
+2. **Shutdown steals.** The server-loop `finally` does
+   `if sock_path.exists(): sock_path.unlink()` — by PATH, without checking the
+   inode is still the one it bound. So the ORPHANED daemon, on exit, deletes the
+   LIVE daemon's socket.
+3. **`systemctl stop` is remote-control, not process control.** The unit's
+   `ExecStop` is `comfyless.generate --unload --device cuda:%i`, which sends an
+   `unload` request over the shared socket — to whoever owns it. `unload` returns
+   `False`, stopping that server's loop (and triggering (2)). So stopping the
+   systemd unit can shut down an unrelated manual daemon and delete its socket,
+   while the systemd process itself is merely SIGTERM'd afterwards.
+
+Hit live 2026-08-01 during the ADR-044 Part C smoke: `comfyless@1.service` was
+running when a manual `--serve` was started on cuda:1 for its `--ref-root`. Both
+processes ran; the manual one owned the socket; the systemd one was a VRAM-holding
+ghost. Confirmed by socket mtime and `pgrep`.
+
+**Why not now:** the fix is a genuine design question, not a patch — options are
+an ownership check (bind to a temp path + atomic rename, verify inode before
+unlink), an abstract-namespace socket, `SO_REUSEADDR`-style refusal ("a daemon is
+already serving cuda:1 — stop it first"), or systemd socket activation so the
+unit owns the socket and manual runs cannot bind at all. Refusing to start beats
+stealing, but it changes the restart ergonomics the systemd unit depends on. That
+deserves its own slice, and none of it is on the ADR-044 path.
+
+**Trigger:** the next `--serve` / systemd-unit change, or the next time a run
+inexplicably ignores a daemon flag (that symptom is almost always this). Interim
+workaround: exactly one daemon per device — `systemctl --user stop comfyless@<N>`
+BEFORE starting a manual one, and `pgrep -af "comfyless.generate --serve"` to
+confirm.
