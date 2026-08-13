@@ -2372,13 +2372,36 @@ matches no fragment and lands on the generic var — which works, but only by
 accident. Decide: add a proxy fragment, or make the generic var the documented
 path for proxied endpoints.
 
-**The one that fails SILENTLY — `model` pins.** Every `enhancers.toml` entry
-today omits `model` and relies on `_resolve_endpoint_model` doing `GET
-/v1/models` and taking `ids[0]`. That is only safe because it is one server per
-port. A single proxy fronting many models breaks the assumption without
-erroring — you would enhance/judge with whatever model sorts first. **Every
-entry must gain an explicit `model = "..."` in the same slice as the URL
-change.** This is the highest-risk item here precisely because nothing raises.
+**The one that fails SILENTLY — `ids[0]` model selection.** Every
+`enhancers.toml` entry today omits `model` and relies on
+`_resolve_endpoint_model` doing `GET /v1/models` and taking `ids[0]`. That is
+only safe because it is one server per port. A proxy fronting many models breaks
+the assumption without erroring — you would enhance/judge with whatever model
+sorts first. **This is the highest-risk item here precisely because nothing
+raises.**
+
+What to do INSTEAD of `ids[0]` is deliberately left open (Grant, 2026-08-13):
+the proxy is getting its own semantics for naming a model when several are
+served, so the replacement is a consumption decision that follows the proxy's
+contract, not something to guess at now. An explicit per-entry `model = "..."`
+pin is the obvious candidate and may well be the answer — do not treat it as
+settled. What IS settled: `ids[0]` cannot survive, and whatever replaces it
+lands in the same slice as the URL rewrite.
+
+**Cold-start latency vs. our hardcoded timeouts.** The proxy fronts a scheduler
+that can START a model that isn't currently up. That turns a request into a
+potentially minutes-long operation (a 284B MoE load is not a 120 s event), and
+every HTTP timeout in this repo is a hardcoded literal with no config surface:
+`enhance.py:452` `timeout=10` (the `/v1/models` GET), `enhance.py:479`
+`timeout=120` (chat), `refine.py:77` `JUDGE_HTTP_TIMEOUT = 120` (judge + duel;
+plumbed through as a parameter but never sourced from the registry). The
+concepts enricher inherits enhance's values. Two consequences to design for:
+(1) these need to become backend-cfg-readable rather than literals, and (2) a
+cold-start timeout is a DIFFERENT failure from an endpoint being down, and
+today both surface as the same `EnhanceError`/`RefineError` — which matters most
+in refine, where an endpoint failure charges the F7 iteration counter and can
+end a run under a misleading outcome. Also note `/v1/models` may list startable
+models rather than resident ones, so a listing hit is not proof of readiness.
 
 **Config surface to rewrite:** `enhancers.toml` (9 entries, localhost:8016-8022
 plus the 2026-08-13 `deepseek-v4-flash` on :8036), `enhancers.example.toml`
