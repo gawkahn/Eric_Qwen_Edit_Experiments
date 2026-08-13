@@ -2500,6 +2500,25 @@ the same slice. Sharpest consequence in refine: an endpoint failure charges the
 F7 iteration counter, so a model that is merely *warming* could burn a run's
 iteration budget while reporting a misleading outcome.
 
+**Liveness gap — now confirmed against the built artifact.** `models.json`'s
+entries carry exactly `id`, `object`, `created`, `owned_by`. **There is no state
+or availability field**, so the gap described below is a property of the shipped
+inventory, not an inference from the ADR.
+
+A second argument arrived from the ai-stack model-bringup session (2026-08-13)
+and it is stronger than the scheduling one: **models are mutually exclusive by
+GPU capacity, permanently.** `deepseek-v4-flash-0731` (:8035) and its abliterated
+sibling (:8036) each fill both cards (~187 GiB), so one running means the other
+structurally cannot — and that generalises to any two two-card models, forever,
+independent of any scheduler. So "the model you want is down because a different
+one is up" is a standing property of a fleet with more models than cards, not
+merely a warming state. Consequence for us: probing N models cannot distinguish
+"not started" from "cannot start while its neighbour holds the cards," so no
+amount of client-side cleverness reconstructs the signal. That session also
+noted our own connect failures against :8036 earlier that day were its model
+swaps — i.e. the "indistinguishable from an outage" failure mode below already
+happened to us once, from a cause that was neither filtering nor a fault.
+
 **Explicit bring-up, and the liveness gap it runs into.** Grant's design intent
 (2026-08-13): waking a model must be an EXPLICIT decision, never an automatic
 consequence of asking for one that is down — with an offer of what to do instead
@@ -2552,13 +2571,34 @@ in `scripts/git-policy/_red-zone-paths.sh`. Any token wiring that touches it
 needs `security-auditor` plus a saved `docs/security/review-*.md` and an ADR
 reference, or pre-commit rejects the commit. Budget for a spec-first slice.
 
-**Why not now:** the gateway is designed and accepted but not yet standing, so
-none of it is testable. Two of the three original unknowns are now answered by
-ADR-008 — the URL is `http://<host>:8100/v1`, and the token rides
-`Authorization: Bearer` on every allowlisted path including `/v1/models` (D3 is
-path-independent, and D6 explicitly refuses an unauthenticated inventory
-endpoint). What genuinely remains open is the model-naming semantics and the
-scheduler's request shape, both of which are Grant's to settle upstream.
+**Why not now — REVISED 2026-08-13 (later the same day): the gateway is already
+standing, so "untestable" no longer applies.** Measured directly:
+
+    curl -o /dev/null -w '%{http_code}' http://localhost:8100/v1/models   # 401 (auth live)
+    ss -ltn  →  127.0.0.1:8100, 172.17.0.1:8100, 192.168.1.153:8100   (proxy)
+                127.0.0.1:8101                                        (router, correctly loopback)
+                0.0.0.0:8036                                          (backends NOT yet migrated)
+
+So D1/D2/D3/D9 are implemented and enforcing; what remains on ai-stack's side is
+**slice 4, the backend loopback migration**, which is the step that does not
+affect us (we are a host process). The only thing gating a test on our side is
+the bearer, which is an operator secret under `${STATE_DIR}/secrets/` — ask
+Grant for it rather than going looking.
+
+**The model-naming question is effectively answered by implementation.** The
+proxy's inventory is `infra/gateway/models.json`, generated from the ai-stack
+README registry by `tools/scripts/gen-gateway-inventory.sh` (which also emits
+the router's backend table, so the two cannot drift — never hand-edit either).
+It currently holds **29 entries whose `id`s are exactly the README names**,
+including `deepseek-v4-flash-0731-abliterated-nvfp4` and the four
+`gemma4-*-heretic*` / three `qwen3-vl-*` ids we consume. So a per-entry
+`model = "<registry name>"` pin is no longer a guess — it is reading the served
+inventory. Confirm against the live `/v1/models` at migration time, since the
+generator can add entries.
+
+**And `ids[0]` is now concretely, not theoretically, wrong:** the first entry in
+that inventory is `gpt-oss-120b`. Every backend in `enhancers.toml` that omits
+`model` would silently resolve to it.
 
 **Trigger — two of them, and the second is a deadline we do not control:**
 
