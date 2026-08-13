@@ -2329,3 +2329,86 @@ inexplicably ignores a daemon flag (that symptom is almost always this). Interim
 workaround: exactly one daemon per device — `systemctl --user stop comfyless@<N>`
 BEFORE starting a manual one, and `pgrep -af "comfyless.generate --serve"` to
 confirm.
+
+## 2026-08-13 — single-entrypoint LLM proxy: token plumbing + `model` pins
+
+**What:** an ai-stack-wide proxy/router is being wired to sit in front of every
+LLM endpoint. When it lands, this repo needs a config sweep, one code decision,
+and one deferred security item promoted. Inventory taken 2026-08-13 (gitnexus
+index fresh at `85cc02b`); recorded now so the surface doesn't have to be
+re-derived when the proxy exists.
+
+**Already token-ready — config only, no code.** The `key_env` convention
+(config holds the env-var NAME, the value comes from the environment, never the
+command line) is implemented by all three LLM consumers, and all three read the
+SAME registry via `enhance.load_backends`, so one `key_env` line per
+`enhancers.toml` entry serves every caller:
+
+- `comfyless/enhance.py` — `_post_chat` + `_resolve_endpoint_model`, Bearer on
+  both `/chat/completions` and `/models`
+- `comfyless/refine.py` — `_backend_key` / `_post_judge` (judge + ADR-039 duel);
+  `key_env` with a literal `key` fallback
+- `comfyless/catalog_enrich_concepts.py` — reuses `enhance._post_chat` + `key_env`
+  (this is the LoRA-catalog LLM plane; it needs nothing new)
+
+**Confirmed OUT of scope — verified, not assumed:**
+
+- `comfyless/server.py` (daemon) makes zero LLM calls. Enhancement runs
+  CLIENT-side in `generate.py` (~:4639) before dispatch, so the token lives in
+  the CLI process env; rotating it needs no daemon restart.
+- `comfyless/mcp_server.py` has no outbound LLM call — its tools are `generate`,
+  `list_models`, `list_loras`, `list_transformers`, `extract_params`, `search`.
+  It is called FROM a model, not calling one.
+- `comfyless/video.py:799` spawns workers with `subprocess.Popen(cmd)` and no
+  `env=`, so `--devices` workers inherit the token for free.
+- `comfyless/catalog_enrich.py` is civitai, not an LLM — its own auth axis.
+
+**Needs a code decision — the node pack.**
+`nodes/eric_qwen_prompt_rewriter.py` (and the inpaint / controlnet rewriters that
+import its `_resolve_api_key`) use an older, separate mechanism: `_ENV_KEY_MAP`
+maps URL FRAGMENTS (`deepseek`/`openai`/`anthropic`) to env names, then falls
+back to generic `ERIC_QWEN_API_KEY`, then `api_keys.ini`. Under a proxy the URL
+matches no fragment and lands on the generic var — which works, but only by
+accident. Decide: add a proxy fragment, or make the generic var the documented
+path for proxied endpoints.
+
+**The one that fails SILENTLY — `model` pins.** Every `enhancers.toml` entry
+today omits `model` and relies on `_resolve_endpoint_model` doing `GET
+/v1/models` and taking `ids[0]`. That is only safe because it is one server per
+port. A single proxy fronting many models breaks the assumption without
+erroring — you would enhance/judge with whatever model sorts first. **Every
+entry must gain an explicit `model = "..."` in the same slice as the URL
+change.** This is the highest-risk item here precisely because nothing raises.
+
+**Config surface to rewrite:** `enhancers.toml` (9 entries, localhost:8016-8022
+plus the 2026-08-13 `deepseek-v4-flash` on :8036), `enhancers.example.toml`
+(committed, :8016/:8017), `implementation_details.md:49`, and a stale-reading
+fixture at `test_catalog_enrich_concepts.py:227`. `catalog_cli.py:78`'s
+`--backend gemma-moe-nvfp4` default is a NAME, so it survives the port change
+unless the proxy renames models.
+
+**Security items the token reactivates:**
+
+- **A11 promoted.** `implementation_details.md:139` defers openai-endpoint
+  redirect hardening as LOW: urllib follows redirects and forwards
+  `Authorization: Bearer` cross-host. Its trigger reads "if a non-localhost
+  endpoint is ever configured" — that is TOO NARROW. A *localhost* proxy that
+  302s leaks the token just as well. The real trigger is "once a real token is
+  in play." Re-scope A11 and fix it in the token slice.
+- `enhance._post_chat` echoes 300 bytes of the HTTPError body into the raised
+  exception; a proxy 401 could reflect a token into a log. Low, but look.
+- The token must never land in the committed `enhancers.example.toml`
+  (`enhancers.toml` itself is gitignored).
+
+**Process cost — not a config sweep.** `comfyless/refine.py` is a Red Zone path
+in `scripts/git-policy/_red-zone-paths.sh`. Any token wiring that touches it
+needs `security-auditor` plus a saved `docs/security/review-*.md` and an ADR
+reference, or pre-commit rejects the commit. Budget for a spec-first slice.
+
+**Why not now:** the proxy does not exist yet, so none of it is testable — the
+URLs, the model ids the proxy will advertise, and whether it wants the token on
+`/v1/models` as well as `/v1/chat/completions` are all unknown until it is up.
+
+**Trigger:** the proxy going live. Do the `model` pins and the A11 redirect fix
+in the SAME slice as the URL rewrite — a proxied endpoint with neither is the
+combination that fails quietly.
