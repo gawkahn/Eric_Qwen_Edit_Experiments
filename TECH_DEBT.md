@@ -2338,6 +2338,49 @@ and one deferred security item promoted. Inventory taken 2026-08-13 (gitnexus
 index fresh at `85cc02b`); recorded now so the surface doesn't have to be
 re-derived when the proxy exists.
 
+**The contract is already written and accepted** (read both before doing any of
+this): `AI_Stack/Decisions/ADR-008-LLM-Egress-Gateway.md` (accepted 2026-08-08)
+and the negotiation channel `AI_Lab/contracts/llm_egress_gateway_bridge.md`.
+Shape: nginx auth proxy on **:8100** (the only exposed port, one static bearer
+via `Authorization: Bearer`, path-independent auth) → `vllm_router` on
+127.0.0.1:8101 → vLLM backends on **127.0.0.1:8001-8036**. Consumers set
+`base_url` to `http://<host>:8100/v1`. The allowlist is closed and exact: POST
+`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, GET `/v1/models` —
+nothing else. Both paths this repo uses are on it.
+
+**Correction to the premise this entry was opened with — the ports do NOT
+break.** D9 keeps the backends on 8001-8036 and only rebinds them from
+`0.0.0.0` to `127.0.0.1`. comfyless is a **host process**, so loopback stays
+reachable and *every current `enhancers.toml` URL keeps working through
+cutover*. ADR-008's cutover analysis (D1) enumerates the consumers that break as
+the **containerized** ones — OpenWebUI, SillyTavern, ComfyUI nodes — because a
+container cannot reach a host loopback bind. Consequences worth being explicit
+about: (a) nothing forces a migration on our schedule, so this is elective work
+we can sequence ourselves; (b) until we migrate we are a host-local path around
+the gateway that the token does not govern — not a LAN exposure and not a new
+one (I-GW11 accepts exactly this residual: the host-local hole is any local uid,
+closed by uid-scoped nftables in local_agents' future work, not by topology);
+(c) an elective migration that never happens is how a port dictionary survives
+the project that was supposed to delete it.
+
+**ADR-008's one un-enumerable consumer is ours, and the answer is NIL.** The ADR
+says at D1: "confirm whether any ComfyUI workflow or custom node calls a host
+LLM endpoint. That is runtime workflow state, not visible in the configs, and it
+is the one consumer this ADR cannot enumerate from the repo." Swept 2026-08-13:
+this pack IS installed in the bridge-networked containers
+(`ai-stack-data/{comfyui,comfy1}/custom_nodes/comfyui-eric-qwen-edit`, plus
+`comfy-dev/basedir`), and it does ship three nodes that CAN call a host LLM —
+`eric_qwen_prompt_rewriter.py` and the inpaint/controlnet variants importing its
+`_resolve_api_key`, via an operator-typed `api_url` widget. But **no saved
+workflow uses them, and no saved workflow under any ComfyUI tree contains an
+OpenAI-style `http://host:port/v1` URL at all**; the repo's own
+`workflows/*.{json,png}` artifacts are likewise clean. Their defaults
+(`localhost:1234` LM Studio, `localhost:11434` Ollama) resolve *inside* the
+container, so they could never have reached a host backend without someone
+typing a host-reachable address, and nobody has. Zero exposure at cutover from
+this repo. Re-run the sweep if that changes:
+`grep -rlio "http://[a-z0-9._-]*:[0-9]\{2,5\}/v1" <comfy trees>/run/ComfyUI/user`.
+
 **Already token-ready — config only, no code.** The `key_env` convention
 (config holds the env-var NAME, the value comes from the environment, never the
 command line) is implemented by all three LLM consumers, and all three read the
@@ -2380,28 +2423,82 @@ the assumption without erroring — you would enhance/judge with whatever model
 sorts first. **This is the highest-risk item here precisely because nothing
 raises.**
 
+ADR-008 **D6/I-GW5 makes this strictly worse than "ambiguous"**: `GET
+/v1/models` is served by the proxy from the **full static inventory** and
+"enumerates every model the gateway is configured to route to, under the exact
+name consumers must send, **regardless of whether that model is currently
+running**." That is deliberate — it exists so OpenWebUI's model picker isn't
+empty on a cold box — and D6 accepts the consequence in terms: "a pick can 503."
+So `ids[0]` would not merely pick an arbitrary model, it would routinely pick a
+**down** one and 503 on the first chat call. A listing hit is explicitly not
+proof of readiness.
+
 What to do INSTEAD of `ids[0]` is deliberately left open (Grant, 2026-08-13):
 the proxy is getting its own semantics for naming a model when several are
 served, so the replacement is a consumption decision that follows the proxy's
-contract, not something to guess at now. An explicit per-entry `model = "..."`
-pin is the obvious candidate and may well be the answer — do not treat it as
-settled. What IS settled: `ids[0]` cannot survive, and whatever replaces it
-lands in the same slice as the URL rewrite.
+contract. An explicit per-entry `model = "..."` pin is the obvious candidate —
+do not treat it as settled. What IS settled: `ids[0]` cannot survive, and
+whatever replaces it lands in the same slice as the URL rewrite.
 
-**Cold-start latency vs. our hardcoded timeouts.** The proxy fronts a scheduler
-that can START a model that isn't currently up. That turns a request into a
-potentially minutes-long operation (a 284B MoE load is not a 120 s event), and
-every HTTP timeout in this repo is a hardcoded literal with no config surface:
-`enhance.py:452` `timeout=10` (the `/v1/models` GET), `enhance.py:479`
-`timeout=120` (chat), `refine.py:77` `JUDGE_HTTP_TIMEOUT = 120` (judge + duel;
-plumbed through as a parameter but never sourced from the registry). The
-concepts enricher inherits enhance's values. Two consequences to design for:
-(1) these need to become backend-cfg-readable rather than literals, and (2) a
-cold-start timeout is a DIFFERENT failure from an endpoint being down, and
-today both surface as the same `EnhanceError`/`RefineError` — which matters most
-in refine, where an endpoint failure charges the F7 iteration counter and can
-end a run under a misleading outcome. Also note `/v1/models` may list startable
-models rather than resident ones, so a listing hit is not proof of readiness.
+**The D7 availability contract is specified against an SDK we do not use.**
+This is the largest code finding here and it is ours alone — the bridge
+negotiated D7 with local_agents, whose consumer is the `openai` Python SDK, and
+every mechanism in it is an SDK behaviour: `x-should-retry: false` short-circuits
+`_should_retry`, `Retry-After` is honoured verbatim by `_calculate_retry_timeout`
+for `0 < x ≤ 60`, and `x-model-warming` / `x-model-ready-eta-seconds` are read
+off `.response.headers` (I-GW12 chose headers over body precisely because
+headers survive all three of the SDK's error-construction branches). **comfyless
+uses raw `urllib`**, which auto-retries nothing, honours `Retry-After` not at
+all, and — in our handlers — *discards the headers entirely*: both
+`enhance._post_chat` and `refine._post_judge` catch `urllib.error.HTTPError` and
+keep only `e.code` plus 300 bytes of body. So today a warming model and a dead
+model are the same `EnhanceError`/`RefineError` string, and the ETA the gateway
+went out of its way to make readable is dropped on the floor. Consuming D7 means
+reading `e.headers` explicitly at both sites. Note the ADR states the three
+states as: not-running-and-nothing-will-wake-it → 503 + `x-should-retry: false`;
+warming → 503 + `Retry-After` + the two `x-model-*` headers; proxy/router broken
+→ 502. Genuine upstream 503s pass through untouched (I-GW7), and auth failures
+are 401/403 and never 503 (I-GW6), so status alone cleanly separates "refused"
+from "unavailable."
+
+**Cold start cannot be absorbed, by anyone.** ADR-008 measured two 235B launches
+at **1,239 s and 1,137 s (19-21 min)** and states plainly that no combination of
+`Retry-After` (capped at 60 s) and SDK retries can hide that — the design
+surfaces the condition instead. Our hardcoded timeouts are all far below it and
+have no config surface: `enhance.py:452` `timeout=10` on the `/v1/models` GET,
+`enhance.py:479` `timeout=120` chat, `refine.py:77` `JUDGE_HTTP_TIMEOUT = 120`
+(judge + duel; a parameter, but never sourced from the registry). The concepts
+enricher inherits enhance's values. These should become backend-cfg-readable in
+the same slice. Sharpest consequence in refine: an endpoint failure charges the
+F7 iteration counter, so a model that is merely *warming* could burn a run's
+iteration budget while reporting a misleading outcome.
+
+**Explicit bring-up, and the liveness gap it runs into.** Grant's design intent
+(2026-08-13): waking a model must be an EXPLICIT decision, never an automatic
+consequence of asking for one that is down — with an offer of what to do instead
+("Qwen 32B isn't up but Gemma 4 is, use that instead?"). ADR-008 leaves room for
+this by construction: D7 ends "the gateway reports 'warming' and an ETA; the
+scheduler owns 'make it running'," and lifecycle is explicitly out of that ADR.
+Two things to work out on our side before the scheduler slice freezes its shape:
+
+1. **We cannot currently offer an alternative, because nothing tells us what is
+   up.** D6 deliberately removed liveness from `/v1/models` (full static
+   inventory, running or not), so the only liveness signal in the whole contract
+   is a 503 on an actual call. Probing every candidate to build an "is up" list
+   is N requests to find one answer. If a cheap liveness signal is wanted — a
+   field on the `/v1/models` entries, or a separate endpoint — that is a
+   **request to raise on the bridge doc**, and it is much cheaper to raise
+   before the scheduler slice than after. Note the allowlist is closed and
+   exact, so a new endpoint is an ADR-008 change, not a client-side choice.
+2. **Most of our LLM calls have no human attached.** An interactive
+   "use Gemma instead?" prompt only makes sense on the foreground CLI; refine
+   loops, the MCP server, video workers and `--iterate` batches are all
+   non-interactive and need a *policy* instead (fail fast naming the model and
+   what the operator should launch — which is exactly what the D7 not-running
+   body carries). The repo already has the right precedent for the split:
+   `comfyless/pause.py`'s `sigint_pause` no-op guards (no TTY / not main thread
+   / detached stdin) are the shape to reuse rather than reinvent, and the same
+   guards decide correctly here.
 
 **Config surface to rewrite:** `enhancers.toml` (9 entries, localhost:8016-8022
 plus the 2026-08-13 `deepseek-v4-flash` on :8036), `enhancers.example.toml`
@@ -2428,10 +2525,19 @@ in `scripts/git-policy/_red-zone-paths.sh`. Any token wiring that touches it
 needs `security-auditor` plus a saved `docs/security/review-*.md` and an ADR
 reference, or pre-commit rejects the commit. Budget for a spec-first slice.
 
-**Why not now:** the proxy does not exist yet, so none of it is testable — the
-URLs, the model ids the proxy will advertise, and whether it wants the token on
-`/v1/models` as well as `/v1/chat/completions` are all unknown until it is up.
+**Why not now:** the gateway is designed and accepted but not yet standing, so
+none of it is testable. Two of the three original unknowns are now answered by
+ADR-008 — the URL is `http://<host>:8100/v1`, and the token rides
+`Authorization: Bearer` on every allowlisted path including `/v1/models` (D3 is
+path-independent, and D6 explicitly refuses an unauthenticated inventory
+endpoint). What genuinely remains open is the model-naming semantics and the
+scheduler's request shape, both of which are Grant's to settle upstream.
 
-**Trigger:** the proxy going live. Do the `model` pins and the A11 redirect fix
-in the SAME slice as the URL rewrite — a proxied endpoint with neither is the
-combination that fails quietly.
+**Trigger:** the gateway going live. Note this is NOT forced by ai-stack's
+cutover — see the premise correction above; our URLs survive it — so the trigger
+is a decision, and the risk is that an elective migration quietly never happens.
+When it does: the `ids[0]` replacement, `e.headers` consumption for D7, the
+configurable timeouts, and the A11 redirect fix all belong in the SAME slice as
+the URL rewrite. A gateway URL with the old `ids[0]` resolution and header-blind
+error handling is the combination that fails quietly and looks like a working
+migration.
