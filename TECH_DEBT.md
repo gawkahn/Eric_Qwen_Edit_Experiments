@@ -2355,13 +2355,40 @@ reachable and *every current `enhancers.toml` URL keeps working through
 cutover*. ADR-008's cutover analysis (D1) enumerates the consumers that break as
 the **containerized** ones — OpenWebUI, SillyTavern, ComfyUI nodes — because a
 container cannot reach a host loopback bind. Consequences worth being explicit
-about: (a) nothing forces a migration on our schedule, so this is elective work
-we can sequence ourselves; (b) until we migrate we are a host-local path around
-the gateway that the token does not govern — not a LAN exposure and not a new
-one (I-GW11 accepts exactly this residual: the host-local hole is any local uid,
-closed by uid-scoped nftables in local_agents' future work, not by topology);
-(c) an elective migration that never happens is how a port dictionary survives
-the project that was supposed to delete it.
+about: (a) nothing forces a migration on ai-stack's cutover schedule, so we
+sequence it ourselves; (b) until we migrate we are a host-local path around the
+gateway that the token does not govern — not a LAN exposure and not a new one
+(I-GW11 accepts exactly this residual); (c) an elective migration that never
+happens is how a port dictionary survives the project that was supposed to
+delete it.
+
+**But the host-process path is transitional, not durable** (Grant, 2026-08-13):
+direct host→backend reachability is expected to be withdrawn, leaving the proxy
+as the only ingress. **So this migration is elective in TIMING and mandatory in
+OUTCOME** — plan it as work that will be forced, not work that might never be
+needed. ADR-008's 2026-08-10 changelog already names the mechanism: host-local
+isolation is "a packet-filter question, not a topology one," with a uid-scoped
+`nftables` `owner`-match rule as the right instrument, scoped to local_agents
+rather than closed in ADR-008 (which is why I-GW11 stays open). Two consequences:
+
+- **That rule, as described, denies comfyless.** Its stated virtue is that it
+  "can permit one broker while denying the rest of the box" — and comfyless *is*
+  the rest of the box, same operator and same uid (`gawkahn`) as everything else
+  here. Correct security outcome, but it means either comfyless has migrated to
+  :8100 by then or it needs an explicit allowance.
+- **It fails in the worst available shape.** A filtered connection and a dead
+  backend are indistinguishable at our error boundary — both arrive as a connect
+  failure and render as the same "cannot reach endpoint" string. The day
+  host-local egress closes, comfyless reports every model as down, which reads
+  as an ai-stack outage rather than a policy change. Notice turns a confusing
+  incident into a one-line config edit; notice has been requested (item 3 of the
+  bridge doc below).
+
+**Bridge channel opened** (2026-08-13):
+`AI_Lab/contracts/llm_gateway_bridge_image_gen.md` — ai-stack ↔ Image_gen,
+separate from the CLOSED ai-stack ↔ local_agents egress bridge. Carries the
+ComfyUI nil-exposure answer, the liveness request, and the notice request.
+Both sibling sessions pinged directly (`ai-stack-aa`, `scheduler-bb`).
 
 **ADR-008's one un-enumerable consumer is ours, and the answer is NIL.** The ADR
 says at D1: "confirm whether any ComfyUI workflow or custom node calls a host
@@ -2533,11 +2560,16 @@ path-independent, and D6 explicitly refuses an unauthenticated inventory
 endpoint). What genuinely remains open is the model-naming semantics and the
 scheduler's request shape, both of which are Grant's to settle upstream.
 
-**Trigger:** the gateway going live. Note this is NOT forced by ai-stack's
-cutover — see the premise correction above; our URLs survive it — so the trigger
-is a decision, and the risk is that an elective migration quietly never happens.
-When it does: the `ids[0]` replacement, `e.headers` consumption for D7, the
-configurable timeouts, and the A11 redirect fix all belong in the SAME slice as
-the URL rewrite. A gateway URL with the old `ids[0]` resolution and header-blind
-error handling is the combination that fails quietly and looks like a working
-migration.
+**Trigger — two of them, and the second is a deadline we do not control:**
+
+1. **The gateway going live** is the earliest we *can* migrate. Not forced by
+   ai-stack's cutover (our URLs survive it), so this one is a decision.
+2. **Host-local egress restriction is when we *must* have migrated** — the
+   uid-scoped nftables work above. Watch the bridge doc for notice; if it lands
+   without warning the symptom is "every model is down."
+
+Whenever it happens, the `ids[0]` replacement, `e.headers` consumption for D7,
+the configurable timeouts, and the A11 redirect fix all belong in the SAME slice
+as the URL rewrite. A gateway URL with the old `ids[0]` resolution and
+header-blind error handling is the combination that fails quietly and looks like
+a working migration.
