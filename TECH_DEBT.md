@@ -2519,6 +2519,54 @@ noted our own connect failures against :8036 earlier that day were its model
 swaps — i.e. the "indistinguishable from an outage" failure mode below already
 happened to us once, from a cause that was neither filtering nor a fault.
 
+**SMOKED END-TO-END THROUGH THE LIVE GATEWAY, 2026-08-13.** A `[gateway-deepseek]`
+entry was added to `enhancers.toml` (deliberately separate from the raw-backend
+`[deepseek-v4-flash]`, which is untouched and still works) with the three changes
+a gateway entry needs: `url = http://localhost:8100/v1`, an explicit
+`model = "deepseek-v4-flash-0731-abliterated-nvfp4"`, and
+`key_env = "COMFYLESS_LLM_TOKEN"`. Results:
+
+- **The happy path works with no code change.** `python -m comfyless.enhance`
+  produced correct enhanced prompts through the authenticated gateway. The
+  `key_env` convention carries the bearer end-to-end exactly as designed —
+  confirming the "already token-ready" claim above against a real enforcing
+  proxy rather than against the source.
+- **Auth boundary verified both directions:** `/v1/models` answers 401
+  unauthenticated and 200 with the bearer.
+- **Missing-token failure is BETTER than predicted.** The note further up warned
+  the empty-key path would read as a bad token rather than a missing one. The
+  gateway's own 401 body says *"Invalid or missing bearer token"*, so the
+  ambiguity is named by the server. Our silent-empty behaviour is still worth
+  fixing (a client-side "key_env NAME is set but the variable is empty" warning
+  costs nothing) but it is not the trap it was described as.
+- **The D7 down-model contract is live and correct.** Requesting
+  `gemma4-31b-heretic` (in the inventory, not running) returns
+  **503** + `x-should-retry: false` + `x-gateway-rendered: 1`, with
+  `error.code = "model_not_running"` and `error.type = "server_error"` in the
+  body. No `Retry-After` / `x-model-warming` — correct, since the warming branch
+  is inert with no scheduler.
+- **`error.code == "model_not_running"` is the discriminator to consume.** It is
+  machine-readable and beats both prose-matching and header-sniffing for
+  separating "this model is down" from every other 5xx.
+- **Our header-blindness is confirmed, exactly as documented.** comfyless
+  surfaces that 503 as `EnhanceError: openai-endpoint HTTP 503 from ... {body}`
+  with the body truncated at 300 chars and **every header discarded**, so
+  `x-should-retry: false` never reaches the operator and the prose is cut
+  mid-sentence before the part telling them how to launch the model.
+
+**Spec-vs-implementation divergence worth knowing (reported upstream):** ADR-008
+D7's table says the not-running 503 body "names the model, says how to launch
+it." **It does not name the model** — the rendered body is static and generic
+("The requested model is not serving on this host..."). That is not sloppiness,
+it is forced: the model name lives in the POST body, and D1 deliberately keeps
+the proxy out of body parsing ("doing that in the proxy would mean parsing the
+most attacker-controlled part of the request inside the component that holds the
+auth decision"). So naming the model in the proxy-rendered 503 is unimplementable
+without giving up the property D1 exists to protect. The implementation chose
+correctly; the ADR text is what should move. **Consequence for us:** never expect
+the error body to identify the failed model — we already know which model we
+sent, so any "X isn't up" message must be built from our own request state.
+
 **Explicit bring-up, and the liveness gap it runs into.** Grant's design intent
 (2026-08-13): waking a model must be an EXPLICIT decision, never an automatic
 consequence of asking for one that is down — with an offer of what to do instead
