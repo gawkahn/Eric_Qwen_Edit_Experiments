@@ -23,6 +23,12 @@ pre-stage items, which are cheap and remove most of the risk.
 | torch 2.11.0 on Python 3.14 | **Yes — `cp314` wheels published on PyPI** | `uv.lock` wheel inventory |
 | Rest of the locked tree on 3.14 | **Zero blockers.** 22 packages ship `cp314`; 79 are pure-python; the 3 that look like `cp310`-only (`protobuf`, `safetensors`, `torchao`) are `abi3` stable-ABI and run on 3.14 | `uv.lock` wheel inventory |
 
+**Timing gate:** the LTS→LTS offer only opens at **26.04.1** (`Prompt=lts` is
+confirmed set on this box). 26.04.1 slipped from its scheduled 2026-08-06 to a
+reported ~2026-08-27. Do not reach for `do-release-upgrade -d` to beat the gate
+— the point release exists to absorb exactly the early-adopter breakage this
+plan is trying to avoid.
+
 **Consequences.** The two unknowns that could have vetoed the timing — mergerfs
 and the NVIDIA driver — are both resolved in favour of proceeding. The driver is
 the *same version* rebuilt, so there is no downgrade risk to the Blackwell/nvfp4
@@ -91,8 +97,23 @@ becomes irrelevant to every project.
     # then per uv-managed repo:
     rm -rf .venv && uv sync
 
-Validate immediately after — `./.venv/bin/python3 -c "import torch"` and the
-full `just tests` battery. Doing this now converts the largest upgrade risk into
+Validate immediately after — three checks, in order:
+
+    grep '^home' .venv/pyvenv.cfg     # MUST show ~/.local/share/uv/..., not /usr/bin
+    ./.venv/bin/python3 -c "import torch; print(torch.__version__, torch.version.cuda)"
+    just tests
+
+The first line is the actual proof of decoupling: uv's default preference picks
+the managed interpreter once installed, but verify rather than trust it. Note
+the managed 3.12 is currently 3.12.13 vs the system's 3.12.3 — A1 is itself a
+patch-version bump, which is fine, and is exactly why it should soak for a week
+before the OS moves.
+
+Torch provenance was verified 2026-08-20 down to the wheel: the venv's
+`2.11.0+cu130` IS the locked PyPI wheel (dist-info Version plain `2.11.0`,
+`INSTALLER: uv`, no `direct_url.json` — PyTorch embeds the tag only in
+`version.py` and ships cu13.0 as the PyPI default, with the `nvidia_*-13.x`
+deps in the lock). So the rebuild reproduces the CUDA stack faithfully. Doing this now converts the largest upgrade risk into
 a normal working day, and the rebuilt venv is exercised for a week before the
 upgrade rather than discovered broken after it.
 
@@ -138,6 +159,21 @@ Several run on floating tags, which violates §11 and means a post-upgrade repul
 can silently change the image. Capture digests now (`docker image inspect
 --format '{{index .RepoDigests 0}}'`) and pin them, so container behaviour is a
 constant across the upgrade rather than a second variable.
+
+### A4b. Take a rollback snapshot  ← the missing undo
+
+`do-release-upgrade` has no rollback, and `/` is plain ext4 — no filesystem
+snapshots. **timeshift is already installed on this box**; take a snapshot
+immediately before the upgrade and verify its storage target is NOT the root
+partition it protects (and not the mergerfs pool — timeshift rsync mode wants
+a real ext4 target):
+
+    sudo timeshift --list                # confirm target device first
+    sudo timeshift --create --comments "pre-26.04 upgrade"
+
+Without this, the recovery story for a failed upgrade is "reinstall 24.04 and
+restore by hand from A5's config captures" — A5 records what the config *was*,
+it does not restore anything.
 
 ### A5. Capture golden state
 
@@ -204,6 +240,12 @@ Two RTX PRO 6000 Blackwell, driver 595.84, CUDA 13.2. **Note both
 `nvidia-driver-590-open` and `nvidia-driver-595-open` are installed** — resolve
 that before or during the upgrade rather than letting apt choose.
 
+Risk here is lower than this section's placement implies: the box already runs
+kernel `7.0.0-29-generic` (the 26.04-era kernel, via HWE `7.0.0-29.29~24.04.2`)
+and resolute ships the *same* 595.84 driver rebuilt. The kernel/driver pair
+barely changes at upgrade; what B2 actually guards is packaging fallout
+(module rebuild, the 590/595 conflict), not a version jump.
+
     nvidia-smi                                   # both GPUs, driver >= 595
     ./.venv/bin/python3 -c "import torch;print(torch.cuda.device_count(), torch.version.cuda)"
 
@@ -242,7 +284,9 @@ script; if that lands first, this unit changes anyway.
 ### B6. Containers and the gateway
 
     docker ps
-    docker run --rm --gpus all nvidia/cuda:13.0-base nvidia-smi     # runtime intact
+    # nvidia runtime check — use an image already present (zero pull, so a
+    # registry/network problem can't masquerade as a runtime failure):
+    docker run --rm --gpus all nvcr.io/nvidia/vllm:26.03-py3 nvidia-smi
     curl -o /dev/null -w '%{http_code}' http://localhost:8100/v1/models   # expect 401
     ss -ltn | grep -E '8100|8101'
 
