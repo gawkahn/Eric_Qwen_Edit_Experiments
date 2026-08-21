@@ -176,26 +176,120 @@ importable and skip cleanly otherwise). Typecheck `comfyless` 455 -> 453,
 `nodes` and `pipelines` unchanged — a drop, as predicted for a slice that only
 removes imports. Pixel manifest compared against `manifest-pre1a.json`.
 
-### Slice 3 — Clear the three third-party-authored functions  ← the delicate one
+### Slice 3 — Clear the third-party-authored functions  ← the delicate one
 
-Reimplement in `comfyless.core`: `build_sigma_schedule` (88 lines, the
-substantial one), the Eric-authored portion of `load_lora_with_key_fix`, and the
-4 lines in `decode_latents_with_upscale_vae_safe`. comfyless switches to the
-core versions. **The node pack keeps its originals, untouched.**
+**The estimate in this section was wrong by an order of magnitude, and the
+slice is split accordingly.** What follows is the measured position.
 
-**Also lands here** (both inherited from earlier slices, same structural
-reason — they exist only to serve the `nodes.*` imports this slice removes):
-the `_PROJECT_ROOT` `sys.path` insert, and `_install_shims()` together with the
-`import comfyless  # triggers _install_shims()` line at `generate.py:31`.
+The plan named three targets and sized them at roughly 140 lines total. The
+actual figure is the *transitive closure* of each entry point, and it is
+**~750 Eric-authored lines**:
 
-*Proof obligation, and it is strict:* a harness that runs old and new
-`build_sigma_schedule` across a grid of `(num_steps, denoise, schedule, power)`
-covering all five schedules and asserts elementwise equality within float
-tolerance. If any pair diverges, that is a **behaviour change**, not a rounding
-detail — it silently alters every replay of an existing sidecar using that
-schedule, and must be escalated rather than absorbed.
+| Entry point | Planned | Measured closure | Eric-authored |
+|---|---|---|---|
+| `build_sigma_schedule` | 88 lines | 136 lines, self-contained | 87 |
+| `decode_latents_with_upscale_vae_safe` | "4 lines" | itself 106 lines, **100% Grant** — but it calls `decode_latents_with_upscale_vae` (109 lines) | 94 |
+| `load_lora_with_key_fix` | "the Eric-authored portion" (50 lines) | **22 module-level names, 1269 lines** — the whole LoRA adapter subsystem | 658 |
 
-*Also:* `git blame` over `comfyless/core/` reports one author.
+`load_lora_with_key_fix` is not a function, it is the root of a subsystem:
+`_normalize_keys`, `_decode_kohya_keys`, `_detect_adapter_type`,
+`_load_{lora,lokr,loha}_adapter` and their `_peft` / `_direct` variants,
+`_adapter_module_path`, `_bake_lora_alpha_scales`, `_apply_te_lora`,
+`_rename_lora_down_up`, `plan_match_model_names`, `_load_state_dict`,
+`_TE_PREFIX_MAP`, `_SUFFIX_MARKERS`. comfyless calls it as its ONLY LoRA
+entry point, with full generality over whatever adapter file the user passes,
+so none of that closure is optional.
+
+#### Slice 3a — `build_sigma_schedule`  ✅ done
+
+`comfyless/core/sigma_schedules.py` is a from-scratch implementation of the
+schedule contract, written against the specification rather than the original:
+Karras/EDM warping at rho=3 and rho=7, inverse-beta-CDF warping, the two-stage
+arctan curve, and the truncation rule that keeps the start sigma
+schedule-independent. It dispatches on a table instead of an if/elif chain and
+carries its own docstrings. `comfyless/generate.py` switched to it; the node
+pack keeps its original, untouched.
+
+*Proof achieved, and it exceeded the obligation.* All **13,000** frozen cases
+in `tests/golden/sigma_schedules.json.gz` match **bitwise**, not merely within
+float tolerance — 0 length mismatches, worst elementwise difference exactly
+0.0.
+
+The golden grid is `num_steps` in 1..80 (26 values) x `denoise` 0.05..1.0 (20)
+x 5 schedules x 5 `power` values, which leaves real gaps: no `denoise` above
+1.0 or at/below 0, no degenerate or non-integer `num_steps`, no rounding ties,
+no odd schedule spellings. Those were closed by **differential testing against
+the node-pack original while both still existed in one tree** — the only
+window in which that comparison is possible, since after slice 6 they live in
+separate repos:
+
+- 1,080 edge combinations (`num_steps` in {0, -1, 1, 2, 3, 1000, 4096, 12.5,
+  12.0, 0.5, -2.5, True} x `denoise` in {0, -0.5, 1e-9, 0.5, 0.999, 1.0, 1.5,
+  4.0, NaN, inf} x 9 schedule spellings including case and whitespace
+  variants): 486 identical outputs, 594 raising the **same exception type** on
+  both sides, 0 divergent.
+- 19,900 exact `num_steps * denoise == x.5` rounding ties: 0 divergent.
+- 4,000 random off-grid cases: 0 divergent.
+
+~37,000 cases, zero divergence, failure modes and their exception classes
+included.
+
+**This is what the differential sweep was for.** A first pass swept only
+integer `num_steps` and reported clean; `code-reviewer` read the two
+implementations side by side and predicted a divergence in a region that sweep
+never entered, which the sweep then confirmed. Splitting the original's single
+pre-branch `t = np.linspace(0, 1, keep)` into per-helper position arrays
+removed an accidental input guard: `bong_tangent` builds its curve with
+`np.arange`, which accepts floats, so `build_sigma_schedule(12.5, 1.0,
+"bong_tangent")` returned a 13-element schedule where all four other schedules
+— and the original — raised `TypeError`. Unreachable from comfyless (the
+machine boundary rejects float ints, MCP coerces, the CLI is `type=int`), but
+a real break in the property the replay contract rests on: that the five
+schedules answer identically for a given input.
+
+Closed with `count = operator.index(count)`, placed **after** the denoise
+resolution rather than at entry so the ORDER in which degenerate inputs are
+rejected is also unchanged — guarding at entry made a float `num_steps` with a
+NaN `denoise` raise `TypeError` where the original raised `ValueError`. That
+ordering detail is why the sweep reports same-exception rather than merely
+both-raise.
+
+`test_sigma_schedules.py` (40 assertions) verifies the golden's own sha256
+before trusting it, gates on both `<=1e-12` and bitwise equality (the latter as
+a drift tripwire for a future numpy/scipy bump), pins the range,
+shared-start-sigma, warp-ordering and fallback contracts, and freezes the
+degenerate-input exception types that the golden grid never sampled —
+including one assertion per schedule that a non-integer count is rejected,
+which is the regression test for the divergence above. 34/34 suites green;
+typecheck unchanged at 453/438/94; pixel manifest ALL MATCH against
+`manifest-pre1a.json`, including the sigma-sweep cases the swap actually
+touches. (The manifest predates the `operator.index` guard; the guard is a
+no-op for the integer counts comfyless produces, and the 13,000-case golden
+remains bitwise identical after it, so pixels cannot have moved.)
+
+#### Slice 3b — the upscale-VAE decode  (not started)
+
+94 Eric-authored lines in `decode_latents_with_upscale_vae`. Needs its own
+golden: the ADR-030 2x Wan decode path, captured before the swap.
+
+#### Slice 3c — the LoRA adapter subsystem  (not started, needs its own ADR)
+
+658 Eric-authored lines across 13 helpers. This is the highest-risk code in
+the repo by track record — the Krea LoRA regression, fp8 buffer-blindness, the
+LoKR alpha-sentinel convention and the LoKR→LoRA flatten rescue all live in
+here — and unlike the sigma schedules there is **no frozen golden**, because
+equivalence can only be demonstrated against real adapter files on a GPU
+across LoRA/LoKR/LoHa x peft/direct x fp8/bf16. Building that harness is the
+first task of 3c, not an afterthought, and 3c should carry its own ADR rather
+than ride this Vision.
+
+**Consequence for the shims.** `_install_shims()`, the `_PROJECT_ROOT`
+`sys.path` insert and `generate.py:31` cannot be deleted until 3b AND 3c land,
+because `comfyless/{generate,server}.py` still import
+`nodes.eric_qwen_edit_lora` (module-level `import folder_paths`) and
+`nodes.eric_qwen_upscale_vae`. Five `nodes.*` imports remain, down from six.
+
+*Also, when 3c lands:* `git blame` over `comfyless/core/` reports one author.
 
 ### Slice 4 — Resolve the layering inversion
 

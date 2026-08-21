@@ -1535,7 +1535,7 @@ def _sigma_schedule_gate(pipe, schedule: str, model_family: str, steps: int):
     # takes+forwards sigmas (test_nag pins this), so the two stay in lockstep.
     if "sigmas" not in inspect.signature(pipe.__call__).parameters:
         return None, f"{model_family}'s pipeline does not accept custom sigmas"
-    from nodes.eric_qwen_image_multistage import build_sigma_schedule
+    from comfyless.core.sigma_schedules import build_sigma_schedule
     # comfyless is full-denoise txt2img: denoise=1.0 → keep == steps, so the
     # schedule only reshapes spacing across the full sigma range.
     return build_sigma_schedule(steps, 1.0, schedule=schedule), None
@@ -2490,9 +2490,10 @@ def generate(
         effective_sampler = "default"
 
     # ── Sigma schedule (ADR-028): reshape flow-match sigma spacing ────
-    # `schedule` was long recorded-but-ignored; apply it here via the node
-    # path's build_sigma_schedule, gated to flow-match schedulers that accept
-    # sigmas. Orthogonal to --sampler (spacing vs integration order — they
+    # `schedule` was long recorded-but-ignored; apply it here via
+    # comfyless.core.sigma_schedules.build_sigma_schedule (ADR-045 slice 3a —
+    # the node pack keeps its own copy), gated to flow-match schedulers that
+    # accept sigmas. Orthogonal to --sampler (spacing vs integration order — they
     # compose). Warn-and-ignore everywhere else — the warning is carried in
     # metadata (schedule_warnings) so the daemon/MCP client sees it.
     schedule_warnings: List[str] = []
