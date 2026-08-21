@@ -60,7 +60,7 @@ _NAG_BLOCK_PREFIX = "transformer_blocks."
 
 # The formula moved to nag_common with the ADR-024 family expansion;
 # re-exported here so existing importers (tests) keep working unchanged.
-from pipelines.nag_common import nag_merge  # noqa: F401
+from comfyless.core.pipelines.nag_common import nag_merge  # noqa: F401
 
 
 class NAGKrea2AttnProcessor:

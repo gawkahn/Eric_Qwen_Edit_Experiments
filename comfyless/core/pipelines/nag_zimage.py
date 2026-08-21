@@ -36,7 +36,7 @@ from diffusers.pipelines.z_image.pipeline_z_image import (
 )
 from diffusers.utils import logging
 
-from pipelines.nag_common import nag_lane_merge_front
+from comfyless.core.pipelines.nag_common import nag_lane_merge_front
 
 
 logger = logging.get_logger(__name__)

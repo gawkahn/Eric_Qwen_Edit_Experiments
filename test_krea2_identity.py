@@ -25,7 +25,7 @@ import PIL.Image
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from pipelines import krea2_identity_edit as kie
+from comfyless.core.pipelines import krea2_identity_edit as kie
 from diffusers.models.transformers.transformer_krea2 import Krea2Transformer2DModel
 
 

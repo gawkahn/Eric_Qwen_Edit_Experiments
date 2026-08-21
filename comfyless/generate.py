@@ -745,14 +745,14 @@ _NAG_CFG_OWNS_NEGATIVE: Dict[str, bool] = {
 }
 
 _NAG_MODULES: Dict[str, str] = {
-    "krea":            "pipelines.nag_krea2",
-    "krea-turbo":      "pipelines.nag_krea2",
-    "flux":            "pipelines.nag_flux",
-    "flux2":           "pipelines.nag_flux2",
-    "flux2klein":      "pipelines.nag_flux2",
-    "flux2klein-base": "pipelines.nag_flux2",
-    "zimage":          "pipelines.nag_zimage",
-    "zimage-turbo":    "pipelines.nag_zimage",
+    "krea":            "comfyless.core.pipelines.nag_krea2",
+    "krea-turbo":      "comfyless.core.pipelines.nag_krea2",
+    "flux":            "comfyless.core.pipelines.nag_flux",
+    "flux2":           "comfyless.core.pipelines.nag_flux2",
+    "flux2klein":      "comfyless.core.pipelines.nag_flux2",
+    "flux2klein-base": "comfyless.core.pipelines.nag_flux2",
+    "zimage":          "comfyless.core.pipelines.nag_zimage",
+    "zimage-turbo":    "comfyless.core.pipelines.nag_zimage",
 }
 
 
@@ -1877,7 +1877,7 @@ def _run_qwen_edit_refs(
 #: "flux2-native" threads the refs into the stock pipeline's `image=` kwarg
 #: (Flux2Pipeline and Flux2KleinPipeline share the signature and semantics —
 #: ADR-036 finding 4); "krea2-identity" runs the identity-preserving
-#: instruction edit through `pipelines.krea2_identity_edit` (ADR-043 / epic D1
+#: instruction edit through `comfyless.core.pipelines.krea2_identity_edit` (ADR-043 / epic D1
 #: — no new mode, no new family string, entry stays `--ref-image`).
 _REF_FAMILY_KINDS: Dict[str, str] = {
     "qwen-edit":       "qwen-edit",
@@ -1898,7 +1898,7 @@ _REF_KINDS_MODE_BOTH_ONLY = ("flux2-native", "krea2-identity")
 #: Krea-2 identity edit takes at most two sources, in the fixed semantic order
 #: #1 = scene (RoPE frame 1) / #2 = identity (frame 2) — epic D8, proven by a
 #: swapped-order positive control. Deliberately duplicated from
-#: `pipelines.krea2_identity_edit.MAX_SOURCES` (the QUANT_MODES precedent): this
+#: `comfyless.core.pipelines.krea2_identity_edit.MAX_SOURCES` (the QUANT_MODES precedent): this
 #: predicate must stay importable without pulling diffusers into the CLI's
 #: validation path. test_ref_edit.py asserts the two stay in sync.
 _KREA2_IDENTITY_MAX_REFS = 2
@@ -2576,7 +2576,7 @@ def generate(
                 # pipe.__call__ — that call has no callback_on_step_end, so the
                 # hook correctly no-ops here rather than injecting a callback
                 # the edit loop would silently swallow through **kwargs.
-                from pipelines.krea2_identity_edit import (
+                from comfyless.core.pipelines.krea2_identity_edit import (
                     Krea2IdentityEditPipeline, identity_edit_pipe_call)
                 with sigint_pause(Krea2IdentityEditPipeline.__call__,
                                   call_kwargs, enabled=interactive_pause):

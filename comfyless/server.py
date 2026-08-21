@@ -1140,7 +1140,7 @@ def _handle_generate(
         # evict: an ordinary OOM should not cost a 30 GB reload.
         if req.get("identity", False) is True:
             try:
-                from pipelines.krea2_identity_edit import (
+                from comfyless.core.pipelines.krea2_identity_edit import (
                     Krea2IdentityEditAttnProcessor)
                 _pipe = server_state.get("pipeline")
                 _tf = getattr(_pipe, "transformer", None) if _pipe else None

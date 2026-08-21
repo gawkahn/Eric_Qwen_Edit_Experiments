@@ -1654,7 +1654,7 @@ print("\n── ADR-044: identity-edit residue never survives in the cache ─�
 import contextlib  # noqa: E402
 import io  # noqa: E402
 
-from pipelines.krea2_identity_edit import (                        # noqa: E402
+from comfyless.core.pipelines.krea2_identity_edit import (                        # noqa: E402
     Krea2IdentityEditAttnProcessor)
 
 

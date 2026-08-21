@@ -1015,7 +1015,7 @@ check("3 refs on flux2-native still routes (cap is krea2-identity-scoped)",
 # Drift guard: generate.py's local cap must equal the pipeline's MAX_SOURCES.
 # They are deliberately duplicated so the CLI's validation path stays free of
 # diffusers (the QUANT_MODES precedent) — this is what keeps them honest.
-import pipelines.krea2_identity_edit as _k2mod  # noqa: E402
+import comfyless.core.pipelines.krea2_identity_edit as _k2mod  # noqa: E402
 check("_KREA2_IDENTITY_MAX_REFS mirrors pipelines MAX_SOURCES",
       cg._KREA2_IDENTITY_MAX_REFS == _k2mod.MAX_SOURCES,
       f"{cg._KREA2_IDENTITY_MAX_REFS} vs {_k2mod.MAX_SOURCES}")
@@ -1270,8 +1270,8 @@ check("the identity-path rebalance exclusion appears at apply AND record sites",
           'if (rebalance and model_family in ("krea", "krea-turbo")\n'
           '            and ref_kind != "krea2-identity"):') == 1)
 check("the identity-edit import is LAZY (a text2img run must not pay it)",
-      "from pipelines.krea2_identity_edit import (" in _gen_src
-      and "from pipelines.krea2_identity_edit import" not in
+      "from comfyless.core.pipelines.krea2_identity_edit import (" in _gen_src
+      and "from comfyless.core.pipelines.krea2_identity_edit import" not in
           _gen_src[:_gen_src.index("def generate(")])
 check("ref_boost/grounding_px are recorded in the metadata dict",
       '"ref_boost": ref_boost,' in _gen_src

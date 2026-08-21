@@ -40,7 +40,7 @@ from diffusers.pipelines.flux.pipeline_flux import (
 )
 from diffusers.utils import logging
 
-from pipelines.nag_common import nag_lane_merge_full, nag_lane_merge_tail
+from comfyless.core.pipelines.nag_common import nag_lane_merge_full, nag_lane_merge_tail
 
 
 logger = logging.get_logger(__name__)

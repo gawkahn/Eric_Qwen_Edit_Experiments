@@ -19,7 +19,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from pipelines import nag_krea2 as nag
+from comfyless.core.pipelines import nag_krea2 as nag
 from diffusers.models.transformers.transformer_krea2 import (
     Krea2Attention,
     Krea2AttnProcessor,
@@ -433,10 +433,10 @@ check("finally-restore is UNCONDITIONAL (partial-swap-proof N6)",
 # ADR-024 family expansion — Flux.1 / Flux.2 / Z-Image
 # ══════════════════════════════════════════════════════════════════════
 
-from pipelines import nag_common
-from pipelines import nag_flux
-from pipelines import nag_flux2
-from pipelines import nag_zimage
+from comfyless.core.pipelines import nag_common
+from comfyless.core.pipelines import nag_flux
+from comfyless.core.pipelines import nag_flux2
+from comfyless.core.pipelines import nag_zimage
 
 print("\n── nag_common: shared formula (ADR-024) ───────────────────────")
 check("nag_krea2.nag_merge IS nag_common.nag_merge (single source)",
