@@ -14,6 +14,13 @@ a back-to-back probe CANNOT establish reproducibility; only comparison across
 separated batches can.  Mechanism unexplained; do not assume it will not shift
 again.
 
+EXECUTION PATH IS PINNED.  `--savepath` delegates the run to the daemon when
+one is alive and silently falls back in-process when it is not -- a hidden
+variable that flipped mid-experiment on 2026-08-21 when the cuda:0 daemon died,
+and the most likely cause of the "unexplained" Z-Image shift recorded below.
+This harness passes an explicit `--output`, which `_should_delegate_to_server`
+skips, so every case runs in-process regardless of daemon state.
+
 Cases carry strict=True/False.  Only strict cases can fail a comparison;
 non-strict ones are reported as informational drift.
 
@@ -35,7 +42,7 @@ from PIL import Image
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY   = os.path.join(REPO, ".venv/bin/python3")
 MB   = os.path.expanduser("~/projects/ai-lab/ai-base/models/hf-local")
-OUT  = "/home/gawkahn/projects/ai-lab/ai-stack-data/comfyless"
+OUT  = os.path.join(os.path.expanduser("~"), "comfyless-baseline-out")
 HERE = os.path.join(REPO, "tests", "golden")
 
 PROMPT = ("A weathered brass sextant resting on a folded nautical chart, beside "
@@ -79,8 +86,9 @@ CASES += [
 ]
 
 def newest(tag):
-    g = sorted(glob.glob(f"{OUT}/{tag}*.png"), key=os.path.getmtime)
-    return g[-1] if g else None
+    # explicit --output => exact path, no increment suffix, no glob race
+    p = os.path.join(OUT, tag + ".png")
+    return p if os.path.exists(p) else None
 
 def pixhash(path):
     a = np.array(Image.open(path).convert("RGB"))
@@ -92,12 +100,13 @@ def capture(label):
                      "git_head": subprocess.run(["git","-C",REPO,"rev-parse","--short","HEAD"],
                                                 capture_output=True,text=True).stdout.strip()},
            "cases": {}}
+    os.makedirs(OUT, exist_ok=True)
     for c in CASES:
         tag = f"bl-{label}-{c['tag']}"
         cmd = [PY, "-m", "comfyless.generate", "--model", f"{MB}/{c['model']}",
                "--prompt", PROMPT, "--seed", str(SEED), "--steps", str(c["steps"]),
                "--width", str(W), "--height", str(H), "--device", "cuda:0",
-               "--savepath", tag] + c["extra"]
+               "--output", os.path.join(OUT, tag + ".png")] + c["extra"]
         if c["cfg"] is not None: cmd += ["--cfg", str(c["cfg"])]
         t0 = time.time()
         r = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO)

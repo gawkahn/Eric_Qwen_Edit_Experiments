@@ -1,10 +1,10 @@
 {
   "_meta": {
-    "label": "v2a",
-    "captured": "2026-08-21 07:39:29",
+    "label": "post1a",
+    "captured": "2026-08-21 08:42:54",
     "seed": 77341,
     "prompt": "A weathered brass sextant resting on a folded nautical chart, beside exactly three tangerines and a cracked porcelain teacup. A handwritten paper label reads MERIDIAN 47. Late afternoon window light, deep shadows, fine dust in the air.",
-    "git_head": "de0145e"
+    "git_head": "dd4e1a6"
   },
   "cases": {
     "sched-linear": {
@@ -22,8 +22,8 @@
         1024,
         3
       ],
-      "file": "bl-v2a-sched-linear0001.png",
-      "secs": 27.6
+      "file": "bl-post1a-sched-linear.png",
+      "secs": 33.7
     },
     "sched-balanced": {
       "status": "ok",
@@ -40,8 +40,8 @@
         1024,
         3
       ],
-      "file": "bl-v2a-sched-balanced0001.png",
-      "secs": 11.9
+      "file": "bl-post1a-sched-balanced.png",
+      "secs": 32.7
     },
     "sched-karras": {
       "status": "ok",
@@ -58,8 +58,8 @@
         1024,
         3
       ],
-      "file": "bl-v2a-sched-karras0001.png",
-      "secs": 11.8
+      "file": "bl-post1a-sched-karras.png",
+      "secs": 33.5
     },
     "sched-beta57": {
       "status": "ok",
@@ -76,8 +76,8 @@
         1024,
         3
       ],
-      "file": "bl-v2a-sched-beta570001.png",
-      "secs": 12.0
+      "file": "bl-post1a-sched-beta57.png",
+      "secs": 32.6
     },
     "sched-bong_tangent": {
       "status": "ok",
@@ -94,8 +94,8 @@
         1024,
         3
       ],
-      "file": "bl-v2a-sched-bong_tangent0001.png",
-      "secs": 12.0
+      "file": "bl-post1a-sched-bong_tangent.png",
+      "secs": 31.8
     },
     "samp-default": {
       "status": "ok",
@@ -112,8 +112,8 @@
         1024,
         3
       ],
-      "file": "bl-v2a-samp-default0001.png",
-      "secs": 12.0
+      "file": "bl-post1a-samp-default.png",
+      "secs": 30.7
     },
     "samp-multistep2": {
       "status": "ok",
@@ -130,8 +130,8 @@
         1024,
         3
       ],
-      "file": "bl-v2a-samp-multistep20001.png",
-      "secs": 12.0
+      "file": "bl-post1a-samp-multistep2.png",
+      "secs": 32.1
     },
     "samp-multistep3": {
       "status": "ok",
@@ -148,8 +148,8 @@
         1024,
         3
       ],
-      "file": "bl-v2a-samp-multistep30001.png",
-      "secs": 12.0
+      "file": "bl-post1a-samp-multistep3.png",
+      "secs": 31.7
     },
     "samp-res_2m": {
       "status": "ok",
@@ -166,8 +166,8 @@
         1024,
         3
       ],
-      "file": "bl-v2a-samp-res_2m0001.png",
-      "secs": 12.1
+      "file": "bl-post1a-samp-res_2m.png",
+      "secs": 33.0
     },
     "samp-res_3m": {
       "status": "ok",
@@ -184,8 +184,8 @@
         1024,
         3
       ],
-      "file": "bl-v2a-samp-res_3m0001.png",
-      "secs": 12.2
+      "file": "bl-post1a-samp-res_3m.png",
+      "secs": 33.4
     },
     "fam-krea2-turbo": {
       "status": "ok",
@@ -199,8 +199,8 @@
         1024,
         3
       ],
-      "file": "bl-v2a-fam-krea2-turbo0001.png",
-      "secs": 11.5
+      "file": "bl-post1a-fam-krea2-turbo.png",
+      "secs": 33.0
     },
     "fam-flux2-klein": {
       "status": "ok",
@@ -208,14 +208,14 @@
       "extra": [],
       "steps": 12,
       "strict": true,
-      "pixel_sha256": "d343bad908770a6e306b8fa8b674a9130fd6958ec4906ddbe1c2b92efebdf88b",
+      "pixel_sha256": "ef35c35be4bfa2423a0c1d2b3a17e05fd2b6ec63850c2e816bbae535e73aaf16",
       "shape": [
         1024,
         1024,
         3
       ],
-      "file": "bl-v2a-fam-flux2-klein0001.png",
-      "secs": 23.2
+      "file": "bl-post1a-fam-flux2-klein.png",
+      "secs": 36.5
     },
     "fam-sdxl-jugg": {
       "status": "ok",
@@ -229,8 +229,8 @@
         1024,
         3
       ],
-      "file": "bl-v2a-fam-sdxl-jugg0001.png",
-      "secs": 10.1
+      "file": "bl-post1a-fam-sdxl-jugg.png",
+      "secs": 15.0
     },
     "fam-qwen-2512": {
       "status": "ok",
@@ -238,14 +238,14 @@
       "extra": [],
       "steps": 12,
       "strict": true,
-      "pixel_sha256": "8ac8650634acd7021da3bedbc5919448c9a2ca51ab57bd120260712d25549be6",
+      "pixel_sha256": "93787c33cb8bc7eb95aa2ebc5c6f556e05595db6e3cdce26c66c022c581b2b3e",
       "shape": [
         1024,
         1024,
         3
       ],
-      "file": "bl-v2a-fam-qwen-25120001.png",
-      "secs": 35.7
+      "file": "bl-post1a-fam-qwen-2512.png",
+      "secs": 43.6
     },
     "fam-zimage-turbo": {
       "status": "ok",
@@ -253,14 +253,14 @@
       "extra": [],
       "steps": 8,
       "strict": false,
-      "pixel_sha256": "ef62666882ccad25df6eac1e8d716a88201a16263566ce85407a70d1293e37a0",
+      "pixel_sha256": "6169a81c75c20b3b423822651ffb82d0c40f044a879117397d5cb73f4be1b358",
       "shape": [
         1024,
         1024,
         3
       ],
-      "file": "bl-v2a-fam-zimage-turbo0001.png",
-      "secs": 22.6
+      "file": "bl-post1a-fam-zimage-turbo.png",
+      "secs": 34.4
     },
     "fam-chroma-flash": {
       "status": "ok",
@@ -268,14 +268,14 @@
       "extra": [],
       "steps": 12,
       "strict": false,
-      "pixel_sha256": "712ddcb2629f32b013bea6d720d3701d14bbd997867bf142ee9084e3799a6590",
+      "pixel_sha256": "6f87623bfded78042592e3daf194ca54ba20ac793ed63d068a56f93333355f4e",
       "shape": [
         1024,
         1024,
         3
       ],
-      "file": "bl-v2a-fam-chroma-flash0001.png",
-      "secs": 25.9
+      "file": "bl-post1a-fam-chroma-flash.png",
+      "secs": 33.0
     },
     "feat-lora-krea2": {
       "status": "ok",
@@ -292,8 +292,8 @@
         1024,
         3
       ],
-      "file": "bl-v2a-feat-lora-krea20001.png",
-      "secs": 36.6
+      "file": "bl-post1a-feat-lora-krea2.png",
+      "secs": 33.7
     },
     "feat-nag-krea2": {
       "status": "ok",
@@ -310,8 +310,8 @@
         1024,
         3
       ],
-      "file": "bl-v2a-feat-nag-krea20001.png",
-      "secs": 19.4
+      "file": "bl-post1a-feat-nag-krea2.png",
+      "secs": 43.0
     },
     "feat-quant-fp8": {
       "status": "ok",
@@ -322,14 +322,14 @@
       ],
       "steps": 12,
       "strict": true,
-      "pixel_sha256": "5392e696d10c1ab3037f2b6ccff387c54c583f6ddc5d36a8245da4e9fbb90c12",
+      "pixel_sha256": "0e13c96bdb2ff059b0ac7f0ab64b9cf342a921ee2b1a5b4eff8724ee6562571a",
       "shape": [
         1024,
         1024,
         3
       ],
-      "file": "bl-v2a-feat-quant-fp80001.png",
-      "secs": 70.8
+      "file": "bl-post1a-feat-quant-fp8.png",
+      "secs": 93.7
     }
   }
 }
