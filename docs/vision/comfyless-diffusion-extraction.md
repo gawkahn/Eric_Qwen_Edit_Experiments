@@ -111,7 +111,9 @@ reachable.
 
 `_install_shims()` **stays** in this slice — `eric_diffusion_utils` and
 `eric_diffusion_manual_loop` still import `comfy` / `folder_paths`, so the stubs
-are still load-bearing. Removing them is slice 2.
+are still load-bearing. Slice 2 removes core's need for them; the stubs
+themselves survive until slice 3, because `comfyless/generate.py` still imports
+`nodes.eric_qwen_edit_lora`, which imports `folder_paths` at module level.
 
 *Proof achieved:* 32/32 suites green after each of 1a and 1b; pixel manifest
 ALL MATCH; typecheck diagnostics exactly conserved at 987 across both slices
@@ -120,13 +122,59 @@ independent evidence that nothing was created or lost. All 18 moved files
 recorded by git as renames at 99-100% similarity, so history follows them.
 *Revert:* one commit per sub-slice, moves plus import rewrites.
 
-### Slice 2 — Cut core's ComfyUI dependency, delete the shims
+### Slice 2 — Cut core's ComfyUI dependency  ✅ done
 
-Remove the direct `comfy` / `folder_paths` imports from the two core modules
-that carry them, then delete `_install_shims()`.
+Remove the direct `comfy` / `folder_paths` dependencies from the core modules
+that carry them.
 
-*Proof:* `python -c "import comfyless.core"` succeeds in an interpreter where
-`comfy` and `folder_paths` are provably absent; battery green.
+**Deleting `_install_shims()` MOVED to slice 3**, for exactly the reason the
+`sys.path` insert did. Measured: with the stubs evicted and `comfy` /
+`folder_paths` blocked at the meta-path, `import comfyless.core` succeeds but
+`import comfyless.generate` fails — it pulls in `nodes.eric_qwen_edit_lora`,
+which has a **module-level** `import folder_paths` (line 40).
+`nodes/eric_qwen_image_multistage.py` additionally reaches for `comfy.utils`
+and `comfy.model_management` inside functions. The shims exist to serve those
+three `nodes.*` imports, so they cannot die before slice 3 severs them. Slice 2
+is therefore scoped to *core*, which is the part the extraction actually needs.
+
+**`folder_paths` needed no change.** `resolve_component_path`
+(`eric_diffusion_utils.py:398`) already wraps its import in
+`try/except Exception`, so with ComfyUI absent it degrades to a no-op and
+returns the path unchanged. It is an optional host-integration hook, not a
+dependency, and it stays for the node pack's benefit.
+
+**`comfy.utils.bislerp` was a real dependency and is now ours.** The shim never
+stubbed `bislerp`, only `ProgressBar` — so `upscale_flux_latents` /
+`upscale_flux2_latents` raised `AttributeError` under comfyless and only ever
+worked inside ComfyUI. (The battery hid this: `test_manual_loop.py` injects its
+own fake `bislerp`.) Upstream `bislerp` is comfyanonymous's, ComfyUI commit
+`34887b88`, **GPL-3.0** — incompatible with this repo's CC BY-NC / Commercial
+dual license — so it could not be vendored. `comfyless/core` now carries its
+own implementation, its behaviour matched to ComfyUI's by **black-box probing
+rather than reading the source**: `align_corners=False` centre-aligned
+coordinates, slerped direction, lerped magnitude, `v0`-verbatim on parallel
+pairs, plain lerp on antiparallel pairs, zero vectors contributing no
+direction, width pass before height.
+
+*Deliberate divergence, pinned by `test_bislerp.py`:* the two agree to ~2e-06
+(float32 rounding) on every input whose sample coordinates avoid exact integer
+ties — which includes **every realistic latent upscale ratio** (measured: 2x,
+1.5x and mixed ratios at C=16/64 are all tie-free, so the node pack's real
+output is unchanged to float32 noise). At a tie, ComfyUI's two tap-index arrays
+disagree by 2 and it emits a one-row **spike discontinuity** (3 -> 19, output
+row 9, where `9.5 * 3/19 == 1.5` exactly: rows `[a, a, b]` come back
+`a, a, ..., a, b, mix`). We treat that as an upstream bug and interpolate
+smoothly. This is the one behaviour change in the slice, and it only fires
+where upstream was wrong.
+
+*Proof achieved:* with `comfy` / `folder_paths` blocked at the meta-path and no
+shims installed, `import comfyless.core`, `...core.eric_diffusion_manual_loop`
+and `...core.eric_diffusion_utils` all succeed. 33/33 suites green (the glob
+picked up the new `test_bislerp.py`; 23 assertions, 20 of which need no
+ComfyUI, and the 3 cross-checks run against a real ComfyUI when one is
+importable and skip cleanly otherwise). Typecheck `comfyless` 455 -> 453,
+`nodes` and `pipelines` unchanged — a drop, as predicted for a slice that only
+removes imports. Pixel manifest compared against `manifest-pre1a.json`.
 
 ### Slice 3 — Clear the three third-party-authored functions  ← the delicate one
 
@@ -134,6 +182,11 @@ Reimplement in `comfyless.core`: `build_sigma_schedule` (88 lines, the
 substantial one), the Eric-authored portion of `load_lora_with_key_fix`, and the
 4 lines in `decode_latents_with_upscale_vae_safe`. comfyless switches to the
 core versions. **The node pack keeps its originals, untouched.**
+
+**Also lands here** (both inherited from earlier slices, same structural
+reason — they exist only to serve the `nodes.*` imports this slice removes):
+the `_PROJECT_ROOT` `sys.path` insert, and `_install_shims()` together with the
+`import comfyless  # triggers _install_shims()` line at `generate.py:31`.
 
 *Proof obligation, and it is strict:* a harness that runs old and new
 `build_sigma_schedule` across a grid of `(num_steps, denoise, schedule, power)`

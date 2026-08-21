@@ -2661,3 +2661,30 @@ the configurable timeouts, and the A11 redirect fix all belong in the SAME slice
 as the URL rewrite. A gateway URL with the old `ids[0]` resolution and
 header-blind error handling is the combination that fails quietly and looks like
 a working migration.
+
+## 2026-08-21 — two stale ComfyUI residues left behind by the comfyless extraction
+
+**What:** Two dead references to the pre-extraction layout, both found by
+`code-reviewer` during ADR-045 slice 2. Neither affects behaviour today.
+
+1. `test_manual_loop.py:414-421` and `:688-702` install fake
+   `sys.modules["comfy.utils"]` modules carrying a stub `bislerp`, and their
+   comments still say "it requires comfy.utils which we mocked". As of slice 2
+   `comfyless/core/eric_diffusion_manual_loop.py` no longer imports
+   `comfy.utils` at all, so **both injections are inert** — those tests now
+   silently exercise the real `bislerp`. That is the stronger test and it
+   passes, but the mocks are misleading scaffolding and the comments are false.
+2. `comfyless/core/eric_diffusion_lora_check.py:370` — docstring still advises
+   `python -m nodes.eric_diffusion_lora_check`, a module path that stopped
+   existing when slice 1b moved the file into `comfyless/core/`.
+
+**Why not now:** Slice 2's declared edit scope was
+`comfyless/core/eric_diffusion_manual_loop.py` + its new test. Deleting mocks
+inside a 1900-line unrelated suite, and editing a second core module's
+docstring, are both "clean up while here" (global §4) — separate slice,
+separate diff, so the slice-2 diff stays a readable story.
+
+**Trigger:** Slice 7 (node-pack cutover) already has to decide which suites
+stay with the node pack and which follow comfyless into the new repo, and it
+must read those suites' imports to do it. Fold both fixes in there. Earlier
+trigger: whenever either file is next opened for its own reasons.

@@ -969,6 +969,100 @@ def generate_flux(
     return final_latents
 
 
+# ── Latent-space bislerp upscale ──────────────────────────────────────
+# `bislerp` is bilinear resampling in which the two-point blend is a
+# SPHERICAL interpolation of the channel vector (direction slerped, norm
+# lerped) rather than an independent per-channel lerp.  That preserves the
+# norm/direction relationships VAE decoders are sensitive to, which is why
+# it is the right primitive for latent upscaling.
+#
+# This is our own implementation.  ComfyUI ships a `comfy.utils.bislerp`
+# and the multistage node path used to call it, but that made this module
+# unimportable outside ComfyUI (the comfyless shim never stubbed `bislerp`,
+# so `upscale_flux_latents` raised AttributeError under the CLI) and it
+# would have dragged GPL-3.0 code into a CC BY-NC / Commercial dual-licensed
+# package.  See ADR-045.
+#
+# Behaviour was matched to ComfyUI's by black-box probing, not by reading
+# its source.  The two agree to ~2e-06 (float32 rounding) on every input
+# whose sample coordinates avoid exact integer ties -- which includes every
+# realistic latent upscale ratio (2x, 1.5x, ...).  They deliberately
+# DIVERGE at tie coordinates: ComfyUI computes its two tap-index arrays
+# independently, so at a coordinate landing within float epsilon of an
+# integer they can disagree by 2, emitting a one-row spike discontinuity
+# (e.g. 3 -> 19, output row 9, where 9.5 * 3/19 == 1.5 exactly).  We treat
+# that as an upstream bug and interpolate smoothly instead.  test_bislerp.py
+# pins both the agreement and the deliberate divergence.
+
+def _bislerp_taps(src: int, dst: int, device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample positions for a 1-D resize, as (idx_lo, idx_hi, frac).
+
+    Uses ``align_corners=False`` centre alignment, obtained by bilinearly
+    resampling an index ramp so the edge-clamping matches torch's own.
+    """
+    ramp = torch.arange(src, device=device, dtype=torch.float32).view(1, 1, 1, src)
+    coords = torch.nn.functional.interpolate(
+        ramp, size=(1, dst), mode="bilinear", align_corners=False
+    ).flatten().clamp(0.0, float(src - 1))
+    idx_lo = coords.floor().to(torch.int64).clamp(0, src - 1)
+    idx_hi = (idx_lo + 1).clamp(max=src - 1)
+    return idx_lo, idx_hi, coords - idx_lo.to(coords.dtype)
+
+
+def _bislerp_blend(v0: torch.Tensor, v1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """Slerp the direction of the last-dim vectors, lerp their magnitude."""
+    m0 = v0.norm(dim=-1, keepdim=True)
+    m1 = v1.norm(dim=-1, keepdim=True)
+    # A vector with no length has no direction, so it contributes nothing
+    # to the blend while its magnitude still lerps.  All three of nan/posinf/
+    # neginf must be pinned to 0 explicitly: nan_to_num's DEFAULTS send the
+    # infinities to +/-dtype-max instead, and a vector whose components are
+    # subnormal-tiny (|x| ~ 1e-23) has an exactly-zero float32 norm while
+    # being nonzero, so v/m is +/-inf rather than nan.  Left at the defaults
+    # those +/-dtype-max "directions" multiply out to +inf and -inf in the
+    # dot product, whose sum is nan -- and a nan dot satisfies NEITHER mask
+    # below, so it selects the main branch and lands in a live output row.
+    d0 = torch.nan_to_num(v0 / m0, nan=0.0, posinf=0.0, neginf=0.0)
+    d1 = torch.nan_to_num(v1 / m1, nan=0.0, posinf=0.0, neginf=0.0)
+    dot = (d0 * d1).sum(dim=-1, keepdim=True)
+    theta = torch.acos(dot.clamp(-1.0, 1.0))
+    out = (torch.sin((1.0 - t) * theta) * d0 + torch.sin(t * theta) * d1) / torch.sin(theta)
+    out = out * (m0 * (1.0 - t) + m1 * t)
+    # Parallel: the great circle is undefined (sin(theta) == 0) and the
+    # blend is just the shared direction -- keep v0 verbatim.
+    out = torch.where(dot > 1.0 - 1e-5, v0, out)
+    # Antiparallel: every great circle between them is equally valid, so
+    # there is no meaningful rotation; fall back to a plain vector lerp.
+    out = torch.where(dot < 1e-5 - 1.0, v0 * (1.0 - t) + v1 * t, out)
+    return out
+
+
+def _bislerp_axis(x: torch.Tensor, dst: int, axis: int) -> torch.Tensor:
+    """Resize ``x`` (B, H, W, C) along ``axis`` (1=H, 2=W) to ``dst``."""
+    idx_lo, idx_hi, frac = _bislerp_taps(x.shape[axis], dst, x.device)
+    shape = [1, 1, 1, 1]
+    shape[axis] = dst
+    return _bislerp_blend(
+        x.index_select(axis, idx_lo), x.index_select(axis, idx_hi), frac.view(shape)
+    )
+
+
+def bislerp(samples: torch.Tensor, width: int, height: int) -> torch.Tensor:
+    """Resize ``samples`` (B, C, H, W) to ``(height, width)`` by bislerp.
+
+    Width is resampled before height; the two passes are not commutative,
+    and this order is the one ComfyUI's implementation uses.
+    """
+    dtype = samples.dtype
+    # Half precision loses too much in the acos/sin round-trip to be worth
+    # keeping; everything else computes in its own dtype.
+    work = torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
+    x = samples.to(work).permute(0, 2, 3, 1)          # (B, H, W, C)
+    x = _bislerp_axis(x, int(width), 2)
+    x = _bislerp_axis(x, int(height), 1)
+    return x.permute(0, 3, 1, 2).to(dtype)
+
+
 def upscale_flux_latents(
     packed_latents: torch.Tensor,
     src_h: int, src_w: int,
@@ -997,7 +1091,6 @@ def upscale_flux_latents(
     Returns:
         Packed latents at the new resolution: ``(B, dst_seq, C*4)``
     """
-    import comfy.utils as comfy_utils
 
     # Compute source latent shape (matches FluxPipeline._unpack_latents math)
     src_h_lat = 2 * (int(src_h) // (vae_scale_factor * 2))
@@ -1016,7 +1109,7 @@ def upscale_flux_latents(
     spatial = spatial.reshape(B, C, src_h_lat, src_w_lat)
 
     # Bislerp upscale in latent space (preserves vector norms)
-    upscaled = comfy_utils.bislerp(spatial, dst_w_lat, dst_h_lat)
+    upscaled = bislerp(spatial, dst_w_lat, dst_h_lat)
     # bislerp returns (B, C, dst_h_lat, dst_w_lat)
 
     # Re-pack: (B, C, dst_h_lat, dst_w_lat) → (B, dst_seq, C*4)
@@ -1912,7 +2005,6 @@ def upscale_flux2_latents(
     target resolution are also in row-major order — they will index the
     re-packed tokens correctly.
     """
-    import comfy.utils as comfy_utils
 
     B, src_seq, C = packed_latents.shape
     dst_h_patched = 2 * (int(dst_h) // (vae_scale_factor * 2)) // 2
@@ -1938,7 +2030,7 @@ def upscale_flux2_latents(
     spatial = torch.stack(spatial_list, dim=0)  # (B, C, src_H, src_W)
 
     # Bislerp upscale to target patched spatial dims
-    upscaled = comfy_utils.bislerp(spatial, dst_w_patched, dst_h_patched)
+    upscaled = bislerp(spatial, dst_w_patched, dst_h_patched)
 
     # Re-pack in row-major order: (B, C, H, W) → (B, H*W, C)
     B_up, C_up, H_up, W_up = upscaled.shape
