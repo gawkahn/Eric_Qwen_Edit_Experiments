@@ -83,6 +83,11 @@ CASES += [
          steps=SW_STEPS),
     case("feat-nag-krea2",  SWEEP, "--nag-scale", "5.0", steps=SW_STEPS),
     case("feat-quant-fp8",  "Qwen-Image-2512", "--quant", "fp8", steps=12),
+    # ADR-030 2x Wan decode — the surface slice 3b reimplements. Qwen-only
+    # (the upscale VAE shares Qwen's latent space); output is 2048x2048.
+    case("feat-upscale-vae", "Qwen-Image-2512",
+         "--upscale-vae", f"{MB}/Wan2.1-VAE-upscale2x",
+         steps=12),
 ]
 
 def newest(tag):

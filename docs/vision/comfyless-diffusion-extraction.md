@@ -267,10 +267,64 @@ touches. (The manifest predates the `operator.index` guard; the guard is a
 no-op for the integer counts comfyless produces, and the 13,000-case golden
 remains bitwise identical after it, so pixels cannot have moved.)
 
-#### Slice 3b — the upscale-VAE decode  (not started)
+#### Slice 3b — the upscale-VAE decode  ✅ done
 
-94 Eric-authored lines in `decode_latents_with_upscale_vae`. Needs its own
-golden: the ADR-030 2x Wan decode path, captured before the swap.
+`comfyless/core/upscale_vae_decode.py`. The closure was larger than this
+section first recorded: `decode_latents_with_upscale_vae` (109 lines, 94
+third-party) imports `_unpack_latents` (11 lines, 100% third-party) from
+`nodes/eric_qwen_image_multistage.py` **inside its function body**, which a
+first-pass same-file analysis missed — the same class of miss as slice 1b's
+grep patterns. 105 third-party lines across two files, not 94 in one.
+`decode_latents_with_upscale_vae_safe` (106 lines) is 100% Grant and moved as
+written.
+
+*Proof.* The real upscale VAE is a multi-GB decoder, so equivalence rests on a
+**deterministic stub** standing in for the one opaque call. That is a
+deliberate choice, not a shortcut: everything around `vae.decode` — the
+unpack, the per-channel normalisation, the pixel_shuffle, the range map, the
+tiling decision, device resolution and the transformer offload/restore — then
+runs on CPU with no weights, exhaustively and in CI, where a single GPU golden
+image would have proven one path once.
+
+- 28 shape/batch/seed combinations: **bitwise identical**, including the exact
+  `enable_tiling` kwargs and the `use_tiling` flag.
+- 3 dtypes (fp32/fp16/bf16) and 3 `vae_scale_factor` values: identical.
+- `unpack_qwen_latents` against the original standalone: identical.
+- Offload/restore on the clean AND raising paths: identical.
+- On a real cuda:0 device — the CPU tests cannot reach the offload branch at
+  all, since it is guarded on `device.type != "cpu"` — transformer offloaded
+  to CPU during the decode, restored afterwards, outputs identical, and
+  restored even when the decode raises.
+- **Against the REAL multi-GB upscale VAE, both branches**: latents generated
+  ONCE and decoded by each implementation, so generation variance is excluded
+  and only the decode is under test. Tiled (1280x1280, latent side 160,
+  2560x2560 out) and untiled (1024x1024, latent side 128) are both **bitwise
+  identical**, `max|diff| = 0.0`.
+
+  That last check exists because `code-reviewer` caught what the stub could
+  not: the `feat-upscale-vae` matrix case added for this very surface runs at
+  1024x1024, whose latent side is **exactly** 128, and the tiling guard is
+  `> 128` — so the case meant to cover the decode never entered the tiled
+  branch. The frozen golden pinned the `enable_tiling` call and its kwargs,
+  never tiled numerics. Inference said "both call the same diffusers method so
+  it must match"; the differential says it does.
+
+`test_upscale_vae_decode.py` (52 assertions) freezes output sha256s **captured
+from the node-pack original**, so the goldens encode its behaviour rather than
+the new module's, and skips the three CUDA-only assertions rather than passing
+them vacuously on a CPU box.
+
+*One detail deliberately not tidied:* the normalisation is written
+`spatial / (1 / std) + mean`, not the algebraically identical
+`spatial * std + mean`. The two differ in the last bit, the pixel harness
+hashes exact bytes, and matching the original is the point.
+
+*Baseline gap closed:* the pixel matrix had **no** upscale-VAE coverage, so
+`feat-upscale-vae` (Qwen-Image-2512, 2048x2048 output) was added — 20 cases
+now — and `pre3b` was captured with the ORIGINAL code before the swap, since
+that comparison is only available before it. `pre3b` vs `post3b`: **ALL
+MATCH**, all 20 cases. (That case is untiled by construction; see TECH_DEBT
+2026-08-21 for the tiled-coverage note.)
 
 #### Slice 3c — the LoRA adapter subsystem  (not started, needs its own ADR)
 
@@ -284,10 +338,11 @@ first task of 3c, not an afterthought, and 3c should carry its own ADR rather
 than ride this Vision.
 
 **Consequence for the shims.** `_install_shims()`, the `_PROJECT_ROOT`
-`sys.path` insert and `generate.py:31` cannot be deleted until 3b AND 3c land,
-because `comfyless/{generate,server}.py` still import
-`nodes.eric_qwen_edit_lora` (module-level `import folder_paths`) and
-`nodes.eric_qwen_upscale_vae`. Five `nodes.*` imports remain, down from six.
+`sys.path` insert and `generate.py:31` cannot be deleted until 3c lands,
+because `comfyless/{generate,server}.py` still import `nodes.eric_qwen_edit_lora`,
+which carries a module-level `import folder_paths`. **Four** `nodes.*` imports
+remain, down from six, and they are now all the LoRA cluster — so 3c is the
+last thing standing between here and a comfyless that never touches `nodes/`.
 
 *Also, when 3c lands:* `git blame` over `comfyless/core/` reports one author.
 

@@ -1,0 +1,353 @@
+{
+  "_meta": {
+    "label": "pre3b",
+    "captured": "2026-08-21 15:05:21",
+    "seed": 77341,
+    "prompt": "A weathered brass sextant resting on a folded nautical chart, beside exactly three tangerines and a cracked porcelain teacup. A handwritten paper label reads MERIDIAN 47. Late afternoon window light, deep shadows, fine dust in the air.",
+    "git_head": "cd90b32"
+  },
+  "cases": {
+    "sched-linear": {
+      "status": "ok",
+      "model": "Krea-2-Turbo",
+      "extra": [
+        "--schedule",
+        "linear"
+      ],
+      "steps": 12,
+      "strict": true,
+      "pixel_sha256": "33c31e6ae9dd29e5fb879a9fabcda2bea2e2a843b5cbea19ccc4bc6428d0dfeb",
+      "shape": [
+        1024,
+        1024,
+        3
+      ],
+      "file": "bl-pre3b-sched-linear.png",
+      "secs": 33.3
+    },
+    "sched-balanced": {
+      "status": "ok",
+      "model": "Krea-2-Turbo",
+      "extra": [
+        "--schedule",
+        "balanced"
+      ],
+      "steps": 12,
+      "strict": true,
+      "pixel_sha256": "12bccbd06304c47659c4feab9d35c9439eecffdb06785dcd86aa656ebfa35f7b",
+      "shape": [
+        1024,
+        1024,
+        3
+      ],
+      "file": "bl-pre3b-sched-balanced.png",
+      "secs": 23.1
+    },
+    "sched-karras": {
+      "status": "ok",
+      "model": "Krea-2-Turbo",
+      "extra": [
+        "--schedule",
+        "karras"
+      ],
+      "steps": 12,
+      "strict": true,
+      "pixel_sha256": "47f72aedeb0f90c79d9cceb8dbbec75dc0ea95095f310cd1284f12ae96af79f9",
+      "shape": [
+        1024,
+        1024,
+        3
+      ],
+      "file": "bl-pre3b-sched-karras.png",
+      "secs": 22.5
+    },
+    "sched-beta57": {
+      "status": "ok",
+      "model": "Krea-2-Turbo",
+      "extra": [
+        "--schedule",
+        "beta57"
+      ],
+      "steps": 12,
+      "strict": true,
+      "pixel_sha256": "852e42a918db550d0681004cd00340b452bb075b3b4a095bb571f2201f05fe99",
+      "shape": [
+        1024,
+        1024,
+        3
+      ],
+      "file": "bl-pre3b-sched-beta57.png",
+      "secs": 22.5
+    },
+    "sched-bong_tangent": {
+      "status": "ok",
+      "model": "Krea-2-Turbo",
+      "extra": [
+        "--schedule",
+        "bong_tangent"
+      ],
+      "steps": 12,
+      "strict": true,
+      "pixel_sha256": "5739cc6ed227c92504cbc90de2f9d8ce82e38e8db5e5329adeb410a9801e6088",
+      "shape": [
+        1024,
+        1024,
+        3
+      ],
+      "file": "bl-pre3b-sched-bong_tangent.png",
+      "secs": 23.8
+    },
+    "samp-default": {
+      "status": "ok",
+      "model": "Krea-2-Turbo",
+      "extra": [
+        "--sampler",
+        "default"
+      ],
+      "steps": 12,
+      "strict": true,
+      "pixel_sha256": "33c31e6ae9dd29e5fb879a9fabcda2bea2e2a843b5cbea19ccc4bc6428d0dfeb",
+      "shape": [
+        1024,
+        1024,
+        3
+      ],
+      "file": "bl-pre3b-samp-default.png",
+      "secs": 23.2
+    },
+    "samp-multistep2": {
+      "status": "ok",
+      "model": "Krea-2-Turbo",
+      "extra": [
+        "--sampler",
+        "multistep2"
+      ],
+      "steps": 12,
+      "strict": true,
+      "pixel_sha256": "4a80962b0e0f12adc21bf0422130d774802dbc4ecf4ab2a57cf4947a135b9339",
+      "shape": [
+        1024,
+        1024,
+        3
+      ],
+      "file": "bl-pre3b-samp-multistep2.png",
+      "secs": 22.4
+    },
+    "samp-multistep3": {
+      "status": "ok",
+      "model": "Krea-2-Turbo",
+      "extra": [
+        "--sampler",
+        "multistep3"
+      ],
+      "steps": 12,
+      "strict": true,
+      "pixel_sha256": "4a80962b0e0f12adc21bf0422130d774802dbc4ecf4ab2a57cf4947a135b9339",
+      "shape": [
+        1024,
+        1024,
+        3
+      ],
+      "file": "bl-pre3b-samp-multistep3.png",
+      "secs": 22.7
+    },
+    "samp-res_2m": {
+      "status": "ok",
+      "model": "Krea-2-Turbo",
+      "extra": [
+        "--sampler",
+        "res_2m"
+      ],
+      "steps": 12,
+      "strict": true,
+      "pixel_sha256": "ed46be1a64ec0fdaa6897a76fb96c6f8ff44d8541b1c5bb24ec459b944af89ac",
+      "shape": [
+        1024,
+        1024,
+        3
+      ],
+      "file": "bl-pre3b-samp-res_2m.png",
+      "secs": 23.2
+    },
+    "samp-res_3m": {
+      "status": "ok",
+      "model": "Krea-2-Turbo",
+      "extra": [
+        "--sampler",
+        "res_3m"
+      ],
+      "steps": 12,
+      "strict": true,
+      "pixel_sha256": "b2d73783ceacfb76dbb4ebb30fd506d282117b349264cf8ffa823df140f95124",
+      "shape": [
+        1024,
+        1024,
+        3
+      ],
+      "file": "bl-pre3b-samp-res_3m.png",
+      "secs": 22.9
+    },
+    "fam-krea2-turbo": {
+      "status": "ok",
+      "model": "Krea-2-Turbo",
+      "extra": [],
+      "steps": 12,
+      "strict": true,
+      "pixel_sha256": "33c31e6ae9dd29e5fb879a9fabcda2bea2e2a843b5cbea19ccc4bc6428d0dfeb",
+      "shape": [
+        1024,
+        1024,
+        3
+      ],
+      "file": "bl-pre3b-fam-krea2-turbo.png",
+      "secs": 23.3
+    },
+    "fam-flux2-klein": {
+      "status": "ok",
+      "model": "FLUX.2-klein-9B",
+      "extra": [],
+      "steps": 12,
+      "strict": true,
+      "pixel_sha256": "ef35c35be4bfa2423a0c1d2b3a17e05fd2b6ec63850c2e816bbae535e73aaf16",
+      "shape": [
+        1024,
+        1024,
+        3
+      ],
+      "file": "bl-pre3b-fam-flux2-klein.png",
+      "secs": 22.9
+    },
+    "fam-sdxl-jugg": {
+      "status": "ok",
+      "model": "Juggernaut-XL_v9",
+      "extra": [],
+      "steps": 20,
+      "strict": true,
+      "pixel_sha256": "2c69fdb0bdb64388ff737889b9037832f65d0aaeb5831a4602a354190f504acc",
+      "shape": [
+        1024,
+        1024,
+        3
+      ],
+      "file": "bl-pre3b-fam-sdxl-jugg.png",
+      "secs": 10.7
+    },
+    "fam-qwen-2512": {
+      "status": "ok",
+      "model": "Qwen-Image-2512",
+      "extra": [],
+      "steps": 12,
+      "strict": true,
+      "pixel_sha256": "93787c33cb8bc7eb95aa2ebc5c6f556e05595db6e3cdce26c66c022c581b2b3e",
+      "shape": [
+        1024,
+        1024,
+        3
+      ],
+      "file": "bl-pre3b-fam-qwen-2512.png",
+      "secs": 37.1
+    },
+    "fam-zimage-turbo": {
+      "status": "ok",
+      "model": "Z-Image-Turbo",
+      "extra": [],
+      "steps": 8,
+      "strict": false,
+      "pixel_sha256": "6169a81c75c20b3b423822651ffb82d0c40f044a879117397d5cb73f4be1b358",
+      "shape": [
+        1024,
+        1024,
+        3
+      ],
+      "file": "bl-pre3b-fam-zimage-turbo.png",
+      "secs": 26.6
+    },
+    "fam-chroma-flash": {
+      "status": "ok",
+      "model": "Chroma1-Flash",
+      "extra": [],
+      "steps": 12,
+      "strict": false,
+      "pixel_sha256": "6f87623bfded78042592e3daf194ca54ba20ac793ed63d068a56f93333355f4e",
+      "shape": [
+        1024,
+        1024,
+        3
+      ],
+      "file": "bl-pre3b-fam-chroma-flash.png",
+      "secs": 29.2
+    },
+    "feat-lora-krea2": {
+      "status": "ok",
+      "model": "Krea-2-Turbo",
+      "extra": [
+        "--lora",
+        "/home/gawkahn/projects/ai-lab/ai-base/models/comfyui/models/loras/Krea/krea2_turbo_lora_rank_64_bf16.safetensors:0.7"
+      ],
+      "steps": 12,
+      "strict": true,
+      "pixel_sha256": "54955b0364baba4e97fc2fc523700b2615133595559641ba806c6de0a11e29f1",
+      "shape": [
+        1024,
+        1024,
+        3
+      ],
+      "file": "bl-pre3b-feat-lora-krea2.png",
+      "secs": 38.2
+    },
+    "feat-nag-krea2": {
+      "status": "ok",
+      "model": "Krea-2-Turbo",
+      "extra": [
+        "--nag-scale",
+        "5.0"
+      ],
+      "steps": 12,
+      "strict": true,
+      "pixel_sha256": "46ca066ae317bb27361e89bcc81b17b96d4111eb748f8c7a1d27ba03b921144c",
+      "shape": [
+        1024,
+        1024,
+        3
+      ],
+      "file": "bl-pre3b-feat-nag-krea2.png",
+      "secs": 30.6
+    },
+    "feat-quant-fp8": {
+      "status": "ok",
+      "model": "Qwen-Image-2512",
+      "extra": [
+        "--quant",
+        "fp8"
+      ],
+      "steps": 12,
+      "strict": true,
+      "pixel_sha256": "0e13c96bdb2ff059b0ac7f0ab64b9cf342a921ee2b1a5b4eff8724ee6562571a",
+      "shape": [
+        1024,
+        1024,
+        3
+      ],
+      "file": "bl-pre3b-feat-quant-fp8.png",
+      "secs": 69.4
+    },
+    "feat-upscale-vae": {
+      "status": "ok",
+      "model": "Qwen-Image-2512",
+      "extra": [
+        "--upscale-vae",
+        "/home/gawkahn/projects/ai-lab/ai-base/models/hf-local/Wan2.1-VAE-upscale2x"
+      ],
+      "steps": 12,
+      "strict": true,
+      "pixel_sha256": "a7a8ebf0063324d27c494023094d170a0363b14920c7236e12fe73845cdee4df",
+      "shape": [
+        2048,
+        2048,
+        3
+      ],
+      "file": "bl-pre3b-feat-upscale-vae.png",
+      "secs": 51.2
+    }
+  }
+}

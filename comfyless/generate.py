@@ -1619,13 +1619,15 @@ def _decode_upscale_2x(packed_latents, pipe, upscale_vae, height, width,
                        device):
     """Decode packed pipeline latents to a 2× PIL image via the upscale VAE.
 
-    Reuses the proven node helper (device pinning, transformer
-    offload/restore, auto-tiling). ``packed_latents`` is what the pipe
-    returns under ``output_type='latent'``.
+    Uses the comfyless-owned decode in
+    ``comfyless.core.upscale_vae_decode`` (device pinning, transformer
+    offload/restore, auto-tiling) — ADR-045 slice 3b; the node pack keeps
+    its own copy. ``packed_latents`` is what the pipe returns under
+    ``output_type='latent'``.
     """
     import numpy as np
     from PIL import Image
-    from nodes.eric_qwen_upscale_vae import decode_latents_with_upscale_vae_safe
+    from comfyless.core.upscale_vae_decode import decode_latents_with_upscale_vae_safe
 
     vsf = int(getattr(pipe, "vae_scale_factor", 8) or 8)
     img = decode_latents_with_upscale_vae_safe(

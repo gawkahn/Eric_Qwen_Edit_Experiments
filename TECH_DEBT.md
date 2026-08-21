@@ -2688,3 +2688,30 @@ separate diff, so the slice-2 diff stays a readable story.
 stay with the node pack and which follow comfyless into the new repo, and it
 must read those suites' imports to do it. Fold both fixes in there. Earlier
 trigger: whenever either file is next opened for its own reasons.
+
+## 2026-08-21 — the pixel matrix's upscale-VAE case never tiles
+
+**What:** `feat-upscale-vae` in `scripts/capture_baseline.py` runs
+Qwen-Image-2512 at the harness default 1024x1024. The upscale-VAE decode tiles
+when a LATENT side exceeds 128, and 1024px gives a latent side of exactly
+`2 * (1024 // 16) == 128` — so the guard `h_lat > 128 or w_lat > 128` is False
+and the case added specifically to cover the ADR-030 decode exercises only the
+UNTILED branch. Found by `code-reviewer` during slice 3b; the unit suite's
+tiled golden pins the `enable_tiling` call and kwargs, not tiled numerics.
+
+For slice 3b itself this is closed: the tiled path was proven separately
+against the real VAE at 1280x1280 (latent side 160), decoding one set of
+generated latents with both the node-pack original and the comfyless
+implementation — bitwise identical, `max|diff| = 0.0`. That check is not
+repeatable after the repos split, since it needs both implementations present.
+
+**Why not now:** adding a tiled case to the matrix means a 2560x2560 decode on
+every capture, and a capture already runs ~11 minutes and is taken several
+times per slice. The cost lands on every future slice, not just the ones that
+touch this decode.
+
+**Trigger:** the next change to the upscale-VAE decode, tiling geometry, or the
+`_TILE_THRESHOLD_LAT` constant. At that point either add a >=1040px case to
+the matrix (latent side 130) or write a dedicated tiled regression against a
+frozen decode output, since the differential-against-the-original route will
+no longer exist.
