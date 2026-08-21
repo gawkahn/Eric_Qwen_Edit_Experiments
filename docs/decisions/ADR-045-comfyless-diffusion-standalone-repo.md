@@ -1,6 +1,6 @@
 # ADR-045 — Split comfyless + runtime core into a standalone repo
 
-Status:   proposed
+Status:   accepted
 
 ## Context
 
@@ -281,6 +281,11 @@ exactly the drift the pin exists to prevent.
   Attribution decision changed from carry-with-headers to clear-before-first-commit,
   making the new repository original work with a freely chosen license; node
   repository licensing explicitly untouched.
+- 2026-08-20 — **Accepted.** Verified that all 14 moving modules plus
+  `comfyless/` are 100% Grant-authored (zero Eric commits, zero Eric blame
+  lines), so the extracted history can be carried in full without importing
+  third-party-authored code — history preservation and the clean-license goal
+  are not in tension. Extraction plan: `docs/vision/comfyless-diffusion-extraction.md`.
 - 2026-08-20 — Python target set to 3.14 for the new repository, 3.12 retained
   for the node pack; dependency tree verified 3.14-clean against `uv.lock`.
 
