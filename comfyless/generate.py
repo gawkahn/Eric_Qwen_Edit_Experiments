@@ -45,7 +45,7 @@ from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Sequence,
 
 import torch
 
-from nodes.eric_diffusion_utils import (
+from comfyless.core.eric_diffusion_utils import (
     QUANT_MODES,
     build_quant_config,
     detect_pipeline_class,
@@ -62,7 +62,7 @@ from nodes.eric_diffusion_utils import (
     VAE_TILING_CHOICES,
     _is_hf_repo_id,
 )
-from nodes.eric_diffusion_samplers import sampler_choices, swap_sampler
+from comfyless.core.eric_diffusion_samplers import sampler_choices, swap_sampler
 from nodes.eric_qwen_edit_lora import load_lora_with_key_fix
 
 from comfyless.family_defaults import (DISTILLED_FAMILIES, FAMILY_DEFAULTS,
@@ -1508,7 +1508,7 @@ def _sigma_schedule_gate(pipe, schedule: str, model_family: str, steps: int):
     caller warns-and-ignores. `linear` / unset return (None, None) silently."""
     if not schedule or schedule == "linear":
         return None, None
-    from nodes.eric_diffusion_scheduler import is_flow_match
+    from comfyless.core.eric_diffusion_scheduler import is_flow_match
     # This gate runs PRE-swap: `pipe.scheduler` is the model's default scheduler,
     # not the multistep one swap_sampler installs around the call. That's a valid
     # proxy — every registry sampler is a FlowMatchEuler subclass whose
@@ -1581,7 +1581,7 @@ def _load_upscale_vae(path: str, subfolder: str, precision: str,
     import os
     import torch
     from diffusers import AutoencoderKLWan
-    from nodes.eric_diffusion_utils import resolve_hf_path
+    from comfyless.core.eric_diffusion_utils import resolve_hf_path
 
     resolved = resolve_hf_path(path.strip(), allow_download=allow_download)
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
@@ -1847,7 +1847,7 @@ def _run_qwen_edit_refs(
     import numpy as np
     from PIL import Image
 
-    from nodes.eric_diffusion_manual_loop import (
+    from comfyless.core.eric_diffusion_manual_loop import (
         decode_qwen_latents, generate_qwen_edit)
 
     pils, ref_provenance = _load_ref_pils(ref_images)

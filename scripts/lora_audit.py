@@ -36,28 +36,37 @@ _fp.get_folder_paths = lambda _category: []
 _fp.get_full_path = lambda _category, _name: None
 sys.modules["folder_paths"] = _fp
 
-# ── Classifier reuse via fake-package + spec_from_file_location ────────
-# `from nodes.* import …` triggers nodes/__init__.py which transitively
-# requires ComfyUI's `comfy.*` package. We register a minimal `nodes`
-# package object in sys.modules (no __init__ execution) with its
-# __path__ set so relative imports inside loaded modules
-# (`from .eric_lora_format_convert import …`) resolve correctly. Each
-# module is then loaded with its dotted name `nodes.<modname>`.
+# ── Classifier reuse ───────────────────────────────────────────────────
+# These modules moved to comfyless/core/ (ADR-045 slice 1b).  That package
+# is import-safe -- its __init__ is a docstring, unlike nodes/__init__.py
+# which pulls in every node class and ComfyUI's `comfy.*`.  So the old
+# fake-package + spec_from_file_location scaffolding is no longer needed:
+# a plain import resolves the modules AND their relative imports.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _NODES_DIR = _REPO_ROOT / "nodes"
 
+# Run as a script, sys.path[0] is scripts/, so `comfyless` is not importable
+# from here.  (The folder_paths stub above is already installed, and
+# comfyless/__init__ only fills gaps, so it will not be displaced.)
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+# Modules still under nodes/ (e.g. eric_qwen_edit_lora) still need the fake
+# package: nodes/__init__.py imports every node class and ComfyUI's `comfy.*`.
 _nodes_pkg = types.ModuleType("nodes")
 _nodes_pkg.__path__ = [str(_NODES_DIR)]
-sys.modules["nodes"] = _nodes_pkg
+sys.modules.setdefault("nodes", _nodes_pkg)
 
 
 def _load_node_module(modname: str):
-    """Load nodes/<modname>.py as the dotted module `nodes.<modname>`."""
+    """Import a classifier module, wherever slice 1b left it."""
+    if (_REPO_ROOT / "comfyless" / "core" / f"{modname}.py").exists():
+        return importlib.import_module(f"comfyless.core.{modname}")
     dotted = f"nodes.{modname}"
     if dotted in sys.modules:
         return sys.modules[dotted]
-    path = _NODES_DIR / f"{modname}.py"
-    spec = importlib.util.spec_from_file_location(dotted, path)
+    spec = importlib.util.spec_from_file_location(
+        dotted, _NODES_DIR / f"{modname}.py")
     mod = importlib.util.module_from_spec(spec)
     sys.modules[dotted] = mod
     spec.loader.exec_module(mod)
@@ -70,7 +79,7 @@ _load_node_module("eric_lora_format_convert")
 _convert_mod = _load_node_module("eric_lora_format_convert_apply")
 _check_mod = _load_node_module("eric_diffusion_lora_check")
 _qwen_mod = _load_node_module("eric_qwen_edit_lora")
-_convert_base_mod = sys.modules["nodes.eric_lora_format_convert"]
+_convert_base_mod = sys.modules["comfyless.core.eric_lora_format_convert"]
 
 check_lora = _check_mod.check_lora
 build_param_dict_from_dir = _check_mod.build_param_dict_from_dir

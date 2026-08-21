@@ -29,8 +29,8 @@ import torch
 import torch.nn as nn
 from peft import LoraConfig, inject_adapter_in_model
 
-from nodes.eric_lora_format_convert import ConversionPlan, RenameRule
-from nodes.eric_lora_format_convert_apply import (
+from comfyless.core.eric_lora_format_convert import ConversionPlan, RenameRule
+from comfyless.core.eric_lora_format_convert_apply import (
     convert_state_dict,
     resolve_merge_target,
     resolve_restore_target,

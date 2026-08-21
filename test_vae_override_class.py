@@ -34,7 +34,7 @@ import diffusers
 # every node class and expects a ComfyUI environment). Established pattern
 # from the other suites.
 _spec = importlib.util.spec_from_file_location(
-    "edu", Path(__file__).parent / "nodes" / "eric_diffusion_utils.py")
+    "edu", Path(__file__).parent / "comfyless" / "core" / "eric_diffusion_utils.py")
 edu = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(edu)
 

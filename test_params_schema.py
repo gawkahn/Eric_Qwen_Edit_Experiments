@@ -846,7 +846,7 @@ check("overlay: silent when all family keys are explicit",
 # ──────────────────────────────────────────────────────────────────────
 print("\n── Krea-2 family detection + defaults + routing ────────────────")
 
-from nodes.eric_diffusion_utils import infer_model_family
+from comfyless.core.eric_diffusion_utils import infer_model_family
 
 # Detection: one Krea2Pipeline class → two families via is_distilled.
 check("krea: Krea2Pipeline → 'krea' (single-arg form unchanged)",

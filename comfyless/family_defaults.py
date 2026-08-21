@@ -16,7 +16,7 @@ in `generate.py` consumes the dict generically.
 Conventions for editing FAMILY_DEFAULTS:
 
 * Keys must match strings produced by `infer_model_family` in
-  `nodes/eric_diffusion_utils.py`: ``qwen-image``, ``qwen-edit``,
+  `comfyless/core/eric_diffusion_utils.py`: ``qwen-image``, ``qwen-edit``,
   ``flux2klein``, ``flux2``, ``chroma``, ``flux``, ``auraflow``,
   ``sd3``, ``sdxl``, ``sd1``, ``zimage``.  Unknown families pass
   through with no overlay (no error).

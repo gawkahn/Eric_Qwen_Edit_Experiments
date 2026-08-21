@@ -47,12 +47,12 @@ if "comfy.utils" not in sys.modules:
 
 import torch  # noqa: E402
 
-from nodes.eric_lora_format_convert import (  # noqa: E402
+from comfyless.core.eric_lora_format_convert import (  # noqa: E402
     apply_rename_rules,
     decode_kohya_to_bfl,
     get_plan,
 )
-from nodes.eric_lora_format_convert_apply import (  # noqa: E402
+from comfyless.core.eric_lora_format_convert_apply import (  # noqa: E402
     convert_state_dict,
     find_matching_plan,
 )
@@ -502,7 +502,7 @@ def test_kohya_decode_txt_mod_compound():
 
 def test_kohya_decoded_detected_as_bfl_original():
     """After Kohya decode, detect_lora_format should recognise bfl_original."""
-    from nodes.eric_lora_format_convert import detect_lora_format
+    from comfyless.core.eric_lora_format_convert import detect_lora_format
     sd = {
         "lora_unet_double_blocks_0_img_attn_qkv.lora_down.weight": torch.zeros(1),
         "lora_unet_single_blocks_0_linear1.lora_down.weight": torch.zeros(1),

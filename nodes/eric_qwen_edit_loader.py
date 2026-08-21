@@ -26,7 +26,7 @@ from .eric_diffusion_component_loader import (
     available_device_options,
     resolve_device_with_fallback,
 )
-from .eric_diffusion_utils import resolve_hf_path
+from comfyless.core.eric_diffusion_utils import resolve_hf_path
 
 
 class EricQwenEditLoader:

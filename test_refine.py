@@ -1176,7 +1176,7 @@ check("--judge-recipe parser default is the None sentinel",
 # 28 steps / cfg 3.5 instead of its 8 / 0.0. The fix keys the overlay on None
 # sentinels: unset CLI flag → family default → _GEN_KEY_FALLBACKS backstop.
 print("== build_config_from_args: FAMILY_DEFAULTS overlay ==")
-import nodes.eric_diffusion_utils as _edu  # noqa: E402
+import comfyless.core.eric_diffusion_utils as _edu  # noqa: E402
 
 
 def _overlay_cfg(family, extra_flags=(), collect_logs=None):

@@ -77,7 +77,7 @@ for m in ("comfy", "comfy.utils", "comfy.model_management"):
         sys.modules[m] = types.ModuleType(m)
 
 spec = importlib.util.spec_from_file_location(
-    "eric_diffusion_manual_loop", "nodes/eric_diffusion_manual_loop.py"
+    "eric_diffusion_manual_loop", "comfyless/core/eric_diffusion_manual_loop.py"
 )
 ml = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ml)

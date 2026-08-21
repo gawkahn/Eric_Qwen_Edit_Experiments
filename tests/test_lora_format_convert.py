@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Eric Hiss. All rights reserved.
 # Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
 """
-Unit tests for nodes/eric_lora_format_convert.py (slice 2 framework).
+Unit tests for comfyless/core/eric_lora_format_convert.py (slice 2 framework).
 
 Run from project root:
 
@@ -49,7 +49,7 @@ if "comfy.utils" not in sys.modules:
 
 import torch  # noqa: E402
 
-from nodes.eric_lora_format_convert import (  # noqa: E402
+from comfyless.core.eric_lora_format_convert import (  # noqa: E402
     CONVERSION_PLANS,
     ConversionPlan,
     RenameRule,

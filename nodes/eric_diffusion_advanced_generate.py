@@ -55,13 +55,13 @@ from typing import Tuple
 import torch
 
 from .eric_qwen_edit_utils import pil_to_tensor
-from .eric_diffusion_utils import build_model_metadata
+from comfyless.core.eric_diffusion_utils import build_model_metadata
 from .eric_diffusion_generate import (
     ASPECT_RATIOS,
     compute_dimensions,
     resolve_override_dimensions,
 )
-from .eric_diffusion_manual_loop import (
+from comfyless.core.eric_diffusion_manual_loop import (
     sampler_names,
     sampler_cost,
     SIGMA_SCHEDULE_NAMES,

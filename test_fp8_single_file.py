@@ -34,19 +34,12 @@ from safetensors.torch import save_file
 # (which imports every node file and their ComfyUI deps).
 import types  # noqa: E402
 
-if "nodes" not in sys.modules:
-    _pkg = types.ModuleType("nodes")
-    _pkg.__path__ = [str(Path(__file__).parent / "nodes")]
-    sys.modules["nodes"] = _pkg
 
 
 def _load_pkg_module(alias, modname):
-    spec = importlib.util.spec_from_file_location(
-        f"nodes.{modname}", Path(__file__).parent / "nodes" / f"{modname}.py")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[f"nodes.{modname}"] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    # comfyless.core is a real, import-safe package (ADR-045 slice 1b), so the
+    # synthetic-package scaffolding this used to need is gone.
+    return importlib.import_module(f"comfyless.core.{modname}")
 
 
 krea2c = _load_pkg_module("krea2c", "eric_krea2_convert")
@@ -1164,7 +1157,7 @@ check("DMR resolution map: scale buffers INVISIBLE (req 23 NEGATIVE)",
 # must be unchanged. comfyless import installs the folder_paths shims the
 # nodes package needs (established suite pattern).
 import comfyless.generate  # noqa: F401,E402 — shims
-from nodes.eric_lora_format_convert_apply import _apply_converted_lora_as_delta  # noqa: E402
+from comfyless.core.eric_lora_format_convert_apply import _apply_converted_lora_as_delta  # noqa: E402
 _h3 = _DMRHost()
 _s_before = _h3.q.weight_scale.clone()
 _apply_converted_lora_as_delta(
@@ -1181,7 +1174,7 @@ check("DMR LIFO ledger pops the unloaded adapter (req 25)",
 
 # req 28: PEFT-wrapped bf16 + ScaledFp8Linear coexistence resolves each
 # correctly through the merged map.
-from nodes.eric_lora_format_convert_apply import resolve_merge_target  # noqa: E402
+from comfyless.core.eric_lora_format_convert_apply import resolve_merge_target  # noqa: E402
 class _Wrapped(nn.Module):
     def __init__(self):
         super().__init__()

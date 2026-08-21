@@ -299,7 +299,7 @@ def _load_lokr_adapter(pipe, state_dict: dict, adapter_name: str,
         # loader's diffusers fast path, which does the arch key mapping.
         # Lossy (rank-64 SVD); the alternative is a silent no-op.
         # (2026-07-06; TECH_DEBT LoKR-on-Z-Image.)
-        from .eric_lora_format_convert_apply import flatten_lokr_to_lora_sd
+        from comfyless.core.eric_lora_format_convert_apply import flatten_lokr_to_lora_sd
         try:
             flat = flatten_lokr_to_lora_sd(state_dict, log_prefix=log_prefix)
         except Exception as flat_err:  # noqa: BLE001 — never let rescue crash the load
@@ -383,7 +383,7 @@ def _load_lokr_adapter_direct(pipe, state_dict: dict, adapter_name: str,
     single re-merge at changed weight.
     """
     import math, re
-    from .eric_diffusion_fp8_ops import (
+    from comfyless.core.eric_diffusion_fp8_ops import (
         apply_merge_delta, merge_resolution_map, record_direct_merge,
         refuse_unmergeable_base,
     )
@@ -571,7 +571,7 @@ def _load_loha_adapter_direct(pipe, state_dict: dict, adapter_name: str,
     LoHa delta = ``(w1_a @ w1_b) * (w2_a @ w2_b) * (alpha / r) * weight``.
     When *alpha* is absent, scale defaults to ``1.0``.
     """
-    from .eric_diffusion_fp8_ops import (
+    from comfyless.core.eric_diffusion_fp8_ops import (
         apply_merge_delta, merge_resolution_map, record_direct_merge,
         refuse_unmergeable_base,
     )
@@ -1090,7 +1090,7 @@ def _load_lora_adapter_direct(pipe, state_dict: dict, adapter_name: str,
     The user *weight* is baked in at merge time.  ``set_adapters()`` will
     not be able to change it afterwards (a limitation of direct merge).
     """
-    from .eric_diffusion_fp8_ops import (
+    from comfyless.core.eric_diffusion_fp8_ops import (
         apply_merge_delta, merge_resolution_map, record_direct_merge,
         refuse_unmergeable_base,
     )
@@ -1213,11 +1213,11 @@ def unload_adapters(pipe, adapter_names, log_prefix: str = "[LoRA]") -> None:
             # LIFO guard + ledger pop (DMR req 25) runs regardless of backup
             # presence so the ledger stays authoritative even if a backup was
             # manually removed (final code-review finding 1).
-            from .eric_diffusion_fp8_ops import warn_non_lifo_unload
+            from comfyless.core.eric_diffusion_fp8_ops import warn_non_lifo_unload
             warn_non_lifo_unload(transformer, adapter_name, log_prefix)
             if backup:
-                from .eric_lora_format_convert_apply import resolve_restore_target
-                from .eric_diffusion_fp8_ops import (
+                from comfyless.core.eric_lora_format_convert_apply import resolve_restore_target
+                from comfyless.core.eric_diffusion_fp8_ops import (
                     merge_resolution_map, restore_merge_backup,
                 )
                 # Same map as merge time: .weight buffers included so
@@ -1363,9 +1363,9 @@ def load_lora_with_key_fix(pipe, lora_path: str, adapter_name: str,
 
     Returns True if the LoRA was loaded, False if it was skipped.
     """
-    from .eric_diffusion_lora_check import check_lora
-    from .eric_lora_format_convert import decode_kohya_to_bfl
-    from .eric_lora_format_convert_apply import (
+    from comfyless.core.eric_diffusion_lora_check import check_lora
+    from comfyless.core.eric_lora_format_convert import decode_kohya_to_bfl
+    from comfyless.core.eric_lora_format_convert_apply import (
         convert_state_dict, find_matching_plan, load_converted_lora,
     )
 

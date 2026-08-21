@@ -54,7 +54,7 @@ import comfyless.mcp_server as mcps  # noqa: E402
 import comfyless.generate as gen_mod  # noqa: E402
 from click.testing import CliRunner  # noqa: E402
 from mcp.types import Tool  # noqa: E402
-from nodes.eric_diffusion_utils import infer_model_family  # noqa: E402
+from comfyless.core.eric_diffusion_utils import infer_model_family  # noqa: E402
 
 
 passed = 0
@@ -755,7 +755,7 @@ def _call(cfg, args, *, expect_error_class=None):
 # eu.resolve_hf_path). Cascade is NOT migrated in slice 3 (OQ-C -> slice 3b),
 # so its raw-path + HF-resolution contract is unchanged and still covered by
 # the "Step 3: cascade dispatch" section further down.
-import nodes.eric_diffusion_utils as eu  # noqa: E402
+import comfyless.core.eric_diffusion_utils as eu  # noqa: E402
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1646,7 +1646,7 @@ _CLASS_NAME_OMIT = object()  # sentinel: omit _class_name entirely
 
 # Characterization: scan_model_family agrees with the existing
 # infer_model_family mapping for every supported pipeline class family
-# (the _FAMILY_PATTERNS list in nodes/eric_diffusion_utils.py).
+# (the _FAMILY_PATTERNS list in comfyless/core/eric_diffusion_utils.py).
 _CHARACTERIZATION_CASES = [
     ("QwenImagePipeline",            "qwen-image"),
     ("QwenImageEditPlusPipeline",    "qwen-edit"),
@@ -1872,7 +1872,7 @@ with tempfile.TemporaryDirectory() as _td:
 
 # Module-import hygiene (HIGH-1 folded 2026-05-23): importing
 # `comfyless.catalog` must NOT trigger `import torch`. The torch import
-# is gated behind the lazy `from nodes.eric_diffusion_utils import
+# is gated behind the lazy `from comfyless.core.eric_diffusion_utils import
 # infer_model_family` inside scan_model_family's body.
 #
 # Subprocess check — by the time this test file runs, torch is already

@@ -37,7 +37,7 @@ build_sigma_schedule = _ms_mod.build_sigma_schedule
 # Load scheduler module directly to avoid the ComfyUI __init__.py chain
 import importlib.util
 _sched_spec = importlib.util.spec_from_file_location(
-    "_eric_diffusion_scheduler", "nodes/eric_diffusion_scheduler.py"
+    "_eric_diffusion_scheduler", "comfyless/core/eric_diffusion_scheduler.py"
 )
 _sched_mod = importlib.util.module_from_spec(_sched_spec)
 _sched_spec.loader.exec_module(_sched_mod)

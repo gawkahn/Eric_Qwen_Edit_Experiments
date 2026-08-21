@@ -3679,7 +3679,7 @@ def _overlay_family_defaults(base: dict,
     (--transformer-path is a catalog scan root, not a weight override), so
     base never carries transformer_path on this path. Port the warning if
     refine ever grows one."""
-    from nodes.eric_diffusion_utils import detect_pipeline_class
+    from comfyless.core.eric_diffusion_utils import detect_pipeline_class
     family = None
     try:
         _, _, family = detect_pipeline_class(base["model"])
@@ -3996,7 +3996,7 @@ def _detect_family_for_gate(model_path: str) -> Optional[str]:
     Distinct from _overlay_family_defaults' silent degrade: the GATE decides
     whether edit mode may engage, so callers treat None as 'not an edit
     family' — which refuses edit mode (fail-closed) and passes t2i."""
-    from nodes.eric_diffusion_utils import detect_pipeline_class
+    from comfyless.core.eric_diffusion_utils import detect_pipeline_class
     try:
         _, _, family = detect_pipeline_class(model_path)
         return family

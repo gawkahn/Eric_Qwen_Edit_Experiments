@@ -15,8 +15,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 import comfyless  # noqa: F401  installs folder_paths / comfy shims
 import torch
 
-from nodes.eric_lora_format_convert import detect_lora_format
-from nodes.eric_lora_format_convert_apply import find_matching_plan, convert_state_dict
+from comfyless.core.eric_lora_format_convert import detect_lora_format
+from comfyless.core.eric_lora_format_convert_apply import find_matching_plan, convert_state_dict
 
 
 passed = 0
@@ -155,7 +155,7 @@ print("\n── fp8-resident buffer visibility ───────────
 # Drive the ACTUAL production helpers (not an inline reconstruction) so a
 # revert of either buffer-aware fix fails this suite.
 from nodes.eric_qwen_edit_lora import plan_match_model_names
-from nodes.eric_lora_format_convert_apply import (
+from comfyless.core.eric_lora_format_convert_apply import (
     resolve_merge_target, mergeable_target_names,
 )
 

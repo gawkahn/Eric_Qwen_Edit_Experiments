@@ -63,7 +63,7 @@ for m in ("comfy", "comfy.utils", "comfy.model_management"):
         sys.modules[m] = types.ModuleType(m)
 
 spec = importlib.util.spec_from_file_location(
-    "eric_diffusion_samplers", "nodes/eric_diffusion_samplers.py"
+    "eric_diffusion_samplers", "comfyless/core/eric_diffusion_samplers.py"
 )
 samplers_mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(samplers_mod)

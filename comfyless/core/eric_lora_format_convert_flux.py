@@ -21,7 +21,7 @@ What's NOT covered (yet):
     plan with its own rename table.
 
 Ground truth was confirmed by inspecting:
-  - nodes/eric_lora_format_convert.py (framework)
+  - comfyless/core/eric_lora_format_convert.py (framework)
   - klein_snofs_v1_1.safetensors (real LoKR LoRA, ai-toolkit, 2026-04)
   - FLUX.2-klein-9B/transformer/*.safetensors (model parameters)
 

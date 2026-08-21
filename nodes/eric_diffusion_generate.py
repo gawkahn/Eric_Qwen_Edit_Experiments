@@ -21,8 +21,8 @@ from datetime import datetime
 from typing import Tuple
 
 from .eric_qwen_edit_utils import pil_to_tensor
-from .eric_diffusion_samplers import sampler_choices, swap_sampler
-from .eric_diffusion_utils import build_model_metadata
+from comfyless.core.eric_diffusion_samplers import sampler_choices, swap_sampler
+from comfyless.core.eric_diffusion_utils import build_model_metadata
 
 
 # ── Resolution helpers ───────────────────────────────────────────────────────

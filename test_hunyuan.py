@@ -73,7 +73,7 @@ for m in ("comfy", "comfy.utils", "comfy.model_management"):
         sys.modules[m] = types.ModuleType(m)
 
 spec = importlib.util.spec_from_file_location(
-    "eric_diffusion_utils", "nodes/eric_diffusion_utils.py"
+    "eric_diffusion_utils", "comfyless/core/eric_diffusion_utils.py"
 )
 utils_mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(utils_mod)
@@ -95,9 +95,9 @@ _nodes_pkg.__path__ = ["nodes"]
 sys.modules["nodes"] = _nodes_pkg
 for _name, _attrs in [
     ("nodes.eric_qwen_edit_utils",   {"pil_to_tensor": lambda *a, **k: None}),
-    ("nodes.eric_diffusion_samplers",
+    ("comfyless.core.eric_diffusion_samplers",
      {"sampler_choices": lambda *a, **k: ["default"], "swap_sampler": None}),
-    ("nodes.eric_diffusion_utils",   {"build_model_metadata": lambda *a, **k: {}}),
+    ("comfyless.core.eric_diffusion_utils",   {"build_model_metadata": lambda *a, **k: {}}),
 ]:
     _stub_mod = types.ModuleType(_name)
     for _k, _v in _attrs.items():
@@ -738,7 +738,7 @@ with open("nodes/eric_diffusion_loader.py") as f:
 check(
     "nodes loader imports resolve_vae_tiling from eric_diffusion_utils",
     "resolve_vae_tiling" in nodes_loader_src
-    and "from .eric_diffusion_utils import" in nodes_loader_src,
+    and "from comfyless.core.eric_diffusion_utils import" in nodes_loader_src,
 )
 check(
     "nodes loader calls resolve_vae_tiling(model_family, vae_tiling)",
@@ -1389,7 +1389,7 @@ class _FakeRefinerClass:
 # nodes.eric_diffusion_utils with only `build_model_metadata`; populate
 # the three names hunyuan_chain.load_refiner_pipeline imports inside its
 # body, then patch them with spies for this test block.
-eduh = sys.modules["nodes.eric_diffusion_utils"]
+eduh = sys.modules["comfyless.core.eric_diffusion_utils"]
 _orig_resolve = getattr(eduh, "resolve_hf_path", None)
 _orig_detect = getattr(eduh, "detect_pipeline_class", None)
 _orig_tiling = getattr(eduh, "resolve_vae_tiling", None)

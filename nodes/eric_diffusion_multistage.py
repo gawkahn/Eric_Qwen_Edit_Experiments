@@ -28,9 +28,9 @@ from typing import Tuple
 from .eric_qwen_edit_utils import pil_to_tensor
 from .eric_diffusion_generate import ASPECT_RATIOS, compute_dimensions
 from .eric_qwen_edit_lora import _set_adapters_safe
-from .eric_diffusion_samplers import sampler_choices, swap_sampler
-from .eric_diffusion_manual_loop import _maybe_enable_vae_tiling
-from .eric_diffusion_utils import build_model_metadata
+from comfyless.core.eric_diffusion_samplers import sampler_choices, swap_sampler
+from comfyless.core.eric_diffusion_manual_loop import _maybe_enable_vae_tiling
+from comfyless.core.eric_diffusion_utils import build_model_metadata
 from datetime import datetime
 
 # Reuse the latent helpers and sigma math from the Qwen multistage node —

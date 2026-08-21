@@ -94,7 +94,7 @@ def scan_model_family(model_dir: str) -> Optional[str]:
     # consumer of this module regardless of whether they call this helper
     # (security-auditor HIGH-1, slice 2 step 1, 2026-05-23). Python caches
     # imports so subsequent calls within a process pay no extra cost.
-    from nodes.eric_diffusion_utils import infer_model_family
+    from comfyless.core.eric_diffusion_utils import infer_model_family
 
     index_path = os.path.join(model_dir, "model_index.json")
     if not os.path.isfile(index_path):
@@ -604,7 +604,7 @@ def _parse_manifest_entry(
     # Lazy imports for the resolvers — `nodes.eric_diffusion_utils`
     # imports torch at top-level (see Step 1 HIGH-1 / 2026-05-23
     # security review).
-    from nodes.eric_diffusion_utils import _is_hf_repo_id, resolve_hf_path
+    from comfyless.core.eric_diffusion_utils import _is_hf_repo_id, resolve_hf_path
 
     if _is_hf_repo_id(target):
         try:

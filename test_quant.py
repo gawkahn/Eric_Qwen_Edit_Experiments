@@ -37,7 +37,7 @@ import torch.nn as nn
 # every node class and expects a ComfyUI environment). Established pattern
 # from the other suites.
 _spec = importlib.util.spec_from_file_location(
-    "edu", Path(__file__).parent / "nodes" / "eric_diffusion_utils.py")
+    "edu", Path(__file__).parent / "comfyless" / "core" / "eric_diffusion_utils.py")
 edu = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(edu)
 
@@ -395,7 +395,7 @@ except RuntimeError as e:
 # MOVED into the dispatcher (Vision invariant 7 / security review req 24).
 # Source inspection so a refactor can't silently reintroduce a raw write.
 _lora_src = (Path(__file__).parent / "nodes" / "eric_qwen_edit_lora.py").read_text()
-_conv_src = (Path(__file__).parent / "nodes"
+_conv_src = (Path(__file__).parent / "comfyless" / "core"
              / "eric_lora_format_convert_apply.py").read_text()
 for fn, src in [("_load_lokr_adapter_direct", _lora_src),
                 ("_load_loha_adapter_direct", _lora_src),

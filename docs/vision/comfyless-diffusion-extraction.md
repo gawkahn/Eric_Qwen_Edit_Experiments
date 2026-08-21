@@ -1,6 +1,6 @@
 # Vision — extracting `comfyless_diffusion`
 
-Status: proposed — slice 1 not started
+Status: in progress — slices 1a and 1b done
 Decision record: `docs/decisions/ADR-045-comfyless-diffusion-standalone-repo.md` (accepted 2026-08-20)
 
 ## Lens (global §1)
@@ -82,6 +82,28 @@ operation.
 
 ### Slice 1 — Create `comfyless/core/`, move the library modules
 
+**SPLIT during execution.** Measured, the import rewrite was 51 files, not
+"comfyless/ and a few node files". Executed as two slices:
+
+- **1a (done)** — the 6 `pipelines/` modules (nag_* + krea2_identity_edit).
+  10 files, 26 import lines.
+- **1b (done)** — the `nodes/` library modules. Grew from 8 to **12**: the
+  closed dependency cluster pulled in `eric_krea2_convert` (imported by both
+  utils and fp8_ops) and the three `eric_lora_format_convert_{flux,chroma,krea}`
+  variants, which `eric_lora_format_convert` imports as registration
+  side-effects via `from . import X` — a form three successive grep patterns
+  missed (the first omitted `from . import`, the second used `[a-z_]+` which
+  excludes the digits in `fp8_ops`, the third filtered out `importlib`). Only
+  a name-based search over all files found them. 52 files, 78 rewritten lines
+  plus 6 hand-fixed dynamic loaders.
+
+**Deleting the `sys.path` insert MOVED to slice 3.** It cannot happen here:
+the only remaining `nodes.*` imports in comfyless are the three Eric-lineage
+functions (`load_lora_with_key_fix` / `is_direct_merge_adapter`,
+`build_sigma_schedule`, `decode_latents_with_upscale_vae_safe`). The last
+coupling to `nodes/` IS the third-party-authored code, so slice 3 severs the
+dependency and clears the license residue in one action.
+
 Move the 14 verified-Grant modules into `comfyless/core/` with `git mv` (so
 rename detection holds), rewrite imports across `comfyless/` and `nodes/`, and
 delete the `_PROJECT_ROOT` `sys.path` insert that currently makes `nodes/`
@@ -91,8 +113,12 @@ reachable.
 `eric_diffusion_manual_loop` still import `comfy` / `folder_paths`, so the stubs
 are still load-bearing. Removing them is slice 2.
 
-*Proof:* battery green; `grep -r "sys.path.insert" comfyless/` empty.
-*Revert:* single commit, pure moves plus import rewrites.
+*Proof achieved:* 32/32 suites green after each of 1a and 1b; pixel manifest
+ALL MATCH; typecheck diagnostics exactly conserved at 987 across both slices
+(1a moved 360 pipelines->comfyless, 1b moved 82 nodes->comfyless), which is
+independent evidence that nothing was created or lost. All 18 moved files
+recorded by git as renames at 99-100% similarity, so history follows them.
+*Revert:* one commit per sub-slice, moves plus import rewrites.
 
 ### Slice 2 — Cut core's ComfyUI dependency, delete the shims
 

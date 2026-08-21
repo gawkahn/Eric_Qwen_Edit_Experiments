@@ -91,7 +91,7 @@ def load_refiner_pipeline(
     `_dcae_downsample_rearrange`. Operator override (`--vae-tiling on`)
     still applies if desired.
     """
-    from nodes.eric_diffusion_utils import (
+    from comfyless.core.eric_diffusion_utils import (
         detect_pipeline_class,
         resolve_hf_path,
         resolve_vae_tiling,

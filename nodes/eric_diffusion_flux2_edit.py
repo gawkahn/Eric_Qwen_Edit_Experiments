@@ -23,7 +23,7 @@ from typing import Tuple
 import torch
 from PIL import Image
 
-from .eric_diffusion_utils import build_model_metadata
+from comfyless.core.eric_diffusion_utils import build_model_metadata
 from .eric_qwen_edit_utils import pil_to_tensor
 
 

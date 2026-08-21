@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import comfyless  # noqa: F401 — installs the folder_paths/comfy stubs
 import comfyless.generate as cg
-import nodes.eric_diffusion_manual_loop as nml
+import comfyless.core.eric_diffusion_manual_loop as nml
 
 passed = 0
 failed = 0

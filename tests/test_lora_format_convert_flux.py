@@ -49,7 +49,7 @@ if "comfy.utils" not in sys.modules:
 
 import torch  # noqa: E402
 
-from nodes.eric_lora_format_convert import (  # noqa: E402
+from comfyless.core.eric_lora_format_convert import (  # noqa: E402
     apply_rename_rules,
     get_plan,
 )

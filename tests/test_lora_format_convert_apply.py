@@ -45,8 +45,8 @@ if "comfy.utils" not in sys.modules:
 
 import torch  # noqa: E402
 
-from nodes.eric_lora_format_convert import get_plan  # noqa: E402
-from nodes.eric_lora_format_convert_apply import (  # noqa: E402
+from comfyless.core.eric_lora_format_convert import get_plan  # noqa: E402
+from comfyless.core.eric_lora_format_convert_apply import (  # noqa: E402
     _apply_converted_lora_as_delta,
     convert_state_dict,
     find_matching_plan,

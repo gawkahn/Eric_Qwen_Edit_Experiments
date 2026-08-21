@@ -22,7 +22,7 @@ Chroma vs Klein key differences relevant to conversion:
 Ground truth confirmed by inspecting:
   - Chroma1-base & Chroma1-HD transformer parameters (identical)
   - Chubby_Body_Type.safetensors (real Chroma standard LoRA, rank 32)
-  - nodes/eric_lora_format_convert_flux.py (Klein plan as template)
+  - comfyless/core/eric_lora_format_convert_flux.py (Klein plan as template)
 
 Author: Eric Hiss (GitHub: EricRollei)
 """

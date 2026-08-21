@@ -21,7 +21,7 @@ import os
 import torch
 from typing import Tuple
 
-from .eric_diffusion_utils import (
+from comfyless.core.eric_diffusion_utils import (
     DTYPE_MAP,
     detect_pipeline_class,
     detect_load_variant,

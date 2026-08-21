@@ -200,7 +200,7 @@ def cmd_inspect(args, cfg: dict) -> int:
             print(f"          {k}: {v_str}")
 
     # Adapter format detection — use the same suffix table the loader uses
-    from nodes.eric_diffusion_lora_check import (
+    from comfyless.core.eric_diffusion_lora_check import (
         _strip_adapter_suffix, check_lora,
     )
 
@@ -289,7 +289,7 @@ def cmd_check(args, cfg: dict) -> int:
         )
         return 1
 
-    from nodes.eric_diffusion_lora_check import build_param_dict_from_dir, check_lora
+    from comfyless.core.eric_diffusion_lora_check import build_param_dict_from_dir, check_lora
 
     print(f"\n[check] Indexing transformer params from {transformer_dir} …")
     param_dict = build_param_dict_from_dir(str(transformer_dir))
@@ -306,7 +306,7 @@ def cmd_check(args, cfg: dict) -> int:
     # is the cheap, model-load-free version of what slice 4's loader
     # path does at LoRA-load time.
     if result.matched == 0 and result.total_layers > 0:
-        from nodes.eric_lora_format_convert_apply import (
+        from comfyless.core.eric_lora_format_convert_apply import (
             convert_state_dict, find_matching_plan,
         )
         # Load the raw state dict (no torch model, just safetensors)

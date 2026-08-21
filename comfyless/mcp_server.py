@@ -171,7 +171,7 @@ def _basename_or_repo_id(value: str) -> str:
     # Local-import keeps the comfyless.mcp_server module light when imported
     # from comfyless.generate's lazy-import path (avoid pulling diffusers
     # transitively at module import time).
-    from nodes.eric_diffusion_utils import _is_hf_repo_id
+    from comfyless.core.eric_diffusion_utils import _is_hf_repo_id
     if _is_hf_repo_id(value):
         return value
     return os.path.basename(value)
@@ -373,7 +373,7 @@ def _resolve_sidecar_ref(value, kinds: tuple, family, index: dict,
     """
     if not isinstance(value, str) or not value:
         return value, False
-    from nodes.eric_diffusion_utils import _is_hf_repo_id
+    from comfyless.core.eric_diffusion_utils import _is_hf_repo_id
     if _is_hf_repo_id(value):
         return value, False  # HF passthrough: unchanged, no notice (N14)
     base = os.path.basename(value)

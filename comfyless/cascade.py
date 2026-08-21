@@ -217,7 +217,7 @@ def _resolve_scaffolding(repo: str, allow_hf_download: bool) -> str:
     """Resolve scaffolding_repo to a local path. Goes through resolve_hf_path so
     HF repo IDs and local absolute paths are both accepted, matching the rest of
     comfyless."""
-    from nodes.eric_diffusion_utils import resolve_hf_path
+    from comfyless.core.eric_diffusion_utils import resolve_hf_path
     return resolve_hf_path(repo, allow_download=allow_hf_download)
 
 
