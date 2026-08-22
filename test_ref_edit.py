@@ -1077,7 +1077,7 @@ check("both out of band → both warnings, still no exception", len(_wb) == 2)
 # types nothing still loses CFG.
 print("\n── ADR-043 Part B: accepted-but-unapplied knobs ───────────────")
 
-import comfyless.family_defaults as _kfd  # noqa: E402
+import comfyless.core.family_defaults as _kfd  # noqa: E402
 check("premise: Krea-2-Raw's family default really does set cfg_scale > 0",
       _kfd.FAMILY_DEFAULTS["krea"]["cfg_scale"] > 0,
       f"got {_kfd.FAMILY_DEFAULTS['krea']!r}")

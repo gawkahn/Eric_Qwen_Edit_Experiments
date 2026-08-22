@@ -359,7 +359,7 @@ for fam in ("flux", "qwen-image", "sdxl", "auraflow", "foobar"):
 # ──────────────────────────────────────────────────────────────────────
 print("── family_defaults: hunyuan-image row exists with ADR-014 §4 values")
 
-from comfyless.family_defaults import FAMILY_DEFAULTS
+from comfyless.core.family_defaults import FAMILY_DEFAULTS
 
 check(
     "FAMILY_DEFAULTS['hunyuan-image'] exists",
@@ -886,7 +886,7 @@ check(
 # the Step-4 daemon scope. Inv 12 is the Step-3 ComfyUI-node scope.
 # Inv 13 is the live-smoke memory ceiling (no CPU coverage).
 
-import comfyless.hunyuan_chain as hc
+import comfyless.core.hunyuan_chain as hc
 import contextlib
 import io
 from PIL import Image as _PILImage
@@ -957,7 +957,7 @@ print("── Inv 1 — no filesystem search (structural + runtime) ────
 # "no path-derivation" posture at the source level. Defends against a
 # future engineer adding sibling-glob logic without re-reading ADR-016
 # Alternative A's rationale.
-with open("comfyless/hunyuan_chain.py") as f:
+with open("comfyless/core/hunyuan_chain.py") as f:
     chain_src = f.read()
 for forbidden in ("os.listdir", "Path.glob", ".iterdir(", ".scandir(", "os.scandir"):
     check(
@@ -1549,11 +1549,11 @@ print("── Step 3 / Inv 9 — Generate node shares the hunyuan_chain loader +
 # guarantee for the asymmetric shared-encoder optimization (ADR-016 §e).
 check(
     "ComfyUI Generate node imports hunyuan_chain.load_refiner_pipeline",
-    "from comfyless.hunyuan_chain import load_refiner_pipeline" in node_gen_src,
+    "from comfyless.core.hunyuan_chain import load_refiner_pipeline" in node_gen_src,
 )
 check(
     "ComfyUI Generate node imports hunyuan_chain.run_chain",
-    "from comfyless.hunyuan_chain import run_chain" in node_gen_src,
+    "from comfyless.core.hunyuan_chain import run_chain" in node_gen_src,
 )
 check(
     "ComfyUI Generate node calls load_refiner_pipeline (not inline construction)",
@@ -1626,7 +1626,7 @@ print("── Step 3 / Inv 5 + 6 — Generate node sources operating point from 
 # drift from the comfyless schema.
 check(
     "ComfyUI Generate node imports FAMILY_DEFAULTS for refiner defaults",
-    "from comfyless.family_defaults import FAMILY_DEFAULTS" in node_gen_src,
+    "from comfyless.core.family_defaults import FAMILY_DEFAULTS" in node_gen_src,
 )
 check(
     "ComfyUI Generate node reads FAMILY_DEFAULTS['hunyuan-image'] for refiner defaults",

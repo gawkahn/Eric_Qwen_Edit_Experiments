@@ -2800,3 +2800,14 @@ root-cause job — likely an environment- or catalog-state-dependent branch in
 Vision's "no slice ends with a red battery" must-never even when the slice did
 not cause it. Establish the first red commit with `git bisect run
 ./.venv/bin/python3 test_refine.py`.
+
+**Update 2026-08-22 (slice 4, root-caused, still open):** not catalog state.
+`refine.main` returns rc=2 before `refine_loop` because the ADR-040 D3a entry
+gate consults the **live comfyless daemon** on this machine, whose
+`--ref-root` is `.../ai-stack-data/comfyless`; the test's `--output-dir`
+(`/tmp/eout_*`) is outside it, so the gate refuses the run. Captured stderr:
+"the run directory '/tmp/eout_…' is outside the reference roots of the daemon
+on 'cuda'". The block is hermetic only when no daemon is listening — which is
+why it passed at authoring time and on CI. Fix belongs to the test (stub the
+daemon probe in that block, as the slice-B blocks above it already do), not
+to `refine.py`.

@@ -65,7 +65,7 @@ from comfyless.core.eric_diffusion_utils import (
 from comfyless.core.eric_diffusion_samplers import sampler_choices, swap_sampler
 from comfyless.core.lora_adapters import load_lora_with_key_fix
 
-from comfyless.family_defaults import (DISTILLED_FAMILIES, FAMILY_DEFAULTS,
+from comfyless.core.family_defaults import (DISTILLED_FAMILIES, FAMILY_DEFAULTS,
                                         apply_family_defaults)
 
 CONTRACT_VERSION = 1
@@ -2195,7 +2195,7 @@ def generate(
                 f"--model resolved to family {model_family!r}. Drop --refiner "
                 f"or point --model at a HunyuanImage-2.1-Diffusers checkpoint."
             )
-        from comfyless import hunyuan_chain
+        from comfyless.core import hunyuan_chain
         # Daemon path may pre-load both base and refiner (server cache);
         # accept a pre-loaded refiner from the cache when the server
         # provides one, otherwise load fresh.
@@ -2546,7 +2546,7 @@ def generate(
             output_height=(height if ref_dims_explicit else None),
         )
     elif refiner_pipe is not None:
-        from comfyless import hunyuan_chain
+        from comfyless.core import hunyuan_chain
         with swap_sampler(pipe, effective_sampler, log_prefix="[comfyless]"):
             final_pil = hunyuan_chain.run_chain(
                 pipe, refiner_pipe, call_kwargs,

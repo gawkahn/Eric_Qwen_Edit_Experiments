@@ -565,7 +565,7 @@ check("override-keys: malformed spec (no =) ignored",
 # ──────────────────────────────────────────────────────────────────────
 print("\n── FAMILY_DEFAULTS shape (ADR-009) ─────────────────────────────")
 
-from comfyless.family_defaults import FAMILY_DEFAULTS
+from comfyless.core.family_defaults import FAMILY_DEFAULTS
 
 check("FAMILY_DEFAULTS is a dict",
       isinstance(FAMILY_DEFAULTS, dict))
@@ -780,7 +780,7 @@ check("distilled-warn: only steps explicit -> still warns (cfg inherited)",
 # Table sync: every distilled family is a real FAMILY_DEFAULTS row, and the
 # membership is not derivable from cfg_scale (krea-turbo 0.0, zimage-turbo 1.0)
 # — which is exactly why it is declared rather than inferred.
-from comfyless.family_defaults import DISTILLED_FAMILIES  # noqa: E402
+from comfyless.core.family_defaults import DISTILLED_FAMILIES  # noqa: E402
 
 check("distilled-warn: DISTILLED_FAMILIES all present in FAMILY_DEFAULTS",
       all(f in g.FAMILY_DEFAULTS for f in DISTILLED_FAMILIES),

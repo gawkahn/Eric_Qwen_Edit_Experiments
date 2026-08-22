@@ -1,6 +1,6 @@
 # Vision — extracting `comfyless_diffusion`
 
-Status: in progress — slices 1, 2, 3a, 3b, 3c done; next: slice 4
+Status: in progress — slices 1, 2, 3a, 3b, 3c, 4 done; next: slice 5
 Decision record: `docs/decisions/ADR-045-comfyless-diffusion-standalone-repo.md` (accepted 2026-08-20)
 
 ## Lens (global §1)
@@ -403,13 +403,32 @@ slice of their own (TECH_DEBT 2026-08-22; slice 5 at the latest).
 
 *Also:* `git blame` over `comfyless/core/` now reports one author.
 
-### Slice 4 — Resolve the layering inversion
+### Slice 4 — Resolve the layering inversion  ✅ done
 
 `nodes/eric_diffusion_generate.py` imports `hunyuan_chain` and
 `family_defaults` from comfyless at three sites. Decide per module whether it
 belongs in core or whether the node drops the dependency.
 
-*Proof:* `grep -rE "^\s*(from|import) comfyless" nodes/ pipelines/` is empty.
+**Decision: both moved into core** (`comfyless/core/hunyuan_chain.py`,
+`comfyless/core/family_defaults.py`, `git mv` so history follows). Neither
+depends on the CLI layer — `family_defaults` imports only `typing`;
+`hunyuan_chain` imports `sys`/`typing` at module level and torch/diffusers
+lazily — and both are consumed by the node pack and by three comfyless
+modules (`generate`, `server`, `refine`). Dropping the node's dependency
+instead would have duplicated the refiner loader and the 4 / 3.5 operating
+point the ADR-016 co-lock exists to keep single-sourced. No shims, as in
+slice 1b: every in-repo caller and test path string was rewritten.
+
+*Proof (corrected):* the grep as originally written can never be empty —
+slice 1 deliberately routed the node pack through `comfyless.core`, which IS
+the intended direction. The invariant is that nothing under `nodes/` or
+`pipelines/` imports from comfyless **outside** core:
+
+    grep -rnE "^\s*(from|import) comfyless(\.|$| )" nodes/ pipelines/ | grep -v "comfyless\.core"
+
+Empty after this slice. Battery 35/36 (`test_refine.py` red on `main`
+before the slice, see TECH_DEBT 2026-08-22); per-root typecheck conserved
+(453 / 438 / 94).
 
 ### Slice 5 — Packaging: src layout, package data, console script
 

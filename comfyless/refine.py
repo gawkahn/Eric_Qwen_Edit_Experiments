@@ -46,7 +46,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from comfyless.family_defaults import (FAMILY_DEFAULTS,
+from comfyless.core.family_defaults import (FAMILY_DEFAULTS,
                                         apply_family_defaults)
 from comfyless.output_format import _EXT_TO_NAME, OutputFormat, resolve_output_format
 

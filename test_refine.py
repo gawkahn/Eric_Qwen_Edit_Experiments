@@ -1297,7 +1297,7 @@ check("--patience CLI default is 0", _pat_args.patience == 0)
 # 2026-07-18, MEDIUM). See _overlay_family_defaults' docstring.
 _OVERLAY_KNOWN_KEYS = {"steps", "cfg_scale", "true_cfg_scale", "width",
                        "height", "refiner_steps", "refiner_cfg"}
-from comfyless.family_defaults import FAMILY_DEFAULTS as _FD  # noqa: E402
+from comfyless.core.family_defaults import FAMILY_DEFAULTS as _FD  # noqa: E402
 _unknown_fd_keys = {k for fam in _FD.values() for k in fam} - _OVERLAY_KNOWN_KEYS
 check("every FAMILY_DEFAULTS key is known to the refine overlay",
       not _unknown_fd_keys, detail=f"unhandled: {sorted(_unknown_fd_keys)}")
@@ -1852,7 +1852,7 @@ check("D5: unparseable refusal degrades to None (generic wording)",
 print("\n== parity slice 1: shared family-defaults applier + --schedule port ==")
 # The overlay core now lives in family_defaults; both callers are adapters, so
 # the CFG-aliasing rule can't drift between them again (it shipped twice).
-from comfyless import family_defaults as _fd  # noqa: E402
+from comfyless.core import family_defaults as _fd  # noqa: E402
 check("shared applier is the single source (refine delegates to it)",
       "apply_family_defaults(" in
       open(os.path.join(os.path.dirname(os.path.abspath(refine.__file__)),

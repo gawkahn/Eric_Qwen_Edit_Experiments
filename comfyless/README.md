@@ -353,7 +353,7 @@ The params file is the "recipe," `--override` is inline edits, and explicit flag
 
 `comfyless` knows that different model families have different sweet spots. Setting `cfg=3.5` (the schema baseline) starves SDXL/Pony/Illustrious; Qwen-Image wants `true_cfg_scale=4.0` and 50 steps per its model card. Rather than relying on every caller to know each family's preference, `comfyless` overlays family-appropriate defaults automatically once it detects the family from `model_index.json`.
 
-**Where the values live:** [`comfyless/family_defaults.py`](family_defaults.py). One dict, alphabetical by family, one inline comment per entry naming the source. Editing this file is the only change needed to adjust a family's defaults.
+**Where the values live:** [`comfyless/core/family_defaults.py`](core/family_defaults.py). One dict, alphabetical by family, one inline comment per entry naming the source. Editing this file is the only change needed to adjust a family's defaults.
 
 **What it controls (today):** `cfg_scale` / `true_cfg_scale` / `steps`. Other keys could be added by extending entries — `sampler` and `schedule` are already supported by the overlay applier and just don't have family-specific values yet.
 

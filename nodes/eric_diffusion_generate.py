@@ -424,8 +424,8 @@ class EricDiffusionGenerate:
                     f"{model_family!r}. Clear refiner_path or load a "
                     f"HunyuanImage-2.1-Diffusers checkpoint in the loader."
                 )
-            from comfyless.hunyuan_chain import load_refiner_pipeline
-            from comfyless.family_defaults import FAMILY_DEFAULTS
+            from comfyless.core.hunyuan_chain import load_refiner_pipeline
+            from comfyless.core.family_defaults import FAMILY_DEFAULTS
             # Pull refiner_steps / refiner_cfg from FAMILY_DEFAULTS — the
             # ComfyUI node exposes only refiner_path (per Vision OQ4) and
             # reads the operating point from the same source of truth the
@@ -527,7 +527,7 @@ class EricDiffusionGenerate:
         # untouched (ADR-016 §(g) / Vision Inv 8).
         try:
             if refiner_pipe is not None:
-                from comfyless.hunyuan_chain import run_chain
+                from comfyless.core.hunyuan_chain import run_chain
                 with swap_sampler(pipe, effective_sampler):
                     final_pil = run_chain(
                         pipe, refiner_pipe, call_kwargs,

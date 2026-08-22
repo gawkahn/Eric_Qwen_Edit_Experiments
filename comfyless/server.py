@@ -614,7 +614,7 @@ def _maybe_load_refiner(
             f"--model resolved to family {model_family!r}. Drop refiner_path "
             f"or point --model at a HunyuanImage-2.1-Diffusers checkpoint."
         )
-    from comfyless.hunyuan_chain import load_refiner_pipeline
+    from comfyless.core.hunyuan_chain import load_refiner_pipeline
     return load_refiner_pipeline(
         refiner_path, base_pipe=base_pipe,
         precision=req_precision, device=req_device,

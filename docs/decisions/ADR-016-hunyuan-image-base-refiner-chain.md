@@ -507,6 +507,15 @@ mcp_server.py non-thread assertion).
   references to the CFG-routing ADR updated from ADR-014 to ADR-025 (that
   ADR was renumbered to avoid a collision with main's lora-audit ADR-014).
 
+- 2026-08-22 — Moved to `comfyless/core/hunyuan_chain.py` (ADR-045 slice 4,
+  layering inversion). The ComfyUI Generate node's shared-loader co-lock (§e,
+  Step 3 / Inv 9) made the node pack import from the comfyless CLI layer;
+  the module has no dependency on that layer (only `sys`/`typing` at import,
+  torch/diffusers lazily), so it is core. Import path
+  `comfyless.core.hunyuan_chain`; contents and `test_hunyuan.py` structural
+  pins unchanged apart from the path. Earlier path references here are
+  historical.
+
 ## AI-Disclosure
 
 Claude (Opus 4.7) authored; Grant reviewed.

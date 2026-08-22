@@ -180,6 +180,15 @@ them. The dict is therefore designed for one-edit changes:
 
 ## Changelog
 
+- **2026-08-22** — **Moved to `comfyless/core/family_defaults.py`** (ADR-045
+  slice 4, layering inversion). The module was the node pack's only remaining
+  import from the comfyless CLI layer (`nodes/eric_diffusion_generate.py` read
+  `FAMILY_DEFAULTS["hunyuan-image"]` for the refiner operating point). It has
+  no dependency on anything outside `typing`, so it is library code and belongs
+  in core; the dependency now runs `nodes → core ← comfyless`. Import path
+  `comfyless.core.family_defaults`; contents unchanged. Earlier path references
+  in this ADR are historical.
+
 - **2026-07-25** — **One shared applier (parity-audit slice 1).** The overlay
   existed in two implementations — `generate._apply_family_defaults`
   (explicit_keys/iterated_axes bookkeeping, because it materializes every
