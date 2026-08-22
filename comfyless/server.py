@@ -666,7 +666,7 @@ def _handle_generate(
         _load_pipeline, _expand_savepath_template, _resolve_savepath, generate,
         KREA_REBALANCE_DEFAULT_MULT,
     )
-    from nodes.eric_qwen_edit_lora import load_lora_with_key_fix
+    from comfyless.core.lora_adapters import load_lora_with_key_fix
 
     req_precision = req.get("precision") or precision
 
@@ -827,7 +827,7 @@ def _handle_generate(
         if rec is not None:
             if abs(rec["weight"] - lora_weight) <= 1e-9:
                 continue
-            from nodes.eric_qwen_edit_lora import is_direct_merge_adapter
+            from comfyless.core.lora_adapters import is_direct_merge_adapter
             if is_direct_merge_adapter(pipe, rec["adapter_name"]):
                 # Direct-merge adapters bake weight at merge time — a new
                 # weight CANNOT take effect without a reload. Loud, never

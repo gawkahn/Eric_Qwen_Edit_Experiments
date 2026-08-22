@@ -1,6 +1,6 @@
 # Vision — extracting `comfyless_diffusion`
 
-Status: in progress — slices 1a and 1b done
+Status: in progress — slices 1, 2, 3a, 3b, 3c done; next: slice 4
 Decision record: `docs/decisions/ADR-045-comfyless-diffusion-standalone-repo.md` (accepted 2026-08-20)
 
 ## Lens (global §1)
@@ -326,25 +326,82 @@ that comparison is only available before it. `pre3b` vs `post3b`: **ALL
 MATCH**, all 20 cases. (That case is untiled by construction; see TECH_DEBT
 2026-08-21 for the tiled-coverage note.)
 
-#### Slice 3c — the LoRA adapter subsystem  (not started, needs its own ADR)
+#### Slice 3c — the LoRA adapter subsystem  ✅ done (ADR-046)
 
-658 Eric-authored lines across 13 helpers. This is the highest-risk code in
-the repo by track record — the Krea LoRA regression, fp8 buffer-blindness, the
-LoKR alpha-sentinel convention and the LoKR→LoRA flatten rescue all live in
-here — and unlike the sigma schedules there is **no frozen golden**, because
-equivalence can only be demonstrated against real adapter files on a GPU
-across LoRA/LoKR/LoHa x peft/direct x fp8/bf16. Building that harness is the
-first task of 3c, not an afterthought, and 3c should carry its own ADR rather
-than ride this Vision.
+`comfyless/core/lora_adapters.py`. Measured with `git blame -w` before starting:
+1,540 lines, **782 Eric / 758 Grant**, interleaved per function — so the
+record is ADR-046, not this section. Grant-authored functions (`_apply_te_lora`,
+`_decode_kohya_keys`, `_bake_lora_alpha_scales`, `unload_adapters`,
+`is_direct_merge_adapter`, `plan_match_model_names`, the pre-check / conversion
+/ failure-report body of `load_lora_with_key_fix`) were spliced **verbatim** by
+line range — the suite proves them character-identical (G5) — and everything
+Eric-authored was re-implemented from the per-function contract in the ADR. The
+three near-identical `_load_*_adapter_direct` loops became one `_merge_direct`
+driver parameterised by kind; `_set_adapters_safe`, `get_lora_list`,
+`get_lora_full_path` were not ported (ComfyUI / node-only). The node pack keeps
+its original untouched.
 
-**Consequence for the shims.** `_install_shims()`, the `_PROJECT_ROOT`
-`sys.path` insert and `generate.py:31` cannot be deleted until 3c lands,
-because `comfyless/{generate,server}.py` still import `nodes.eric_qwen_edit_lora`,
-which carries a module-level `import folder_paths`. **Four** `nodes.*` imports
-remain, down from six, and they are now all the LoRA cluster — so 3c is the
-last thing standing between here and a comfyless that never touches `nodes/`.
+*Proof, three layers, built before the swap* (`test_lora_adapters.py`, 256
+assertions, original and rewrite run **side by side in one process** — no
+goldens, the live differential is stronger while the original is in the repo):
 
-*Also, when 3c lands:* `git blame` over `comfyless/core/` reports one author.
+- **Layer A — the real corpus, key space.** Every readable LoRA header in the
+  catalog: **308 files, 278,678 keys** (294 lora, 11 lokr, 3 unknown; 0 LoHa on
+  this machine → TECH_DEBT 2026-08-22). `adapter_module_path` on every key,
+  `detect_adapter_type`, `normalize_keys` (no-model), `rename_lora_down_up` and
+  `make_adapter_name` on every file: **identical, including key order**.
+- **Layer B — synthetic models, full behaviour.** Tiny diffusers-layout
+  transformers, bf16 and fp8-resident (`ScaledFp8Linear`), plus a PEFT-wrapped
+  base; LoRA / LoKR / LoHa dicts with and without alpha, `alpha ≠ rank`,
+  `lora_down/up` naming, `.default.` PEFT names, every key prefix, shape
+  mismatches, absent modules; driven through direct merge (3 kinds), PEFT
+  injection, the orchestrators, `unload_adapters`, `normalize_keys` with a
+  model, and `load_lora_with_key_fix` end to end on temp files with every
+  fixable-error text. Compared bitwise: every parameter and buffer, the
+  `peft_config` registry, backup dicts, the LIFO ledger, return values, the
+  pipeline call sequence. All identical.
+- **Layer C — the pixel matrix.** `feat-lora-krea2` was the only LoRA case;
+  four were added so each real load path is hashed end to end:
+  `feat-lora-qwen-lightning` (lora_down/up + `.alpha` bake),
+  `feat-lora-krea-kohya` (`lora_unet_*` Kohya), `feat-lora-krea-lokr` and
+  `feat-lora-klein-lokr` (LoKR → plan / flatten / SVD). `pre3c` captured with
+  the ORIGINAL code (24 cases; the 20 shared cases reproduce `post3b` exactly).
+  `pre3c` vs `post3c`: **ALL MATCH, 24/24 strict** — every LoRA path
+  byte-identical through a real 9–20B model, including the two LoKR cases
+  whose SVD flatten was the reproducibility worry (it reproduced).
+
+*The one recorded deviation.* `normalize_keys` step (c) — prefix discovery —
+in the original scans the first 20 adapter paths against the first **50** model
+names, both in set-iteration order: hash-seed-dependent, and on a real
+transformer with thousands of modules the 50-name window usually misses, so
+the original falls to "warn and leave unchanged" (then 0-module merge →
+False). The rewrite scans sorted paths against **all** names. Deterministic,
+a strict superset, and the only place this slice does not preserve the
+original — it was already a branch the original reached by accident.
+`code-reviewer` caught that the ADR under-described it ("same space") and that
+the promised multi-candidate case was missing; both fixed (ADR-046 #5, B6.3,
+B6.4 pins the divergence on a 108-module model as *expected*).
+
+*Found along the way, pre-existing and preserved:* when PEFT rejects a LoKR
+factorisation (`set_peft_model_state_dict` size mismatch), `inject_adapter_in_model`
+has already wrapped the target, so the direct-merge fallback looks for
+`to_q.weight`, finds only `to_q.base_layer.weight`, applies 0 — and the flatten
+rescue is what actually runs (B3.7b).
+
+*Red Zone.* `server.py` changed by two import lines; `security-auditor` (Fable)
+verified every ADR-019 DMR requirement preserved (21, 23/DMR-3/8, 24, 25, 29,
+65), exception-boundary parity, `weights_only=True`, sanitised `adapter_name`,
+no import-time side effects — no CRITICAL/HIGH. One MEDIUM that predates the
+slice: the git-policy Red Zone path list still names `nodes/eric_diffusion_fp8_ops.py`
+(dead since 1b) and gates neither core file → TECH_DEBT 2026-08-22, trigger no
+later than slice 6. `docs/security/review-slice-3c-lora-adapters-2026-08-22.md`.
+
+**Consequence for the shims.** `grep -rE "^\s*(from|import) nodes" comfyless/`
+is now empty. `_install_shims()` and the `sys.path` insert are runtime-dead but
+still load-bearing for every test suite that imports `nodes.*` — deleted in a
+slice of their own (TECH_DEBT 2026-08-22; slice 5 at the latest).
+
+*Also:* `git blame` over `comfyless/core/` now reports one author.
 
 ### Slice 4 — Resolve the layering inversion
 

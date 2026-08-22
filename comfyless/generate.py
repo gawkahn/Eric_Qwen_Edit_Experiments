@@ -63,7 +63,7 @@ from comfyless.core.eric_diffusion_utils import (
     _is_hf_repo_id,
 )
 from comfyless.core.eric_diffusion_samplers import sampler_choices, swap_sampler
-from nodes.eric_qwen_edit_lora import load_lora_with_key_fix
+from comfyless.core.lora_adapters import load_lora_with_key_fix
 
 from comfyless.family_defaults import (DISTILLED_FAMILIES, FAMILY_DEFAULTS,
                                         apply_family_defaults)
@@ -1330,7 +1330,7 @@ def apply_adapter_weights(pipe, pairs) -> Optional[str]:
     Returns a warning string when scaling failed (adapters stay loaded at
     full strength — warn-don't-block), else None.
     """
-    from nodes.eric_qwen_edit_lora import is_direct_merge_adapter
+    from comfyless.core.lora_adapters import is_direct_merge_adapter
     peft_pairs = [(n, w) for n, w in pairs
                   if not is_direct_merge_adapter(pipe, n)]
     if not peft_pairs:

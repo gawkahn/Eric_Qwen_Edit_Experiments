@@ -1312,7 +1312,7 @@ finally:
 print("── slice DLW: daemon LoRA weights ─────────────────────────────")
 
 import comfyless.generate as _gen2
-import nodes.eric_qwen_edit_lora as _nlora
+import comfyless.core.lora_adapters as _nlora   # what server.py imports (ADR-046)
 
 
 import types as _types

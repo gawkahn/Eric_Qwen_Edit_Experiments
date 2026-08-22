@@ -118,12 +118,20 @@ pixel matrix hashes exact bytes and "matching the original" is the slice.
    `pfx` such that some `p ∈ P` ends with some `m ∈ M` (`p` strictly longer)
    and more than 30% of P map into M under `pfx`; apply it. (d) Nothing → warn
    with samples and return the filtered dict unchanged. **Known deviation:**
-   the original's step (c) inspects the first 20 of P and first 50 of M in
-   *set iteration order*, which is hash-seed-dependent, so the candidate it
-   finds first is not reproducible across processes. The new implementation
-   searches the same space in **sorted** order. On every input where the
-   original's answer is unique the two agree; the harness constructs one
-   multi-candidate case to document the difference rather than hide it.
+   the original's step (c) inspects the first 20 of P against only the first
+   50 of M, both in *set iteration order* — hash-seed-dependent, so which
+   candidate it finds (or whether the 50-name window contains a match at all)
+   is not reproducible across processes; on a real transformer with thousands
+   of modules the window usually misses and the original falls to (d). The new
+   implementation scans the first 20 P in **sorted** order against **every**
+   module name — a strict superset, deterministic. Consequence: where the
+   original warns and returns the dict unchanged (then direct-merges 0 modules
+   and reports False), the rewrite can strip the prefix and load. That is a
+   deliberate improvement on a branch the original only reached by accident,
+   and it is the ONE place this slice does not preserve the original. The
+   harness pins it both ways: a multi-candidate case asserts the new answer is
+   the sorted-first candidate, and a >50-module case asserts the expected
+   divergence explicitly rather than hiding it.
 6. **`rename_lora_down_up(sd)`** — if any key contains `lora_down` or `lora_up`,
    rewrite `.lora_down.weight → .lora_A.weight` and `.lora_up.weight →
    .lora_B.weight`; otherwise return the same object.
@@ -212,7 +220,8 @@ wrote, so it is the cheapest place to catch a backup-shape drift). Negative
 cases: a LoKR whose factorisation PEFT rejects must fall to direct merge in
 both; a 0-module direct merge must return False in both; the DMR source guard
 (no `param.data.add_`, `apply_merge_delta(` and `merge_resolution_map(`
-present) is re-pointed at the new driver.
+present) is duplicated against the new driver in the new suite;
+`test_quant.py` keeps guarding the node-pack copy until slice 6 removes it.
 
 **Layer C — the pixel matrix, GPU.** `feat-lora-krea2` (lora_A/B, fast path)
 is the only LoRA case today. Four cases are added so each real load path is

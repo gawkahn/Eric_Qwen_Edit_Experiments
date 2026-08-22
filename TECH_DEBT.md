@@ -2715,3 +2715,88 @@ touch this decode.
 the matrix (latent side 130) or write a dedicated tiled regression against a
 frozen decode output, since the differential-against-the-original route will
 no longer exist.
+
+## 2026-08-22 — `_install_shims()` and the `sys.path` insert outlived their last comfyless consumer
+
+**What:** After ADR-045 slice 3c (ADR-046) nothing under `comfyless/` imports
+`nodes.*` or `comfy.*` any more, so `comfyless/__init__.py`'s `_PROJECT_ROOT`
+`sys.path` insert and the `folder_paths` / `comfy.utils` /
+`comfy.model_management` stubs are dead for the runtime. They are still load-
+bearing for the TEST battery: every suite that imports `nodes.*`
+(`test_lora_alpha_bake.py`, `test_lora_convert_krea.py`,
+`test_lora_order_insensitive.py`, `test_lora_adapters.py`'s differential,
+`test_quant.py`, `test_hunyuan.py`, …) relies on `import comfyless` installing
+them first. Vision item 5 says "deleted, not ported".
+
+**Why not now:** slice 3c's declared scope is the LoRA subsystem and its four
+imports. Deleting the shims means deciding, suite by suite, whether each keeps
+importing the node pack (then installs its own stub, as `scripts/lora_audit.py`
+already does for the F-4 test) or follows comfyless — which is slice 7's
+suite-ownership decision. Doing it here would widen a 6-file diff into a
+15-suite one.
+
+**Trigger:** slice 5 (src layout) at the latest — `_PROJECT_ROOT` resolves to
+`src/` there and is silently wrong (ADR-045 §Implementation hazards). Earlier:
+whenever a suite is next re-pointed from `nodes.*` to `comfyless.core`.
+
+## 2026-08-22 — the LoHa adapter path has no real-file exercise on this machine
+
+**What:** ADR-046's corpus measurement found ZERO LoHa (`hada_*`) files among
+the 308 readable LoRAs in the catalog. The rewritten LoHa path in
+`comfyless/core/lora_adapters.py` is proven equivalent to the original only on
+synthetic state dicts (`test_lora_adapters.py` B1.14–B1.19, B3.9–B3.10, B5.15),
+and the pixel matrix has no LoHa case because there is nothing to load.
+
+**Why not now:** fabricating a "real" LoHa by training one is out of scope for
+an equivalence slice, and the synthetic cases cover every branch of the driver
+(alpha present/absent, shape mismatch, absent module, fp8 base, PEFT failure →
+direct). The exposure is in PEFT's `LoHaConfig` handling of a trainer-written
+file, which the synthetic dicts exercise structurally but not with
+trainer-produced shapes/alpha conventions.
+
+**Trigger:** the first LoHa file that enters the catalog — add it to the corpus
+layer automatically (Layer A picks it up by header) and to the pixel matrix by
+hand.
+
+## 2026-08-22 — the Red Zone path gate names a file that no longer exists, and not the two that replaced it
+
+**What:** `scripts/git-policy/_red-zone-paths.sh` (and the Review-bar table in
+`CLAUDE.md`) gate `nodes/eric_diffusion_fp8_ops.py` — the scaled-fp8 parser /
+DMR dispatcher. That path has been dead since ADR-045 slice 1b moved the file
+to `comfyless/core/eric_diffusion_fp8_ops.py`, so the T1 commit-policy trigger
+for `security-auditor` + ADR reference on that surface is a silent no-op. Slice
+3c (ADR-046) adds `comfyless/core/lora_adapters.py`, through which every daemon
+LoRA weight write, backup and registry mutation now flows — also un-gated.
+Found by `security-auditor` on slice 3c
+(`docs/security/review-slice-3c-lora-adapters-2026-08-22.md`, MEDIUM).
+
+**Why not now:** the policy layer is its own change boundary (global §4 — the
+git-policy scripts, their smoke tests `just policy-test`, the CI mirror and
+the CLAUDE.md table move together). Slice 3c's scope is the LoRA subsystem.
+
+**Trigger:** next policy slice, and NO LATER than slice 6 (the split), where
+the gate set moves to the new repo anyway (Vision "Red Zone path moving without
+its gate configuration" must-never). Fix: replace the `nodes/` pattern with
+`comfyless/core/eric_diffusion_fp8_ops\.py`, add
+`comfyless/core/lora_adapters\.py`, update both the regex function and
+`list_red_zone_paths`, update the CLAUDE.md table, re-run `just policy-test`.
+
+## 2026-08-22 — `test_refine.py` is red on `main` (pre-existing; not slice 3c)
+
+**What:** `just tests` during ADR-045 slice 3c reported `test_refine.py FAIL`:
+`KeyError: 'cfg'` at `test_refine.py:2844` in the "slice B fold: pixels-only
+sentinel (LOW-5) + dims note (SHOULD-3)" block — `_stub_loop` never ran, so
+`_loop_capture["cfg"]` was never set. Reproduced identically on a clean
+worktree of HEAD `128ed17` (before any 3c code), so it is not caused by the
+LoRA rewrite; neither `comfyless/refine.py` nor the suite references the LoRA
+module. The other 36 suites in the battery pass.
+
+**Why not now:** different surface (ADR-027 refinement loop, a Red Zone path),
+different slice. Diagnosing why the stubbed loop is not reached is its own
+root-cause job — likely an environment- or catalog-state-dependent branch in
+`build_config_from_seed`, given the block's seed-image dependence.
+
+**Trigger:** immediately next session — a red suite on `main` violates the
+Vision's "no slice ends with a red battery" must-never even when the slice did
+not cause it. Establish the first red commit with `git bisect run
+./.venv/bin/python3 test_refine.py`.

@@ -88,6 +88,20 @@ CASES += [
     case("feat-upscale-vae", "Qwen-Image-2512",
          "--upscale-vae", f"{MB}/Wan2.1-VAE-upscale2x",
          steps=12),
+    # ADR-046 (slice 3c) -- one case per real LoRA load path, so the rewrite
+    # of the adapter subsystem is hashed end to end, not only on the fast path.
+    case("feat-lora-qwen-lightning", "Qwen-Image-2512",   # lora_down/up + .alpha bake
+         "--lora", f"{LORAS}/Qwen/accelerators/Qwen-Image-Lightning-8steps-V11-bf16.safetensors:1.0",
+         steps=8),
+    case("feat-lora-krea-kohya", SWEEP,                    # lora_unet_* Kohya + .alpha
+         "--lora", f"{LORAS}/Krea/style/photo/emerald.safetensors:0.8",
+         steps=SW_STEPS),
+    case("feat-lora-krea-lokr", SWEEP,                     # LoKR -> plan / flatten
+         "--lora", f"{LORAS}/Krea/realism/realism_engine_krea2_v3.1.safetensors:0.8",
+         steps=SW_STEPS),
+    case("feat-lora-klein-lokr", "FLUX.2-klein-9B",        # LoKR on Klein, lokr_to_lora_svd
+         "--lora", f"{LORAS}/Flux.2 Klein 9B/concept/klein_snofs_v1_1.safetensors:0.8",
+         steps=12),
 ]
 
 def newest(tag):

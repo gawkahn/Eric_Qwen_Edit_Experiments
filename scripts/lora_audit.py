@@ -27,10 +27,9 @@ from typing import Any, Optional
 import safetensors.torch  # third-party: convert-output writer (ADR §8, §10)
 
 # ── folder_paths stub (ADR §2, F-4) ────────────────────────────────────
-# MUST be installed BEFORE any node-module load — eric_qwen_edit_lora.py
-# does `import folder_paths` at module level. The stub satisfies the
-# import without pulling in ComfyUI's runtime; any real `folder_paths`
-# on sys.path is never consulted.
+# Installed before anything is imported so no real ComfyUI `folder_paths`
+# on sys.path is ever consulted (test_lora_audit asserts the stub is in
+# place). Since ADR-046 nothing this script loads imports it at all.
 _fp = types.ModuleType("folder_paths")
 _fp.get_folder_paths = lambda _category: []
 _fp.get_full_path = lambda _category, _name: None
@@ -51,8 +50,9 @@ _NODES_DIR = _REPO_ROOT / "nodes"
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-# Modules still under nodes/ (e.g. eric_qwen_edit_lora) still need the fake
-# package: nodes/__init__.py imports every node class and ComfyUI's `comfy.*`.
+# Nothing this script needs lives under nodes/ any more (ADR-046 moved the
+# LoRA loader into comfyless.core), but the fake package keeps the fallback
+# below honest for any module that has not moved yet.
 _nodes_pkg = types.ModuleType("nodes")
 _nodes_pkg.__path__ = [str(_NODES_DIR)]
 sys.modules.setdefault("nodes", _nodes_pkg)
@@ -74,11 +74,11 @@ def _load_node_module(modname: str):
 
 
 # Load in dependency order: convert first, then convert_apply (relative
-# import from convert), then check, then qwen-edit-lora.
+# import from convert), then check, then the LoRA loader (ADR-046).
 _load_node_module("eric_lora_format_convert")
 _convert_mod = _load_node_module("eric_lora_format_convert_apply")
 _check_mod = _load_node_module("eric_diffusion_lora_check")
-_qwen_mod = _load_node_module("eric_qwen_edit_lora")
+_qwen_mod = importlib.import_module("comfyless.core.lora_adapters")
 _convert_base_mod = sys.modules["comfyless.core.eric_lora_format_convert"]
 
 check_lora = _check_mod.check_lora
@@ -89,7 +89,7 @@ _strip_adapter_suffix = _check_mod._strip_adapter_suffix
 find_matching_plan = _convert_mod.find_matching_plan
 convert_state_dict = _convert_mod.convert_state_dict  # S3: convert-path writer
 detect_lora_format = _convert_base_mod.detect_lora_format
-_load_state_dict = _qwen_mod._load_state_dict
+_load_state_dict = _qwen_mod.load_state_dict
 load_lora_with_key_fix = _qwen_mod.load_lora_with_key_fix
 unload_adapters = _qwen_mod.unload_adapters
 
@@ -1200,8 +1200,8 @@ def _prepare_bases(bases: list[BaseSpec], warnings: list[Warning_]) -> None:
 
 # ── Dry-load loop (ADR §7) ─────────────────────────────────────────────
 # The `applied=` token format matches the loader's three direct-merge log
-# lines (lora_direct, lokr_direct, loha_direct in eric_qwen_edit_lora.py
-# at lines 1034, 438, 605 — search 'direct merge .weight='). PEFT and
+# line (one `_merge_direct` driver for lora/lokr/loha in
+# comfyless/core/lora_adapters.py — search 'direct merge (weight='). PEFT and
 # pipeline fast-paths don't emit a count; `applied_modules` is None in
 # those cases. If the loader's print format changes, this regex is the
 # single failure point — re-validate against the loader on each upgrade.
