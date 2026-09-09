@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for the OpenWebUI image-gen tool's pure parse helpers.
 
-The tool module (comfyless/integrations/openwebui/generate_image_tool.py) runs
+The tool module (src/comfyless/integrations/openwebui/generate_image_tool.py) runs
 inside the OWUI container and imports container-only deps (open_webui, fastapi,
 aiohttp, starlette). We stub those so the module imports here, then exercise the
 pure `_parse_loras` / `_parse_weights_csv` helpers that turn the flat chat-tool
@@ -25,7 +25,7 @@ sys.modules["open_webui.models.users"].Users = object
 sys.modules["open_webui.routers.files"].upload_file_handler = lambda *a, **k: None
 
 _spec = importlib.util.spec_from_file_location(
-    "owui_tool", "comfyless/integrations/openwebui/generate_image_tool.py")
+    "owui_tool", "src/comfyless/integrations/openwebui/generate_image_tool.py")
 _m = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_m)
 

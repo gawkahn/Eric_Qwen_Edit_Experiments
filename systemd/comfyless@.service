@@ -22,7 +22,7 @@
 
 [Unit]
 Description=comfyless model server (GPU %i)
-Documentation=file:///home/gawkahn/projects/ai-lab/code/Eric_Qwen_Edit_Experiments/comfyless/README.md
+Documentation=file:///home/gawkahn/projects/ai-lab/code/Eric_Qwen_Edit_Experiments/src/comfyless/README.md
 # Without these, RestartSec=5 vs the default burst window (5 in 10s) means the
 # limit can never trip and a persistent fault (e.g. wedged GPU + retrying MCP
 # client) load/crash-loops forever (infra audit 2026-07-17, SHOULD 1).
@@ -43,8 +43,11 @@ ProtectSystem=full
 # under ~/.cache and the daemon writes to ~/gen-output; enumerate-and-allow
 # is a follow-up if ever wanted.
 WorkingDirectory=/home/gawkahn/projects/ai-lab/code/Eric_Qwen_Edit_Experiments
-# .venv is not an editable install; -m comfyless.generate needs the repo on
-# the path (same as start-mcpo.sh).
+# ADR-045 slice 5 gave the repo a [build-system], so `uv sync` now installs
+# comfyless into .venv (editable) and `-m comfyless.generate` resolves without
+# help — verified from a foreign cwd with PYTHONPATH unset. This line is
+# therefore inert, kept only until slice 8 rewrites this unit onto the
+# `comfyless` console script and the new repo's path.
 Environment=PYTHONPATH=/home/gawkahn/projects/ai-lab/code/Eric_Qwen_Edit_Experiments
 Environment=PYTHONUNBUFFERED=1
 # HF cache must live on raw ext4, not mergerfs (filelock hangs — see the

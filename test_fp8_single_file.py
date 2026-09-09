@@ -1154,9 +1154,9 @@ check("DMR resolution map: scale buffers INVISIBLE (req 23 NEGATIVE)",
 
 # req 23 through the REAL path: a crafted .diff key aimed at a scale
 # buffer must not write (resolves to None → skipped), and the scale
-# must be unchanged. comfyless import installs the folder_paths shims the
-# nodes package needs (established suite pattern).
-import comfyless.generate  # noqa: F401,E402 — shims
+# must be unchanged. comfy_stub installs the folder_paths shims the nodes
+# package needs (ADR-045 slice 5; established suite pattern).
+import comfy_stub; comfy_stub.install()  # ADR-045 slice 5: stubs live here now
 from comfyless.core.eric_lora_format_convert_apply import _apply_converted_lora_as_delta  # noqa: E402
 _h3 = _DMRHost()
 _s_before = _h3.q.weight_scale.clone()

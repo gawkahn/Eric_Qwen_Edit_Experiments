@@ -110,25 +110,25 @@ no pc_no_floors "+    'qux != 1.0',"
 
 # --- Red Zone spec (=ADR, per the _lib.sh adaptation) references ---
 ok pc_redzone_ref "no ref needed" "README.md"                     spec   "$repo_root"  # not RZ
-ok pc_redzone_ref "see docs/decisions/ADR-001-daemon-socket-security.md" "comfyless/server.py" spec "$repo_root"
-no pc_redzone_ref "no reference at all" "comfyless/server.py"     spec   "$repo_root"  # RZ, no ref
-ok pc_redzone_ref "docs/decisions/ADR-011-comfyless-mcp-server.md" "comfyless/mcp_server.py" spec "$repo_root"
+ok pc_redzone_ref "see docs/decisions/ADR-001-daemon-socket-security.md" "src/comfyless/server.py" spec "$repo_root"
+no pc_redzone_ref "no reference at all" "src/comfyless/server.py"     spec   "$repo_root"  # RZ, no ref
+ok pc_redzone_ref "docs/decisions/ADR-011-comfyless-mcp-server.md" "src/comfyless/mcp_server.py" spec "$repo_root"
 # A reference to a NON-existent ADR must NOT satisfy the gate (guards the [ -f ]
 # existence check — the slice-11 HIGH-2 defense).
-no pc_redzone_ref "TODO: write docs/decisions/ADR-999-ghost.md" "comfyless/server.py" spec "$repo_root"
+no pc_redzone_ref "TODO: write docs/decisions/ADR-999-ghost.md" "src/comfyless/server.py" spec "$repo_root"
 # Function-scoped surfaces (_run_json_mode, resolve_hf_path) are deliberately
 # NOT path-gated — their whole files must stay non-RZ (see _red-zone-paths.sh).
-ok pc_redzone_ref "no ref needed" "comfyless/generate.py"          spec "$repo_root"
+ok pc_redzone_ref "no ref needed" "src/comfyless/generate.py"          spec "$repo_root"
 ok pc_redzone_ref "no ref needed" "nodes/eric_diffusion_utils.py"  spec "$repo_root"
 # The other two listed surfaces are RZ.
-no pc_redzone_ref "no reference" "comfyless/refine.py"             spec "$repo_root"
+no pc_redzone_ref "no reference" "src/comfyless/refine.py"             spec "$repo_root"
 no pc_redzone_ref "no reference" "nodes/eric_diffusion_fp8_ops.py" spec "$repo_root"
 
 # --- Red Zone review references (the whole `review` kind was previously untested) ---
 ok pc_redzone_ref "no ref needed" "README.md" review "$repo_root"
-ok pc_redzone_ref "see docs/security/review-comfyless-server-2026-04-23.md" "comfyless/server.py" review "$repo_root"
-no pc_redzone_ref "no reference" "comfyless/server.py" review "$repo_root"
-no pc_redzone_ref "docs/security/review-ghost.md" "comfyless/server.py" review "$repo_root"
+ok pc_redzone_ref "see docs/security/review-comfyless-server-2026-04-23.md" "src/comfyless/server.py" review "$repo_root"
+no pc_redzone_ref "no reference" "src/comfyless/server.py" review "$repo_root"
+no pc_redzone_ref "docs/security/review-ghost.md" "src/comfyless/server.py" review "$repo_root"
 
 # --- end-to-end: check-range must content-check a MERGE commit (finding #1) ---
 # Builds a throwaway repo (under /tmp, safe from the mergerfs fcntl-lock issue),
@@ -149,8 +149,8 @@ e2e_evil_merge_blocked() {
         git commit -qm "feat: add foo" -m "AI-disclosure: none"
         git checkout -q "$init"
         git merge -q --no-ff feat -m "Merge branch 'feat'"
-        mkdir -p comfyless; echo "x = 1" > comfyless/server.py
-        git add comfyless/server.py; git commit -q --amend --no-edit
+        mkdir -p src/comfyless; echo "x = 1" > src/comfyless/server.py
+        git add src/comfyless/server.py; git commit -q --amend --no-edit
         bash "$lib_dir/check-range.sh" "$base" "$(git rev-parse HEAD)"
     ) >/dev/null 2>&1
     local rc=$?; rm -rf "$d"; return $rc

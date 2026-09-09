@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for comfyless/refine.py slices 1-2 — ADR-027 LLM-as-judge.
+"""Tests for src/comfyless/refine.py slices 1-2 — ADR-027 LLM-as-judge.
 
 CPU-only, no GPU, no model weights, no network. Slice 1: the security-critical
 verdict parser (closed two-key allowlist F1, numeric bounds F6, reject-unknown
@@ -409,7 +409,7 @@ print("== F2/F3 structural guard: refine.py never selects a load-plane column ==
 # catalog_db, so the guard is COLUMN-shaped, not an import ban.)
 import ast as _ast  # noqa: E402
 _LOAD_PLANE_COLS = {"abs_path", "root", "relative_path"}
-_src = (Path(__file__).parent / "comfyless" / "refine.py").read_text()
+_src = (Path(__file__).parent / "src" / "comfyless" / "refine.py").read_text()
 _tree = _ast.parse(_src)
 
 # (a) no SQL string literal names a load-plane column

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""IPC robustness tests for comfyless/server.py.
+"""IPC robustness tests for src/comfyless/server.py.
 
 Covers the two failure modes seen on 2026-04-24 with --iterate against a
 running --serve daemon:

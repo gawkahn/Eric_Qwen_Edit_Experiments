@@ -391,7 +391,7 @@ check("nag_end=0.5 keeps NAG on for the first half",
 check("nag_end=0.0 never applies NAG",
       _window(0.0, 8) == [])
 
-_gen_src = Path("comfyless/generate.py").read_text()
+_gen_src = Path("src/comfyless/generate.py").read_text()
 check("generate() routes NAG through nag_pipe_call under swap_sampler",
       "nag_pipe_call(pipe, **call_kwargs)" in _gen_src)
 check("generate() gates NAG by family via _nag_gate (cfg-aware, ADR-024; "
@@ -421,7 +421,7 @@ check("daemon client surfaces wire nag_warnings on stderr",
       # goes silent (code review, 2026-07-25). Pin the stderr emit literal.
       and 'lambda line: print(f"[comfyless] WARNING: {line}", file=sys.stderr)'
       in _gen_src)
-_mcp_src = Path("comfyless/mcp_server.py").read_text()
+_mcp_src = Path("src/comfyless/mcp_server.py").read_text()
 check("MCP surfaces nag_warnings as agent notices",
       "WARNING: NAG" in _mcp_src
       and 'metadata.get("nag_warnings")' in _mcp_src)

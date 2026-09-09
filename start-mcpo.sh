@@ -34,7 +34,9 @@ HOST="${MCPO_HOST:-172.17.0.1}"   # docker bridge gateway: reachable from host +
 PORT="${MCPO_PORT:-8090}"
 GPU="${MCPO_GPU:-0}"              # image gen pinned to GPU0 (dolphin/vLLM lives on GPU1)
 
-# PYTHONPATH is required: the .venv is not an editable install, so `comfyless`
+# PYTHONPATH is no longer required (ADR-045 slice 5 made .venv an editable
+# install), but is kept until slice 8 for the same reason as the systemd unit.
+# Historically: the .venv was not an editable install, so `comfyless`
 # is not importable from mcpo's cwd without it.
 export PYTHONPATH="$REPO"
 export CUDA_VISIBLE_DEVICES="$GPU"

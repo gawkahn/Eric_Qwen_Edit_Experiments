@@ -4,7 +4,7 @@
 CPU-only, no GPU, no model weights. Covers the comfyless.generate side of the
 qwen-edit routing: the MODE→(vl,ref) flag table, the PIL→ComfyUI-tensor
 conversion, and `_run_qwen_edit_refs` — that it decodes each --ref-image spec
-through the real ingestion helper (comfyless/ref_image.py), maps modes to the
+through the real ingestion helper (src/comfyless/ref_image.py), maps modes to the
 correct per-image flags in order ("Picture N"), forwards dims/steps/guidance to
 generate_qwen_edit, and turns the decoded latents back into a PIL image.
 
@@ -580,7 +580,7 @@ check("nag pre-gate: dormant nag_scale stays silent even with refs",
 # resolved size back off the output image BEFORE building metadata, so the
 # sidecar records the truth. Source-text pin (the test_nag.py idiom) — the
 # full generate() path needs a GPU; end-to-end dims are the live smoke.
-_gen_src = Path(__file__).parent.joinpath("comfyless", "generate.py").read_text()
+_gen_src = Path(__file__).parent.joinpath("src", "comfyless", "generate.py").read_text()
 # The kind list generalized when ADR-043 joined (krea2-identity derives dims
 # from its first reference the same way); the GATE is what this pins — the
 # read-back must stay conditional on derived dims, never unconditional.

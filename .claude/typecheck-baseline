@@ -2,6 +2,13 @@
 # aggregation). One line per root declared in pyproject.toml
 # [tool.pyright] include. A commit may only lower a root's count — see
 # scripts/typecheck-per-root.sh for how the live count is computed.
-comfyless=453
+# ADR-045 slice 5 moved comfyless to src/comfyless, so the root name this
+# script buckets by (first path segment) changed from `comfyless` to `src`.
+# Accounting: comfyless=453 -> src=447 + comfy_stub.py=6. Nothing was fixed
+# and nothing was dropped — the 6 diagnostics travelled with the ComfyUI
+# stubs from comfyless/__init__.py to comfy_stub.py, which is why that file
+# was added to [tool.pyright] include rather than left unchecked.
+src=447
+comfy_stub.py=6
 nodes=438
 pipelines=94

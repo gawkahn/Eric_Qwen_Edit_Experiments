@@ -36,7 +36,7 @@ _fp.get_full_path = lambda _category, _name: None
 sys.modules["folder_paths"] = _fp
 
 # ── Classifier reuse ───────────────────────────────────────────────────
-# These modules moved to comfyless/core/ (ADR-045 slice 1b).  That package
+# These modules moved to src/comfyless/core/ (ADR-045 slice 1b).  That package
 # is import-safe -- its __init__ is a docstring, unlike nodes/__init__.py
 # which pulls in every node class and ComfyUI's `comfy.*`.  So the old
 # fake-package + spec_from_file_location scaffolding is no longer needed:
@@ -44,11 +44,14 @@ sys.modules["folder_paths"] = _fp
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _NODES_DIR = _REPO_ROOT / "nodes"
 
-# Run as a script, sys.path[0] is scripts/, so `comfyless` is not importable
-# from here.  (The folder_paths stub above is already installed, and
-# comfyless/__init__ only fills gaps, so it will not be displaced.)
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+# Run as a script, sys.path[0] is scripts/, so neither `nodes` nor `comfyless`
+# is importable from here.  ADR-045 slice 5 moved the package under src/, so
+# the repo root alone no longer reaches it — insert both.  (Under the uv .venv
+# the editable install already provides comfyless; this keeps the script
+# runnable under a bare interpreter, which it was before the move.)
+for _p in (_REPO_ROOT, _REPO_ROOT / "src"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 # Nothing this script needs lives under nodes/ any more (ADR-046 moved the
 # LoRA loader into comfyless.core), but the fake package keeps the fallback
@@ -60,7 +63,7 @@ sys.modules.setdefault("nodes", _nodes_pkg)
 
 def _load_node_module(modname: str):
     """Import a classifier module, wherever slice 1b left it."""
-    if (_REPO_ROOT / "comfyless" / "core" / f"{modname}.py").exists():
+    if (_REPO_ROOT / "src" / "comfyless" / "core" / f"{modname}.py").exists():
         return importlib.import_module(f"comfyless.core.{modname}")
     dotted = f"nodes.{modname}"
     if dotted in sys.modules:
@@ -1201,7 +1204,7 @@ def _prepare_bases(bases: list[BaseSpec], warnings: list[Warning_]) -> None:
 # ── Dry-load loop (ADR §7) ─────────────────────────────────────────────
 # The `applied=` token format matches the loader's three direct-merge log
 # line (one `_merge_direct` driver for lora/lokr/loha in
-# comfyless/core/lora_adapters.py — search 'direct merge (weight='). PEFT and
+# src/comfyless/core/lora_adapters.py — search 'direct merge (weight='). PEFT and
 # pipeline fast-paths don't emit a count; `applied_modules` is None in
 # those cases. If the loader's print format changes, this regex is the
 # single failure point — re-validate against the loader on each upgrade.

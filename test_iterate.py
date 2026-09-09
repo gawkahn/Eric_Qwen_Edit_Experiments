@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Test harness for comfyless iteration mode (ADR-008).
 
-Exercises the pure-logic helpers in comfyless/generate.py:
+Exercises the pure-logic helpers in src/comfyless/generate.py:
   - _validate_iterate_value      (element-shape validator)
   - _plan_iterations             (argparse → plan dict; error cases)
   - _iteration_combos            (Cartesian expansion)

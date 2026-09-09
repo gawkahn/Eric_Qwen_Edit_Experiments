@@ -275,8 +275,8 @@ check("enabled=False: kwargs unchanged after exit",
 # Wiring: the daemon call site and generate() must actually thread the flag.
 # Source-text checks (no torch import needed in this suite).
 _root = Path(__file__).parent
-_server_src = (_root / "comfyless" / "server.py").read_text()
-_gen_src = (_root / "comfyless" / "generate.py").read_text()
+_server_src = (_root / "src" / "comfyless" / "server.py").read_text()
+_gen_src = (_root / "src" / "comfyless" / "generate.py").read_text()
 check("server.py generate() call passes interactive_pause=False",
       "interactive_pause=False" in _server_src)
 check("generate() signature exposes interactive_pause (default True)",

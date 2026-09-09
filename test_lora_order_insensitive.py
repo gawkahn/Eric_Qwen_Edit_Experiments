@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-import comfyless  # installs folder_paths/comfy stubs so nodes/ imports cleanly
+import comfy_stub; comfy_stub.install()  # ADR-045 slice 5: stubs live here now
 
 import torch
 import torch.nn as nn

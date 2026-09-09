@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for comfyless/video.py — single-segment video CLI (ADR-033 slice V1).
+"""Tests for src/comfyless/video.py — single-segment video CLI (ADR-033 slice V1).
 
 No GPU required: covers param validation, mode defaults, keyframe prep,
 sidecar round-trip, and the av encode round-trip with synthetic frames.

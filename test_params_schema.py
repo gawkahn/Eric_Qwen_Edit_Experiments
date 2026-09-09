@@ -499,7 +499,7 @@ check("comfyui: malformed JSON raises ValueError",
 # ──────────────────────────────────────────────────────────────────────
 print("\n── Regression smoke: example sidecar round-trip ────────────────")
 
-_EXAMPLE_PATH = Path(__file__).parent / "comfyless" / "examples" / "qwen_image_hello_world.json"
+_EXAMPLE_PATH = Path(__file__).parent / "src" / "comfyless" / "examples" / "qwen_image_hello_world.json"
 out, err = _capture_stderr(g._load_sidecar, str(_EXAMPLE_PATH))
 check("example sidecar loads",
       isinstance(out, dict) and len(out) > 0)

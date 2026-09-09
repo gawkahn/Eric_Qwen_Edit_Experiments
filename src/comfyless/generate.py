@@ -27,8 +27,6 @@ Author: Eric Hiss (GitHub: EricRollei)
 
 from __future__ import annotations
 
-# Shims MUST be installed before any nodes.* import.
-import comfyless  # noqa: F401 — triggers _install_shims()
 
 import argparse
 import inspect
@@ -1844,8 +1842,9 @@ def _run_qwen_edit_refs(
     records each reference's path, mode, and SHA-256 (over the exact decoded
     bytes) for a truthful sidecar; every reference here is applied (the drop path
     is upstream, for non-qwen-edit families). The node-pack import is lazy —
-    comfyless only pays it on an actual edit run, and `comfyless.__init__` has
-    already stubbed the ComfyUI-only `folder_paths` by the time this runs."""
+    comfyless only pays it on an actual edit run.  (Before ADR-045 slice 5,
+    `comfyless.__init__` also stubbed the ComfyUI-only `folder_paths` by the
+    time this ran; it no longer does — see TECH_DEBT 2026-09-09.)"""
     import numpy as np
     from PIL import Image
 

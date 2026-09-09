@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-import comfyless  # noqa: F401  installs folder_paths / comfy shims
+import comfy_stub; comfy_stub.install()  # ADR-045 slice 5: stubs live here now
 import torch
 
 from comfyless.core.eric_lora_format_convert import detect_lora_format

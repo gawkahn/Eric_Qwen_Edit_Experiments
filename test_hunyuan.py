@@ -73,7 +73,7 @@ for m in ("comfy", "comfy.utils", "comfy.model_management"):
         sys.modules[m] = types.ModuleType(m)
 
 spec = importlib.util.spec_from_file_location(
-    "eric_diffusion_utils", "comfyless/core/eric_diffusion_utils.py"
+    "eric_diffusion_utils", "src/comfyless/core/eric_diffusion_utils.py"
 )
 utils_mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(utils_mod)
@@ -750,7 +750,7 @@ check(
     and "pipeline.vae.disable_tiling()" in nodes_loader_src,
 )
 
-with open("comfyless/generate.py") as f:
+with open("src/comfyless/generate.py") as f:
     cg_src = f.read()
 
 check(
@@ -815,7 +815,7 @@ print("── Invariant 4 — comfyless daemon wires vae_tiling through IPC (str
 # sites against silent regression. Behavior coverage of resolver application
 # lives in the FakePipe test above (which exercises the same _load_pipeline
 # the daemon calls).
-with open("comfyless/server.py") as f:
+with open("src/comfyless/server.py") as f:
     server_src = f.read()
 
 check(
@@ -844,11 +844,11 @@ check(
 # do not silently invalidate the lock (Step 3 code-reviewer minor).
 import re
 check(
-    "comfyless/generate.py _delegate_to_server request dict includes vae_tiling",
+    "src/comfyless/generate.py _delegate_to_server request dict includes vae_tiling",
     re.search(r'"vae_tiling"\s*:\s*args\.vae_tiling', cg_src) is not None,
 )
 
-# Lock the deliberate MCP-server omission. comfyless/mcp_server.py L600-606
+# Lock the deliberate MCP-server omission. src/comfyless/mcp_server.py L600-606
 # explicitly states that operator-tuning knobs (precision, offload_vae,
 # attention_slicing, sequential_offload, vae_tiling) are NOT exposed on the
 # MCP schema — the LLM agent should not be tuning these per-call. The MCP
@@ -858,7 +858,7 @@ check(
 # intent, or (b) silently threading args through without updating the
 # comment block. Forces the change to surface here. (Step 3 code-reviewer
 # MEDIUM, security-auditor confirmed: out of scope for this slice; locked.)
-with open("comfyless/mcp_server.py") as f:
+with open("src/comfyless/mcp_server.py") as f:
     mcp_src = f.read()
 check(
     "mcp_server.py does NOT thread vae_tiling (deliberate omission per "
@@ -957,7 +957,7 @@ print("── Inv 1 — no filesystem search (structural + runtime) ────
 # "no path-derivation" posture at the source level. Defends against a
 # future engineer adding sibling-glob logic without re-reading ADR-016
 # Alternative A's rationale.
-with open("comfyless/core/hunyuan_chain.py") as f:
+with open("src/comfyless/core/hunyuan_chain.py") as f:
     chain_src = f.read()
 for forbidden in ("os.listdir", "Path.glob", ".iterdir(", ".scandir(", "os.scandir"):
     check(
@@ -1477,7 +1477,7 @@ print("── Inv 10 — non-regression: non-hunyuan families behave identically
 # gated on model_family == "hunyuan-image" (or refiner_path set, for
 # the negative case). A future engineer who fans the gate out to other
 # families would break this lock.
-with open("comfyless/generate.py") as f:
+with open("src/comfyless/generate.py") as f:
     gen_src = f.read()
 check(
     "generate() refiner gate is family-conditional (model_family == \"hunyuan-image\")",
@@ -1744,7 +1744,7 @@ check(
 # ══════════════════════════════════════════════════════════════════════
 #
 # Step 4 wires the refiner chain into the comfyless daemon
-# (comfyless/server.py). Tests parallel the Step-2 tile-VAE-skip
+# (src/comfyless/server.py). Tests parallel the Step-2 tile-VAE-skip
 # structural co-locking pattern PLUS behavior coverage of the two
 # daemon-specific helpers (_maybe_load_refiner, _evict_chain) which
 # are pure enough to drive on CPU without ML-stack imports.
@@ -1753,7 +1753,7 @@ check(
 # field; cache_key includes it; cache miss evicts BOTH base + refiner;
 # additive — clients that omit it see byte-for-byte identical behavior.
 
-with open("comfyless/server.py") as f:
+with open("src/comfyless/server.py") as f:
     server_src = f.read()
 
 

@@ -1063,8 +1063,8 @@ _REPO = os.path.dirname(os.path.abspath(__file__))
 # search/list import there; its real invariant is "the GENERATE path stays
 # DB-independent," enforced by the S5 monkeypatch-DB-away runtime test
 # (Vision proof hooks), not an import ban (S1 review finding 4).
-for fname in ("comfyless/generate.py", "comfyless/server.py",
-              "comfyless/catalog.py"):
+for fname in ("src/comfyless/generate.py", "src/comfyless/server.py",
+              "src/comfyless/catalog.py"):
     tree = ast.parse(open(os.path.join(_REPO, fname), encoding="utf-8").read())
     imports = []
     for node in ast.walk(tree):

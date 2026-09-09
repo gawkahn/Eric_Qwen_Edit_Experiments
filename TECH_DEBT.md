@@ -2739,6 +2739,20 @@ suite-ownership decision. Doing it here would widen a 6-file diff into a
 `src/` there and is silently wrong (ADR-045 §Implementation hazards). Earlier:
 whenever a suite is next re-pointed from `nodes.*` to `comfyless.core`.
 
+**Resolved: 2026-09-09 (ADR-045 slice 5)** — both deleted, not ported.
+`comfyless/__init__.py` is now a docstring plus `from __future__`. The stubs
+moved to `comfy_stub.py` at the repository root (node-pack side of the
+boundary) and the five suites that were getting them as an import side effect
+now call `comfy_stub.install()` explicitly. The suite-ownership question the
+entry worried about did NOT have to be answered: every suite still imports
+`nodes.*` exactly as before, it just says so out loud. `resolve_component_path`
+keeps its `import folder_paths` inside a `try/except` — without the stub it
+raises ImportError, is caught, and returns the caller's path unchanged, which
+is the same result the no-op stub produced *when no importable `folder_paths`
+exists anywhere*. What the deletion DID drop, named here because the sentence
+above would otherwise overstate it (security-auditor, 2026-09-09): the stub
+unconditionally SHADOWED any other module of that name. See the entry below.
+
 ## 2026-08-22 — the LoHa adapter path has no real-file exercise on this machine
 
 **What:** ADR-046's corpus measurement found ZERO LoHa (`hada_*`) files among
@@ -2781,6 +2795,12 @@ its gate configuration" must-never). Fix: replace the `nodes/` pattern with
 `comfyless/core/lora_adapters\.py`, update both the regex function and
 `list_red_zone_paths`, update the CLAUDE.md table, re-run `just policy-test`.
 
+**Amendment 2026-09-09 (ADR-045 slice 5):** those two paths are now
+`src/comfyless/core/eric_diffusion_fp8_ops.py` and
+`src/comfyless/core/lora_adapters.py`. Match them the way slice 5 matched the
+others — `(^|/)(src/)?comfyless/core/...` — so a range spanning the move is
+still gated. The gap itself is unchanged and still open.
+
 ## 2026-08-22 — `test_refine.py` is red on `main` (pre-existing; not slice 3c)
 
 **What:** `just tests` during ADR-045 slice 3c reported `test_refine.py FAIL`:
@@ -2820,3 +2840,85 @@ green 36/36 with both `comfyless@0` and `comfyless@1` live; `test_refine.py`
 733 passed / 0 failed. `code-reviewer` (Fable) APPROVED — no coverage lost, no
 check ever exercised the real `socket_path` (that surface is covered in
 `test_server_robustness.py`).
+
+## 2026-09-09 — the hatchling build pin is outside uv.lock's integrity hashes
+
+**What:** ADR-045 slice 5 added `[build-system] requires = ["hatchling==1.32.0"]`.
+PEP 517 build requirements are resolved into an isolated environment at build
+time, so this pin is NOT represented in `uv.lock` and gets none of the
+per-artifact hash verification the runtime tree has (global §11 "Hash pinning
+vs version pinning"). A compromised republish of that exact version would be
+picked up by the next `uv build` without the lockfile noticing.
+
+**Why not now:** the mitigations are real but each is its own decision — vendor
+the backend, pin by hash via a build-time constraints file, or accept it on the
+grounds that the build environment is ephemeral and produces an artifact whose
+CONTENTS are reviewable (the wheel manifest is inspected in this slice's proof).
+`uv build --no-build-isolation` against a locked backend is the likely answer
+and it interacts with the slice-6 3.14 environment.
+
+**Trigger:** slice 6 (the new repo builds its own artifacts for real), or the
+next `deps-report` sweep — whichever comes first. Note the pin is invisible to
+`osv-scanner` today because it is not in the lockfile.
+
+**Amendment 2026-09-09 (security-auditor, same day):** the entry above
+understated the risk on two axes. (a) SCOPE — build isolation resolves
+hatchling's own dependencies (packaging, pathspec, pluggy, trove-classifiers)
+as floating, unhashed ranges, so the un-pinned surface is strictly larger than
+the one exact pin §11 appears to satisfy. (b) FREQUENCY — now that uv.lock
+carries `source = { editable = "." }`, the backend is resolved AND EXECUTED on
+every cold-cache `uv sync`: every CI run, every fresh checkout — not merely on
+an explicit `uv build`. Build-backend code runs with full user privileges at
+install time.
+
+## 2026-09-09 — the pyright ratchet root for comfyless is now the meaningless `src`
+
+**What:** `scripts/typecheck-per-root.sh` buckets diagnostics by FIRST path
+segment. After the src-layout move that makes comfyless's root `src` rather
+than `comfyless` — `.claude/typecheck-baseline` now reads `src=447`. It is
+accurate but uninformative, and if a second package ever lands under `src/`
+the two merge into one ratchet number and a regression in one can be masked by
+a drawdown in the other.
+
+**Why not now:** fixing it means changing the bucketing algorithm (e.g. bucket
+by the `[tool.pyright] include` entry that owns the file rather than by first
+segment), which is a change to a T1 enforcement script and belongs to the
+policy layer, not to a packaging slice (global §4). The deliberate choice made
+here was the *smaller* one: rename the baseline key and record the accounting.
+
+**Trigger:** slice 7, where the baseline splits between the two repos anyway
+and comfyless's root becomes `src` in a repo where nothing else lives there —
+at which point this may simply stop mattering. Revisit sooner if anything else
+is added under `src/`.
+
+## 2026-09-09 — `resolve_component_path` imports `folder_paths` from live `sys.path`
+
+**What:** `src/comfyless/core/eric_diffusion_utils.py:400` does a lazy
+`import folder_paths` inside `try/except Exception`. Until ADR-045 slice 5,
+importing anything under `comfyless` had already pre-populated
+`sys.modules["folder_paths"]` with a benign stub, so that import could only
+ever resolve to the stub. With the shims deleted it resolves live. Under the
+`python -m comfyless.*` form — which `systemd/comfyless@.service` and
+`start-mcpo.sh` still use — cwd is on `sys.path`, so a `folder_paths.py`
+sitting in an untrusted working directory would execute at import time, and the
+broad `except Exception` would swallow whatever it raised. Found by
+`security-auditor` on slice 5 (MEDIUM),
+`docs/security/review-slice-5-src-layout-2026-09-09.md`.
+
+**Reachability today is narrow, not zero:** the daemon runs with
+`WorkingDirectory=` the repo root and mcpo runs from `$REPO`, both trusted; the
+six new console scripts put the venv's `bin/` at `sys.path[0]` instead of cwd,
+so they are not exposed at all. The exposure is an operator running
+`python3 -m comfyless.generate` from a directory they do not control — e.g. a
+downloaded model folder.
+
+**Why not now:** slice 5's proof is that the three §12 Red Zone files and every
+other moved module are byte-identical across the rename (verified by blob
+hash). Editing a moved file inside the move slice would forfeit exactly that,
+for a fix that is not urgent. The auditor's own recommendation was a follow-up
+slice.
+
+**Trigger:** next slice that touches `comfyless/core/`, and NO LATER than
+slice 7. Fix is one line: `fp = sys.modules.get("folder_paths")` and return
+`path` when it is absent — real ComfyUI always imports it before node code
+runs, so nothing legitimate needs the live import.

@@ -367,7 +367,7 @@ print("\n== N19: zero isinstance(int|float|bool|str) in server._validate_request
 # tight — immune to formatting and comment shenanigans.
 
 _FORBIDDEN_TYPES = {"int", "float", "bool", "str"}
-_server_src = (Path(__file__).parent / "comfyless" / "server.py").read_text()
+_server_src = (Path(__file__).parent / "src" / "comfyless" / "server.py").read_text()
 _server_tree = ast.parse(_server_src)
 
 def _isinstance_violations_in_body(body):
@@ -519,7 +519,7 @@ print("\n== N30: validator source contains no int() call (AST check) ==")
 # equivalently by walking the validator's AST for any Call node whose
 # func is Name("int"). Immune to comments, docstrings, and formatting.
 
-src_text = (Path(__file__).parent / "comfyless" / "params_validation.py").read_text()
+src_text = (Path(__file__).parent / "src" / "comfyless" / "params_validation.py").read_text()
 tree = ast.parse(src_text)
 int_calls = []
 for node in ast.walk(tree):

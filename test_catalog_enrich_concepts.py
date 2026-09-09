@@ -625,8 +625,8 @@ print("\n== Load-plane independence (ADR-022 invariant 7) ==")
 # ════════════════════════════════════════════════════════════════════════
 
 _REPO = os.path.dirname(os.path.abspath(__file__))
-for fname in ("comfyless/generate.py", "comfyless/server.py",
-              "comfyless/catalog.py"):
+for fname in ("src/comfyless/generate.py", "src/comfyless/server.py",
+              "src/comfyless/catalog.py"):
     tree = ast.parse(open(os.path.join(_REPO, fname), encoding="utf-8").read())
     imports = []
     for node in ast.walk(tree):

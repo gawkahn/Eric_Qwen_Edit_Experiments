@@ -1,6 +1,6 @@
 # Vision — extracting `comfyless_diffusion`
 
-Status: in progress — slices 1, 2, 3a, 3b, 3c, 4 done; next: slice 5
+Status: in progress — slices 1, 2, 3a, 3b, 3c, 4, 5 done; next: slice 6
 Decision record: `docs/decisions/ADR-045-comfyless-diffusion-standalone-repo.md` (accepted 2026-08-20)
 
 ## Lens (global §1)
@@ -430,7 +430,7 @@ Empty after this slice. Battery 35/36 (`test_refine.py` red on `main`
 before the slice, see TECH_DEBT 2026-08-22); per-root typecheck conserved
 (453 / 438 / 94).
 
-### Slice 5 — Packaging: src layout, package data, console script
+### Slice 5 — Packaging: src layout, package data, console script  ✅ done
 
 Move to `src/comfyless/`; declare the 10 recipe TOMLs, `examples/`, and
 keyframe assets as package data; add `[project.scripts]`; fix or delete
@@ -440,6 +440,29 @@ keyframe assets as package data; add `[project.scripts]`; fix or delete
 battery against the installed package** with the working tree off `sys.path`.
 This is the slice that proves the whole premise — nothing has ever installed
 this package before.
+
+**Done 2026-09-09.** hatchling (`==1.32.0`, chosen over setuptools because
+everything under the package directory ships by default — the package-data
+hazard becomes unforgettable rather than merely documented). Distribution name
+deliberately UNCHANGED: ADR-045 keeps this pyproject with the node pack, so
+`comfyui-eric-qwen-edit` is already its final name and `comfyless-diffusion` is
+born in slice 6's fresh file. Six console scripts (`comfyless`,
+`comfyless-{refine,enhance,video,catalog,mcp}`). `_PROJECT_ROOT` and
+`_install_shims()` DELETED, not ported; the ComfyUI stubs moved to
+`comfy_stub.py` at the repo root and five suites now install them explicitly
+(`test_hunyuan.py` already carried its own inline stubs and was left alone).
+
+*Proof as run:* wheel manifest carries all 10 recipe TOMLs, the 4 example JSONs
+and 6 keyframe JPEGs, and leaks no `nodes/`/`pipelines/` (74 entries, 46
+modules). Wheel installed `--no-deps` over the editable install; `comfyless`
+resolved from `site-packages` with `src/` provably absent from `sys.path`;
+**full battery 36/36 green against that installed artifact**, and `comfyless
+--help` runs from the console script. Editable install restored afterwards.
+`just policy-test` 43/43. Residual, stated plainly: dependency RESOLUTION in a
+genuinely empty environment is still unproven — the wheel was installed
+`--no-deps` into a venv that already had the tree, because a clean-venv install
+would pull ~20 GB of torch. Slice 6 closes that when the new repo builds its
+own 3.14 environment.
 
 ### Slice 6 — The split
 

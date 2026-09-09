@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Test harness for the Stable Cascade dispatch in comfyless (ADR-010).
 
-Exercises the pure-logic helpers in comfyless/cascade.py:
+Exercises the pure-logic helpers in src/comfyless/cascade.py:
   - validate_config            (defaults, type checks, alignment, comment keys)
   - load_config                (JSON-parse + filesystem errors)
   - _resolve_torch_dtype       (name aliases, error on bad name)

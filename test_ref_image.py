@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for comfyless/ref_image.py — ADR-035 slice 2 ingestion helper.
+"""Tests for src/comfyless/ref_image.py — ADR-035 slice 2 ingestion helper.
 
 CPU-only, no GPU, no model weights, no network. The negative cases are the
 point: an arbitrary user file must not be able to (a) blow past the byte cap,

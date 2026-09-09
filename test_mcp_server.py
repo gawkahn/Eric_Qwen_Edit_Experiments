@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test suite for comfyless/mcp_server.py — slice 1 step 1 surface.
+"""Test suite for src/comfyless/mcp_server.py — slice 1 step 1 surface.
 
 Coverage (slice-1 Vision negative cases):
   - N1-N4   startup fail-closed for --output-dir / --model-base
@@ -1646,7 +1646,7 @@ _CLASS_NAME_OMIT = object()  # sentinel: omit _class_name entirely
 
 # Characterization: scan_model_family agrees with the existing
 # infer_model_family mapping for every supported pipeline class family
-# (the _FAMILY_PATTERNS list in comfyless/core/eric_diffusion_utils.py).
+# (the _FAMILY_PATTERNS list in src/comfyless/core/eric_diffusion_utils.py).
 _CHARACTERIZATION_CASES = [
     ("QwenImagePipeline",            "qwen-image"),
     ("QwenImageEditPlusPipeline",    "qwen-edit"),
@@ -3127,9 +3127,9 @@ _cat_src = inspect.getsource(cat_mod)
 _argparse_import_re = re.compile(
     r"^\s*(?:import argparse\b|from argparse\b)", re.MULTILINE
 )
-check("N23: comfyless/mcp_server.py contains NO 'import argparse' statement",
+check("N23: src/comfyless/mcp_server.py contains NO 'import argparse' statement",
       not _argparse_import_re.search(_mcps_src))
-check("N23: comfyless/catalog.py contains NO 'import argparse' statement",
+check("N23: src/comfyless/catalog.py contains NO 'import argparse' statement",
       not _argparse_import_re.search(_cat_src))
 # AST-level sanity: parse the modules and verify there is no Import
 # node for argparse anywhere.
@@ -3457,7 +3457,7 @@ check("Sanitize: _FORBIDDEN_NAME_CHARS is a compiled regex",
 print("\n== Slice 3 Step 1: resolve_reference (request-time resolver) ==")
 # ════════════════════════════════════════════════════════════════════════
 #
-# Unit-level coverage of the pure resolver added to comfyless/catalog.py.
+# Unit-level coverage of the pure resolver added to src/comfyless/catalog.py.
 # Handler-integration coverage (uniform agent error, audit cause, notices,
 # resolved_params-as-names) lands in Step 3 (Vision N1-N17). Here we prove
 # the resolver returns the right ResolveResult / ResolveCause for every
