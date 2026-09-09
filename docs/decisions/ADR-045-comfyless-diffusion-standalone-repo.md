@@ -330,5 +330,32 @@ exactly the drift the pin exists to prevent.
   Grant confirmed the licensing calls on 2026-09-09 (strip the headers, clear
   the 28 lines). The engineering record is here; the licensing conclusion
   remains his, as the Decision section already states.
+- 2026-09-09 — Slice 6 done. `comfyless_diffusion` stood up at
+  `~/projects/ai-lab/code/comfyless_diffusion`, **Apache-2.0** (Grant's call,
+  matching the claude_dotfiles project), **no remote** until it is a full
+  working independent unit. 183 commits, one author, blame clean at all three
+  copy-detection levels. Battery 29/29 on CPython 3.14.7 from the tree and
+  against the installed wheel. Two amendments to this ADR's plan, both forced
+  by measurement rather than preference:
+
+  1. **Suite ownership could not wait for slice 7.** Slice 6's proof is
+     "battery green", which makes ownership load-bearing for slice 6. The
+     Vision's rule ("read from imports, not grepped") is necessary but not
+     sufficient — `importlib.import_module("nodes...")` and source-text reads
+     of node files defeat import analysis as thoroughly as they defeat grep.
+     Running the battery was the only honest classifier.
+  2. **The extraction path set was wrong on the first pass.**
+     `scripts/lora_audit.py` loads a repo-ROOT script, `audit_single_files.py`,
+     via importlib (ADR-021 §2) — an edge the path-based extraction missed
+     entirely, surfaced only by a failing suite. Re-extracted with it included.
+     A dependency reachable only through a runtime `importlib` call is exactly
+     what a path filter cannot see; slice 7 should re-check for others before
+     deleting anything here.
+
+  The pin posture is deliberately UNSETTLED and recorded in the new repo's
+  pyproject: the exact application-style pins were carried forward verbatim,
+  but this package is about to become a LIBRARY, where global §11 calls for
+  ranges. That decision belongs with the slice-7 wiring that first makes
+  something consume it.
 
 AI-Disclosure: Claude (Opus 5) authored; Grant reviewed.

@@ -1,6 +1,6 @@
 # Vision — extracting `comfyless_diffusion`
 
-Status: in progress — slices 1, 2, 3a, 3b, 3c, 4, 5 done; next: slice 6
+Status: in progress — slices 1, 2, 3a, 3b, 3c, 3d, 4, 5, 6 done; next: slice 7
 Decision record: `docs/decisions/ADR-045-comfyless-diffusion-standalone-repo.md` (accepted 2026-08-20)
 
 ## Lens (global §1)
@@ -464,7 +464,7 @@ genuinely empty environment is still unproven — the wheel was installed
 would pull ~20 GB of torch. Slice 6 closes that when the new repo builds its
 own 3.14 environment.
 
-### Slice 6 — The split
+### Slice 6 — The split  ✅ done
 
 Install `git-filter-repo` (absent today; `git subtree split` is a weaker
 fallback). Extract `src/comfyless/` with history into `comfyless_diffusion`.
@@ -476,6 +476,33 @@ Create the 3.14 venv, relock, run the battery.
 3.14 against the installed artifact.
 *Not reversible in the usual sense* — but the source repo is untouched until
 slice 7, so the fallback is "delete the new repo and retry."
+
+**Done 2026-09-09** at `/home/gawkahn/projects/ai-lab/code/comfyless_diffusion`
+(git-filter-repo 2.47.0, source commit `1de2be7`; 183 commits, 110 files).
+Apache-2.0 (Grant's call, matching claude_dotfiles), canonical text verified
+against apache.org. **No remote** until it is a full working independent unit.
+
+*Proof as run:* `git log --format=%an | sort -u` → one name. `git blame` reports
+a single author at plain, `-C -M` AND `-C -C -M` — the level that found 193
+attributed lines in the source repo finds zero here, because Eric's originals
+are not in this history to attribute to. `uv lock` resolved 97 packages for 3.14
+with no blockers; battery **29/29 green from the tree AND against the installed
+wheel** (74 entries, all package data, no `nodes/` leakage) with `src/` off
+`sys.path`; `comfyless --help` runs from the console script.
+
+*Open question 3 (suite ownership) had to be answered HERE, not in slice 7* —
+slice 6's proof is "battery green", so ownership is load-bearing for it. Static
+classification by imports was insufficient even done carefully: the Vision's own
+warning ("must be read from imports, not grepped") does not go far enough,
+because `importlib.import_module("nodes...")` and source-text reads of node
+files are invisible to import analysis too. **The battery was the only honest
+classifier** — three suites failed the first run and each named its own owner.
+`test_multistage.py` is node-pack (three `nodes.*` imports). `test_lora_audit.py`
+is comfyless but needed `audit_single_files.py`, which the first extraction left
+behind — re-extracted. `test_quant.py` is comfyless with three cross-repo DMR
+source checks that now SKIP loudly here and run in the node repo. Proposed
+answer for the five side-by-side differentials: they stay in the node
+repository, which after slice 7 holds both halves. Slice 7 confirms.
 
 ### Slice 7 — Node pack cutover
 
