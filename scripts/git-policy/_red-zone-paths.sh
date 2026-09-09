@@ -11,16 +11,35 @@
 # Deliberately NOT listed (function-scoped surfaces, path gating too coarse):
 #   - src/comfyless/generate.py         — only `_run_json_mode` is the §12 surface;
 #     the rest of the file changes in most feature slices.
-#   - nodes/eric_diffusion_utils.py — only `resolve_hf_path` is the surface;
-#     same reasoning. See TECH_DEBT.md entry "git-policy: function-scoped Red
-#     Zone surfaces not path-gateable".
+#   - src/comfyless/core/eric_diffusion_utils.py — TWO function-scoped surfaces
+#     live here, and naming only one of them is how a gap hides: `resolve_hf_path`
+#     (caller-supplied model loading) AND the fp8/comfy_quant DETECTION + REMAP
+#     half of the ADR-019 weight-file surface, whose other half
+#     (eric_diffusion_fp8_ops.py) IS gated above. Same coarseness reasoning as
+#     generate.py — the file changes in most feature slices. See TECH_DEBT.md
+#     entry "git-policy: function-scoped Red Zone surfaces not path-gateable"
+#     and its 2026-09-09 amendment.
+#     (Path corrected 2026-09-09: this comment named the pre-slice-5
+#     `nodes/eric_diffusion_utils.py`, which no longer exists.)
 
 is_red_zone_path() {
     local path="$1"
     if [[ "$path" =~ (^|/)(src/)?comfyless/server\.py$ ]]; then return 0; fi          # Unix-socket IPC daemon
     if [[ "$path" =~ (^|/)(src/)?comfyless/mcp_server\.py$ ]]; then return 0; fi      # MCP server (LLM tool surface)
     if [[ "$path" =~ (^|/)(src/)?comfyless/refine\.py$ ]]; then return 0; fi          # ADR-027 judge/seed surfaces
-    if [[ "$path" =~ (^|/)nodes/eric_diffusion_fp8_ops\.py$ ]]; then return 0; fi  # weight-file content parser (ADR-019)
+    # ADR-045 slice 1b moved the weight-file content parser out of nodes/; the
+    # gate kept naming the old path and was a silent no-op from that day until
+    # 2026-09-09, when a Red Zone edit to the moved file committed without it
+    # firing (security review of slice 3d). lora_adapters.py is added at the
+    # same time: since ADR-046 every daemon LoRA weight write, backup and
+    # registry mutation flows through it, and it was never gated at all.
+    # All three historical spellings stay matched, for the same reason slice 5
+    # kept `(src/)?`: a `check-range` over a range spanning either move must
+    # still content-check the pre-move commits, and a file resurrected at an
+    # old path must not slip the gate. Over-matching a path that no longer
+    # exists costs nothing and fails closed.
+    if [[ "$path" =~ (^|/)((src/)?comfyless/core|nodes)/eric_diffusion_fp8_ops\.py$ ]]; then return 0; fi  # weight-file content parser (ADR-019)
+    if [[ "$path" =~ (^|/)(src/)?comfyless/core/lora_adapters\.py$ ]]; then return 0; fi          # LoRA weight writes / backups / registry (ADR-046)
     return 1
 }
 
@@ -39,6 +58,7 @@ list_red_zone_paths() {
 src/comfyless/server.py
 src/comfyless/mcp_server.py
 src/comfyless/refine.py
-nodes/eric_diffusion_fp8_ops.py
+src/comfyless/core/eric_diffusion_fp8_ops.py
+src/comfyless/core/lora_adapters.py
 EOF
 }

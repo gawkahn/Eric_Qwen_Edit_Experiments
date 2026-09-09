@@ -2795,6 +2795,19 @@ its gate configuration" must-never). Fix: replace the `nodes/` pattern with
 `comfyless/core/lora_adapters\.py`, update both the regex function and
 `list_red_zone_paths`, update the CLAUDE.md table, re-run `just policy-test`.
 
+**Resolved: 2026-09-09** — done as its own commit immediately after slice 3d,
+pulled forward from its "no later than slice 6" trigger because the gap was
+observed FIRING: slice 3d edited `core/eric_diffusion_fp8_ops.py` and the gate
+did not trigger (security review of slice 3d, MEDIUM). The parser is now
+matched at all three historical spellings
+(`(^|/)((src/)?comfyless/core|nodes)/eric_diffusion_fp8_ops\.py$`) so a
+`check-range` spanning either move still content-checks pre-move commits, and
+`(^|/)(src/)?comfyless/core/lora_adapters\.py$` is gated for the first time.
+`list_red_zone_paths`, the CLAUDE.md review-bar table and the review-rules
+bullet are all synced; `just policy-test` grew 8 cases (43 -> 51) covering both
+surfaces, every historical spelling, a not-Red-Zone control and a
+mid-segment-anchor negative.
+
 **Amendment 2026-09-09 (ADR-045 slice 5):** those two paths are now
 `src/comfyless/core/eric_diffusion_fp8_ops.py` and
 `src/comfyless/core/lora_adapters.py`. Match them the way slice 5 matched the
@@ -2922,3 +2935,27 @@ slice.
 slice 7. Fix is one line: `fp = sys.modules.get("folder_paths")` and return
 `path` when it is absent — real ComfyUI always imports it before node code
 runs, so nothing legitimate needs the live import.
+
+## 2026-09-09 — the fp8 DETECTION/REMAP half of the ADR-019 surface is un-gated
+
+**What:** The CLAUDE.md review bar defines the ADR-019 §12 surface as
+`eric_diffusion_fp8_ops.py` **"+ detection/remap in `eric_diffusion_utils.py`"**.
+The first half is now path-gated; the second is not, and the exclusion comment
+in `scripts/git-policy/_red-zone-paths.sh` justified excluding that file by
+naming only `resolve_hf_path`, so the fp8 half was excluded silently rather
+than deliberately. Both halves parse caller-supplied weight-file CONTENT — the
+same risk class. Found by `security-auditor` reviewing the gate repair itself
+(`docs/security/review-redzone-gate-repair-2026-09-09.md`, MEDIUM).
+
+**Why not now:** gating the whole of `eric_diffusion_utils.py` would fire on
+most feature slices — the same coarseness argument that keeps `generate.py`
+un-gated for `_run_json_mode`. Choosing between "gate the file and accept the
+noise", "split the detection/remap code into its own module and gate that", and
+"keep it function-scoped and accept human triggering" is a design decision, not
+a path edit. The comment now NAMES the surface, so the gap is at least visible
+where someone would look.
+
+**Trigger:** the next slice that touches the fp8 detection/remap code, or the
+slice-7 split (where `eric_diffusion_utils.py` moves to the new repo and its
+gate configuration is re-decided anyway). Splitting the module is the option I
+would take first — it makes the surface gateable without the noise.

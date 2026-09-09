@@ -119,9 +119,23 @@ no pc_redzone_ref "TODO: write docs/decisions/ADR-999-ghost.md" "src/comfyless/s
 # Function-scoped surfaces (_run_json_mode, resolve_hf_path) are deliberately
 # NOT path-gated — their whole files must stay non-RZ (see _red-zone-paths.sh).
 ok pc_redzone_ref "no ref needed" "src/comfyless/generate.py"          spec "$repo_root"
-ok pc_redzone_ref "no ref needed" "nodes/eric_diffusion_utils.py"  spec "$repo_root"
+ok pc_redzone_ref "no ref needed" "src/comfyless/core/eric_diffusion_utils.py" spec "$repo_root"  # resolve_hf_path + fp8 detection/remap: BOTH function-scoped
+ok pc_redzone_ref "no ref needed" "nodes/eric_diffusion_utils.py"  spec "$repo_root"  # pre-slice-5 path, deleted; kept as a negative control
 # The other two listed surfaces are RZ.
 no pc_redzone_ref "no reference" "src/comfyless/refine.py"             spec "$repo_root"
+
+# ADR-045 slice 5+ : the fp8 weight-file parser and the LoRA adapter subsystem.
+# The parser is matched at all three historical spellings so a check-range over
+# either move still gates; lora_adapters was never gated before 2026-09-09.
+ok pc_redzone_ref "see docs/decisions/ADR-019-native-quantization-support.md" "src/comfyless/core/eric_diffusion_fp8_ops.py" spec "$repo_root"
+no pc_redzone_ref "no reference" "src/comfyless/core/eric_diffusion_fp8_ops.py" spec "$repo_root"
+no pc_redzone_ref "no reference" "comfyless/core/eric_diffusion_fp8_ops.py"     spec "$repo_root"
+no pc_redzone_ref "no reference" "nodes/eric_diffusion_fp8_ops.py"              spec "$repo_root"
+ok pc_redzone_ref "see docs/decisions/ADR-046-comfyless-owned-lora-adapters.md" "src/comfyless/core/lora_adapters.py" spec "$repo_root"
+no pc_redzone_ref "no reference" "src/comfyless/core/lora_adapters.py"          spec "$repo_root"
+no pc_redzone_ref "no reference" "comfyless/core/lora_adapters.py"              spec "$repo_root"  # pre-slice-5 spelling must STAY gated for check-range
+ok pc_redzone_ref "no ref needed" "src/comfyless/core/lora_adapters.py.bak"     spec "$repo_root"  # $-anchor: a suffixed copy is not the surface
+ok pc_redzone_ref "no ref needed" "xnodes/eric_diffusion_fp8_ops.py"            spec "$repo_root"  # anchor must not match mid-segment
 no pc_redzone_ref "no reference" "nodes/eric_diffusion_fp8_ops.py" spec "$repo_root"
 
 # --- Red Zone review references (the whole `review` kind was previously untested) ---

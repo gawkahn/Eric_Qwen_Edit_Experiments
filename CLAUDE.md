@@ -151,9 +151,10 @@ The file-scoped ones are mechanically gated by
 | Unix socket IPC server | `src/comfyless/server.py` | IPC (Unix sockets) — ADR-001, `review-comfyless-server-2026-04-23.md` |
 | MCP server | `src/comfyless/mcp_server.py` | LLM agent tool surface — ADR-011, `review-comfyless-mcp-server-2026-04-28.md`, `review-mcp-pipeline-cache-2026-06-27.md` |
 | Refinement-loop judge/seed | `src/comfyless/refine.py` | LLM output influencing generation params; seed-image ingestion — ADR-027, `review-refinement-loop-*.md` |
-| HF repo ID resolution + download | `nodes/eric_diffusion_utils.py` `resolve_hf_path` (function-scoped, not path-gated) | Loading model weights from caller-supplied paths |
+| HF repo ID resolution + download | `src/comfyless/core/eric_diffusion_utils.py` `resolve_hf_path` (function-scoped, not path-gated) | Loading model weights from caller-supplied paths |
 | `--json` stdin/stdout bridge | `src/comfyless/generate.py` `_run_json_mode` (function-scoped, not path-gated) | Machine-facing interface; future LLM agent tool surface |
-| Scaled-fp8 / int8-tensorwise file-content parser (ADR-019 slices C..I8) | `nodes/eric_diffusion_fp8_ops.py` + detection/remap in `eric_diffusion_utils.py` | Custom parsing of caller-supplied weight-file CONTENT (header key patterns, scale tensors, comfy_quant descriptors incl. int8 `ci-w`) fed into compute ops — review chain `docs/security/review-slice-{C,Cd,PQ,R1R2R3,I8}-*.md`, reqs 1-56 |
+| Scaled-fp8 / int8-tensorwise file-content parser (ADR-019 slices C..I8) | `src/comfyless/core/eric_diffusion_fp8_ops.py` + detection/remap in `eric_diffusion_utils.py` | Custom parsing of caller-supplied weight-file CONTENT (header key patterns, scale tensors, comfy_quant descriptors incl. int8 `ci-w`) fed into compute ops — review chain `docs/security/review-slice-{C,Cd,PQ,R1R2R3,I8}-*.md`, reqs 1-56 |
+| LoRA adapter subsystem (ADR-046) | `src/comfyless/core/lora_adapters.py` | Every daemon LoRA weight write, backup and registry mutation — `docs/security/review-slice-3c-lora-adapters-2026-08-22.md` |
 
 **Debt:** No §12 security review exists for `resolve_hf_path` (caller-supplied
 model loading) — it should have had one before the code landed. Backlogged —
@@ -171,7 +172,7 @@ closed by ADR-001 + `review-comfyless-server-2026-04-23.md` /
 **Review rules:**
 
 - **Every non-trivial code slice runs `code-reviewer` (Fable) before commit.** "Trivial" = single-line fix, pure doc edit, mechanical rename with no behavior change.
-- **Any change to a `_red-zone-paths.sh` path (`src/comfyless/server.py`, `src/comfyless/mcp_server.py`, `src/comfyless/refine.py`, `nodes/eric_diffusion_fp8_ops.py`) or to the function-scoped `resolve_hf_path` / `_run_json_mode` also runs `security-auditor` (Fable).** Output saved to `docs/security/review-<slug>-<YYYY-MM-DD>.md` and referenced in the commit body.
+- **Any change to a `_red-zone-paths.sh` path (`src/comfyless/server.py`, `src/comfyless/mcp_server.py`, `src/comfyless/refine.py`, `src/comfyless/core/eric_diffusion_fp8_ops.py`, `src/comfyless/core/lora_adapters.py`) or to the function-scoped `resolve_hf_path` / `_run_json_mode` also runs `security-auditor` (Fable).** Output saved to `docs/security/review-<slug>-<YYYY-MM-DD>.md` and referenced in the commit body.
 - **When the `--json` / LLM agent wiring lands:** write spec + ADR before code, run `security-auditor`, treat as Red Zone from the first commit.
 - Trivial skip ask: `"Trivial — skip review? Change: <one-line summary>. Reply 'review' to run it anyway."` Do not self-decide.
 - Pass `model: "fable"` explicitly at every Agent-tool invocation for reviewer agents (`code-reviewer`, `security-auditor`). The frontmatter pin is known-broken in Claude Code 2.1.117 — structural enforcement requires the invocation-time override.
