@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
 """Tier-5 enrichment — offline LLM concept tagging (ADR-041 D1, slice 2b).
 
 Reads each LoRA's catalog metadata, asks a LOCAL LLM to pick concepts from the

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
 """The CLOSED concept vocabulary for catalog enrichment (ADR-041 D1/D5).
 
 WHY A CLOSED VOCABULARY. Slice 2 feeds third-party text (civitai marketing

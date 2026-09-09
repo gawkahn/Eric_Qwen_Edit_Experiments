@@ -289,4 +289,46 @@ exactly the drift the pin exists to prevent.
 - 2026-08-20 — Python target set to 3.14 for the new repository, 3.12 retained
   for the node pack; dependency tree verified 3.14-clean against `uv.lock`.
 
+- 2026-09-09 — Slice 5 landed (src layout, `[build-system]`, console scripts,
+  shims deleted). See the Vision's slice-5 record and
+  `docs/security/review-slice-5-src-layout-2026-09-09.md`.
+- 2026-09-09 — **The attribution verification in "Decision" was underspecified,
+  and the clearing set was incomplete.** This ADR says the new repository is
+  cleared "before first commit", verified by "`git blame` on the new repo
+  reports zero Eric-authored lines". Measured on `src/comfyless/**.py` before
+  extraction, that check returns a different answer per flag set: **plain
+  `git blame` = 0, `-C -M` = 55, `-C -C -M` = 276**. Plain blame is clean only
+  because the core modules enter this repository's history through
+  `b951814` (2026-04-15, "reconstructed bundle", authored by Grant), which
+  reset naive attribution without changing provenance — so the ADR's stated
+  test passes for a metadata reason and cannot carry the licensing conclusion
+  on its own. `git log --format=%an --follow` is clean for the same reason, so
+  the Vision's slice-6 proof inherits the weakness.
+
+  Two residues the "three functions" clearing set (slices 3a/3b/3c) did not
+  cover were found and cleared in slice 3d: the **copyright/attribution header
+  template** (present in 24 of 46 package files — including `server.py`,
+  `generate.py`, `mcp_server.py` and the whole `catalog*` family, all written
+  from scratch by Grant in April 2026 and carrying the header only by template
+  propagation), and **~28 functional lines** in
+  `core/eric_diffusion_utils.py` (generic-pipeline cache scaffolding) and
+  `core/eric_lora_format_convert_apply.py` (delta reshape + `peft_config`
+  registration).
+
+  **Post-clearing measurement: plain = 0, `-C -M` = 5, `-C -C -M` = 193.**
+  The remaining five are two blank lines, the signature
+  `def clear_gen_pipeline_cache() -> bool:` (fixed by the API the node pack
+  imports), `return _GEN_PIPELINE_CACHE` (the only way to express a one-line
+  getter), and `transformer = getattr(pipe, "transformer", None)`. Chasing
+  these to zero would mean obfuscating code to defeat a similarity detector,
+  not authoring independently, so the residue STANDS and is recorded here
+  instead. The `-C -C -M` figure is over-inclusive by construction — it
+  attributes `import torch`, `from __future__ import annotations` and
+  `self._interrupt = False` to Eric wherever identical text exists in his
+  files — and is recorded for completeness, not as a target.
+
+  Grant confirmed the licensing calls on 2026-09-09 (strip the headers, clear
+  the 28 lines). The engineering record is here; the licensing conclusion
+  remains his, as the Decision section already states.
+
 AI-Disclosure: Claude (Opus 5) authored; Grant reviewed.

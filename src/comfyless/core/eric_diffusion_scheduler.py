@@ -1,6 +1,3 @@
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
-# https://github.com/EricRollei/Eric_Qwen_Edit_Experiments
 """
 Eric Diffusion Scheduler Registry & Swap Helper
 
@@ -27,8 +24,6 @@ useful again — but with the helper bypassing ``pipe()`` entirely.
 
 Until then, this module is unimported by any node UI.  The tests still
 exercise it to keep it from rotting.
-
-Author: Eric Hiss (GitHub: EricRollei)
 """
 
 from contextlib import contextmanager

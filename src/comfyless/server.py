@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
 """
 comfyless persistent model server.
 
@@ -22,8 +20,6 @@ Security model: see docs/decisions/ADR-001-daemon-socket-security.md
   - All model/LoRA paths validated against --model-base before any load
   - Adapter names sanitized to [a-zA-Z0-9_-] before use
   - Schema validated at socket boundary before any parameter reaches ML code
-
-Author: Eric Hiss (GitHub: EricRollei)
 """
 
 from __future__ import annotations

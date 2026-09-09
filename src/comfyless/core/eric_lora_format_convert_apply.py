@@ -1,6 +1,3 @@
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
-# https://github.com/EricRollei/Eric_Qwen_Edit_Experiments
 """
 LoRA format conversion — apply step (slice 4).
 
@@ -43,8 +40,6 @@ find_matching_plan first; if a plan is found, it converts and routes
 the result through `_load_lora_adapter`.  No conversion attempt is
 made when no plan matches — the existing loader paths handle those
 cases unchanged.
-
-Author: Eric Hiss (GitHub: EricRollei)
 """
 
 from __future__ import annotations
@@ -747,12 +742,15 @@ def _apply_converted_lora_as_delta(
             delta = (B.float() @ A.float()) * float(weight)
             applied_kind = "lora"
 
+        # A converted delta may arrive flattened or otherwise shaped unlike its
+        # target. Reshape is only valid when the element count matches, so
+        # check that first and treat a mismatch as "not applicable to this
+        # target" rather than letting torch decide by raising.
         if delta.shape != param.shape:
-            try:
-                delta = delta.reshape(param.shape)
-            except RuntimeError:
+            if delta.numel() != param.numel():
                 skipped += 1
                 continue
+            delta = delta.reshape(param.shape)
 
         # Backup + merge via the DMR dispatcher (exact-restore backups for
         # quantized targets; byte-identical legacy path for plain params)
@@ -768,15 +766,17 @@ def _apply_converted_lora_as_delta(
 
     # Mark the adapter so set_adapters() can find it (matches how
     # _load_lokr_adapter_direct registers its direct-merge adapters).
-    if not hasattr(transformer, "peft_config"):
-        transformer.peft_config = {}
-    transformer.peft_config[adapter_name] = {
+    registry = getattr(transformer, "peft_config", None)
+    if registry is None:
+        registry = transformer.peft_config = {}
+    registry[adapter_name] = {
         "_type": "converted_lora_direct",
         "_applied_modules": applied_diff + applied_lora,
         "_weight": weight,
     }
-    if not getattr(transformer, "_hf_peft_config_loaded", False):
-        transformer._hf_peft_config_loaded = True
+    # PEFT keys its lookups off this flag; setting it unconditionally is
+    # equivalent here and avoids a read that only ever precedes the write.
+    transformer._hf_peft_config_loaded = True
 
     print(
         f"{log_prefix} direct delta merge: "

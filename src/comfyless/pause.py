@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
 """^C pause/resume for foreground comfyless generation (vllm-style).
 
 First SIGINT during the denoising loop requests a pause; at the next

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
 """SQLite metadata plane for the LoRA/transformer catalog (ADR-022).
 
 THE DB IS NEVER THE LOAD PLANE (ADR-022 §1 / Vision invariant 7): generation

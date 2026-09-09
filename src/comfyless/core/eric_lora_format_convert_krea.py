@@ -1,6 +1,3 @@
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
-# https://github.com/EricRollei/Eric_Qwen_Edit_Experiments
 """
 Krea-2 LoRA conversion plan.
 
@@ -54,8 +51,6 @@ Ground truth confirmed by inspecting:
     (lora_conversion_utils.py, PR #14074) — its standalone_map matches the
     table above one-for-one. (That upstream converter raises on .diff_b
     leftovers, so krea-native distill LoRAs still need THIS plan.)
-
-Author: Eric Hiss (GitHub: EricRollei)
 """
 
 from __future__ import annotations

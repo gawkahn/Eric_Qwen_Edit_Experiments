@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
 """Catalog build orchestration (ADR-022 S1): scan → audit-manifest join → DB.
 
 `build()` is the no-network ingest (Vision invariant 8): it reuses the

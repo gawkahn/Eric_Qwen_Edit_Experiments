@@ -1,6 +1,3 @@
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
-# https://github.com/EricRollei/Eric_Qwen_Edit_Experiments
 """
 Chroma LoRA conversion plan (slice 5).
 
@@ -23,8 +20,6 @@ Ground truth confirmed by inspecting:
   - Chroma1-base & Chroma1-HD transformer parameters (identical)
   - Chubby_Body_Type.safetensors (real Chroma standard LoRA, rank 32)
   - comfyless/core/eric_lora_format_convert_flux.py (Klein plan as template)
-
-Author: Eric Hiss (GitHub: EricRollei)
 """
 
 from __future__ import annotations

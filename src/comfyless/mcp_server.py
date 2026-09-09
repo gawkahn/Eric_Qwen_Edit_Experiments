@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
 """comfyless MCP server (stdio transport).
 
 Adapts the comfyless generate surface to the Model Context Protocol so that

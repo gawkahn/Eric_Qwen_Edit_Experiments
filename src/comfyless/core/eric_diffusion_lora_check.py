@@ -1,6 +1,3 @@
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
-# https://github.com/EricRollei/Eric_Qwen_Edit_Experiments
 """
 Eric Diffusion LoRA Compatibility Checker
 
@@ -8,8 +5,6 @@ Validates a LoRA's key names and tensor dimensions against a loaded transformer
 (for in-loader use) or a model directory's safetensors headers (standalone scan).
 
 No imports from other eric_ modules — safe to import from anywhere.
-
-Author: Eric Hiss (GitHub: EricRollei)
 """
 
 import json

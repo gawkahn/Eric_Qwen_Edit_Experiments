@@ -1,11 +1,9 @@
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
-# https://github.com/EricRollei/Eric_Qwen_Edit_Experiments
 """
 Eric Diffusion Utilities
 Shared helpers for the generic multi-model diffusion loader/generate nodes.
 """
 
+import contextlib
 import gc
 import json
 import os
@@ -2132,15 +2130,30 @@ def quant_cache_fragment(quant_mode: str, skip: tuple = (), only: tuple = ()) ->
 
 # ── Generic pipeline cache ───────────────────────────────────────────────────
 
-_GEN_PIPELINE_CACHE: dict = {
-    "pipeline": None,
-    "pipeline_dict": None,
-    "model_path": None,
-    "cache_key": None,
-}
+#: Components moved individually when a whole-pipeline .to("cpu") is refused.
+_OFFLOAD_COMPONENTS = ("transformer", "vae", "text_encoder", "text_encoder_2")
+
+
+#: Slots the cache carries. Named once so population and eviction cannot drift
+#: apart — the eviction path below rebuilds from this tuple rather than
+#: repeating one assignment per slot, which a fifth slot would silently outgrow.
+_GEN_CACHE_SLOTS = ("pipeline", "pipeline_dict", "model_path", "cache_key")
+
+
+def _empty_gen_cache() -> dict:
+    """A cache mapping with every slot present and unset."""
+    return dict.fromkeys(_GEN_CACHE_SLOTS)
+
+
+_GEN_PIPELINE_CACHE: dict = _empty_gen_cache()
 
 
 def get_gen_pipeline_cache() -> dict:
+    """The live cache mapping.
+
+    Callers mutate what they get back, so this hands out the module-level
+    object itself rather than a copy — the identity is the contract.
+    """
     return _GEN_PIPELINE_CACHE
 
 
@@ -2172,18 +2185,19 @@ def clear_gen_pipeline_cache() -> bool:
         try:
             pipe.to("cpu")
         except Exception:
-            for attr in ("transformer", "vae", "text_encoder", "text_encoder_2"):
-                comp = getattr(pipe, attr, None)
-                if comp is not None:
-                    try:
-                        comp.to("cpu")
-                    except Exception:
-                        pass
+            # Whole-pipeline move refused: fall back to moving each heavy
+            # component on its own, skipping absent ones and tolerating any
+            # single component that refuses.
+            components = (getattr(pipe, name, None) for name in _OFFLOAD_COMPONENTS)
+            # `is not None`, not truthiness: an empty nn.ModuleList is falsy but
+            # still needs moving (code review, 2026-09-09).
+            for comp in (c for c in components if c is not None):
+                with contextlib.suppress(Exception):
+                    comp.to("cpu")
 
-    _GEN_PIPELINE_CACHE["pipeline"] = None
-    _GEN_PIPELINE_CACHE["pipeline_dict"] = None
-    _GEN_PIPELINE_CACHE["model_path"] = None
-    _GEN_PIPELINE_CACHE["cache_key"] = None
+    # Reset in place: callers hold this mapping (see get_gen_pipeline_cache),
+    # so rebinding the global would strand them on the evicted copy.
+    _GEN_PIPELINE_CACHE.update(_empty_gen_cache())
     del pipe
 
     gc.collect()

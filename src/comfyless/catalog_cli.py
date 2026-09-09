@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
 """comfyless catalog CLI (ADR-022) — the METADATA plane, never the load plane.
 
     python -m comfyless.catalog_cli build --model-base … --lora-path … \

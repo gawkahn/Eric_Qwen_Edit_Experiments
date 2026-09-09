@@ -1,6 +1,3 @@
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
-# https://github.com/EricRollei/Eric_Qwen_Edit_Experiments
 """
 Flux / Klein-9B LoRA conversion plans (slice 3).
 
@@ -24,8 +21,6 @@ Ground truth was confirmed by inspecting:
   - comfyless/core/eric_lora_format_convert.py (framework)
   - klein_snofs_v1_1.safetensors (real LoKR LoRA, ai-toolkit, 2026-04)
   - FLUX.2-klein-9B/transformer/*.safetensors (model parameters)
-
-Author: Eric Hiss (GitHub: EricRollei)
 """
 
 from __future__ import annotations

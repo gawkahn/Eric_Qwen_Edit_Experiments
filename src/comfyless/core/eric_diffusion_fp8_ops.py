@@ -1,6 +1,3 @@
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
-# https://github.com/EricRollei/Eric_Qwen_Edit_Experiments
 """ComfyUI scaled-fp8 single-file support (ADR-019 slice C).
 
 Consumes community fp8 checkpoints on the transformer-override path:

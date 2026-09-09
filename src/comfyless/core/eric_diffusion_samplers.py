@@ -1,6 +1,3 @@
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
-# https://github.com/EricRollei/Eric_Qwen_Edit_Experiments
 """
 Eric Diffusion Custom Sampler Schedulers
 
@@ -57,8 +54,6 @@ The "DPM-Solver++ 2M" formulation you may have seen elsewhere is closely
 related but includes extra factors for specific diffusion noise schedules.
 For pure flow matching (linear ODE), AB2 and DPM++2M converge to the
 same update rule, so we use the simpler and more general naming.
-
-Author: Eric Hiss (GitHub: EricRollei)
 """
 
 import math

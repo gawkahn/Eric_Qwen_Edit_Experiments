@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
 """
 Comfyless image generation — pure Python, no ComfyUI.
 
@@ -21,8 +19,6 @@ Two modes:
 In --json mode, structured input is read from stdin and structured
 output is written to stdout.  Human-readable progress goes to stderr.
 See contracts/image_gen_bridge.md for the full schema.
-
-Author: Eric Hiss (GitHub: EricRollei)
 """
 
 from __future__ import annotations

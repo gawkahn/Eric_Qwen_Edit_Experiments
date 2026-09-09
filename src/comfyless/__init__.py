@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
 """comfyless — headless diffusion runtime.
 
 Historically this module installed ComfyUI compatibility shims (``folder_paths``,

@@ -1165,6 +1165,33 @@ _apply_converted_lora_as_delta(
 check("DMR adversarial .weight_scale.diff does NOT write (DMR-3 NEGATIVE)",
       torch.equal(_h3.q.weight_scale, _s_before))
 
+# ADR-045 slice 3d: the delta/param shape reconciliation was re-expressed
+# from "try .reshape(), catch RuntimeError" to an explicit numel guard. The
+# skip set must be identical, and nothing may be written to a param whose
+# element count the delta cannot fill (code review, 2026-09-09 — this path
+# had no battery-level negative case).
+_h5 = _DMRHost()
+_p5_before = _h5.q.weight.clone()
+check("guard fixture is real: the target param has elements to mismatch",
+      _p5_before.numel() == 64)
+_apply_converted_lora_as_delta(
+    _h5, {"q.weight.diff": torch.full((_p5_before.numel() + 3,), 0.5)},
+    "mismatch", 1.0, "[t]")
+check("numel-mismatched delta is SKIPPED, param untouched (slice 3d guard)",
+      torch.equal(_h5.q.weight, _p5_before))
+
+# The positive half, which is what makes the negative half discriminating: a
+# delta with MATCHING numel but a flat shape still reshapes and merges, so the
+# skip above is the guard firing, not the delta being inert.
+_h6 = _DMRHost()
+_p6_before = _h6.q.weight.clone()
+_apply_converted_lora_as_delta(
+    _h6, {"q.weight.diff": torch.full((_p6_before.numel(),), 0.5)},
+    "flat", 1.0, "[t]")
+check("numel-matching flat delta DOES reshape and merge (slice 3d guard)",
+      not torch.equal(_h6.q.weight, _p6_before)
+      and _h6.q.weight.shape == _p6_before.shape)
+
 # req 25: LIFO ledger warns on out-of-order unload and pops correctly.
 fp8ops.record_direct_merge(_h, "adapterA")
 fp8ops.record_direct_merge(_h, "adapterB")

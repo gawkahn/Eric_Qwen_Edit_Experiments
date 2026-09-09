@@ -1,6 +1,3 @@
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
-# https://github.com/EricRollei/Eric_Qwen_Edit_Experiments
 """
 Eric Diffusion Manual Denoising Loop
 
@@ -37,8 +34,6 @@ top of the standard classical CFG formula.  Qwen latent packing happens
 to be byte-identical to Flux's so ``upscale_flux_latents`` is reused for
 Qwen multistage refinement.  Qwen-Image-Edit (image-conditioning) is
 out of scope — that's a separate pipeline with its own manual loop work.
-
-Author: Eric Hiss (GitHub: EricRollei)
 """
 
 import inspect
@@ -980,8 +975,7 @@ def generate_flux(
 # and the multistage node path used to call it, but that made this module
 # unimportable outside ComfyUI (the comfyless shim never stubbed `bislerp`,
 # so `upscale_flux_latents` raised AttributeError under the CLI) and it
-# would have dragged GPL-3.0 code into a CC BY-NC / Commercial dual-licensed
-# package.  See ADR-045.
+# would have dragged GPL-3.0 code into this package.  See ADR-045.
 #
 # Behaviour was matched to ComfyUI's by black-box probing, not by reading
 # its source.  The two agree to ~2e-06 (float32 rounding) on every input

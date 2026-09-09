@@ -1,6 +1,3 @@
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
-# https://github.com/EricRollei/Eric_Qwen_Edit_Experiments
 """
 Eric LoRA Format Converter — framework / shared infrastructure.
 
@@ -26,8 +23,6 @@ the standard way.
 
 This module is import-safe outside ComfyUI: no folder_paths, no comfy.*
 dependencies; only torch and the Python stdlib.
-
-Author: Eric Hiss (GitHub: EricRollei)
 """
 
 from __future__ import annotations

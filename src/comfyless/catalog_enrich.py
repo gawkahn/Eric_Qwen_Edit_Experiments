@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Eric Hiss. All rights reserved.
-# Licensed under the terms in LICENSE.txt (CC BY-NC 4.0 / Commercial dual license).
 """Catalog enrichment tier 2 — civitai SHA-256 hash lookup (ADR-022 §6).
 
 THE ONLY NETWORK CODE IN THE CATALOG SERVICE. `build` is offline by
