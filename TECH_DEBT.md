@@ -3083,13 +3083,27 @@ production and the thing the tests exercise no longer share a dependency tree,
 and a behaviour difference in (say) `huggingface-hub` would be invisible to one
 of them.
 
-**Why not now:** aligning them is a real decision, not a mechanical fix. Either
-the runtime repo's lock becomes authoritative and the node repo re-resolves
-against it (dragging 37 transitive bumps into the ComfyUI-adjacent environment
-at once), or the node repo's lock is authoritative and the runtime repo pins
-back (giving up the fresh resolution it was validated on), or the divergence is
-accepted and the daemon is deliberately moved onto the runtime repo's venv. The
-third is probably right and belongs with slice 8's infrastructure cutover.
+**Correction 2026-09-09 (same day, prompted by Grant):** the framing above
+originally offered three options — re-resolve the node repo against the newer
+tree, pin the runtime repo back, or move the daemon. The first two are
+contrivances. There is no design reason the daemon runs from the node repo's
+venv at all: `systemd/comfyless@.service` hardcodes that path in four places
+because it was written in July, months before the split, and slice 7 did not
+touch it because ADR-045 assigns the unit to slice 8. ADR-045 ALREADY specifies
+the destination — `ExecStart=/…/.venv/bin/comfyless serve` — and that venv is
+comfyless_diffusion's.
+
+So this is not a lockfile decision. It is an unfinished cutover. Once the unit
+points at the repo that owns the code, on the Python that repo targets, against
+the tree its own battery validates, the divergence stops being a
+"tests-don't-test-what-runs" problem and becomes two projects with two locks,
+which is ordinary. The node repo's lock then only has to be good enough for the
+node pack's own imports.
+
+**Why not now:** it is slice 8's declared scope, and it is an ops change to a
+live service that wants a deliberate restart-and-verify rather than a drive-by
+at the end of a long slice. Everything it needs already exists: the sibling
+venv has the `comfyless` console script, accepts `--serve`, and runs 3.14.7.
 
 **Trigger:** slice 8, when the systemd unit is rewritten onto the console
 script — that is the moment the "which venv does the daemon use" question has to
