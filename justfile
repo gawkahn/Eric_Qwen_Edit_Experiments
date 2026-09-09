@@ -21,7 +21,8 @@ deps-cve:
     echo "== pip-audit (PyPI advisory DB + PYSEC) =="
     uv export --format requirements-txt --no-emit-project --quiet \
       | uv run --with pip-audit==2.10.1 pip-audit -r /dev/stdin --progress-spinner=off \
-          --ignore-vuln PYSEC-2026-3447 --ignore-vuln CVE-2025-3000 || rc=1
+          --ignore-vuln PYSEC-2026-3447 --ignore-vuln CVE-2025-3000 \
+          --ignore-vuln GHSA-4j2p-28q2-5m79 || rc=1
     echo "== osv-scanner (OSV; uv.lock native; ignores from osv-scanner.toml) =="
     mise exec -- osv-scanner scan source --lockfile=uv.lock || rc=1
     exit $rc

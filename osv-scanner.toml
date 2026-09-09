@@ -10,3 +10,7 @@ reason = "torch 2.11.0 (alias CVE-2025-3000): no fixed release exists. Trigger: 
 [[IgnoredVulns]]
 id = "PYSEC-2026-3447"
 reason = "setuptools 81.0.0: fix is 83.0.0 but torch 2.11.0 pins setuptools<82, so the fix is unreachable. Trigger: next torch bump."
+
+[[IgnoredVulns]]
+id = "GHSA-4j2p-28q2-5m79"
+reason = "accelerate 1.13.0 — path traversal + malicious-model DoS via a sharded checkpoint's `weight_map`. REJECTED UPSTREAM: maintainer SunMarc closed huggingface/accelerate#4067 with \"This is not a real security threat so not accepting PRs to fix this\", pointing at accelerate's SECURITY.md — loading a checkpoint you do not trust is already outside their threat model, and a hostile checkpoint has far worse vectors available than a crafted weight_map. No fixed release exists or is planned. Grant accepted 2026-09-09. NOTE this project DOES load caller-supplied checkpoints (ADR-019 parses weight-file content, a §12 surface), so the acceptance rests on the operator obtaining models deliberately, not on the input being trusted. Trigger: re-check if upstream reverses, if a fix ships, or if a path ever appears where comfyless loads a checkpoint it did not get from the operator."

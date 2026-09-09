@@ -3046,3 +3046,52 @@ first (fixes exist). For accelerate, check whether a fix has landed since; if
 not, add a documented ignore with a re-check trigger rather than leaving it
 unrecorded. Note the pins live in BOTH repos' pyproject/uv.lock now — bump both,
 or the node pack and the runtime diverge.
+
+**Update 2026-09-09 (same day) — two of three closed:**
+- **cryptography PYSEC-2026-3552: FIXED.** 49.0.0 -> 50.0.1 in both repos.
+  Transitive via `mcp -> pyjwt[crypto]`, a path the stdio MCP server never
+  exercises, so exposure was almost certainly nil — taken because the fix was
+  free. Note comfyless_diffusion was NEVER exposed: its lockfile was generated
+  fresh on 2026-09-09 and was born at 50.0.1.
+- **accelerate GHSA-4j2p-28q2-5m79: ACCEPTED, documented ignore.** Rejected
+  upstream — maintainer SunMarc closed huggingface/accelerate#4067 with "This is
+  not a real security threat so not accepting PRs to fix this" (verified against
+  the GitHub API, not taken second-hand). No fix exists or is planned. Entry in
+  `osv-scanner.toml` + the pip-audit flag list, with the caveat recorded there
+  that THIS project does load caller-supplied checkpoints, so the acceptance
+  rests on the operator obtaining models deliberately.
+- **transformers GHSA-xrqw-3rrv-vx5w: STILL OPEN.** 5.5.3 -> 5.10.0 is five
+  minors under a library this code uses deeply. Grant's call: its own slice with
+  a full battery and live validation. This is now the only unaddressed finding,
+  and it is the reason `supply-chain-lock` stays red.
+
+## 2026-09-09 — the two repos' lockfiles diverged at birth (37 of 105 packages)
+
+**What:** `comfyless_diffusion`'s `uv.lock` was generated fresh during ADR-045
+slice 6 rather than carried over, so uv resolved the transitive tree against
+that day's PyPI while the node repo's lock still held resolutions months old.
+Measured the same day: of 105 packages present in both, **37 differ** —
+including `huggingface-hub` 1.11.0 vs 1.16.1, `cuda-bindings` 13.2.0 vs 13.3.1,
+`fsspec`, `regex`, `pydantic`, `anyio`, `certifi`. The DIRECT pins match, since
+those are exact in both pyprojects; the drift is entirely transitive.
+
+**Why this is not cosmetic:** after slice 7 the systemd daemon runs
+comfyless SOURCE from the sibling checkout inside the NODE repo's `.venv`, i.e.
+against the node repo's transitive set. But comfyless's own 29-suite battery
+validates that same source against ITS transitive set. So the thing that runs in
+production and the thing the tests exercise no longer share a dependency tree,
+and a behaviour difference in (say) `huggingface-hub` would be invisible to one
+of them.
+
+**Why not now:** aligning them is a real decision, not a mechanical fix. Either
+the runtime repo's lock becomes authoritative and the node repo re-resolves
+against it (dragging 37 transitive bumps into the ComfyUI-adjacent environment
+at once), or the node repo's lock is authoritative and the runtime repo pins
+back (giving up the fresh resolution it was validated on), or the divergence is
+accepted and the daemon is deliberately moved onto the runtime repo's venv. The
+third is probably right and belongs with slice 8's infrastructure cutover.
+
+**Trigger:** slice 8, when the systemd unit is rewritten onto the console
+script — that is the moment the "which venv does the daemon use" question has to
+be answered anyway. Do not close this by re-locking one side without deciding
+which is authoritative.
