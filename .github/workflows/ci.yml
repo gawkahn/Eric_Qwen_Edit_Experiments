@@ -76,6 +76,19 @@ jobs:
           "${{ github.event.pull_request.head.sha }}"
 
   tests:
+    # ── ADR-045 slice 7: BLOCKED ON THE SIBLING REPOSITORY ──────────────────
+    # uv.lock resolves comfyless-diffusion from `../comfyless_diffusion`, a
+    # path source. A GitHub runner checks out this repo alone, so `uv sync
+    # --locked` cannot satisfy it and this job would fail on every push. It is
+    # SKIPPED rather than left red, because a permanently-red job trains people
+    # to ignore CI. Coverage while skipped: LOCAL `just tests` in both repos
+    # only. comfyless_diffusion has no CI at all yet (no .github/, no remote),
+    # so nothing runs there — do not read this skip as "covered elsewhere".
+    # RE-ENABLE by deleting this `if:` when comfyless_diffusion has a remote and
+    # the dependency becomes the git+https pin ADR-045 describes.
+    # See TECH_DEBT 2026-09-09 "the node pack depends on comfyless-diffusion by
+    # local path".
+    if: false
     name: tests (standalone suite battery)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -107,6 +120,19 @@ jobs:
         run: mise exec just -- just tests
 
   typecheck:
+    # ── ADR-045 slice 7: BLOCKED ON THE SIBLING REPOSITORY ──────────────────
+    # uv.lock resolves comfyless-diffusion from `../comfyless_diffusion`, a
+    # path source. A GitHub runner checks out this repo alone, so `uv sync
+    # --locked` cannot satisfy it and this job would fail on every push. It is
+    # SKIPPED rather than left red, because a permanently-red job trains people
+    # to ignore CI. Coverage while skipped: LOCAL `just tests` in both repos
+    # only. comfyless_diffusion has no CI at all yet (no .github/, no remote),
+    # so nothing runs there — do not read this skip as "covered elsewhere".
+    # RE-ENABLE by deleting this `if:` when comfyless_diffusion has a remote and
+    # the dependency becomes the git+https pin ADR-045 describes.
+    # See TECH_DEBT 2026-09-09 "the node pack depends on comfyless-diffusion by
+    # local path".
+    if: false
     name: typecheck (pyright ratchet)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -159,7 +185,45 @@ jobs:
           done <<< "$current_lines"
           exit $rc
 
+  # ── Always-on half of the supply chain ──────────────────────────────────────
+  # These two gates read uv.lock as a FILE and need no dependency resolution, so
+  # the sibling-path problem that skips `supply-chain` does not reach them. They
+  # are split out rather than skipped with it (security review 2026-09-09, HIGH):
+  # the tier-3 check is the only automated guard on the local-path exception this
+  # slice added, and leaving it off would mean a future widening lands silently.
+  supply-chain-lock:
+    name: supply chain (lock-file gates — no install)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      # stdlib only (tomllib): deliberately NOT `uv run`, which would sync.
+      - name: tier-3 hash sources (§11)
+        run: python3 scripts/check_lock_sources.py
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - run: mise trust ./mise.toml
+      - run: mise install
+      # osv-scanner reads the lockfile directly; documented ignores live in
+      # osv-scanner.toml.
+      - name: cve scan — lockfile (§11 gate)
+        run: mise exec -- osv-scanner scan source --lockfile=uv.lock
+
   supply-chain:
+    # ── ADR-045 slice 7: BLOCKED ON THE SIBLING REPOSITORY ──────────────────
+    # uv.lock resolves comfyless-diffusion from `../comfyless_diffusion`, a
+    # path source. A GitHub runner checks out this repo alone, so `uv sync
+    # --locked` cannot satisfy it and this job would fail on every push. It is
+    # SKIPPED rather than left red, because a permanently-red job trains people
+    # to ignore CI. Coverage while skipped: LOCAL `just tests` in both repos
+    # only. comfyless_diffusion has no CI at all yet (no .github/, no remote),
+    # so nothing runs there — do not read this skip as "covered elsewhere".
+    # RE-ENABLE by deleting this `if:` when comfyless_diffusion has a remote and
+    # the dependency becomes the git+https pin ADR-045 describes.
+    # See TECH_DEBT 2026-09-09 "the node pack depends on comfyless-diffusion by
+    # local path".
+    if: false
     name: supply chain (sources + license + cve)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -224,7 +288,7 @@ jobs:
         run: >
           uv run --with semgrep==1.169.0 semgrep scan
           --config p/python --config p/security-audit --config p/secrets
-          --error --quiet --metrics=off src/comfyless/ nodes/ pipelines/ scripts/
+          --error --quiet --metrics=off nodes/ pipelines/ scripts/
 
   secrets:
     name: secret scan (gitleaks)

@@ -8,7 +8,8 @@
 # and nothing was dropped — the 6 diagnostics travelled with the ComfyUI
 # stubs from comfyless/__init__.py to comfy_stub.py, which is why that file
 # was added to [tool.pyright] include rather than left unchecked.
-src=447
+# ADR-045 slice 7: the `src` root (447) left with comfyless_diffusion, which
+# carries its own pyright config now. What remains is the node pack.
 comfy_stub.py=6
 nodes=438
 pipelines=94

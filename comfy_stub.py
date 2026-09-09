@@ -9,8 +9,8 @@ consumer — so they live here, on the node-pack side of the boundary, and are
 installed explicitly by the suites that need them.
 
 Explicit is the point: a suite that imports ``nodes.*`` now says so, instead of
-depending on an unrelated import's side effect.  ``scripts/lora_audit.py``
-already carried its own copy of this stub for the same reason (ADR §2, F-4).
+depending on an unrelated import's side effect.  ``scripts/lora_audit.py`` carried its own copy of this stub for the same
+reason before it moved to comfyless_diffusion (ADR-045 slice 7).
 
 Usage, before the first ``nodes.*`` / ``pipelines.*`` import::
 
@@ -23,6 +23,7 @@ the guard is ``sys.modules`` membership, exactly as the original shims were.)
 
 from __future__ import annotations
 
+import pathlib
 import sys
 import types
 
@@ -61,3 +62,32 @@ def install() -> None:
         cmm.throw_exception_if_processing_interrupted = lambda: None
         sys.modules["comfy.model_management"] = cmm
         sys.modules["comfy"].model_management = cmm
+
+
+# ── ADR-045 slice 7: comfyless lives in another repository ───────────────────
+# Suites that read comfyless SOURCE (AST guards, "no raw write" inspections)
+# cannot use a repo-relative path any more: the package is an installed
+# dependency, so its files are wherever uv put them. Resolve through the import
+# system instead — correct for both an editable install and a real wheel, since
+# the package is pure Python and ships its .py files either way.
+
+def cf_path(dotted: str) -> "pathlib.Path":
+    """Filesystem path of an installed comfyless module."""
+    import importlib
+    import pathlib
+
+    origin = importlib.import_module(dotted).__file__
+    if origin is None:
+        # Namespace package, frozen module, or an exotic loader — the source
+        # inspections that call this cannot work without a real file, and a
+        # clear message beats a TypeError three frames down.
+        raise RuntimeError(
+            f"{dotted} has no __file__; source inspection needs an installed "
+            f"comfyless with real .py files on disk"
+        )
+    return pathlib.Path(origin)
+
+
+def cf_src(dotted: str) -> str:
+    """Source text of an installed comfyless module."""
+    return cf_path(dotted).read_text()

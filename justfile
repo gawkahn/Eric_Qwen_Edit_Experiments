@@ -104,4 +104,4 @@ tests:
 sast:
     uv run --with semgrep==1.169.0 semgrep scan \
       --config p/python --config p/security-audit --config p/secrets \
-      --error --quiet --metrics=off src/comfyless/ nodes/ pipelines/ scripts/
+      --error --quiet --metrics=off nodes/ pipelines/ scripts/

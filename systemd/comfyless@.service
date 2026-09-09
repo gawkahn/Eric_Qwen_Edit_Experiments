@@ -22,7 +22,7 @@
 
 [Unit]
 Description=comfyless model server (GPU %i)
-Documentation=file:///home/gawkahn/projects/ai-lab/code/Eric_Qwen_Edit_Experiments/src/comfyless/README.md
+Documentation=file:///home/gawkahn/projects/ai-lab/code/comfyless_diffusion/src/comfyless/README.md
 # Without these, RestartSec=5 vs the default burst window (5 in 10s) means the
 # limit can never trip and a persistent fault (e.g. wedged GPU + retrying MCP
 # client) load/crash-loops forever (infra audit 2026-07-17, SHOULD 1).

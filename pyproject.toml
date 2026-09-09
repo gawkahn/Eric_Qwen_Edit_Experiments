@@ -4,7 +4,10 @@ version = "3.1.0"
 description = "ComfyUI nodes for multi-model diffusion (Qwen-Image, Flux, Chroma, SDXL, SD3.5, Pony, Illustrious) + Qwen-Edit — 32 nodes for editing, generation, multi-stage, LoRA stacking, Spectrum acceleration, ControlNet-guided generation, and 2× upscale VAE"
 readme = "README.md"
 license = { file = "LICENSE.txt" }
-requires-python = ">=3.11"
+# ADR-045: the node pack stays on 3.12 because it runs inside ComfyUI's
+# interpreter; comfyless_diffusion targets 3.14. The split boundary and the
+# Python boundary are deliberately the same line.
+requires-python = ">=3.12,<3.13"
 authors = [
     { name = "Eric Hiss", email = "eric@historic.camera" }
 ]
@@ -12,6 +15,12 @@ maintainers = [
     { name = "Eric Hiss", email = "eric@historic.camera" }
 ]
 dependencies = [
+    # ── The runtime core, extracted by ADR-045 slice 6 ──────────────────
+    # Exact-pinned per global §11. Resolved from the local checkout via
+    # [tool.uv.sources] below until the repository has a remote and a tag,
+    # at which point this becomes the git+https pin ADR-045 describes and
+    # requirements.txt can carry it too (see TECH_DEBT 2026-09-09).
+    "comfyless-diffusion==0.1.0",
     # ── Comfyless dep-divergence rule (ADR-013, 2026-05-16) ─────────────────
     # The comfyless dev/test environment is the uv-managed `.venv` created by
     # `uv sync`. The pin set below is chosen for the comfyless deploy
@@ -84,56 +93,27 @@ dependencies = [
 # out per global §15 (they deliberately violate the contracts they test).
 # Baseline is per-root now (ADR-042) — .claude/typecheck-baseline, ratchet
 # only goes down, per root.
-[build-system]
-# ADR-045 slice 5. This repository had NO build-system until now, which is why
-# nothing had ever installed the package (the systemd unit's PYTHONPATH line
-# and start-mcpo.sh both existed to work around exactly that).
-#
-# hatchling over setuptools, decided 2026-09-09: everything under the package
-# directory ships by default, so the 10 recipe TOMLs, examples/*.json and the
-# keyframe JPEGs — all loaded at runtime via Path(__file__).parent (ADR-045
-# "Implementation hazards", package data) — are included by construction
-# rather than by a glob someone has to remember to extend. comfyless is pure
-# Python, so setuptools' compiled-extension advantage does not apply here.
-#
-# NOTE (§11): this pin is fetched into an isolated build env and is NOT
-# covered by uv.lock's integrity hashes. It is a hand-owned pin — see the
-# TECH_DEBT entry of 2026-09-09 so the deps-report loop knows to look at it.
-requires = ["hatchling==1.32.0"]
-build-backend = "hatchling.build"
-
-[tool.hatch.build.targets.wheel]
-# src layout: the ONLY thing this wheel contains is comfyless. `nodes/` and
-# `pipelines/` are the ComfyUI node pack — they stay in the working tree and
-# are deliberately not packaged (ADR-045: the node pack remains in place,
-# unrenamed, and will consume core as a pinned dependency after the split).
-packages = ["src/comfyless"]
-
-[project.scripts]
-# The daemon/CLI entry points. `comfyless` is the primary one; the rest expose
-# surfaces that were only reachable as `python -m comfyless.<mod>` before.
-comfyless = "comfyless.generate:main"
-comfyless-refine = "comfyless.refine:main"
-comfyless-enhance = "comfyless.enhance:_cli"
-comfyless-video = "comfyless.video:main"
-comfyless-catalog = "comfyless.catalog_cli:cli"
-comfyless-mcp = "comfyless.mcp_server:main"
-
 [tool.pyright]
 # comfy_stub.py is repo-root test support (ADR-045 slice 5): it holds the
 # ComfyUI stubs that comfyless/__init__.py used to install. Included so
 # that code stays checked after the move instead of silently leaving the
 # checked set along with the ~6 diagnostics it carried.
-include = ["src/comfyless", "nodes", "pipelines", "comfy_stub.py"]
+include = ["nodes", "pipelines", "comfy_stub.py"]
 # integrations/openwebui/generate_image_tool.py imports fastapi/starlette/
 # open_webui.* which resolve only inside the OpenWebUI container it's
 # installed into — pyright is checking it against the wrong runtime by
 # construction (ADR-042 §4). Excluded, not "fixed".
-exclude = ["**/__pycache__", "src/comfyless/integrations/openwebui/generate_image_tool.py"]
+exclude = ["**/__pycache__"]
 pythonVersion = "3.12"
 venvPath = "."
 venv = ".venv"
 typeCheckingMode = "basic"
+
+[tool.uv.sources]
+# Local checkout, editable so edits on either side are live without a release
+# step (ADR-045 "Dependency mechanism"). This is the DEV wiring; the published
+# form is the git+https pin named in the dependency comment above.
+comfyless-diffusion = { path = "../comfyless_diffusion", editable = true }
 
 [dependency-groups]
 # Dev-only tooling for the comfyless uv path (ADR-013). NOT part of

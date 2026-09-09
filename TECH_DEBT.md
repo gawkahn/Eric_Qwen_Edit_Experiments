@@ -2874,6 +2874,12 @@ and it interacts with the slice-6 3.14 environment.
 next `deps-report` sweep — whichever comes first. Note the pin is invisible to
 `osv-scanner` today because it is not in the lockfile.
 
+**Resolved: 2026-09-09 (ADR-045 slice 7)** — for THIS repository: slice 7
+deleted its `[build-system]`, so it no longer builds anything and carries no
+build-backend pin. The debt travelled with the package to
+`comfyless_diffusion`, whose pyproject holds the hatchling pin and whose copy
+of TECH_DEBT.md carries this entry forward. Not fixed — relocated.
+
 **Amendment 2026-09-09 (security-auditor, same day):** the entry above
 understated the risk on two axes. (a) SCOPE — build isolation resolves
 hatchling's own dependencies (packaging, pathspec, pluggy, trove-classifiers)
@@ -2903,6 +2909,12 @@ here was the *smaller* one: rename the baseline key and record the accounting.
 and comfyless's root becomes `src` in a repo where nothing else lives there —
 at which point this may simply stop mattering. Revisit sooner if anything else
 is added under `src/`.
+
+**Resolved: 2026-09-09 (ADR-045 slice 7)** — exactly as predicted. The `src`
+root left this repository with the package; the baseline here is now
+`comfy_stub.py=6 nodes=438 pipelines=94`. In `comfyless_diffusion` the root IS
+`src` in a repo where nothing else lives under it, so the ambiguity the entry
+worried about cannot arise there.
 
 ## 2026-09-09 — `resolve_component_path` imports `folder_paths` from live `sys.path`
 
@@ -2959,3 +2971,78 @@ where someone would look.
 slice-7 split (where `eric_diffusion_utils.py` moves to the new repo and its
 gate configuration is re-decided anyway). Splitting the module is the option I
 would take first — it makes the surface gateable without the noise.
+
+## 2026-09-09 — the node pack depends on comfyless-diffusion by LOCAL PATH
+
+**What:** ADR-045 slice 7 wired `comfyless-diffusion==0.1.0` as a dependency,
+but `comfyless_diffusion` has no remote yet (deliberate — Grant, 2026-09-09:
+no remote until it is a full working independent unit). So the dependency
+resolves through `[tool.uv.sources] { path = "../comfyless_diffusion",
+editable = true }`, which is a DEV-BOX-ONLY wiring. Three consequences, all
+live right now:
+
+1. **`requirements.txt` cannot carry it.** A path source is not expressible
+   there, so the ComfyUI Manager install path (`pip install -r
+   requirements.txt`) now yields a node pack with NO comfyless at all — and
+   every module under `nodes/` imports `comfyless.core.*` at module top. The
+   pyproject ↔ requirements.txt direct-dep agreement rule in CLAUDE.md has a
+   documented exception for this, but the exception is a gap, not a fix.
+2. **Three CI jobs are skipped** (`tests`, `typecheck`, `supply-chain`) — a
+   runner checking out this repo alone cannot resolve a sibling path, so
+   `uv sync --locked` fails. They carry `if: false` with a pointer here.
+3. **The tier-3 supply-chain gate carries a named exception** in
+   `scripts/check_lock_sources.py` admitting exactly this one name at exactly
+   this one path.
+
+**Why not now:** the fix is a remote plus a tag, and the decision to hold the
+remote until the package is a complete working unit is deliberate and correct —
+publishing a half-finished extraction is harder to walk back than a local path.
+
+**Trigger:** the moment `comfyless_diffusion` gets a remote. Then, in one
+slice: replace the path source with
+`comfyless-diffusion @ git+https://github.com/gawkahn/comfyless_diffusion@<tag>`,
+add it to `requirements.txt`, DELETE the `check_lock_sources.py` exception,
+and delete the three `if: false` guards. Each of those three is a deliberate
+loosening that must not outlive its reason.
+
+**Amendment 2026-09-09 (security review, MEDIUM — dependency confusion):**
+`comfyless-diffusion` is an UNREGISTERED PyPI name (verified 404 that day) and
+it sits in `[project.dependencies]`, where `pip` — which ignores
+`[tool.uv.sources]` — will try to resolve it from the index. Today that fails
+loudly. But the requirements.txt breakage above is the funnel: a downstream user
+whose node pack dies with `ModuleNotFoundError: comfyless` will reasonably type
+`pip install comfyless-diffusion`, which executes whatever a squatter published.
+**Never let a bare `comfyless-diffusion==X` line reach requirements.txt or any
+user-facing install instruction — the `git+https` form only.** Cheap mitigation
+available now: reserve the name on PyPI.
+
+## 2026-09-09 — three NEW CVEs in the locked dependency set (§11 MUST)
+
+**What:** `osv-scanner scan source --lockfile=uv.lock` reports three findings
+that are NOT in `osv-scanner.toml`'s documented-ignore list, i.e. genuinely new
+since the 2026-07-16 batch:
+
+| Advisory | Severity | Package | Locked | Fixed in |
+|---|---|---|---|---|
+| `PYSEC-2026-3552` | 8.2 | cryptography | 49.0.0 | **50.0.0** |
+| `GHSA-xrqw-3rrv-vx5w` | 7.1 | transformers | 5.5.3 | **5.10.0** |
+| `GHSA-4j2p-28q2-5m79` | 7.1 | accelerate | 1.13.0 | (none listed) |
+
+Two of the three have a fixed release available. Found while wiring the
+split-out `supply-chain-lock` CI job in ADR-045 slice 7 — the gate was not
+introduced by that slice, it had simply not been looked at during the 17 days
+this workstream was idle, and the `supply-chain` job that would have shown it
+red is one of the three skipped by the sibling-path problem.
+
+**Why not now:** global §11 makes CVE bumps a MUST that preempts other work, and
+they are also explicitly SEPARATE slices — one commit per bump, with the
+changelog link and audit output in the body. Folding three dependency bumps into
+the tail of a repo-split slice would violate both rules at once. `transformers`
+5.5.3 -> 5.10.0 in particular is five minor versions across a library this repo
+uses deeply; it needs its own slice and a full battery run, not a drive-by.
+
+**Trigger: NEXT SESSION, before other work.** Take cryptography and transformers
+first (fixes exist). For accelerate, check whether a fix has landed since; if
+not, add a documented ignore with a re-check trigger rather than leaving it
+unrecorded. Note the pins live in BOTH repos' pyproject/uv.lock now — bump both,
+or the node pack and the runtime diverge.

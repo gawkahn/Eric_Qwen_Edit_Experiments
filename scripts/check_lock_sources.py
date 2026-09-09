@@ -21,6 +21,10 @@ import tomllib
 # Source kinds that carry (or are) hash-verified / local-trusted artifacts.
 _REGISTRY = "registry"
 _LOCAL_SELF = {"editable", "virtual"}  # our own project root, source "."
+# The one non-registry dependency this repo is allowed to carry, pending the
+# other repository getting a remote. Both fields are matched, not just the kind.
+_SIBLING_CORE_NAME = "comfyless-diffusion"
+_SIBLING_CORE_PATH = "../comfyless_diffusion"
 
 
 def find_offenders(lock: dict) -> list[tuple[str, str, object]]:
@@ -33,6 +37,16 @@ def find_offenders(lock: dict) -> list[tuple[str, str, object]]:
         if kind == _REGISTRY:
             continue
         if kind in _LOCAL_SELF and source.get(kind) == ".":
+            continue
+        if (pkg.get("name") == _SIBLING_CORE_NAME
+                and kind == "editable"
+                and source.get(kind) == _SIBLING_CORE_PATH):
+            # ADR-045 slice 7: the runtime core is a sibling checkout on this
+            # machine, not a registry artifact, because comfyless_diffusion has
+            # no remote yet. Named exactly — the name AND the path must both
+            # match, so this cannot widen into "any editable path is fine".
+            # DELETE THIS when the git+https pin lands (TECH_DEBT 2026-09-09,
+            # "the node pack depends on comfyless-diffusion by local path").
             continue
         offenders.append((pkg.get("name", "?"), kind or "none", source.get(kind) if kind else None))
     return offenders

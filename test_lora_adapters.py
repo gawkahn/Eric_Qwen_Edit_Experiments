@@ -2,7 +2,7 @@
 """ADR-046 (ADR-045 slice 3c): comfyless.core.lora_adapters == the original.
 
 Runs the node-pack module (``nodes/eric_qwen_edit_lora.py``) and the
-comfyless rewrite (``src/comfyless/core/lora_adapters.py``) SIDE BY SIDE on the
+comfyless rewrite (``comfyless/core/lora_adapters.py (comfyless_diffusion)``) SIDE BY SIDE on the
 same inputs in the same process and compares outputs bitwise. No goldens:
 while the original lives in the repo the live differential is stronger.
 
@@ -41,7 +41,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO))
-import comfy_stub; comfy_stub.install()  # ADR-045 slice 5: stubs live here now
+import comfy_stub; comfy_stub.install()
+
+# ADR-045 slice 7: comfyless source is read through the import system —
+# see cf_path()/cf_src() in comfy_stub.py.
 
 import torch
 import torch.nn as nn
@@ -617,7 +620,7 @@ print(f"        (original on the wide model: {'stripped' if o_wide[0].startswith
 #  Guards
 # ═══════════════════════════════════════════════════════════════════════
 print("── G. structural guards ─────────────────────────────────────────")
-src = (REPO / "src" / "comfyless" / "core" / "lora_adapters.py").read_text()
+src = comfy_stub.cf_src("comfyless.core.lora_adapters")
 body = src.split("def _merge_direct(")[1].split("\ndef ")[0]
 check("G1 _merge_direct routes every write through apply_merge_delta (DMR)", "apply_merge_delta(" in body)
 check("G2 _merge_direct has no raw param.data.add_ (ADR-019 req 24 NEGATIVE)", "param.data.add_" not in body)
@@ -643,8 +646,8 @@ check("G6 new module imports nothing from nodes/ or ComfyUI",
 check("G7 new module has no Eric Hiss copyright header", "Copyright (c) 2026 Eric Hiss" not in src)
 check("G8 src/comfyless/ no longer imports nodes.eric_qwen_edit_lora",
       not any("nodes.eric_qwen_edit_lora" in p.read_text()
-              for p in (REPO / "src" / "comfyless").rglob("*.py")),
-      str([str(p) for p in (REPO / "src" / "comfyless").rglob("*.py") if "nodes.eric_qwen_edit_lora" in p.read_text()]))
+              for p in comfy_stub.cf_path("comfyless").parent.rglob("*.py")),
+      str([str(p) for p in comfy_stub.cf_path("comfyless").parent.rglob("*.py") if "nodes.eric_qwen_edit_lora" in p.read_text()]))
 
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

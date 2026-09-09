@@ -48,7 +48,12 @@ This repo uses two tools deliberately:
 - **Comfyless dev path** — `uv` is the preferred tool for local development, testing, and reproducibility work. `pyproject.toml` is the human-edited source of truth for dep declarations; `uv.lock` is the machine-generated full transitive lock (kept in version control so `uv sync` is reproducible across machines). `.python-version` pins the interpreter.
 
 Rules:
-- **`pyproject.toml` and `requirements.txt` must agree on direct deps at all times** — both list the same 17 top-level pins in the same order (`torch`, `torchvision`, `torchao`, `diffusers`, `transformers`, `accelerate`, `peft`, `safetensors`, `pillow`, `numpy`, `mcp`, `click`, `scipy`, then the tokenizer backends `sentencepiece`, `protobuf`, `tiktoken`, `ftfy`). Any dep bump edits both. `torchvision` must track `torch`'s minor (2.11 ↔ 0.26). **Documented exception (ADR-033):** `av` (video encode) is pyproject-only — the node pack never imports it, so it deliberately does NOT appear in `requirements.txt`.
+- **`pyproject.toml` and `requirements.txt` must agree on direct deps at all times** — both list the same 17 top-level pins in the same order (`torch`, `torchvision`, `torchao`, `diffusers`, `transformers`, `accelerate`, `peft`, `safetensors`, `pillow`, `numpy`, `mcp`, `click`, `scipy`, then the tokenizer backends `sentencepiece`, `protobuf`, `tiktoken`, `ftfy`). Any dep bump edits both. `torchvision` must track `torch`'s minor (2.11 ↔ 0.26). **Documented exception (ADR-045 slice 7):** `comfyless-diffusion==0.1.0` is
+pyproject-only. It resolves from the local checkout via `[tool.uv.sources]`
+because the repository has no remote yet, and a path source is not something
+`requirements.txt` can express for ComfyUI Manager. It joins requirements.txt
+as a `git+https` pin when the remote exists (TECH_DEBT 2026-09-09).
+**Documented exception (ADR-033):** `av` (video encode) is pyproject-only — the node pack never imports it, so it deliberately does NOT appear in `requirements.txt`.
 - **`uv.lock` is regenerated whenever `pyproject.toml` changes** — `uv lock` after the edit, then commit pyproject + requirements + lock together in one slice.
 - **Do NOT edit `uv.lock` by hand.** It's machine output.
 - Fresh dev setup: `uv sync` (creates `.venv` matching the lock). ComfyUI install still uses pip as before — no change for downstream users.
@@ -60,32 +65,31 @@ python -m py_compile nodes/<file>.py   # syntax check a single file
 
 **Test suites (`just tests` locally; gated in CI since 2026-07-16):**
 ```bash
-python3 test_manual_loop.py                 # 186 tests: samplers, manual loop, encode helper, Qwen edit
-python3 test_multistage.py                  # 141 tests: multistage infrastructure
-python3 test_params_schema.py               # 266 tests: comfyless COMFYLESS_SCHEMA + adapters + krea routing/rebalance + Krea2 attention-backend pin + Z-Image base/Turbo name-hint detection & routing (ADR-009) + LoRA-failure surfacing (ADR-015) + quant sidecar round-trip (quant in SCHEMA_KIND, 2026-07-08) + NAG quadruple sidecar round-trip & family gating (ADR-023) + ADR-043 ref_boost/grounding_px sidecar round-trip (schema defaults, None-sentinel argparse, no-alias pin)
-python3 test_ref_edit.py                    # 217 tests: reference-image routing — ADR-035 qwen-edit ingestion/provenance/replay-trust, ADR-036 flux2-native threading, ADR-040 D3a entry gate + D1b run_id, and ADR-043 Part B krea2-identity (routing table, MODE vl/ref hard error, 2-source cap + slot order, call-kwargs threading, ref_boost/grounding_px range warnings, accepted-but-unapplied cfg/negative/max-seq notices, NAG + rebalance pre-gates, daemon-delegation gate) + the `--identity` opt-in (drop/refuse without the flag naming it, non-krea families provably ungated, no COMFYLESS_SCHEMA key, args-not-params sourcing, forced in-process, client-side no-op notice on the delegated path, and the non-identity ref_boost/grounding_px inert-warning)
-python3 test_cascade.py                     # 129 tests: comfyless Stable Cascade dispatch (ADR-010)
-python3 test_machine_boundary_validator.py  # 138 tests: machine-boundary validator (ADR-012)
-python3 test_iterate.py                     #  92 tests: comfyless --iterate (ADR-008)
-python3 test_samplers.py                    #  41 tests: custom schedulers / sampler swap
-python3 test_server_robustness.py           # 114 tests: comfyless IPC timeouts + BrokenPipe survival + device-keyed socket routing + server-side device pinning + atomic output reservation (ADR-020) + daemon quant carriage (ADR-019 slice DQ: validation, cache-key discrimination, quant forwarding, H-1 symlink refusal) + multi-root _check_paths union (ADR-018) + NAG cache-key freedom & daemon/wire carriage (ADR-023)
-python3 test_mcp_server.py                  # 685 tests: comfyless MCP server (ADR-011 slice 1 + ADR-015 slice 2 catalog/list_models/list_loras + slice 2b list_transformers + slice 3 generate catalog-name migration + slice 3b cascade catalog-name migration + ADR-018 multi-root kind-typed scan + ADR-022 S5 catalog search/family filters + ADR-015 2026-07-06 LoRA-failure name-based notices + slice 4d flat-cascade extract_params stage-name resolution + dtype value-allowlist)
-python3 test_quant.py                       # 147 tests: fp8 + nvfp4 quantize-on-load (ADR-019 slices A + NV) — eligibility policy, cache-key discrimination, DMR dispatcher routing, boundary hygiene, nvfp4 Blackwell gate / mslk fallback / recipe split
-python3 test_fp8_single_file.py             # 239 tests: ComfyUI scaled-fp8 single-file loader + DMR merge (ADR-019 slices C/C-d/DMR) — classifier variants, security-review negatives, ScaledFp8Linear numerics, dequant->merge->requant dispatcher + ComfyUI-native Krea-2 key converter (ADR-019 2026-07-07) + partial-quant naked-fp8 coexistence (slice PQ, reqs 31-38) + non-weight fp8 upcast & dequant-to-bf16 mode (slice R1/R2/R3, reqs 39-45) + int8-tensorwise ci-w consumption (slice I8, reqs 46-56) + per-output-channel int8 scales & wrong-axis-broadcast negatives (review Amendment 2026-07-10, reqs 57-60) + transformer arch-mismatch diagnostics (2026-07-10) + slice NV nvfp4 merge refusal: Float8Tensor allowlist, buffer fallthrough, all-or-nothing entry gate (reqs 61-65)
-python3 test_lora_order_insensitive.py      #  26 tests: direct-merge LoRAs order-insensitive to PEFT wrapping + LoKR->LoRA flatten (LoKR-on-Z-Image rescue: reconstruction, wiring, alpha-sentinel guard)
-python3 test_vae_override_class.py          #  10 tests: --vae override honors the checkpoint's own VAE class (cherry-picked from krea-testing ad6689e)
-python3 test_lora_audit.py                  # 197 tests: scripts/lora_audit.py classify / manifest / dry-load / convert / delete (ADR-014 S1–S4) + transformer audit (ADR-021: prognosis mapping, shape match, sampled dedupe, root disjointness, report-only)
-python3 test_lora_convert_krea.py           #  31 tests: Krea-2 LoRA format-conversion plan (krea_native → diffusers_krea) + fp8-resident buffer-visibility (LoRAs on ScaledFp8Linear bases — fix 7cc99ab)
-python3 test_catalog_db.py                  # 125 tests: catalog DB metadata plane (ADR-022 S1-S5) — schema, FUSE guard, sanitizer, upsert/stale semantics, manifest kind-branch join, families/sidecar/exclusion/search, civitai enrichment (mocked network), load-plane independence
-python3 test_catalog_concepts.py            #  46 tests: ADR-041 slice 2a closed concept vocabulary — frozen-list hygiene (id round-trip, no alias shadowing another concept's id), the normalize() parse boundary (unknown AND ambiguous tags dropped and REPORTED, malformed shapes, MAX_CONCEPTS cap, canonical order), and expand_for_index emitting repo-owned text only (hostile ids ignored not echoed; non-str/unhashable elements skipped)
-python3 test_catalog_enrich_concepts.py     #  71 tests: ADR-041 slice 2b offline LLM enrichment (endpoint fully injected) — code-owned prompt/vocabulary drift guard, entry_metadata projection + trigger dedupe + prompt caps, source_hash invalidation (metadata/vocab/prompt), tolerant parse_response, code-owned sampling (temperature 0, backend creative knobs NOT inherited), and the batch: incremental skip, --refresh, --dry-run, --limit, consecutive-failure abort, isolated-failure continue, hostile-model negatives, end-to-end alias retrieval
-python3 test_krea2_identity.py              #  65 tests: Krea-2 identity edit (ADR-043 Part A) — `[text | source(1..N) | target]` position-id layout at n_src 1 AND 2 incl. the frame-ORDER invariant (frame 1 = scene, frame 2 = identity), ref_boost bias placement across a two-block source span + the 1.0 no-op + bool-mask merge, processor install/restore with cuDNN-pin inheritance (hazard H1), the D10 VL processor composed from the LIVE encoder's vision_config (incl. the negative that catches a hard-coded/checkpoint-dir read — the `--te1` defect), tokenizer/encoder token-id warn-don't-block, source order/count validation (3 refs = hard error), and the AST guard that no subclass method is `self.`-dispatched (the unbound-call defect the first GPU run exposed, 2026-07-31)
-python3 test_nag.py                         # 101 tests: NAG negative guidance (ADR-023 Krea-2 + ADR-024 flux/flux2/flux2klein/zimage expansion) — formula vs reference equations, per-arch processor selection/dormancy/lane re-sync on tiny transformers (incl. Z-Image hand-swap + ragged captions, Flux2 dual/parallel variants, HF1-1 pooled-tiling negative control), pipeline routing guards, N1 boundary-warning pins
-python3 test_pause.py                       #  28 tests: ^C pause/resume for foreground generation (slice PAUSE) — no-op guards (TTY/thread/signature/detached-stdin), double-^C abort parity, late-^C notice, handler restore
-python3 test_lora_adapters.py                # 245 tests: ADR-046 (ADR-045 slice 3c) comfyless.core.lora_adapters vs the node-pack original SIDE BY SIDE — Layer A real-corpus key space (every catalogued LoRA header: adapter_module_path / detect_adapter_type / normalize_keys / rename_lora_down_up / make_adapter_name), Layer B synthetic bf16 + fp8-resident models (direct merge x3 kinds, PEFT injection, orchestrators, unload restore, normalize_keys with a model, load_lora_with_key_fix on temp files, fixable-error predicate), guards (DMR source guard on _merge_direct, verbatim-identity of the moved Grant functions, no nodes/ComfyUI imports)
-python3 test_refine.py                       # 206 tests: refinement loop, ADR-027 slices 1-4 (COMPLETE) + judge-recipe amendment — verdict boundary + catalog layer + greedy hill-climb loop controller + seed-image entry. Closed two-key override allowlist (F1), numeric hygiene (F6: NaN/Infinity/huge-int rejected, weights |w|≤4, scores 1-10), reject-unknown + critique allowlist + verdict coercion (F7), judge image downscale + seed-image byte/pixel caps (F5); LoRA name→path ONLY via ADR-015 resolver (F2), path-stripped planner metadata + structural AST guard (F3); slice-4 seed-image entry (build_config_from_seed): full-schema-authority seeding, F4 loud echo w/ outside-roots flag, --params byte cap, seed-prompt char cap, .safetensors-strip→basename→catalog LoRA resolution w/ path_was_discarded, weight-0 honored, cold-path upscale-VAE parity
+./.venv/bin/python3 test_multistage.py           # multistage infrastructure (nodes/)
+./.venv/bin/python3 test_lora_alpha_bake.py      # LoRA alpha baking (nodes/)
+./.venv/bin/python3 test_lora_adapters.py        # ADR-046 differential: comfyless.core vs the node original
+./.venv/bin/python3 test_hunyuan.py              # differential: comfyless vs nodes kwargs
+./.venv/bin/python3 test_fp8_single_file.py      # scaled-fp8 loader + DMR (node-pack half of the source guards)
+./.venv/bin/python3 test_lora_convert_krea.py    # Krea-2 LoRA conversion + fp8-resident buffers
+./.venv/bin/python3 test_lora_order_insensitive.py  # order-insensitive direct merge
+./.venv/bin/python3 test_flux2.py                # LIVE GPU smoke — outside `just tests`
 ```
-All suites run against the comfyless uv-managed `.venv` — invoke via `./.venv/bin/python3` (created by `uv sync` at the repo root; see ADR-013 for the dep-divergence rule). Expect 0 failures. **`just tests` runs the whole battery** (glob-based over root-level `test_*.py`, excludes the live-GPU `test_flux2.py`, fails on any suite's nonzero exit) — the list above is descriptive; the glob is authoritative and picks up suites the list lags on (e.g. `test_enhance.py`, `test_hunyuan.py`, `test_owui_tool.py`). The `tests/test_lora_format_convert*.py` suites under `tests/` are deliberately OUTSIDE the battery — they date from the old comfy-dev venv and are unverified against the uv `.venv`; see the TECH_DEBT entry before pulling them in.
+
+**ADR-045 slice 7 (2026-09-09) split the battery.** The other 29 suites moved
+to `comfyless_diffusion` along with the code they exercise; run them there with
+`just tests` on its own 3.14 venv. What remains here is the node pack's own
+tests plus the five SIDE-BY-SIDE differentials, which stay in this repository
+precisely because it is the one that has both halves — `nodes/` locally and
+`comfyless` as an installed dependency. `just tests` is glob-based and picks up
+whatever is present, so the list above is descriptive; the glob is
+authoritative.
+Suites run against this repo's uv-managed `.venv` — invoke via
+`./.venv/bin/python3` (created by `uv sync`). `comfyless` resolves from the
+installed dependency, NOT from this tree (ADR-045 slice 7), so the three
+suites that read comfyless source do it through the import system via the
+`cf_path()` helper in `comfy_stub.py`, never a repo-relative path. The
+`tests/test_lora_format_convert*.py` suites under `tests/` remain outside the
+battery — see the TECH_DEBT entry before pulling them in.
 
 `test_flux2.py` is a live GPU smoke test that performs an actual Flux.2 generation — separate from the unit suites above. Run only when you need to verify end-to-end Flux.2 behavior.
 
@@ -146,15 +150,21 @@ The file-scoped ones are mechanically gated by
 `scripts/git-policy/_red-zone-paths.sh` (commit-policy layer, adopted
 2026-07-16) — keep that list and this table in sync:
 
-| Surface | File | Trigger |
+**ADR-045 slice 7 (2026-09-09): this repository no longer has a §12 surface.**
+Every file in the table below moved to `comfyless_diffusion`, which carries its
+own copy of the review bar and of `scripts/git-policy/_red-zone-paths.sh`. The
+table is kept, marked, because `check-range` over a range reaching before the
+split still gates these paths — see the historical-patterns note in that script.
+
+| Surface (all MOVED to comfyless_diffusion) | Former path here | Trigger |
 |---------|------|---------|
-| Unix socket IPC server | `src/comfyless/server.py` | IPC (Unix sockets) — ADR-001, `review-comfyless-server-2026-04-23.md` |
-| MCP server | `src/comfyless/mcp_server.py` | LLM agent tool surface — ADR-011, `review-comfyless-mcp-server-2026-04-28.md`, `review-mcp-pipeline-cache-2026-06-27.md` |
-| Refinement-loop judge/seed | `src/comfyless/refine.py` | LLM output influencing generation params; seed-image ingestion — ADR-027, `review-refinement-loop-*.md` |
-| HF repo ID resolution + download | `src/comfyless/core/eric_diffusion_utils.py` `resolve_hf_path` (function-scoped, not path-gated) | Loading model weights from caller-supplied paths |
-| `--json` stdin/stdout bridge | `src/comfyless/generate.py` `_run_json_mode` (function-scoped, not path-gated) | Machine-facing interface; future LLM agent tool surface |
-| Scaled-fp8 / int8-tensorwise file-content parser (ADR-019 slices C..I8) | `src/comfyless/core/eric_diffusion_fp8_ops.py` + detection/remap in `eric_diffusion_utils.py` | Custom parsing of caller-supplied weight-file CONTENT (header key patterns, scale tensors, comfy_quant descriptors incl. int8 `ci-w`) fed into compute ops — review chain `docs/security/review-slice-{C,Cd,PQ,R1R2R3,I8}-*.md`, reqs 1-56 |
-| LoRA adapter subsystem (ADR-046) | `src/comfyless/core/lora_adapters.py` | Every daemon LoRA weight write, backup and registry mutation — `docs/security/review-slice-3c-lora-adapters-2026-08-22.md` |
+| Unix socket IPC server | `src/comfyless/server.py` | IPC (Unix sockets) — ADR-001 |
+| MCP server | `src/comfyless/mcp_server.py` | LLM agent tool surface — ADR-011 |
+| Refinement-loop judge/seed | `src/comfyless/refine.py` | LLM output influencing generation params — ADR-027 |
+| HF repo ID resolution + download | `src/comfyless/core/eric_diffusion_utils.py` `resolve_hf_path` (function-scoped) | Loading model weights from caller-supplied paths |
+| `--json` stdin/stdout bridge | `src/comfyless/generate.py` `_run_json_mode` (function-scoped) | Machine-facing interface |
+| Scaled-fp8 / int8 file-content parser | `src/comfyless/core/eric_diffusion_fp8_ops.py` | Parsing caller-supplied weight-file CONTENT — ADR-019 |
+| LoRA adapter subsystem | `src/comfyless/core/lora_adapters.py` | Daemon LoRA weight writes / backups / registry — ADR-046 |
 
 **Debt:** No §12 security review exists for `resolve_hf_path` (caller-supplied
 model loading) — it should have had one before the code landed. Backlogged —
@@ -172,7 +182,7 @@ closed by ADR-001 + `review-comfyless-server-2026-04-23.md` /
 **Review rules:**
 
 - **Every non-trivial code slice runs `code-reviewer` (Fable) before commit.** "Trivial" = single-line fix, pure doc edit, mechanical rename with no behavior change.
-- **Any change to a `_red-zone-paths.sh` path (`src/comfyless/server.py`, `src/comfyless/mcp_server.py`, `src/comfyless/refine.py`, `src/comfyless/core/eric_diffusion_fp8_ops.py`, `src/comfyless/core/lora_adapters.py`) or to the function-scoped `resolve_hf_path` / `_run_json_mode` also runs `security-auditor` (Fable).** Output saved to `docs/security/review-<slug>-<YYYY-MM-DD>.md` and referenced in the commit body.
+- **This repository has no current §12 surface** (ADR-045 slice 7 — see the table above). The `_red-zone-paths.sh` patterns are retained so `check-range` still gates commits from BEFORE the split, and they fail closed if a moved file ever reappears here. `security-auditor` triggers for those surfaces now live in `comfyless_diffusion`.
 - **When the `--json` / LLM agent wiring lands:** write spec + ADR before code, run `security-auditor`, treat as Red Zone from the first commit.
 - Trivial skip ask: `"Trivial — skip review? Change: <one-line summary>. Reply 'review' to run it anyway."` Do not self-decide.
 - Pass `model: "fable"` explicitly at every Agent-tool invocation for reviewer agents (`code-reviewer`, `security-auditor`). The frontmatter pin is known-broken in Claude Code 2.1.117 — structural enforcement requires the invocation-time override.

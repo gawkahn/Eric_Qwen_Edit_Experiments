@@ -23,6 +23,21 @@
 #     `nodes/eric_diffusion_utils.py`, which no longer exists.)
 
 is_red_zone_path() {
+    # ── ADR-045 slice 7 ─────────────────────────────────────────────────────
+    # This repository has NO CURRENT Red Zone surface. Every §12 file — the IPC
+    # daemon, the MCP server, the refinement loop, the fp8 weight-file parser,
+    # the LoRA adapter subsystem — moved to comfyless_diffusion, which carries
+    # its own copy of this gate.
+    #
+    # The patterns below are therefore HISTORICAL, and are deliberately kept
+    # rather than emptied: `check-range` over any commit range that reaches
+    # before the split must still content-check the commits that touched those
+    # files while they lived here. Emptying the list would make every pre-split
+    # Red Zone commit retroactively un-gated, which is the same silent-no-op
+    # failure this file was repaired for on 2026-09-09.
+    #
+    # A path matching one of these in the CURRENT tree would mean a moved file
+    # came back; that should be looked at, so it fails closed.
     local path="$1"
     if [[ "$path" =~ (^|/)(src/)?comfyless/server\.py$ ]]; then return 0; fi          # Unix-socket IPC daemon
     if [[ "$path" =~ (^|/)(src/)?comfyless/mcp_server\.py$ ]]; then return 0; fi      # MCP server (LLM tool surface)

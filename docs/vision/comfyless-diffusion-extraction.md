@@ -1,6 +1,6 @@
 # Vision — extracting `comfyless_diffusion`
 
-Status: in progress — slices 1, 2, 3a, 3b, 3c, 3d, 4, 5, 6 done; next: slice 7
+Status: in progress — slices 1, 2, 3a, 3b, 3c, 3d, 4, 5, 6, 7 done; next: slice 8
 Decision record: `docs/decisions/ADR-045-comfyless-diffusion-standalone-repo.md` (accepted 2026-08-20)
 
 ## Lens (global §1)
@@ -504,7 +504,7 @@ source checks that now SKIP loudly here and run in the node repo. Proposed
 answer for the five side-by-side differentials: they stay in the node
 repository, which after slice 7 holds both halves. Slice 7 confirms.
 
-### Slice 7 — Node pack cutover
+### Slice 7 — Node pack cutover  ✅ done
 
 Delete the moved modules here; add the exact-pinned dependency; split
 `.claude/typecheck-baseline`, `scripts/git-policy/_red-zone-paths.sh` (which
@@ -513,6 +513,35 @@ and the CI workflow between the two repos. Pin the node pack to Python 3.12.
 
 *Proof:* battery green in both repos; node pack imports resolve from the
 installed core; `just policy-test` passes in both.
+
+**Done 2026-09-09.** Node repo: 110 files deleted, `comfyless-diffusion==0.1.0`
+wired via a `[tool.uv.sources]` path (no remote yet), `[build-system]` removed
+(virtual project again), pinned to 3.12. New repo: its own policy layer, type
+ratchet (`src=447`, carried unchanged) and an unpruned docs copy.
+
+*Proof as run:* node battery **7/7**, new repo **29/29**; `just policy-test`
+**54/54 here, 52/52 there**; node typecheck roots exactly match the trimmed
+baseline. Before deleting anything, the FULL 36-suite node battery was run with
+`comfyless` already resolving from the dependency — the deletion was made
+against a proven-green state, not hoped through.
+
+*Two deviations from this plan, both deliberate:*
+1. **`_red-zone-paths.sh` does NOT "become empty".** The patterns are retained
+   and marked HISTORICAL. Emptying them would make every pre-split Red Zone
+   commit retroactively un-gated under `check-range` — the same silent-no-op
+   this file was repaired for on 2026-09-09. It also fails closed if a moved
+   file ever reappears here.
+2. **`.pre-commit-config.yaml` needed no change** — checked, not skipped: it
+   contains no `src/` references. It was COPIED to the new repo rather than
+   split.
+
+*Three things this slice broke and recorded rather than hid* (all one entry,
+TECH_DEBT 2026-09-09 "the node pack depends on comfyless-diffusion by LOCAL
+PATH"): `requirements.txt` cannot express a path source, so the ComfyUI Manager
+install path yields a node pack with no comfyless; three CI jobs are skipped
+because a runner cannot resolve a sibling checkout; and the tier-3 lock-source
+gate carries a named exception. All three are deliberate loosenings that must
+be undone the moment the other repo gets a remote.
 
 ### Slice 8 — Infrastructure cutover
 
