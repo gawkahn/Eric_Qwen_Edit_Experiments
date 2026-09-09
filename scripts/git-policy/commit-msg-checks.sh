@@ -13,7 +13,15 @@ source "$lib_dir/_lib.sh"
 message="$(cat "$1")"
 subject="$(printf '%s' "$message" | sed -n '1p')"
 repo_root="$(git rev-parse --show-toplevel)"
-changed="$(git diff --cached --name-only)"
+# --no-renames is load-bearing, not a style choice (security review 2026-09-09,
+# HIGH): with rename detection ON, git reports a moved file by its DESTINATION
+# path only, so moving a Red Zone file to a path the gate does not yet name
+# produces a commit that never presents the gated path — the move, and every
+# edit after it, commits un-gated until a human notices. That is exactly how
+# the fp8 parser's gate went silently dead across slice 1b. With renames off
+# the old path appears as a deletion, the move commit itself trips the gate,
+# and updating the gate becomes part of the move.
+changed="$(git diff --cached --no-renames --name-only)"
 
 # A merge in progress (MERGE_HEAD present) has a git-generated subject and no
 # authored body — skip the message-FORMAT checks; content is still checked at the

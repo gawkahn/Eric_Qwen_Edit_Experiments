@@ -40,7 +40,15 @@ for sha in $commits; do
         parent="$empty_tree"
     fi
     is_merge=0; [ "$nparents" -ge 2 ] && is_merge=1
-    changed="$(git diff --name-only "$parent" "$sha")"
+    # --no-renames is load-bearing, not a style choice (security review 2026-09-09,
+    # HIGH): with rename detection ON, git reports a moved file by its DESTINATION
+    # path only, so moving a Red Zone file to a path the gate does not yet name
+    # produces a commit that never presents the gated path — the move, and every
+    # edit after it, commits un-gated until a human notices. That is exactly how
+    # the fp8 parser's gate went silently dead across slice 1b. With renames off
+    # the old path appears as a deletion, the move commit itself trips the gate,
+    # and updating the gate becomes part of the move.
+    changed="$(git diff --no-renames --name-only "$parent" "$sha")"
 
     range_rc=0
     printf '== %s%s %.60s ==\n' "$sha" "$([ "$is_merge" = 1 ] && echo ' (merge)')" "$subject" >&2

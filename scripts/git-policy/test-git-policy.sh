@@ -169,8 +169,42 @@ e2e_evil_merge_blocked() {
     ) >/dev/null 2>&1
     local rc=$?; rm -rf "$d"; return $rc
 }
+
+# e2e: MOVING a Red Zone file must trip the gate on the OLD path. With git's
+# default rename detection the move is reported by destination only, so the
+# gated path never reaches is_red_zone_path and the move commits un-gated —
+# the mechanism by which the fp8 parser's gate went dead across slice 1b
+# (security review 2026-09-09, HIGH). check-range.sh passes --no-renames; this
+# proves it, and fails if anyone removes the flag.
+e2e_redzone_move_blocked() {
+    local d; d="$(mktemp -d)"
+    (
+        cd "$d" || exit 9
+        git init -q; git config user.email t@example.com; git config user.name t
+        git config commit.gpgsign false
+        mkdir -p src/comfyless/core
+        # >50 identical lines so git scores it a rename with high similarity
+        for _ in $(seq 1 80); do echo "x = 1"; done > src/comfyless/core/lora_adapters.py
+        git add src/comfyless/core/lora_adapters.py
+        git commit -qm "feat: seed" -m "AI-disclosure: none" \
+                   -m "see docs/decisions/ADR-046-comfyless-owned-lora-adapters.md" \
+                   -m "see docs/security/review-slice-3c-lora-adapters-2026-08-22.md"
+        local base; base="$(git rev-parse HEAD)"
+        git mv src/comfyless/core/lora_adapters.py src/comfyless/core/moved_elsewhere.py
+        # No Red Zone reference in THIS message: the move must be refused.
+        git commit -qm "refactor: move it" -m "AI-disclosure: none"
+        bash "$lib_dir/check-range.sh" "$base" "$(git rev-parse HEAD)"
+    ) >/dev/null 2>&1
+    local rc=$?; rm -rf "$d"; return $rc
+}
 if e2e_evil_merge_blocked; then
     fail=$((fail+1)); echo "FAIL: check-range did NOT block an evil merge (Red Zone edit, no spec)"
+else
+    pass=$((pass+1))
+fi
+
+if e2e_redzone_move_blocked; then
+    fail=$((fail+1)); echo "FAIL: check-range did NOT block a Red Zone file MOVE (rename hid the gated path)"
 else
     pass=$((pass+1))
 fi

@@ -41,10 +41,15 @@ the 2026-08-22 → 2026-09-09 gap replayed. Enumerating historical spellings, as
 this change does, protects `check-range` over PAST moves but is structurally
 incapable of covering the next one.
 
-**Disposition: FIXED IN THE FOLLOWING COMMIT** (`--no-renames` on the two
-`git diff --name-only` invocations), kept separate because it changes gate
-BEHAVIOR rather than gate paths and the two call-site scripts are outside this
-change's declared edit scope (global §4). This is the finding that matters most
+**Disposition: FIXED** in the following commit — `--no-renames` on both
+`git diff --name-only` invocations (`check-range.sh:51`,
+`commit-msg-checks.sh:24`), kept as a separate commit because it changes gate
+BEHAVIOR rather than gate paths (global §4). Verified empirically in a scratch
+repo: moving `src/comfyless/core/lora_adapters.py` reports only the destination
+with rename detection on, and both paths with the flag. Pinned by a new e2e
+case (`e2e_redzone_move_blocked`) that MUTATION-TESTS clean: removing the flag
+from `check-range.sh` makes the suite fail with "check-range did NOT block a
+Red Zone file MOVE". This is the finding that matters most
 in the set: it converts the gate from "correct until the next restructure" to
 "forces its own update at move time", in a repository that is mid-restructure.
 
