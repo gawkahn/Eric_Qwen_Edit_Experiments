@@ -770,6 +770,20 @@ class _FakeSock:
     def exists(self): return self._e
 
 
+# ── Suite hermeticity: the daemon probe defaults to "nothing listening" ──────
+# refine.main()'s ADR-040 D3a entry gate consults the LIVE daemon on this box
+# (comfyless.server.socket_path) and refuses any run directory outside that
+# daemon's --ref-root. The blocks below that drive main() far enough to REACH
+# that gate were therefore hermetic only while no daemon was up (most exit 2 at
+# pre-gate arg validation and never cared): with one running, main() returns 2
+# at entry, the block's own stubs never execute, and the failure surfaces far
+# downstream as a bare KeyError on the capture dict
+# (TECH_DEBT 2026-08-22 — root-caused to this gate on 2026-08-22, fixed here).
+# The suite must test the code, not the machine. Blocks that exercise the gate
+# itself stub socket_path True and restore to this default.
+_rg_srv.socket_path = lambda dev: _FakeSock(False)
+
+
 def _drive_run_generation(*, output_format, stem="candidate_00",
                           pre_create=None, daemon_ext=None):
     """Drive the REAL run_generation with socket/daemon/cold heavy paths stubbed,

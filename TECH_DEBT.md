@@ -2811,3 +2811,12 @@ on 'cuda'". The block is hermetic only when no daemon is listening — which is
 why it passed at authoring time and on CI. Fix belongs to the test (stub the
 daemon probe in that block, as the slice-B blocks above it already do), not
 to `refine.py`.
+
+**Resolved: 2026-09-08** — suite-wide default stub in `test_refine.py`
+(`_rg_srv.socket_path = lambda dev: _FakeSock(False)`, installed right after
+`_FakeSock` is defined) makes the ADR-040 D3a probe report "nothing listening"
+regardless of the machine. `refine.py` untouched, per the ruling above. Battery
+green 36/36 with both `comfyless@0` and `comfyless@1` live; `test_refine.py`
+733 passed / 0 failed. `code-reviewer` (Fable) APPROVED — no coverage lost, no
+check ever exercised the real `socket_path` (that surface is covered in
+`test_server_robustness.py`).
