@@ -3148,3 +3148,64 @@ to `comfyless_diffusion/scripts/` alongside `tests/golden/`, repoint `PY` at
 that repo's console script, and re-verify one strict case against
 `manifest-v2a.json` before trusting a full sweep. Do not run `capture` in its
 current state.
+
+## 2026-09-09 — the ComfyUI custom_nodes copies cannot be redeployed yet
+
+**What:** ADR-045 slice 8 lists "redeploy the three stale ComfyUI custom_nodes
+copies" as scope. It was deliberately NOT done, because after slice 7 the copies
+would be broken rather than merely stale. `nodes/__init__.py:9` eagerly imports
+`eric_diffusion_loader`, whose line 19 is a module-level
+`from comfyless.core.eric_diffusion_utils import …`; 12 node files import
+`comfyless.core.*` at module scope. None of the three ComfyUI venvs can import
+`comfyless` (verified 2026-09-09 on all three), and `requirements.txt` — the
+manifest ComfyUI Manager actually runs — deliberately omits
+`comfyless-diffusion` because it resolves from a local path via
+`[tool.uv.sources]` and the sibling repository has no remote. So a plain
+directory copy makes ComfyUI fail to load the entire pack at startup.
+
+Actual deployed state, corrected from the slice plan's "three stale copies":
+`comfyui` (= comfy0) has a copy last touched 2026-04-04, `comfy1` one from
+2026-04-09, and `comfy-dev` has only an EMPTY directory stub at
+`basedir/custom_nodes/Eric_Qwen_Edit_Experiments` — the pack is not deployed
+there at all.
+
+**Why not now (Grant, 2026-09-09):** redeploying would trade stale-but-working
+for broken-at-import. Installing the sibling into each ComfyUI venv from its
+local path would work today — the sibling's `requires-python` floor is `>=3.12`
+and all three venvs are 3.12.3 — but it is a manual per-venv step that
+`requirements.txt` does not capture, so the three would drift independently and
+a downstream user's ComfyUI Manager install would still be broken.
+
+**Trigger:** the sibling repository getting a remote. At that moment
+`comfyless-diffusion` joins `requirements.txt` as a `git+https` pin (already
+tracked as its own entry), the ComfyUI Manager path works for a real downstream
+user rather than only this machine, and the redeploy becomes a plain copy again.
+Do the redeploy in that same slice, and verify by starting one ComfyUI and
+confirming the pack registers its nodes — not by checking that files copied.
+
+## 2026-09-09 — `enhancers.toml` stayed here while the code that reads it left
+
+**What:** `comfyless.enhance` moved to `comfyless_diffusion` in ADR-045 slice 7,
+but its config did not. The live `enhancers.toml` is an untracked file at THIS
+repo's root (only `enhancers.example.toml` is tracked), and
+`~/.bashrc` now exports `COMFYLESS_ENHANCERS` as an absolute path back to it —
+deliberately NOT following `COMFYLESS_HOME`, which slice 8 repointed at the
+sibling. So the enhancer config is the one piece of the comfyless surface still
+anchored to the node repository, by an absolute path in a dotfile.
+
+It works, and it is honest about itself (the `.bashrc` comment says so), but it
+is a split-brain: someone cloning `comfyless_diffusion` alone gets working
+enhance code with no example config and no hint that a config is expected.
+
+**Why not now:** slice 8's scope is the infrastructure cutover, and this is a
+config-ownership question rather than a path repoint. It also needs a real
+decision that shouldn't be made at the tail of a long slice: does the live
+config belong in the sibling repo, in `~/.config/comfyless/`, or stay here? The
+third option is defensible only while this machine is the only consumer — the
+§1 dual-lens question, and the answer probably changes the moment the sibling
+gets a remote.
+
+**Trigger:** the next enhance-related slice, or the sibling repo getting a
+remote — whichever comes first. At minimum, `enhancers.example.toml` should
+move to the sibling alongside the code that parses it, since a repo whose
+`--enhance-prompt` flag has no documented config shape is incomplete.

@@ -166,12 +166,17 @@ split still gates these paths — see the historical-patterns note in that scrip
 | Scaled-fp8 / int8 file-content parser | `src/comfyless/core/eric_diffusion_fp8_ops.py` | Parsing caller-supplied weight-file CONTENT — ADR-019 |
 | LoRA adapter subsystem | `src/comfyless/core/lora_adapters.py` | Daemon LoRA weight writes / backups / registry — ADR-046 |
 
-**Debt:** No §12 security review exists for `resolve_hf_path` (caller-supplied
-model loading) — it should have had one before the code landed. Backlogged —
-when that surface is next modified, write the missing review before touching
-the code. (`src/comfyless/server.py` was previously listed here too; that half was
-closed by ADR-001 + `review-comfyless-server-2026-04-23.md` /
-`review-comfyless-server-hardening-2026-04-23.md`.)
+**Debt: CLOSED — the claim here was wrong.** This paragraph asserted that no
+§12 review existed for `resolve_hf_path` (caller-supplied model loading), and
+carried that as backlog. Two reviews do exist and always did:
+`docs/security/review-resolve-hf-path-2026-04-23.md` and
+`review-resolve-hf-path-hardening-2026-04-23.md`, the second closing three
+MEDIUM findings from the first. Corrected 2026-09-09 while writing the sibling
+repo's CLAUDE.md, when the claim was checked against the directory instead of
+copied forward. The `src/comfyless/server.py` half was likewise closed by
+ADR-001 + `review-comfyless-server-2026-04-23.md` /
+`review-comfyless-server-hardening-2026-04-23.md`. Both surfaces now live in
+comfyless_diffusion; the reviews are in both repos' `docs/security/`.
 
 **Surfaces that become Red Zone on scope change:**
 
@@ -331,9 +336,29 @@ Existing `QWEN_IMAGE_PIPELINE` / `QWEN_EDIT_PIPELINE` nodes are untouched and us
 
 ## OpenWebUI integration (comfyless → mcpo → OWUI)
 
-`src/comfyless/integrations/openwebui/generate_image_tool.py` is a native OpenWebUI Tool (runs inside the OWUI container) that drives image generation from chat and renders results inline. It calls the comfyless MCP server through the **mcpo** OpenAPI bridge — launched via `start-mcpo.sh` at the repo root (model-base = `hf-local`, the curated set; scanning the parent `.../models` also surfaces HF-cache snapshot-hash names). Tools exposed to the model: `generate_image`, `list_models`, `list_loras`, `list_transformers` (catalog names only, no paths). Requires a tool-calling model — gpt-oss works; roleplay-finetuned models (e.g. Dolphin-Venice) do not reliably emit tool calls. See ADR-017 and `src/comfyless/integrations/openwebui/README.md`.
+**The comfyless half of this now lives in the sibling repository** (ADR-045 slice 7); paths below are relative to `../comfyless_diffusion/`. What stays here is `start-mcpo.sh`.
 
-The MCP server (`src/comfyless/mcp_server.py`) caches one pipeline in-process and evicts + frees it on config change (mirrors the `server.py` daemon) so a long-lived server doesn't OOM across model switches; LoRAs are applied via the shared `generate._apply_loras`. See `docs/security/review-mcp-pipeline-cache-2026-06-27.md`.
+`src/comfyless/integrations/openwebui/generate_image_tool.py` is a native OpenWebUI Tool (runs inside the OWUI container) that drives image generation from chat and renders results inline. It calls the comfyless MCP server through the **mcpo** OpenAPI bridge — launched via `start-mcpo.sh` at THIS repo's root, which since ADR-045 slice 8 spawns `comfyless-mcp` from the sibling's venv — override `COMFYLESS_REPO` to point it at a different comfyless_diffusion worktree (model-base = `hf-local`, the curated set; scanning the parent `.../models` also surfaces HF-cache snapshot-hash names). Tools exposed to the model: `generate_image`, `list_models`, `list_loras`, `list_transformers` (catalog names only, no paths). Requires a tool-calling model — gpt-oss works; roleplay-finetuned models (e.g. Dolphin-Venice) do not reliably emit tool calls. See ADR-017 and `src/comfyless/integrations/openwebui/README.md`.
+
+The MCP server (`../comfyless_diffusion/src/comfyless/mcp_server.py`) caches one pipeline in-process and evicts + frees it on config change (mirrors the `server.py` daemon) so a long-lived server doesn't OOM across model switches; LoRAs are applied via the shared `generate._apply_loras`. See `docs/security/review-mcp-pipeline-cache-2026-06-27.md`.
+
+## The comfyless daemon (systemd)
+
+`systemd/comfyless@.service` lives here but runs the SIBLING repo's code: since
+ADR-045 slice 8 its `ExecStart` is
+`comfyless_diffusion/.venv/bin/comfyless --serve --device cuda:%i`, one instance
+per GPU (`systemctl --user start comfyless@0`). It carries no `PYTHONPATH` —
+the console script pins its own interpreter, which is why `.venv/bin` rather
+than the CWD lands on `sys.path[0]`.
+
+Reinstall after editing:
+`cp systemd/comfyless@.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user restart comfyless@0 comfyless@1`
+
+**Caution:** this repo's `.venv/bin` still carries all six `comfyless*` console
+scripts via the local path dependency, so an older unit pointing here would
+keep working while silently running a different transitive dependency tree.
+A wrong unit fails quietly, not loudly. See
+`docs/security/review-slice8-infra-cutover-2026-09-09.md`.
 
 ## Important Constraints
 
