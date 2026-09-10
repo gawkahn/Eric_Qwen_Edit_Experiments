@@ -1,6 +1,6 @@
 # Vision — extracting `comfyless_diffusion`
 
-Status: in progress — slices 1, 2, 3a, 3b, 3c, 3d, 4, 5, 6, 7 done; next: slice 8
+Status: in progress — slices 1, 2, 3a, 3b, 3c, 3d, 4, 5, 6, 7 done; slice 8 done EXCEPT the ComfyUI redeploy, which is blocked on the sibling's remote (see its Outcome below)
 Decision record: `docs/decisions/ADR-045-comfyless-diffusion-standalone-repo.md` (accepted 2026-08-20)
 
 ## Lens (global §1)
@@ -553,6 +553,42 @@ manuals, and the mcpo launcher.
 *Proof:* daemon starts under systemd from the new unit; one live generation
 through the CLI and one through the daemon; pixel-diff against the slice-0
 baseline.
+
+**Outcome (2026-09-09).** Done, with one part deferred and one part discovered.
+
+*Met.* The unit runs `comfyless_diffusion/.venv/bin/comfyless --serve` with
+`WorkingDirectory` repointed and the `PYTHONPATH` line deleted; `start-mcpo.sh`
+spawns `comfyless-mcp` from the same venv. Both instances restarted clean and
+round-tripped a validated `report_roots` request per device; mcpo started,
+served all six tools on `/openapi.json`, and shut down cleanly. The proof bar
+was met exactly: a Krea-2-Turbo generation (seed 77341, 12 steps,
+`--schedule linear`) is pixel-identical to the slice-0 baseline through BOTH the
+CLI and the daemon — 0 differing px, max |d| 0. That also retires, for this path,
+the worry that the 37-package lockfile divergence might perturb output. Infra
+audit: PASS, no MUST findings; it measured the import surface as strictly
+narrower, since a console script puts `.venv/bin` on `sys.path[0]` rather than
+the CWD the `-m` form used. Both its SHOULDs are closed.
+
+*Deferred — the ComfyUI redeploy.* Not skipped: blocked. After slice 7, twelve
+node files import `comfyless.core` at module scope and `nodes/__init__.py`
+imports them eagerly, while no ComfyUI venv can import `comfyless` and
+`requirements.txt` deliberately omits it (local path source, no remote). A
+redeploy would trade stale-but-working for broken-at-import. Grant's call: wait
+for the sibling's remote, at which point the pin becomes `git+https` and the
+ComfyUI Manager path works for a real downstream user rather than only this
+machine. The plan's "all three are four months stale" was also wrong — comfy-dev
+has an empty stub and is not deployed at all.
+
+*Discovered — the interactive path.* The Vision named the unit and the launcher
+but not `~/.bashrc`, which exported `COMFYLESS_HOME` at the node repo and ran
+`comfygen`/`comfyenhance` through `-m` plus `PYTHONPATH`. Those were cut over
+too, since leaving them would have left the hazard the audit flagged sitting on
+the path Grant actually types. The `comfyserv_*` helpers needed nothing — they
+already went through systemd.
+
+*Also.* The sibling repo had no `CLAUDE.md`; one was written. Doc pruning
+(`comfyless_diffusion/docs/README.md`) is NOT part of this slice — it is 46 ADRs
+and ~114 security reviews per side, and wants its own.
 
 ## Sequencing against the OS upgrade
 
