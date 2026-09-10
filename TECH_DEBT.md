@@ -3109,3 +3109,42 @@ venv has the `comfyless` console script, accepts `--serve`, and runs 3.14.7.
 script — that is the moment the "which venv does the daemon use" question has to
 be answered anyway. Do not close this by re-locking one side without deciding
 which is authoritative.
+
+**Resolved: 2026-09-09 — ADR-045 slice 8.** `systemd/comfyless@.service` now
+runs `comfyless_diffusion/.venv/bin/comfyless --serve` with `WorkingDirectory`
+repointed and the inert `Environment=PYTHONPATH=` line deleted; `start-mcpo.sh`
+spawns `comfyless-mcp` from the same venv. Both daemons restarted clean and
+round-tripped a validated `report_roots` request per device. The daemon and the
+battery that validates it now share one dependency tree, so what remains is
+"two projects with two locks", which is ordinary. Measured at the same time: a
+Krea-2-Turbo generation (seed 77341, 12 steps, `--schedule linear`) is
+pixel-identical to the slice-0 baseline through BOTH the CLI and the daemon —
+0 differing px, max |d| 0 — so the 37-package divergence perturbs nothing on
+this path.
+
+## 2026-09-09 — `capture_baseline.py` was orphaned from its manifests by the split
+
+**What:** `scripts/capture_baseline.py` is the pixel-exact regression harness
+for the extraction, and it still lives in the NODE repo. Slice 7 moved
+`tests/golden/` — every `manifest-*.json` it writes and compares — to
+`comfyless_diffusion`. The script's `HERE = REPO/tests/golden` therefore names
+a directory that no longer exists here, and `capture()` writes the manifest as
+its LAST act: a capture run would burn ~18 generations of GPU time and then die
+on `FileNotFoundError`, losing all of it. `PY = REPO/.venv/bin/python3` plus
+`cmd = [PY, "-m", "comfyless.generate"]` is the same node-repo inertia slice 8
+just removed from the unit and the mcpo launcher.
+
+**Why not now:** slice 8's declared scope is the infrastructure cutover
+(systemd, mcpo, custom_nodes, docs). Relocating a tracked file across repos is a
+different decision — it needs the history-preserving move the extraction used,
+not a copy — and the Vision's live-generation bar was met without it (proved
+with a targeted two-path run instead of the full sweep). Fixing it in place
+would be worse: it would make the node repo reach into the sibling for both its
+interpreter and its output directory, inverting the layering slice 4 fixed.
+
+**Trigger:** the next time a baseline is captured or compared — i.e. the next
+slice that changes generation behaviour and wants the regression proof. Move it
+to `comfyless_diffusion/scripts/` alongside `tests/golden/`, repoint `PY` at
+that repo's console script, and re-verify one strict case against
+`manifest-v2a.json` before trusting a full sweep. Do not run `capture` in its
+current state.

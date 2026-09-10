@@ -4,17 +4,24 @@
 #
 # Background: OpenWebUI cannot call an MCP *stdio* server directly; mcpo
 # (MCP -> OpenAPI proxy) bridges it. The native OWUI image tool
-# (comfyless/integrations/openwebui/generate_image_tool.py, ADR-017) posts to
+# (comfyless_diffusion/src/comfyless/integrations/openwebui/generate_image_tool.py,
+# ADR-017) posts to
 # this bridge's /generate endpoint. See memory/reference_mcpo_openwebui_bridge.
 #
 # Run in a dedicated terminal to watch logs, or `nohup ./start-mcpo.sh >~/mcpo.log 2>&1 &`
 # for a detached service. Every var below can be overridden from the environment.
 set -euo pipefail
 
-# Default to the worktree this script lives in, so running it from any worktree
-# (e.g. a branch with a different .venv) uses that worktree's code AND its
-# .venv/bin/python3 — not a hardcoded path. Override REPO to point elsewhere.
-REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+# The MCP server now lives in the sibling comfyless_diffusion repository
+# (ADR-045 slice 8), so this points there rather than at the directory the
+# script sits in. That deliberately gives up the old worktree-follows-script
+# behaviour: dirname would now resolve to the NODE repo, whose tree no longer
+# contains comfyless at all. Note its .venv/bin DOES still carry the six
+# comfyless* console scripts, via the path dependency — so pointing back at it
+# would keep working while silently running the node repo's divergent
+# transitive tree. Fail loudly instead: name the owner explicitly. To drive a
+# comfyless_diffusion worktree, override COMFYLESS_REPO — its .venv comes with it.
+COMFYLESS_REPO="${COMFYLESS_REPO:-/home/gawkahn/projects/ai-lab/code/comfyless_diffusion}"
 # hf-local (not its parent .../models): the parent also walks the HF hub cache,
 # surfacing snapshot-hash-named dirs as catalog entries. hf-local is the curated
 # set with human-readable names (Grant, 2026-06-26).
@@ -34,11 +41,6 @@ HOST="${MCPO_HOST:-172.17.0.1}"   # docker bridge gateway: reachable from host +
 PORT="${MCPO_PORT:-8090}"
 GPU="${MCPO_GPU:-0}"              # image gen pinned to GPU0 (dolphin/vLLM lives on GPU1)
 
-# PYTHONPATH is no longer required (ADR-045 slice 5 made .venv an editable
-# install), but is kept until slice 8 for the same reason as the systemd unit.
-# Historically: the .venv was not an editable install, so `comfyless`
-# is not importable from mcpo's cwd without it.
-export PYTHONPATH="$REPO"
 export CUDA_VISIBLE_DEVICES="$GPU"
 export HF_HOME=/mnt/nvme-8tb/hf
 export HF_HUB_CACHE=/mnt/nvme-8tb/hf
@@ -76,7 +78,7 @@ echo "[start-mcpo] pinned mcpo==${MCPO_VERSION} with mcp==${MCP_VERSION}"
 
 exec uvx --from "mcpo==${MCPO_VERSION}" --with "mcp==${MCP_VERSION}" \
   mcpo --host "$HOST" --port "$PORT" -- \
-  "$REPO/.venv/bin/python3" -m comfyless.mcp_server \
+  "$COMFYLESS_REPO/.venv/bin/comfyless-mcp" \
     --model-base "$MODEL_BASE" \
     --lora-path "$LORA_PATH" \
     --transformer-path "$TRANSFORMER_PATH_CKPT" \

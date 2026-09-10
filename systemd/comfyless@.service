@@ -11,7 +11,7 @@
 #   loginctl enable-linger
 #
 # Under systemd stdin is /dev/null (not a TTY), so the ^C pause hook
-# (comfyless/pause.py) is doubly inert here — no terminal to catch a stray
+# (comfyless_diffusion/src/comfyless/pause.py) is doubly inert here — no terminal to catch a stray
 # ^C in, which is half the reason this unit exists (see
 # docs/security/review-pause-daemon-guard-2026-07-17.md).
 #
@@ -42,13 +42,7 @@ ProtectSystem=full
 # ProtectHome=read-only deliberately NOT set: torch/triton JIT caches write
 # under ~/.cache and the daemon writes to ~/gen-output; enumerate-and-allow
 # is a follow-up if ever wanted.
-WorkingDirectory=/home/gawkahn/projects/ai-lab/code/Eric_Qwen_Edit_Experiments
-# ADR-045 slice 5 gave the repo a [build-system], so `uv sync` now installs
-# comfyless into .venv (editable) and `-m comfyless.generate` resolves without
-# help — verified from a foreign cwd with PYTHONPATH unset. This line is
-# therefore inert, kept only until slice 8 rewrites this unit onto the
-# `comfyless` console script and the new repo's path.
-Environment=PYTHONPATH=/home/gawkahn/projects/ai-lab/code/Eric_Qwen_Edit_Experiments
+WorkingDirectory=/home/gawkahn/projects/ai-lab/code/comfyless_diffusion
 Environment=PYTHONUNBUFFERED=1
 # HF cache must live on raw ext4, not mergerfs (filelock hangs — see the
 # filesystem constraint in ~/.claude/CLAUDE.md).
@@ -56,7 +50,7 @@ Environment=HF_HOME=/mnt/nvme-8tb/hf
 Environment=HF_HUB_CACHE=/mnt/nvme-8tb/hf
 # Uncomment to keep tqdm step bars out of the journal:
 # Environment=TQDM_DISABLE=1
-ExecStart=/home/gawkahn/projects/ai-lab/code/Eric_Qwen_Edit_Experiments/.venv/bin/python3 -m comfyless.generate --serve \
+ExecStart=/home/gawkahn/projects/ai-lab/code/comfyless_diffusion/.venv/bin/comfyless --serve \
     --device cuda:%i \
     --model-base /home/gawkahn/projects/ai-lab/ai-base/models \
     --output-dir /home/gawkahn/projects/ai-lab/ai-stack-data/comfyless \
@@ -64,7 +58,7 @@ ExecStart=/home/gawkahn/projects/ai-lab/code/Eric_Qwen_Edit_Experiments/.venv/bi
 # Clean shutdown via the existing device-scoped unload path; SIGTERM is the
 # systemd fallback if the daemon is wedged past TimeoutStopSec (stale socket
 # is unlinked at next startup — server.py run_server handles it).
-ExecStop=/home/gawkahn/projects/ai-lab/code/Eric_Qwen_Edit_Experiments/.venv/bin/python3 -m comfyless.generate --unload --device cuda:%i
+ExecStop=/home/gawkahn/projects/ai-lab/code/comfyless_diffusion/.venv/bin/comfyless --unload --device cuda:%i
 Restart=on-failure
 RestartSec=5
 # A generation can be mid-flight at stop; give --unload time to be queued
