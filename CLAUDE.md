@@ -49,10 +49,14 @@ This repo uses two tools deliberately:
 
 Rules:
 - **`pyproject.toml` and `requirements.txt` must agree on direct deps at all times** — both list the same 17 top-level pins in the same order (`torch`, `torchvision`, `torchao`, `diffusers`, `transformers`, `accelerate`, `peft`, `safetensors`, `pillow`, `numpy`, `mcp`, `click`, `scipy`, then the tokenizer backends `sentencepiece`, `protobuf`, `tiktoken`, `ftfy`). Any dep bump edits both. `torchvision` must track `torch`'s minor (2.11 ↔ 0.26). **Documented exception (ADR-045 slice 7):** `comfyless-diffusion==0.1.0` is
-pyproject-only. It resolves from the local checkout via `[tool.uv.sources]`
-because the repository has no remote yet, and a path source is not something
-`requirements.txt` can express for ComfyUI Manager. It joins requirements.txt
-as a `git+https` pin when the remote exists (TECH_DEBT 2026-09-09).
+pyproject-only. It resolves from the local checkout via `[tool.uv.sources]`,
+and a path source is not something `requirements.txt` can express for ComfyUI
+Manager. **The remote now exists — `github.com/gawkahn/comfyless_diffusion`,
+private, added 2026-09-12 — so this exception is no longer forced, only
+unconverted.** Replacing the path source with a `git+https` pin is its own
+slice, and the ComfyUI redeploy depends on it landing first (TECH_DEBT
+2026-09-09). Note the pin will need a credential path for ComfyUI Manager,
+since the repo is private.
 **Documented exception (ADR-033):** `av` (video encode) is pyproject-only — the node pack never imports it, so it deliberately does NOT appear in `requirements.txt`.
 - **`uv.lock` is regenerated whenever `pyproject.toml` changes** — `uv lock` after the edit, then commit pyproject + requirements + lock together in one slice.
 - **Do NOT edit `uv.lock` by hand.** It's machine output.

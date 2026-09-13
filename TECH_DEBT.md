@@ -2975,8 +2975,15 @@ would take first — it makes the surface gateable without the noise.
 ## 2026-09-09 — the node pack depends on comfyless-diffusion by LOCAL PATH
 
 **What:** ADR-045 slice 7 wired `comfyless-diffusion==0.1.0` as a dependency,
-but `comfyless_diffusion` has no remote yet (deliberate — Grant, 2026-09-09:
-no remote until it is a full working independent unit). So the dependency
+but `comfyless_diffusion` had no remote at the time (deliberate — Grant,
+2026-09-09: no remote until it is a full working independent unit). **Unblocked
+2026-09-12: a PRIVATE remote now exists at
+`github.com/gawkahn/comfyless_diffusion`. This entry is actionable, not
+blocked.** Private-ness adds one wrinkle the original entry did not anticipate:
+a `git+https` pin to a private repo needs credentials at install time, so the
+ComfyUI Manager story is "works for Grant with a token", not "works for a
+stranger" — decide whether that is acceptable or whether the repo goes public
+before the pin lands. So the dependency
 resolves through `[tool.uv.sources] { path = "../comfyless_diffusion",
 editable = true }`, which is a DEV-BOX-ONLY wiring. Three consequences, all
 live right now:
@@ -3180,6 +3187,14 @@ a downstream user's ComfyUI Manager install would still be broken.
 `comfyless-diffusion` joins `requirements.txt` as a `git+https` pin (already
 tracked as its own entry), the ComfyUI Manager path works for a real downstream
 user rather than only this machine, and the redeploy becomes a plain copy again.
+
+**FIRED 2026-09-12** — the remote exists (private). Still blocked on the pin
+itself, which has not been converted; the ordering is pin first, then redeploy,
+because ComfyUI Manager installs from `requirements.txt`. One correction to the
+reasoning above: because the remote is PRIVATE, the pin does not make this
+"work for a real downstream user" — it makes it work for anyone holding a
+credential. If the goal is genuinely a downstream user, that needs either a
+public repo or a PyPI release, which is still an open question in the Vision.
 Do the redeploy in that same slice, and verify by starting one ComfyUI and
 confirming the pack registers its nodes — not by checking that files copied.
 
