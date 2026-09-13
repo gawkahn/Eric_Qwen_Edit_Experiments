@@ -166,8 +166,8 @@ wheels = [
 
 [[package]]
 name = "comfyless-diffusion"
-version = "0.1.0"
-source = { git = "https://github.com/gawkahn/comfyless_diffusion.git?tag=v0.1.0#e106175c7e5d940c7346b51a03cfb2ba7dd0fadd" }
+version = "0.1.3"
+source = { git = "https://github.com/gawkahn/comfyless_diffusion.git?tag=v0.1.3#dcfd86704b1af840c8b3d6a74d9f2bfcb6b8f117" }
 dependencies = [
     { name = "accelerate" },
     { name = "av" },
@@ -227,7 +227,7 @@ requires-dist = [
     { name = "accelerate", specifier = "==1.13.0" },
     { name = "av", specifier = "==18.0.0" },
     { name = "click", specifier = "==8.3.3" },
-    { name = "comfyless-diffusion", git = "https://github.com/gawkahn/comfyless_diffusion.git?tag=v0.1.0" },
+    { name = "comfyless-diffusion", git = "https://github.com/gawkahn/comfyless_diffusion.git?tag=v0.1.3" },
     { name = "diffusers", specifier = "==0.39.0" },
     { name = "ftfy", specifier = "==6.3.1" },
     { name = "mcp", specifier = "==1.28.1" },
@@ -243,7 +243,7 @@ requires-dist = [
     { name = "torch", specifier = "==2.11.0" },
     { name = "torchao", specifier = "==0.17.0" },
     { name = "torchvision", specifier = "==0.26.0" },
-    { name = "transformers", specifier = "==5.5.3" },
+    { name = "transformers", specifier = "==5.10.2" },
 ]
 
 [package.metadata.requires-dev]
@@ -1400,7 +1400,7 @@ wheels = [
 
 [[package]]
 name = "transformers"
-version = "5.5.3"
+version = "5.10.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "huggingface-hub" },
@@ -1413,9 +1413,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "typer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/af/35/cd5b0d1288e65d2c12db4ce84c1ec1074f7ee9bced040de6c9d69e70d620/transformers-5.5.3.tar.gz", hash = "sha256:3f60128e840b40d352655903552e1eed4f94ed49369a4d43e1bc067bd32d3f50", size = 8226047, upload-time = "2026-04-09T15:52:56.231Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8d/38/d5f978bd5091019e89aef29b9a831f5cd70f2598963a3ead8b9570cab592/transformers-5.10.2.tar.gz", hash = "sha256:f9a44b9c8ca9ab1156b467f574d832ea066284299c2fd0ed84641ccb592751fc", size = 8799687, upload-time = "2026-06-04T18:43:49.119Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a1/0b/f8524551ab2d896dfaca74ddb70a4453d515bbf4ab5451c100c7788ae155/transformers-5.5.3-py3-none-any.whl", hash = "sha256:e48f3ec31dd96505e96e66b63a1e43e1ad7a65749e108d9227caaf51051cdb02", size = 10236257, upload-time = "2026-04-09T15:52:52.866Z" },
+    { url = "https://files.pythonhosted.org/packages/73/6f/e1564b0cc182afa05e219a8e09a8e770ffaab879b6b824b56c819bd221da/transformers-5.10.2-py3-none-any.whl", hash = "sha256:8a669db546f82c7c3618cb46ceb0f0afd89292bc70f319c058f8332ec63e268d", size = 11003830, upload-time = "2026-06-04T18:43:45.303Z" },
 ]
 
 [[package]]

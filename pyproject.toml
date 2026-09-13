@@ -20,7 +20,7 @@ dependencies = [
     # now that comfyless_diffusion has a remote and a v0.1.0 tag (2026-09-12).
     # uv.lock records the resolved COMMIT alongside the tag, so the pin is
     # immutable even though a tag is not.
-    "comfyless-diffusion==0.1.0",
+    "comfyless-diffusion==0.1.3",
     # ── Comfyless dep-divergence rule (ADR-013, 2026-05-16) ─────────────────
     # The comfyless dev/test environment is the uv-managed `.venv` created by
     # `uv sync`. The pin set below is chosen for the comfyless deploy
@@ -59,7 +59,12 @@ dependencies = [
     # pin (was rev 29a59fd9, 0.39.0.dev0). This pin is what ends the branch's
     # reason to exist; it merges to main with the krea support.
     "diffusers==0.39.0",
-    "transformers==5.5.3",
+    # 5.10.2, not the 5.10.0 that PYSEC-2026-3929 names as "fixed": 5.10.0 is
+    # YANKED on PyPI ("pushed from a week old main branch ... missing a bunch of
+    # fixes", upstream). 5.10.2 is the lowest non-yanked release at or above the
+    # fix. MUST stay in lockstep with comfyless_diffusion's pin — a mismatch
+    # makes the two repos unresolvable against each other.
+    "transformers==5.10.2",
     "accelerate==1.13.0",
     "peft==0.18.1",
     # safetensors 0.8.0: required by diffusers>=0.39.0 (release bumped its
@@ -123,7 +128,7 @@ typeCheckingMode = "basic"
 #
 # NOTE: the repository is PRIVATE, so resolving this needs a credential
 # (`gh auth git-credential` covers it locally; CI needs a token secret).
-comfyless-diffusion = { git = "https://github.com/gawkahn/comfyless_diffusion.git", tag = "v0.1.0" }
+comfyless-diffusion = { git = "https://github.com/gawkahn/comfyless_diffusion.git", tag = "v0.1.3" }
 
 [dependency-groups]
 # Dev-only tooling for the comfyless uv path (ADR-013). NOT part of

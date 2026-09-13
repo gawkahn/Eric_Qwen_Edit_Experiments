@@ -3114,6 +3114,37 @@ or the node pack and the runtime diverge.
   a full battery and live validation. This is now the only unaddressed finding,
   and it is the reason `supply-chain-lock` stays red.
 
+**RESOLVED 2026-09-12 — transformers 5.5.3 -> 5.10.2.** Not 5.10.0, the version
+the advisory names as fixed: **5.10.0 is YANKED on PyPI**, upstream's own reason
+being "We pushed from a week old main branch ... uncertain its gonna be working
+properly and mostly it is missing a bunch of fixes!" 5.10.2 is the lowest
+non-yanked release at or above the fix, so it clears the CVE with the smallest
+delta. 5.17.0 is latest and was deliberately not taken — seven further minors of
+unrelated change for no security gain. Worth remembering: an advisory's "fixed
+version" can be a release the maintainers have since pulled; `uv lock` warned,
+nothing else would have.
+
+Validation, given that a five-minor jump under a deeply-used library was the
+stated concern:
+- Sibling battery 29/29, node battery 7/7.
+- A cross-version DIFFERENTIAL on all three transformers surfaces this code
+  actually uses, same weights and prompt, float32 on CPU for determinism, run
+  under 5.5.3 and 5.10.2: the Qwen2.5-VL text encoder (`hidden_sha` identical),
+  CLIP penultimate + pooled for the SDXL path (identical), and `Qwen2VLProcessor`
+  for the edit path (identical `input_ids`, same key set). Bit-identical on all
+  three.
+- `just deps-cve` is green in both repos; `supply-chain-lock` is no longer red
+  by design.
+
+**What is NOT proven:** an end-to-end pixel generation. A tensor-parallel vLLM
+job was holding 90.6 GB on both GPUs at the time, leaving ~5 GB — not enough for
+a 20B image model, and not worth killing someone's job over. The CPU
+differential covers the API surface the bump actually risks (every transformers
+import site in the codebase); what remains unexercised is the diffusers/torch
+pixel path, which this bump does not touch. Run one Qwen pixel case against
+`08-21-26/restructure-baseline/manifest-v2a.json` when a GPU is free.
+
+
 ## 2026-09-09 — the two repos' lockfiles diverged at birth (37 of 105 packages)
 
 **What:** `comfyless_diffusion`'s `uv.lock` was generated fresh during ADR-045

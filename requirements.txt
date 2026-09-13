@@ -15,7 +15,7 @@
 # ────────────────────────────────────────────────────────────────────────
 # The runtime core (ADR-045). Every module under nodes/ imports
 # comfyless.core.* at module top, so the node pack does not load without this.
-# Pinned to the v0.1.0 tag. NOTE a tag is mutable: only uv.lock records the
+# Pinned to the v0.1.3 tag. NOTE a tag is mutable: only uv.lock records the
 # resolved commit, and pip consumers of THIS file do not get that pin — the
 # uv path (`uv sync --locked`) does.
 #
@@ -23,7 +23,7 @@
 # anyone holding a credential for it and fails for everyone else. That is a
 # known gap in the ComfyUI Manager story, not an oversight — see TECH_DEBT
 # 2026-09-09 and the Vision's open question on PyPI vs git+https.
-comfyless-diffusion @ git+https://github.com/gawkahn/comfyless_diffusion.git@v0.1.0
+comfyless-diffusion @ git+https://github.com/gawkahn/comfyless_diffusion.git@v0.1.3
 torch==2.11.0
 # torchvision must match torch's minor (2.11 ↔ 0.26); required by the
 # diffusers SD image-transform path — basic SD generation errors without it.
@@ -38,7 +38,7 @@ mslk-cuda==1.1.0
 # diffusers 0.39.0 (released 2026-07-03): first PyPI release with Krea2 —
 # replaces the krea-testing git pin (was rev 29a59fd9, 0.39.0.dev0).
 diffusers==0.39.0
-transformers==5.5.3
+transformers==5.10.2
 accelerate==1.13.0
 peft==0.18.1
 # safetensors 0.8.0: required by diffusers>=0.39.0; lockstep with the diffusers pin
