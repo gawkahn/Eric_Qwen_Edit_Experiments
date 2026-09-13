@@ -167,7 +167,7 @@ wheels = [
 [[package]]
 name = "comfyless-diffusion"
 version = "0.1.0"
-source = { editable = "../comfyless_diffusion" }
+source = { git = "https://github.com/gawkahn/comfyless_diffusion.git?tag=v0.1.0#e106175c7e5d940c7346b51a03cfb2ba7dd0fadd" }
 dependencies = [
     { name = "accelerate" },
     { name = "av" },
@@ -189,32 +189,6 @@ dependencies = [
     { name = "torchvision" },
     { name = "transformers" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "accelerate", specifier = "==1.13.0" },
-    { name = "av", specifier = "==18.0.0" },
-    { name = "click", specifier = "==8.3.3" },
-    { name = "diffusers", specifier = "==0.39.0" },
-    { name = "ftfy", specifier = "==6.3.1" },
-    { name = "mcp", specifier = "==1.28.1" },
-    { name = "mslk-cuda", specifier = "==1.1.0" },
-    { name = "numpy", specifier = "==2.4.4" },
-    { name = "peft", specifier = "==0.18.1" },
-    { name = "pillow", specifier = "==12.3.0" },
-    { name = "protobuf", specifier = "==7.35.1" },
-    { name = "safetensors", specifier = "==0.8.0" },
-    { name = "scipy", specifier = "==1.17.1" },
-    { name = "sentencepiece", specifier = "==0.2.1" },
-    { name = "tiktoken", specifier = "==0.13.0" },
-    { name = "torch", specifier = "==2.11.0" },
-    { name = "torchao", specifier = "==0.17.0" },
-    { name = "torchvision", specifier = "==0.26.0" },
-    { name = "transformers", specifier = "==5.5.3" },
-]
-
-[package.metadata.requires-dev]
-dev = [{ name = "pre-commit", specifier = "==4.6.0" }]
 
 [[package]]
 name = "comfyui-eric-qwen-edit"
@@ -253,7 +227,7 @@ requires-dist = [
     { name = "accelerate", specifier = "==1.13.0" },
     { name = "av", specifier = "==18.0.0" },
     { name = "click", specifier = "==8.3.3" },
-    { name = "comfyless-diffusion", editable = "../comfyless_diffusion" },
+    { name = "comfyless-diffusion", git = "https://github.com/gawkahn/comfyless_diffusion.git?tag=v0.1.0" },
     { name = "diffusers", specifier = "==0.39.0" },
     { name = "ftfy", specifier = "==6.3.1" },
     { name = "mcp", specifier = "==1.28.1" },

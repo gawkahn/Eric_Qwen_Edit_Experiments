@@ -76,19 +76,28 @@ jobs:
           "${{ github.event.pull_request.head.sha }}"
 
   tests:
-    # ── ADR-045 slice 7: BLOCKED ON THE SIBLING REPOSITORY ──────────────────
-    # uv.lock resolves comfyless-diffusion from `../comfyless_diffusion`, a
-    # path source. A GitHub runner checks out this repo alone, so `uv sync
-    # --locked` cannot satisfy it and this job would fail on every push. It is
-    # SKIPPED rather than left red, because a permanently-red job trains people
-    # to ignore CI. Coverage while skipped: LOCAL `just tests` in both repos
-    # only. comfyless_diffusion has no CI at all yet (no .github/, no remote),
-    # so nothing runs there — do not read this skip as "covered elsewhere".
-    # RE-ENABLE by deleting this `if:` when comfyless_diffusion has a remote and
-    # the dependency becomes the git+https pin ADR-045 describes.
-    # See TECH_DEBT 2026-09-09 "the node pack depends on comfyless-diffusion by
-    # local path".
-    if: false
+    # ── ADR-045: gated on a cross-repo credential ───────────────────────────
+    # The original blocker (a `path` source a lone runner cannot resolve) is
+    # GONE as of 2026-09-12: comfyless-diffusion is now a git+https pin. What
+    # replaced it is narrower — comfyless_diffusion is a PRIVATE repository and
+    # a workflow's default GITHUB_TOKEN is scoped to THIS repo only, so
+    # `uv sync --locked` still cannot fetch it without a credential.
+    #
+    # TO TURN THESE THREE JOBS ON, no code change needed:
+    #   1. create a token with read access to gawkahn/comfyless_diffusion
+    #      (fine-grained, Contents: read-only is enough)
+    #   2. add it as the secret COMFYLESS_CORE_TOKEN
+    #   3. set the repository VARIABLE CROSS_REPO_CI to `true`
+    # Skipped (not red) until then, because a permanently-red job trains people
+    # to ignore CI. `vars` is used for the gate because the `secrets` context is
+    # NOT available in a job-level `if:`.
+    #
+    # UNTESTED: the auth step below has never run — these jobs have been
+    # skipped since they were written. Expect to iterate once the flag flips.
+    # Coverage while skipped is LOCAL `just tests` in both repos only; the
+    # sibling still has no CI of its own, so do not read this as "covered
+    # elsewhere". See TECH_DEBT 2026-09-09.
+    if: ${{ vars.CROSS_REPO_CI == 'true' }}
     name: tests (standalone suite battery)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -103,6 +112,20 @@ jobs:
       # Full locked venv (CUDA wheel tree included — the lock is exact; the
       # suites are proven CPU-safe, GPU never touched). UV_NO_CACHE: don't
       # hold the wheels twice on runner disk.
+      # comfyless-diffusion is a git+https pin against a PRIVATE repo, so the
+      # fetch needs a credential the default GITHUB_TOKEN does not provide.
+      # Rewrites github.com https URLs for git only; Actions masks the token.
+      - name: authenticate to the private core repository
+        # Fail LOUD on a missing secret. Repository `vars` are exposed to
+        # fork-PR runs but secrets are not, so with CROSS_REPO_CI=true every
+        # fork PR would otherwise reach `uv sync` with an empty token, get a
+        # 404 on the private repo, and report "repository not found" — which
+        # reads as "repo deleted", not "secret missing".
+        run: |
+          [ -n "$TOKEN" ] || { echo "::error::CROSS_REPO_CI is true but COMFYLESS_CORE_TOKEN is empty (fork PR, or secret not set)"; exit 1; }
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+        env:
+          TOKEN: ${{ secrets.COMFYLESS_CORE_TOKEN }}
       - run: uv sync --locked
         env:
           UV_NO_CACHE: "1"
@@ -120,19 +143,28 @@ jobs:
         run: mise exec just -- just tests
 
   typecheck:
-    # ── ADR-045 slice 7: BLOCKED ON THE SIBLING REPOSITORY ──────────────────
-    # uv.lock resolves comfyless-diffusion from `../comfyless_diffusion`, a
-    # path source. A GitHub runner checks out this repo alone, so `uv sync
-    # --locked` cannot satisfy it and this job would fail on every push. It is
-    # SKIPPED rather than left red, because a permanently-red job trains people
-    # to ignore CI. Coverage while skipped: LOCAL `just tests` in both repos
-    # only. comfyless_diffusion has no CI at all yet (no .github/, no remote),
-    # so nothing runs there — do not read this skip as "covered elsewhere".
-    # RE-ENABLE by deleting this `if:` when comfyless_diffusion has a remote and
-    # the dependency becomes the git+https pin ADR-045 describes.
-    # See TECH_DEBT 2026-09-09 "the node pack depends on comfyless-diffusion by
-    # local path".
-    if: false
+    # ── ADR-045: gated on a cross-repo credential ───────────────────────────
+    # The original blocker (a `path` source a lone runner cannot resolve) is
+    # GONE as of 2026-09-12: comfyless-diffusion is now a git+https pin. What
+    # replaced it is narrower — comfyless_diffusion is a PRIVATE repository and
+    # a workflow's default GITHUB_TOKEN is scoped to THIS repo only, so
+    # `uv sync --locked` still cannot fetch it without a credential.
+    #
+    # TO TURN THESE THREE JOBS ON, no code change needed:
+    #   1. create a token with read access to gawkahn/comfyless_diffusion
+    #      (fine-grained, Contents: read-only is enough)
+    #   2. add it as the secret COMFYLESS_CORE_TOKEN
+    #   3. set the repository VARIABLE CROSS_REPO_CI to `true`
+    # Skipped (not red) until then, because a permanently-red job trains people
+    # to ignore CI. `vars` is used for the gate because the `secrets` context is
+    # NOT available in a job-level `if:`.
+    #
+    # UNTESTED: the auth step below has never run — these jobs have been
+    # skipped since they were written. Expect to iterate once the flag flips.
+    # Coverage while skipped is LOCAL `just tests` in both repos only; the
+    # sibling still has no CI of its own, so do not read this as "covered
+    # elsewhere". See TECH_DEBT 2026-09-09.
+    if: ${{ vars.CROSS_REPO_CI == 'true' }}
     name: typecheck (pyright ratchet)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -147,6 +179,20 @@ jobs:
         with:
           version: "0.11.7" # match dev box; exact pin per §11
           enable-cache: false
+      # comfyless-diffusion is a git+https pin against a PRIVATE repo, so the
+      # fetch needs a credential the default GITHUB_TOKEN does not provide.
+      # Rewrites github.com https URLs for git only; Actions masks the token.
+      - name: authenticate to the private core repository
+        # Fail LOUD on a missing secret. Repository `vars` are exposed to
+        # fork-PR runs but secrets are not, so with CROSS_REPO_CI=true every
+        # fork PR would otherwise reach `uv sync` with an empty token, get a
+        # 404 on the private repo, and report "repository not found" — which
+        # reads as "repo deleted", not "secret missing".
+        run: |
+          [ -n "$TOKEN" ] || { echo "::error::CROSS_REPO_CI is true but COMFYLESS_CORE_TOKEN is empty (fork PR, or secret not set)"; exit 1; }
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+        env:
+          TOKEN: ${{ secrets.COMFYLESS_CORE_TOKEN }}
       - run: uv sync --locked
         env:
           UV_NO_CACHE: "1"
@@ -211,19 +257,28 @@ jobs:
         run: mise exec -- osv-scanner scan source --lockfile=uv.lock
 
   supply-chain:
-    # ── ADR-045 slice 7: BLOCKED ON THE SIBLING REPOSITORY ──────────────────
-    # uv.lock resolves comfyless-diffusion from `../comfyless_diffusion`, a
-    # path source. A GitHub runner checks out this repo alone, so `uv sync
-    # --locked` cannot satisfy it and this job would fail on every push. It is
-    # SKIPPED rather than left red, because a permanently-red job trains people
-    # to ignore CI. Coverage while skipped: LOCAL `just tests` in both repos
-    # only. comfyless_diffusion has no CI at all yet (no .github/, no remote),
-    # so nothing runs there — do not read this skip as "covered elsewhere".
-    # RE-ENABLE by deleting this `if:` when comfyless_diffusion has a remote and
-    # the dependency becomes the git+https pin ADR-045 describes.
-    # See TECH_DEBT 2026-09-09 "the node pack depends on comfyless-diffusion by
-    # local path".
-    if: false
+    # ── ADR-045: gated on a cross-repo credential ───────────────────────────
+    # The original blocker (a `path` source a lone runner cannot resolve) is
+    # GONE as of 2026-09-12: comfyless-diffusion is now a git+https pin. What
+    # replaced it is narrower — comfyless_diffusion is a PRIVATE repository and
+    # a workflow's default GITHUB_TOKEN is scoped to THIS repo only, so
+    # `uv sync --locked` still cannot fetch it without a credential.
+    #
+    # TO TURN THESE THREE JOBS ON, no code change needed:
+    #   1. create a token with read access to gawkahn/comfyless_diffusion
+    #      (fine-grained, Contents: read-only is enough)
+    #   2. add it as the secret COMFYLESS_CORE_TOKEN
+    #   3. set the repository VARIABLE CROSS_REPO_CI to `true`
+    # Skipped (not red) until then, because a permanently-red job trains people
+    # to ignore CI. `vars` is used for the gate because the `secrets` context is
+    # NOT available in a job-level `if:`.
+    #
+    # UNTESTED: the auth step below has never run — these jobs have been
+    # skipped since they were written. Expect to iterate once the flag flips.
+    # Coverage while skipped is LOCAL `just tests` in both repos only; the
+    # sibling still has no CI of its own, so do not read this as "covered
+    # elsewhere". See TECH_DEBT 2026-09-09.
+    if: ${{ vars.CROSS_REPO_CI == 'true' }}
     name: supply chain (sources + license + cve)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -241,6 +296,20 @@ jobs:
       # ~14 GB free disk — code-reviewer 2026-07-16); if disk/time still becomes
       # a problem, switch the license/cve scans to `uv export`-based inputs
       # that don't install.
+      # comfyless-diffusion is a git+https pin against a PRIVATE repo, so the
+      # fetch needs a credential the default GITHUB_TOKEN does not provide.
+      # Rewrites github.com https URLs for git only; Actions masks the token.
+      - name: authenticate to the private core repository
+        # Fail LOUD on a missing secret. Repository `vars` are exposed to
+        # fork-PR runs but secrets are not, so with CROSS_REPO_CI=true every
+        # fork PR would otherwise reach `uv sync` with an empty token, get a
+        # 404 on the private repo, and report "repository not found" — which
+        # reads as "repo deleted", not "secret missing".
+        run: |
+          [ -n "$TOKEN" ] || { echo "::error::CROSS_REPO_CI is true but COMFYLESS_CORE_TOKEN is empty (fork PR, or secret not set)"; exit 1; }
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+        env:
+          TOKEN: ${{ secrets.COMFYLESS_CORE_TOKEN }}
       - run: uv sync --locked
         env:
           UV_NO_CACHE: "1"

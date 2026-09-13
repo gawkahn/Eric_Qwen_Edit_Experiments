@@ -16,10 +16,10 @@ maintainers = [
 ]
 dependencies = [
     # ── The runtime core, extracted by ADR-045 slice 6 ──────────────────
-    # Exact-pinned per global §11. Resolved from the local checkout via
-    # [tool.uv.sources] below until the repository has a remote and a tag,
-    # at which point this becomes the git+https pin ADR-045 describes and
-    # requirements.txt can carry it too (see TECH_DEBT 2026-09-09).
+    # Exact-pinned per global §11, resolved from the git+https source below
+    # now that comfyless_diffusion has a remote and a v0.1.0 tag (2026-09-12).
+    # uv.lock records the resolved COMMIT alongside the tag, so the pin is
+    # immutable even though a tag is not.
     "comfyless-diffusion==0.1.0",
     # ── Comfyless dep-divergence rule (ADR-013, 2026-05-16) ─────────────────
     # The comfyless dev/test environment is the uv-managed `.venv` created by
@@ -110,10 +110,20 @@ venv = ".venv"
 typeCheckingMode = "basic"
 
 [tool.uv.sources]
-# Local checkout, editable so edits on either side are live without a release
-# step (ADR-045 "Dependency mechanism"). This is the DEV wiring; the published
-# form is the git+https pin named in the dependency comment above.
-comfyless-diffusion = { path = "../comfyless_diffusion", editable = true }
+# git+https against the tag, NOT the sibling checkout. The path source this
+# replaced was editable, so edits in comfyless_diffusion were live here with no
+# release step; that convenience is deliberately gone. The node pack now
+# consumes a RELEASED core, which is what makes `uv.lock` reproducible off this
+# machine and lets the three CI jobs run at all.
+#
+# Co-developing both repos? Don't re-add a path source — override just your
+# local venv, and leave the lock alone:
+#     uv pip install -e ../comfyless_diffusion
+# then `uv sync` to snap back to the pinned tag when you're done.
+#
+# NOTE: the repository is PRIVATE, so resolving this needs a credential
+# (`gh auth git-credential` covers it locally; CI needs a token secret).
+comfyless-diffusion = { git = "https://github.com/gawkahn/comfyless_diffusion.git", tag = "v0.1.0" }
 
 [dependency-groups]
 # Dev-only tooling for the comfyless uv path (ADR-013). NOT part of

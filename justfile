@@ -19,7 +19,16 @@ deps-cve:
     set -uo pipefail
     rc=0
     echo "== pip-audit (PyPI advisory DB + PYSEC) =="
-    uv export --format requirements-txt --no-emit-project --quiet \
+    # --no-emit-package comfyless-diffusion: since 2026-09-12 that dep is a
+    # git+https pin, and pip-audit refuses a VCS requirement outright ("we don't
+    # have a way to hash version control repositories"), which killed this whole
+    # half of the recipe. Dropping the line is correct rather than a workaround:
+    # it is OUR OWN first-party code with no PyPI advisories to find, and its
+    # transitive deps still appear as their own entries, so nothing goes
+    # unscanned (104 pinned packages either way). osv-scanner below reads
+    # uv.lock natively and never had the problem.
+    uv export --format requirements-txt --no-emit-project \
+      --no-emit-package comfyless-diffusion --quiet \
       | uv run --with pip-audit==2.10.1 pip-audit -r /dev/stdin --progress-spinner=off \
           --ignore-vuln PYSEC-2026-3447 --ignore-vuln CVE-2025-3000 \
           --ignore-vuln GHSA-4j2p-28q2-5m79 || rc=1

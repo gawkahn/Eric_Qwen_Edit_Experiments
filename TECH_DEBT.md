@@ -3023,6 +3023,48 @@ whose node pack dies with `ModuleNotFoundError: comfyless` will reasonably type
 user-facing install instruction — the `git+https` form only.** Cheap mitigation
 available now: reserve the name on PyPI.
 
+**Resolved: 2026-09-12 — the local-path wiring is gone.** `comfyless_diffusion`
+got a private remote and a `v0.1.0` tag, so `[tool.uv.sources]` is now
+`{ git = "https://github.com/gawkahn/comfyless_diffusion.git", tag = "v0.1.0" }`
+and `uv.lock` records the resolved commit `e106175c`. All three consequences the
+entry listed are addressed:
+
+1. `requirements.txt` carries the dep now, as a `git+https` line.
+2. The three CI jobs no longer carry `if: false`. They are gated on a
+   repository variable `CROSS_REPO_CI` instead, because the ORIGINAL blocker
+   (unresolvable path source) was replaced by a narrower one: the core repo is
+   private and a workflow's default `GITHUB_TOKEN` cannot read another repo. A
+   token step is wired but UNTESTED — it has never run. Flipping the variable
+   plus adding a `COMFYLESS_CORE_TOKEN` secret turns them on.
+3. The tier-3 exception in `scripts/check_lock_sources.py` was rewritten, not
+   deleted: name AND repo URL AND a real 40-hex commit fragment must all match.
+   **The first version of this check shipped a hole, caught in review the same
+   day.** It matched the URL with a bare `startswith`, which any CONTINUATION of
+   the allowed URL also satisfies — including
+   `…/comfyless_diffusion.git/../../evil/repo.git#<40-hex>`, which git's libcurl
+   transport resolves by squashing the dot-segments, so it would have fetched an
+   attacker's repository at a real commit of THEIR tree while passing the gate.
+   Fixed by requiring the character after the allowed URL to be `?`, `#`, or
+   end-of-string. Now negative-tested across nine shapes: three legitimate forms
+   allowed; dot-segment escape, URL-suffix lookalike, extra path segment,
+   tag-only (mutable), truncated SHA, and wrong package name all rejected.
+   Worth recording rather than quietly fixing: a prefix match reads as strict
+   and is not.
+
+Verified: `uv sync` swapped the editable path install for a git install at the
+pinned commit, and the node battery is 7/7 against it.
+
+**What did NOT get fixed, deliberately:** the private repo means that
+`requirements.txt` line works for a credential holder and fails for everyone
+else, so the ComfyUI Manager story is still not "works for a stranger". That is
+the Vision's open question (PyPI vs `git+https` vs public), unchanged by this
+slice. **Also lost, deliberately:** cross-repo live editing. The path source was
+editable, so sibling edits were instantly live here. Now the node pack consumes
+a released core — which is the point — and co-development needs
+`uv pip install -e ../comfyless_diffusion` in the local venv, documented in
+`[tool.uv.sources]`.
+
+
 ## 2026-09-09 — three NEW CVEs in the locked dependency set (§11 MUST)
 
 **What:** `osv-scanner scan source --lockfile=uv.lock` reports three findings
@@ -3190,7 +3232,9 @@ user rather than only this machine, and the redeploy becomes a plain copy again.
 
 **FIRED 2026-09-12** — the remote exists (private). Still blocked on the pin
 itself, which has not been converted; the ordering is pin first, then redeploy,
-because ComfyUI Manager installs from `requirements.txt`. One correction to the
+because ComfyUI Manager installs from `requirements.txt`. **Pin landed the same
+day — see the Resolved note on the local-path entry above; the redeploy itself
+is still the open half of this entry.** One correction to the
 reasoning above: because the remote is PRIVATE, the pin does not make this
 "work for a real downstream user" — it makes it work for anyone holding a
 credential. If the goal is genuinely a downstream user, that needs either a
