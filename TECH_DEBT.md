@@ -3265,7 +3265,39 @@ user rather than only this machine, and the redeploy becomes a plain copy again.
 itself, which has not been converted; the ordering is pin first, then redeploy,
 because ComfyUI Manager installs from `requirements.txt`. **Pin landed the same
 day — see the Resolved note on the local-path entry above; the redeploy itself
-is still the open half of this entry.** One correction to the
+is still the open half of this entry.**
+
+**CLOSED 2026-09-12 — Grant's decision: do not redeploy at all.** Not deferred
+again; the entry is settled. With the pin landed, the redeploy became *possible*
+and the measurement showed it is not *desirable*. Installing this repo's
+`requirements.txt` into a ComfyUI venv changes five shared libraries —
+`torch` (2.10.0 -> 2.11.0 on comfy0/comfy1), `transformers` (5.5.x -> 5.10.2),
+`diffusers` (0.36/0.37 -> 0.39.0), `accelerate`, `safetensors` (0.7 -> 0.8) —
+and adds `torchao`. Those sit underneath **137 other custom node packs on
+comfy0 and 135 on comfy1**. comfy-dev would have been the contained option (14
+packs, torch and accelerate already matching) but was declined too.
+
+This is precisely the conflict ADR-013 predicted when it made comfyless deploy
+via its own uv venv: "pins in this file may diverge from ComfyUI's bundled torch
+in the future ... that conflict is upstream's resolver, not a node-pack break."
+The divergence is now real and measured rather than anticipated.
+
+Consequences accepted, stated plainly so nobody rediscovers them as bugs:
+- The node pack is NOT loadable in any ComfyUI on this machine and will not be.
+  The deployed copies at `comfyui/custom_nodes/` (2026-04-04) and
+  `comfy1/custom_nodes/` (2026-04-09) stay frozen at pre-split code; comfy-dev
+  keeps an empty stub. None of them import `comfyless`, so none of them break —
+  they are simply old.
+- `requirements.txt` remains the published manifest for a hypothetical
+  downstream user and is kept correct, but it is no longer exercised by any
+  install on this machine. Nothing here proves it works.
+- Grant's actual path is the comfyless CLI and daemon, which run from
+  `comfyless_diffusion`'s own venv and are unaffected.
+
+**Trigger to revisit:** wanting to actually run these nodes inside ComfyUI
+again, or ComfyUI's own bundled versions catching up to these pins (at which
+point the conflict evaporates on its own). Re-measure the table above before
+acting — it was accurate on 2026-09-12 and will drift. One correction to the
 reasoning above: because the remote is PRIVATE, the pin does not make this
 "work for a real downstream user" — it makes it work for anyone holding a
 credential. If the goal is genuinely a downstream user, that needs either a

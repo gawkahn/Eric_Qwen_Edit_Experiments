@@ -576,11 +576,15 @@ imports them eagerly, while no ComfyUI venv can import `comfyless` and
 redeploy would trade stale-but-working for broken-at-import. Grant's call: wait
 for the sibling's remote, at which point the pin becomes `git+https` and the
 ComfyUI Manager path works for a real downstream user rather than only this
-machine. **Remote added 2026-09-12 (private) — this is unblocked; the pin
-conversion and then the redeploy are the next two slices, in that order.
-Caveat: private means the pin works for a credential holder, not for a
-stranger, which leaves open question 4 below (PyPI vs `git+https`) still
-genuinely open rather than answered by the remote.** The plan's "all three are four months stale" was also wrong — comfy-dev
+machine. **Remote added 2026-09-12 (private); the pin conversion landed the
+same day. The redeploy itself is now CLOSED — Grant decided against it.** With
+the pin in place the redeploy became possible, and measuring it showed it would
+upgrade five shared libraries beneath 137 and 135 unrelated custom node packs on
+comfy0/comfy1. That is the conflict ADR-013 predicted, now real. The node pack
+is therefore not loadable in ComfyUI on this machine by choice; the CLI and
+daemon paths are unaffected. See TECH_DEBT 2026-09-09 (ComfyUI copies) for the
+accepted consequences. Open question 4 below (PyPI vs `git+https` vs public)
+remains genuinely open — the private remote did not answer it. The plan's "all three are four months stale" was also wrong — comfy-dev
 has an empty stub and is not deployed at all.
 
 *Discovered — the interactive path.* The Vision named the unit and the launcher
