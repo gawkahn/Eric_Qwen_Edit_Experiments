@@ -3329,7 +3329,32 @@ Consequences accepted, stated plainly so nobody rediscovers them as bugs:
 **Trigger to revisit:** wanting to actually run these nodes inside ComfyUI
 again, or ComfyUI's own bundled versions catching up to these pins (at which
 point the conflict evaporates on its own). Re-measure the table above before
-acting — it was accurate on 2026-09-12 and will drift. One correction to the
+acting — it was accurate on 2026-09-12 and will drift.
+
+**REOPENED 2026-09-13 — Grant: update ComfyUI to latest FIRST, then redeploy.**
+The second half of that trigger is being pursued deliberately rather than waited
+for. Measurement supporting the plan: **ComfyUI core's own pins are FLOATING and
+unbounded** — `torch`, `transformers>=4.50.3`, `safetensors>=0.4.2`,
+`numpy>=1.25.0`, no upper bounds anywhere in its `requirements.txt`. So updating
+ComfyUI should carry torch, transformers and safetensors forward on comfy0/comfy1
+on its own, closing three of the five gaps without us touching anything.
+
+Two gaps will NOT close that way, because neither is a ComfyUI core dependency:
+- `diffusers` (0.36/0.37 -> 0.39.0). It is present in those venvs only because
+  some other custom node pulled it in. 0.39.0 is the one that actually matters —
+  it provides `Krea2Transformer2DModel`.
+- `torchao` (absent -> 0.17.0), needed for the fp8 quantize-on-load path.
+
+It also reframes the risk, in our favour: since ComfyUI core imposes no ceiling,
+installing this repo's `requirements.txt` cannot conflict with ComfyUI *itself*.
+The exposure is only to whichever of the 137/135 other custom node packs pin
+ranges of their own — a much narrower question than "will ComfyUI break".
+
+**Ordering:** (1) update ComfyUI on each install, (2) RE-MEASURE the version
+table above — it was accurate 2026-09-12 and the whole point is that it should
+look different afterwards, (3) then decide the redeploy on the smaller gap.
+Step 1 is its own piece of work and belongs to the ai-stack side, not this
+repo's session: three installs, 272 custom node packs between them. One correction to the
 reasoning above: because the remote is PRIVATE, the pin does not make this
 "work for a real downstream user" — it makes it work for anyone holding a
 credential. If the goal is genuinely a downstream user, that needs either a
