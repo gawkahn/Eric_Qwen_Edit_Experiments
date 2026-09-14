@@ -149,18 +149,27 @@ no pc_redzone_ref "docs/security/review-ghost.md" "src/comfyless/server.py" revi
 # default used above and by the commit-msg hook) for "the index". This is what
 # lets a referenced doc be deleted later without retroactively failing the
 # commit that cited it. See _gp_ref_exists in _lib.sh.
-gp_root_sha="$(git rev-list --max-parents=0 HEAD | head -1)"
+# Both operands are derived at RUN TIME, deliberately:
+#   - the ADR is whichever one this repo currently has, not a hard-coded name,
+#     so the docs prune this change unblocks cannot break the suite by deleting
+#     the file a test happened to cite (code review 2026-09-13).
+#   - the negative case uses the EMPTY TREE, not this repo's root commit. CI
+#     checks out at depth 1, where `rev-list --max-parents=0 HEAD` resolves to
+#     the pushed commit itself — in which the ADR *does* exist, so the assertion
+#     inverted and the job failed while passing locally on a full clone.
+gp_any_adr="$(git ls-files 'docs/decisions/ADR-*.md' | head -1)"
+gp_empty_tree="$(git hash-object -t tree /dev/null)"
 # Present at HEAD's tree -> passes.
-ok pc_redzone_ref "see docs/decisions/ADR-001-daemon-socket-security.md" "src/comfyless/server.py" spec "$repo_root" HEAD
-# The SAME reference against the ROOT commit's tree, where the ADR did not yet
-# exist -> blocked. This is the discriminating case: under the old working-tree
-# test both of these passed identically, because the file exists on disk now.
-no pc_redzone_ref "see docs/decisions/ADR-001-daemon-socket-security.md" "src/comfyless/server.py" spec "$repo_root" "$gp_root_sha"
+ok pc_redzone_ref "see $gp_any_adr" "src/comfyless/server.py" spec "$repo_root" HEAD
+# The SAME reference against a tree that contains nothing -> blocked. This is
+# the discriminating case: under the old working-tree test both of these passed
+# identically, because the file exists on disk now.
+no pc_redzone_ref "see $gp_any_adr" "src/comfyless/server.py" spec "$repo_root" "$gp_empty_tree"
 # An unresolvable tree-ish must FAIL CLOSED, not wave the commit through.
-no pc_redzone_ref "see docs/decisions/ADR-001-daemon-socket-security.md" "src/comfyless/server.py" spec "$repo_root" "0000000000000000000000000000000000000000"
+no pc_redzone_ref "see $gp_any_adr" "src/comfyless/server.py" spec "$repo_root" "0000000000000000000000000000000000000000"
 # _gp_ref_exists itself: a blob passes, a tree (directory) does not. The old
 # `[ -f ]` also rejected a directory; keep that property.
-ok _gp_ref_exists "$repo_root" "" "docs/decisions/ADR-001-daemon-socket-security.md"
+ok _gp_ref_exists "$repo_root" "" "$gp_any_adr"
 no _gp_ref_exists "$repo_root" "" "docs/decisions"
 no _gp_ref_exists "$repo_root" "" "docs/decisions/ADR-999-ghost.md"
 # A committed SYMLINK types as `blob`, so the mode — not the object type — is
