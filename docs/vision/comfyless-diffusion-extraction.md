@@ -551,12 +551,28 @@ three are four months stale). Update `CLAUDE.md` in both repos, the vault
 manuals, and the mcpo launcher.
 
 *Proof:* daemon starts under systemd from the new unit; one live generation
-through the CLI and one through the daemon; pixel-diff against the slice-0
-baseline.
+through the CLI and one through the daemon; pixel-diff against the reference
+matrix.
+
+> **Which manifest.** Earlier revisions of this line said "the slice-0 baseline
+> in `08-21-26/restructure-baseline`". Do not use that. It is an UNTRACKED local
+> scratch directory, and its `manifest-v2a.json` holds a stale
+> `fam-qwen-2512` hash — comparing against it reports an 858,968-pixel
+> regression that does not exist (cost a full bisect on 2026-09-13; see
+> TECH_DEBT). The authoritative references are the tracked manifests in
+> `comfyless_diffusion/tests/golden/`; the newest full matrix is
+> `manifest-post3c.json`.
 
 **Outcome (2026-09-09).** Done, with one part deferred and one part discovered.
 
-*Met.* The unit runs `comfyless_diffusion/.venv/bin/comfyless --serve` with
+*Met — and re-proven in full on 2026-09-13.* Once the GPUs freed, the entire
+24-case `manifest-post3c` matrix was re-run against the post-split code on
+transformers 5.10.2 and the git+https pin: **24/24 pixel-identical, zero strict
+failures**, covering every sigma schedule, sampler, model family, LoRA load path,
+NAG, fp8 quantization and the 2x upscale-VAE decode. The extraction, the pin and
+the dependency bump are all output-neutral, measured rather than asserted.
+
+The unit runs `comfyless_diffusion/.venv/bin/comfyless --serve` with
 `WorkingDirectory` repointed and the `PYTHONPATH` line deleted; `start-mcpo.sh`
 spawns `comfyless-mcp` from the same venv. Both instances restarted clean and
 round-tripped a validated `report_roots` request per device; mcpo started,

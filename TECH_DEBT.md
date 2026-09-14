@@ -3144,6 +3144,38 @@ import site in the codebase); what remains unexercised is the diffusers/torch
 pixel path, which this bump does not touch. Run one Qwen pixel case against
 `08-21-26/restructure-baseline/manifest-v2a.json` when a GPU is free.
 
+**Pixel validation COMPLETED 2026-09-13 — 24/24, zero strict failures.** The
+GPUs freed up and the full `manifest-post3c` matrix was re-run against the
+post-split code on transformers 5.10.2 and the git+https pin: all 5 sigma
+schedules, all 5 samplers, all 6 families (Krea-2-Turbo, FLUX.2-klein-9B,
+Juggernaut-XL, Qwen-Image-2512, Z-Image-Turbo, Chroma1-Flash), all 5 LoRA load
+paths (rank-64, Kohya, LoKR x2, Qwen Lightning), plus NAG, `--quant fp8` and the
+2x upscale-VAE decode. Every case pixel-identical, including the two
+drift-prone non-strict ones. 747 s of GPU time. Nothing about the extraction,
+the pin, or the transformers bump changed generation output.
+
+**TRAP, cost a false alarm — read before running this comparison again.** The
+Vision's proof line says to pixel-diff "against the slice-0 baseline in
+`08-21-26/restructure-baseline`". That directory's `manifest-v2a.json` carries a
+**stale `fam-qwen-2512` hash** (`8ac8650634ac`). The Qwen hash shifted once
+between two captures on 2026-08-21, and every manifest from `pre1a` onward —
+nine of them, through `post3c` — records `93787c33cb8b` instead. Comparing today
+against v2a therefore reports an 858,968-pixel "regression" that does not exist.
+Two independent bisects were needed to clear it: transformers 5.5.3 vs 5.10.2
+produce byte-identical output, and so do the core and node venvs.
+
+Compounding it, `08-21-26/` is UNTRACKED — a local scratch directory the Vision
+points at as if it were the record. The authoritative references are the tracked
+manifests in `comfyless_diffusion/tests/golden/`, and the newest full matrix
+there is `manifest-post3c.json`. Use that one.
+
+Also worth correcting: `scripts/capture_baseline.py`'s header lists
+Qwen-Image-2512 under "reproducible (0 differing px across runs)". The manifest
+history contradicts that — it shifted once, unexplained, exactly like the
+Z-Image case the same header documents as "batch-stable, not call-stable". Treat
+Qwen as batch-stable too.
+
+
 
 ## 2026-09-09 — the two repos' lockfiles diverged at birth (37 of 105 packages)
 
