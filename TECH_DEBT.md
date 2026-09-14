@@ -3388,3 +3388,48 @@ gets a remote.
 remote — whichever comes first. At minimum, `enhancers.example.toml` should
 move to the sibling alongside the code that parses it, since a repo whose
 `--enhance-prompt` flag has no documented config shape is incomplete.
+
+## 2026-09-13 — pruning the duplicated docs is BLOCKED by the Red Zone gate
+
+**What:** the plan was to delete the 138 CORE-ONLY documents from the node
+repository (a reviewed classification put 194 docs into CORE-ONLY 138 /
+NODE-ONLY 1 / BOTH 39 / PROCESS 16). It cannot be done as-is.
+`scripts/git-policy/_lib.sh` `pc_redzone_ref` validates a Red Zone commit's
+message by checking `[ -f "$repo_root/$ref" ]` — the referenced ADR or security
+review must exist **in the working tree**. `check-range` re-validates historical
+commits against the CURRENT tree, so deleting a referenced doc retroactively
+turns a commit that passed into one that fails.
+
+**Measured, not assumed:** scanning history for commits touching Red Zone paths
+and extracting the docs their messages cite gives **105 distinct referenced
+documents** in the node repo. Intersecting that with a 38-file sample of the
+proposed delete list produced **24 collisions** — and only 11 of the 89
+CORE-ONLY security reviews were in that sample, so the true overlap is larger.
+Pruning would break `check-range` across a substantial share of history.
+
+Latent rather than active: `check-range` runs on PRs over `base..head`, and this
+repo is pushed to directly, so nothing is failing today. It would bite the first
+time a PR range reached back far enough — which is exactly the scenario the
+node CLAUDE.md kept the historical Red Zone patterns for.
+
+**Why not now:** the real fix is to make the reference check resolve against the
+commit's OWN tree (`git cat-file -e "$commit:$ref"`) rather than the working
+tree, threading the commit SHA through `pc_redzone_ref` and `check-range`. That
+is a deliberate change to the enforcement layer — it changes what the gate
+means — and wants its own slice plus a reviewer, not a drive-by at the end of a
+long session. Pruning is cosmetic by comparison: git history retains every
+deleted file regardless, so this is navigability, not exposure.
+
+**Trigger:** whenever the docs duplication becomes actually annoying, or the
+gate is touched for another reason. Order is fixed: fix the gate FIRST, then
+prune. Do not prune "only the non-colliding files" — the collision set grows
+with every new Red Zone commit, so that just moves the landmine.
+
+**Done in the meantime:** the classification itself is the durable artifact and
+is worth not re-deriving — CORE-ONLY 138, NODE-ONLY 1 (ADR-007, the strip-Eric-
+prefix decision, which is purely about ComfyUI class/display names), BOTH 39,
+PROCESS 16. The BOTH bucket is the interesting finding: it is large because the
+newer `eric_diffusion_*` node track deliberately imports `comfyless.core` rather
+than reimplementing it, so decisions about CFG routing, samplers, sigma
+schedules, quantization, LoRA fallback, Hunyuan and Krea2-identity genuinely
+govern both repos and should stay in both.
