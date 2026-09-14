@@ -353,9 +353,16 @@ jobs:
       # tokenless). `--error` fails the job on any finding. Rules are
       # registry-fetched (drift accepted, same posture as a CVE gate); FPs are
       # suppressed inline with # nosemgrep + a justification comment.
+      # --no-project is load-bearing, not tidiness: without it `uv run` syncs the
+      # project environment first, which since the 2026-09-12 git+https pin means
+      # cloning the PRIVATE comfyless_diffusion — so this job failed on every
+      # push with "could not read Username for 'https://github.com'", unrelated
+      # to any finding. semgrep is a static analyzer over source text and needs
+      # none of the project's dependencies; skipping the sync also drops a
+      # ~500 MiB torch download from a 10-minute job.
       - name: semgrep (SAST — 0-baseline)
         run: >
-          uv run --with semgrep==1.169.0 semgrep scan
+          uv run --no-project --with semgrep==1.169.0 semgrep scan
           --config p/python --config p/security-audit --config p/secrets
           --error --quiet --metrics=off nodes/ pipelines/ scripts/
 

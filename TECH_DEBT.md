@@ -3504,3 +3504,30 @@ comments, so nothing is lost right now — only misfiled.
 following an "(ADR-012)" citation and landing on the validator ADR. Fix is an
 ADR covering the gate layer plus a mechanical repoint of the citations; note the
 sibling repo carries the same wrong citation in its copy.
+
+## 2026-09-14 — the sast job was red on every push, unrelated to any finding
+
+**What:** `.github/workflows/ci.yml` ran semgrep as `uv run --with semgrep=...`.
+`uv run` inside a project directory syncs the project environment first, and
+since the git+https pin landed (2026-09-12, `52731d9`) that means cloning the
+PRIVATE `comfyless_diffusion`. A workflow's default `GITHUB_TOKEN` is scoped to
+its own repository, so the job failed with `could not read Username for
+'https://github.com'` — a credential error wearing a SAST job's name. Fixed the
+same day by adding `--no-project`: semgrep is a static analyzer over source text
+and needs none of the project's dependencies.
+
+**Why this is worth an entry rather than just a fix:** the failure was silent in
+the way that matters. `sast` was NOT gated on `vars.CROSS_REPO_CI` and had no
+auth step, so unlike `tests` / `typecheck` / `supply-chain` it did not skip — it
+went red, and stayed red across at least two pushes while reading as an ordinary
+CI failure. The gating design assumed exactly three jobs need the cross-repo
+credential; `sast` needed it by accident, through `uv run`'s implicit sync, and
+nothing in the workflow said so. Audit the other jobs against that assumption
+before adding any new one: `git-policy`, `commit-policy`, `supply-chain-lock`
+and `secrets` were checked on 2026-09-14 and genuinely do not resolve the
+project environment.
+
+**Trigger:** any new CI job that invokes `uv run` or `uv sync`. Decide
+deliberately whether it needs the project environment; if it does, it belongs
+behind the `CROSS_REPO_CI` gate with the auth step, and if it does not, it wants
+`--no-project`.
