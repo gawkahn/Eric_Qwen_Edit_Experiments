@@ -49,6 +49,9 @@ for sha in $commits; do
     # the old path appears as a deletion, the move commit itself trips the gate,
     # and updating the gate becomes part of the move.
     changed="$(git diff --no-renames --name-only "$parent" "$sha")"
+    # Same diff with DELETIONS removed. The Red Zone gate's "the artifact is in
+    # this commit" branch must not be satisfied by a path this commit DELETES.
+    present="$(git diff --no-renames --diff-filter=d --name-only "$parent" "$sha")"
 
     range_rc=0
     printf '== %s%s %.60s ==\n' "$sha" "$([ "$is_merge" = 1 ] && echo ' (merge)')" "$subject" >&2
@@ -62,8 +65,10 @@ for sha in $commits; do
     # Content checks apply to EVERY commit (merges included — the fix), with the
     # overridable ones gated by an explicit `Policy-override:` trailer.
     if ! printf '%s' "$message" | grep -qiE '^Policy-override:'; then
-        pc_redzone_ref "$message" "$changed" spec   "$repo_root" || range_rc=1
-        pc_redzone_ref "$message" "$changed" review "$repo_root" || range_rc=1
+        # 5th arg = the commit's OWN tree; 6th = the changed set minus deletions.
+        # See _gp_ref_exists and pc_redzone_ref in _lib.sh for why each matters.
+        pc_redzone_ref "$message" "$changed" spec   "$repo_root" "$sha" "$present" || range_rc=1
+        pc_redzone_ref "$message" "$changed" review "$repo_root" "$sha" "$present" || range_rc=1
         while IFS= read -r td; do
             [ -z "$td" ] && continue
             pc_tech_debt_no_deletion "$(git diff --unified=0 "$parent" "$sha" -- "$td")" || range_rc=1

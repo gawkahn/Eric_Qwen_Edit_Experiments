@@ -144,6 +144,146 @@ ok pc_redzone_ref "see docs/security/review-comfyless-server-2026-04-23.md" "src
 no pc_redzone_ref "no reference" "src/comfyless/server.py" review "$repo_root"
 no pc_redzone_ref "docs/security/review-ghost.md" "src/comfyless/server.py" review "$repo_root"
 
+# --- Red Zone references resolve against a TREE, not the working tree ---
+# The 5th argument is a git tree-ish: a commit SHA for check-range, empty (the
+# default used above and by the commit-msg hook) for "the index". This is what
+# lets a referenced doc be deleted later without retroactively failing the
+# commit that cited it. See _gp_ref_exists in _lib.sh.
+gp_root_sha="$(git rev-list --max-parents=0 HEAD | head -1)"
+# Present at HEAD's tree -> passes.
+ok pc_redzone_ref "see docs/decisions/ADR-001-daemon-socket-security.md" "src/comfyless/server.py" spec "$repo_root" HEAD
+# The SAME reference against the ROOT commit's tree, where the ADR did not yet
+# exist -> blocked. This is the discriminating case: under the old working-tree
+# test both of these passed identically, because the file exists on disk now.
+no pc_redzone_ref "see docs/decisions/ADR-001-daemon-socket-security.md" "src/comfyless/server.py" spec "$repo_root" "$gp_root_sha"
+# An unresolvable tree-ish must FAIL CLOSED, not wave the commit through.
+no pc_redzone_ref "see docs/decisions/ADR-001-daemon-socket-security.md" "src/comfyless/server.py" spec "$repo_root" "0000000000000000000000000000000000000000"
+# _gp_ref_exists itself: a blob passes, a tree (directory) does not. The old
+# `[ -f ]` also rejected a directory; keep that property.
+ok _gp_ref_exists "$repo_root" "" "docs/decisions/ADR-001-daemon-socket-security.md"
+no _gp_ref_exists "$repo_root" "" "docs/decisions"
+no _gp_ref_exists "$repo_root" "" "docs/decisions/ADR-999-ghost.md"
+# A committed SYMLINK types as `blob`, so the mode — not the object type — is
+# what decides. The old `[ -f ]` followed symlinks and rejected dangling ones;
+# _gp_ref_exists refuses all of them (security review 2026-09-13, INFO).
+e2e_symlink_ref_rejected() {
+    local d; d="$(mktemp -d)"
+    (
+        cd "$d" || exit 9
+        git init -q; git config user.email t@example.com; git config user.name t
+        git config commit.gpgsign false
+        mkdir -p docs/decisions
+        ln -s /nonexistent/target docs/decisions/ADR-001-daemon-socket-security.md
+        git add docs; git commit -qm "docs: a symlink" -m "AI-disclosure: none"
+        _gp_ref_exists "$d" HEAD "docs/decisions/ADR-001-daemon-socket-security.md"
+    ) >/dev/null 2>&1
+    local rc=$?; rm -rf "$d"; return $rc
+}
+
+# A commit that DELETES an ADR while touching a Red Zone file must not be
+# credited by the "the artifact IS in this commit" branch — `--name-only` lists
+# deleted paths, so before the 6th parameter this passed with no citation at all
+# (security review 2026-09-13, INFO).
+e2e_deleted_artifact_not_credited() {
+    local d; d="$(mktemp -d)"
+    (
+        cd "$d" || exit 9
+        git init -q; git config user.email t@example.com; git config user.name t
+        git config commit.gpgsign false
+        mkdir -p docs/decisions docs/security src/comfyless
+        echo adr    > docs/decisions/ADR-001-daemon-socket-security.md
+        echo review > docs/security/review-comfyless-server-2026-04-23.md
+        echo "x = 1" > src/comfyless/server.py
+        git add .; git commit -qm "feat: seed" -m "AI-disclosure: none"
+        local base; base="$(git rev-parse HEAD)"
+        # Delete BOTH artifacts and edit the daemon, citing nothing. Deleting
+        # only one is not a discriminating test: the other `kind` blocks the
+        # commit for an unrelated reason and the hole stays hidden.
+        git rm -q docs/decisions/ADR-001-daemon-socket-security.md \
+                  docs/security/review-comfyless-server-2026-04-23.md
+        echo "x = 2" > src/comfyless/server.py; git add src/comfyless/server.py
+        git commit -qm "refactor: drop both docs" -m "AI-disclosure: none"
+        bash "$lib_dir/check-range.sh" "$base" "$(git rev-parse HEAD)"
+    ) >/dev/null 2>&1
+    local rc=$?; rm -rf "$d"; return $rc
+}
+
+# e2e: deleting a referenced doc must NOT retroactively fail the commit that
+# cited it. This is the whole point of the tree-scoped resolution — the docs
+# prune was blocked on exactly this (TECH_DEBT 2026-09-13: 105 referenced docs,
+# 24 collisions in a 38-file sample). Under the old gate this range FAILED.
+e2e_redzone_ref_survives_doc_deletion() {
+    local d; d="$(mktemp -d)"
+    (
+        cd "$d" || exit 9
+        git init -q; git config user.email t@example.com; git config user.name t
+        git config commit.gpgsign false
+        mkdir -p docs/decisions docs/security src/comfyless
+        echo adr    > docs/decisions/ADR-001-daemon-socket-security.md
+        echo review > docs/security/review-comfyless-server-2026-04-23.md
+        git add docs; git commit -qm "docs: seed the artifacts" -m "AI-disclosure: none"
+        local base; base="$(git rev-parse HEAD)"
+        echo "x = 1" > src/comfyless/server.py; git add src/comfyless/server.py
+        git commit -qm "feat: touch the daemon" -m "AI-disclosure: none" \
+                   -m "see docs/decisions/ADR-001-daemon-socket-security.md" \
+                   -m "see docs/security/review-comfyless-server-2026-04-23.md"
+        # Now prune the docs. The Red Zone commit above must still validate.
+        git rm -q docs/decisions/ADR-001-daemon-socket-security.md \
+                  docs/security/review-comfyless-server-2026-04-23.md
+        git commit -qm "docs: prune the duplicated docs" -m "AI-disclosure: none"
+        bash "$lib_dir/check-range.sh" "$base" "$(git rev-parse HEAD)"
+    ) >/dev/null 2>&1
+    local rc=$?; rm -rf "$d"; return $rc
+}
+
+# e2e: the converse. A commit citing a doc that did not exist in ITS OWN tree
+# must be blocked, even though the doc exists by the time check-range runs.
+# §12 fixes the order (ADR first, then the code), so a forward reference is a
+# policy violation; the old working-tree test could not see one at all.
+e2e_redzone_forward_ref_blocked() {
+    local d; d="$(mktemp -d)"
+    (
+        cd "$d" || exit 9
+        git init -q; git config user.email t@example.com; git config user.name t
+        git config commit.gpgsign false
+        mkdir -p docs/decisions docs/security src/comfyless
+        echo base > README.md; git add README.md
+        git commit -qm "docs: base" -m "AI-disclosure: none"
+        local base; base="$(git rev-parse HEAD)"
+        echo "x = 1" > src/comfyless/server.py; git add src/comfyless/server.py
+        git commit -qm "feat: touch the daemon" -m "AI-disclosure: none" \
+                   -m "see docs/decisions/ADR-001-daemon-socket-security.md" \
+                   -m "see docs/security/review-comfyless-server-2026-04-23.md"
+        # The cited docs arrive only AFTER the commit that cites them.
+        echo adr    > docs/decisions/ADR-001-daemon-socket-security.md
+        echo review > docs/security/review-comfyless-server-2026-04-23.md
+        git add docs; git commit -qm "docs: add them late" -m "AI-disclosure: none"
+        bash "$lib_dir/check-range.sh" "$base" "$(git rev-parse HEAD)"
+    ) >/dev/null 2>&1
+    local rc=$?; rm -rf "$d"; return $rc
+}
+
+# e2e: an UNTRACKED working-tree doc must not satisfy the gate. `[ -f ]` could
+# not tell the difference, so a commit could cite an ADR that was never
+# committed at all. Index resolution closes that.
+e2e_redzone_untracked_ref_blocked() {
+    local d; d="$(mktemp -d)"
+    (
+        cd "$d" || exit 9
+        git init -q; git config user.email t@example.com; git config user.name t
+        git config commit.gpgsign false
+        mkdir -p docs/decisions src/comfyless
+        echo base > README.md; git add README.md
+        git commit -qm "docs: base" -m "AI-disclosure: none"
+        # Present on disk, never added to the index.
+        echo adr > docs/decisions/ADR-001-daemon-socket-security.md
+        echo "x = 1" > src/comfyless/server.py; git add src/comfyless/server.py
+        pc_redzone_ref "see docs/decisions/ADR-001-daemon-socket-security.md" \
+                       "src/comfyless/server.py" spec "$d" ""
+    ) >/dev/null 2>&1
+    local rc=$?; rm -rf "$d"; return $rc
+}
+
 # --- end-to-end: check-range must content-check a MERGE commit (finding #1) ---
 # Builds a throwaway repo (under /tmp, safe from the mergerfs fcntl-lock issue),
 # creates an "evil merge" that sneaks a Red Zone edit in with no spec reference,
@@ -205,6 +345,36 @@ fi
 
 if e2e_redzone_move_blocked; then
     fail=$((fail+1)); echo "FAIL: check-range did NOT block a Red Zone file MOVE (rename hid the gated path)"
+else
+    pass=$((pass+1))
+fi
+
+if e2e_redzone_ref_survives_doc_deletion; then
+    pass=$((pass+1))
+else
+    fail=$((fail+1)); echo "FAIL: deleting a referenced doc retroactively failed the commit that cited it"
+fi
+
+if e2e_redzone_forward_ref_blocked; then
+    fail=$((fail+1)); echo "FAIL: check-range did NOT block a commit citing a doc absent from its own tree"
+else
+    pass=$((pass+1))
+fi
+
+if e2e_redzone_untracked_ref_blocked; then
+    fail=$((fail+1)); echo "FAIL: an untracked working-tree doc satisfied the Red Zone gate"
+else
+    pass=$((pass+1))
+fi
+
+if e2e_symlink_ref_rejected; then
+    fail=$((fail+1)); echo "FAIL: a committed symlink satisfied the Red Zone gate"
+else
+    pass=$((pass+1))
+fi
+
+if e2e_deleted_artifact_not_credited; then
+    fail=$((fail+1)); echo "FAIL: a DELETED ADR was credited as the commit's own artifact"
 else
     pass=$((pass+1))
 fi

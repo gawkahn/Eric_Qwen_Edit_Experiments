@@ -22,6 +22,9 @@ repo_root="$(git rev-parse --show-toplevel)"
 # the old path appears as a deletion, the move commit itself trips the gate,
 # and updating the gate becomes part of the move.
 changed="$(git diff --cached --no-renames --name-only)"
+# Same staged set with DELETIONS removed — the Red Zone gate's "the artifact is
+# in this commit" branch must not be satisfied by a doc this commit deletes.
+present="$(git diff --cached --no-renames --diff-filter=d --name-only)"
 
 # A merge in progress (MERGE_HEAD present) has a git-generated subject and no
 # authored body — skip the message-FORMAT checks; content is still checked at the
@@ -34,7 +37,10 @@ if [ "$is_merge" -eq 0 ]; then
     pc_ai_disclosure "$message" || rc=1
 fi
 if ! printf '%s' "$message" | grep -qiE '^Policy-override:'; then
-    pc_redzone_ref "$message" "$changed" spec   "$repo_root" || rc=1
-    pc_redzone_ref "$message" "$changed" review "$repo_root" || rc=1
+    # No tree-ish: the commit does not exist yet, so the cited ADR/review is
+    # resolved against the INDEX (HEAD's tree plus what is staged) — which is
+    # exactly the tree this commit is about to create. See _gp_ref_exists.
+    pc_redzone_ref "$message" "$changed" spec   "$repo_root" "" "$present" || rc=1
+    pc_redzone_ref "$message" "$changed" review "$repo_root" "" "$present" || rc=1
 fi
 exit $rc

@@ -116,6 +116,49 @@ pc_baseline_no_increase() {
     return $rc
 }
 
+# Does <ref> exist as a regular file in the tree being validated?
+#
+# treeish="" (the default, used by the commit-msg hook) means "the commit being
+# written" and resolves against the INDEX — HEAD's tree plus whatever is staged.
+# A commit SHA (what check-range passes) resolves against that commit's own tree.
+#
+# Resolving against a TREE rather than the working tree is what makes the gate
+# stable over time. The old test was `[ -f "$repo_root/$ref" ]`, which asks
+# whether the doc exists NOW; since check-range re-validates historical commits,
+# deleting a referenced ADR retroactively failed a commit that passed when it was
+# made. Measured in this repo before the fix: 105 distinct docs are cited by Red
+# Zone commits, and a 38-file sample of a proposed docs prune already collided
+# with 24 of them (TECH_DEBT 2026-09-13).
+#
+# It also closes a smaller hole in the same expression: an UNTRACKED working-tree
+# file satisfied `[ -f ]`, so a commit could cite an ADR that was never committed
+# and the gate would wave it through.
+#
+# The test is the entry's MODE, not its object type: `cat-file -t` reports `blob`
+# for a SYMLINK too (mode 120000), including a dangling one, so a committed
+# symlink named like an ADR would have satisfied the gate — the old `[ -f ]`
+# followed symlinks and rejected dangling ones (security review 2026-09-13,
+# INFO). Only a regular file (100644/100755) passes; a directory (040000), a
+# symlink (120000) and a gitlink/submodule (160000) are all refused.
+#
+# Fails closed on every git error. An unresolvable tree-ish, a non-repo path, a
+# missing entry, a corrupt object or a killed git all yield empty output, which
+# matches no case arm. A conflicted index path yields its stage-1/2/3 lines
+# rather than a single mode, which also matches nothing.
+_gp_ref_exists() {
+    local repo_root="$1" treeish="$2" ref="$3" mode
+    if [ -n "$treeish" ]; then
+        mode="$(git -C "$repo_root" ls-tree --format='%(objectmode)' "$treeish" -- "$ref" 2>/dev/null)"
+    else
+        # The index. Stage 0 only; `awk` over a conflicted path emits 3 lines.
+        mode="$(git -C "$repo_root" ls-files -s -- "$ref" 2>/dev/null | awk '{print $1}')"
+    fi
+    case "$mode" in
+        100644|100755) return 0;;
+        *)             return 1;;
+    esac
+}
+
 # If any changed file is Red Zone, the message must reference an existing
 # ADR (kind=spec) or docs/security/review-*.md (kind=review), OR such a file
 # must itself be in the changed set. Mirrors require-redzone-*.sh.
@@ -124,8 +167,21 @@ pc_baseline_no_increase() {
 # this repo's spec-first artifact is the ADR (global §12 — "write the ADR →
 # run security review → write code", commits reference
 # docs/decisions/ADR-NNN-<slug>.md). No docs/specs/ exists here.
+#
+# $5 (treeish) picks the tree the reference is resolved against — see
+# _gp_ref_exists above.
+#
+# $6 (present_files) is the changed set with DELETIONS REMOVED, used only by the
+# "the artifact IS in this commit" branch. Without it, `--name-only` lists a
+# deleted path, so a commit that DELETES both an ADR and a review while touching
+# a Red Zone file satisfied the gate with no citation at all (security review
+# 2026-09-13, INFO — pre-existing). Defaults to changed_files so the older 4- and
+# 5-argument call sites keep working. The two-commit form of the same trick —
+# cite in one commit, delete in the next — is NOT caught and structurally cannot
+# be without re-breaking the prune; see TECH_DEBT 2026-09-13.
 pc_redzone_ref() {
-    local message="$1" changed_files="$2" kind="$3" repo_root="${4:-$_gp_repo_root}"
+    local message="$1" changed_files="$2" kind="$3" repo_root="${4:-$_gp_repo_root}" treeish="${5-}"
+    local present_files="${6-$changed_files}"
     local pattern label
     case "$kind" in
         spec)   pattern='docs/decisions/ADR-[A-Za-z0-9_.-]+\.md';   label='ADR (docs/decisions/ADR-*.md)';;
@@ -139,12 +195,12 @@ pc_redzone_ref() {
     done <<< "$changed_files"
     [ "$has_rz" -eq 0 ] && return 0
 
-    # A referenced file that exists in the repo passes.
+    # A referenced file that exists in the validated tree passes.
     local ref
     ref=$(printf '%s' "$message" | grep -oE "$pattern" | head -1 || true)
-    if [ -n "$ref" ] && [ -f "$repo_root/$ref" ]; then return 0; fi
-    # A file of the right kind in the changed set passes (the artifact IS here).
-    if printf '%s' "$changed_files" | grep -qE "^$pattern$"; then return 0; fi
+    if [ -n "$ref" ] && _gp_ref_exists "$repo_root" "$treeish" "$ref"; then return 0; fi
+    # A file of the right kind ADDED OR MODIFIED here passes (the artifact IS here).
+    if printf '%s' "$present_files" | grep -qE "^$pattern$"; then return 0; fi
 
     echo "BLOCKED: Red Zone change without a referenced $label (§Red Zone handling)." >&2
     echo "  Reference it in the commit body, or include the file in the commit." >&2

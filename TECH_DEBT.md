@@ -3433,3 +3433,74 @@ newer `eric_diffusion_*` node track deliberately imports `comfyless.core` rather
 than reimplementing it, so decisions about CFG routing, samplers, sigma
 schedules, quantization, LoRA fallback, Hunyuan and Krea2-identity genuinely
 govern both repos and should stay in both.
+
+**Resolved: 2026-09-13 — the gate was fixed; the prune is unblocked.**
+`pc_redzone_ref` now resolves a cited ADR/review against a git TREE rather than
+the working tree: the commit's own tree in `check-range`, the index in the
+commit-msg hook (`_gp_ref_exists` in `scripts/git-policy/_lib.sh`). Deleting a
+referenced doc no longer retroactively fails the commit that cited it — proven
+by deleting the doc cited by `67960aee` and watching the old gate block it and
+the new gate pass it. Full-history re-run over all 540 commits is byte-identical
+on every block kind, so nothing else moved. What remains of the prune is the
+classification and the deletion itself, NOT a blocker. See the two entries below
+for what the fix cost.
+
+## 2026-09-13 — the Red Zone gate cannot catch a two-commit cite-then-delete
+
+**What:** with per-commit-tree resolution, a PR can cite a doc and then delete
+it. Commit 1 adds a Red Zone change plus the ADR it cites and passes against its
+own tree; commit 2 deletes that ADR while touching only `docs/`, so it presents
+no Red Zone path and is never gated. The range ends green with Red Zone code
+whose citation is dangling in the net tree. The old working-tree check caught
+this by accident, so this is a real capability the fix gives up.
+
+The single-commit form IS closed: a commit that deletes an ADR while touching a
+Red Zone file used to be credited by the "the artifact IS in this commit" branch,
+because `--name-only` lists deleted paths. `pc_redzone_ref` now takes a sixth
+argument carrying the changed set with deletions filtered out
+(`--diff-filter=d`), and both callers pass it.
+
+**Why not now:** it is not deferred for effort — it is structurally mutually
+exclusive with the fix above, and that is the part worth not re-deriving. A
+range-level guard ("a doc cited by an in-range commit must still exist at the
+tip") was written, tested, and REVERTED, because a prune and a cite-then-delete
+are the same shape: Red Zone commit first, deletion of its cited doc later, both
+inside the range. Nothing mechanical separates them — only intent and elapsed
+time. Any guard strong enough to catch the second re-breaks the first for every
+range reaching back past a Red Zone commit, which is exactly the blocker this
+slice removed. The security review's suggested remediation (re-verify each
+in-range citation at the tip) has this flaw; narrowing it to "deleted by a commit
+in this range" does not help, because the prune commit is in the range too.
+
+The right shape, if it is ever wanted, is a SEPARATE tip-only invariant — "every
+Red Zone file in the current tree has a live ADR and review" — rather than
+bending the per-commit gate. That is a different question from the one this gate
+answers, and conflating the two is what produced the tension. Note also that the
+escape hatches are intact: `Policy-override:` in the message and, locally,
+`SKIP=commit-msg-checks`.
+
+**Trigger:** a real cite-then-delete actually occurring, or the first time
+someone wants "does main's Red Zone code have live docs" answered — at which
+point build it as the tip-only check, not as a change to `pc_redzone_ref`.
+
+## 2026-09-13 — no ADR owns the git-policy / quality-gate layer in this repo
+
+**What:** `scripts/git-policy/*.sh` and `.github/workflows/ci.yml` cite
+"(ADR-012)" throughout as the decision record for the commit-policy layer.
+`docs/decisions/ADR-012-machine-boundary-validator.md` is about the comfyless
+machine-boundary validator and has nothing to do with commit policy. The
+citation was inherited verbatim from the quality-gate kit, whose ADR numbering
+is `local_agents`', and it was never repointed at adoption (2026-07-16). There
+is no ADR in this repo covering the gate layer at all.
+
+**Why not now:** found while looking for the right Changelog to append the
+tree-scoped-resolution decision to, at the tail of an already-long slice.
+Writing the missing ADR retroactively inverts §12's fixed order and deserves its
+own slice; mis-citing it further in the same breath would be worse. The
+reasoning that would have gone in it is in the entry above and in the code
+comments, so nothing is lost right now — only misfiled.
+
+**Trigger:** the next deliberate change to `scripts/git-policy/`, or anyone
+following an "(ADR-012)" citation and landing on the validator ADR. Fix is an
+ADR covering the gate layer plus a mechanical repoint of the citations; note the
+sibling repo carries the same wrong citation in its copy.
