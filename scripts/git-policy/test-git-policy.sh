@@ -109,11 +109,19 @@ no pc_no_floors '+    "bar==2.*",'
 no pc_no_floors "+    'qux != 1.0',"
 
 # --- Red Zone spec (=ADR, per the _lib.sh adaptation) references ---
-# The cited docs below are FIXTURES, not subject matches: pc_redzone_ref only
-# asks whether a doc of the right kind exists in the validated tree, never
-# whether it is about the changed file. They are drawn from the BOTH bucket of
-# docs/README.md, the set this repository keeps permanently, so the 2026-09-15
-# CORE-ONLY prune (and any later one) cannot silently redden these assertions.
+# The cited docs in the three assertions immediately below are FIXTURES, not
+# subject matches: pc_redzone_ref only asks whether a doc of the right kind
+# exists in the validated tree, never whether it is about the changed file.
+# They are drawn from the BOTH bucket of docs/README.md, the set this
+# repository keeps permanently, so the 2026-09-15 CORE-ONLY prune (and any
+# later one) cannot silently redden them.
+#
+# That protection does NOT extend to the ADR-046 citation further down (the
+# lora_adapters assertion). ADR-046 is CORE-ONLY; it survives here only by the
+# human ruling recorded under "Retained despite CORE-ONLY" in docs/README.md.
+# A future pass that revisits those four -- "the sibling has it, strict
+# reachability says delete" -- would redden this suite. Repoint that fixture
+# first, or leave ADR-046 alone.
 ok pc_redzone_ref "no ref needed" "README.md"                     spec   "$repo_root"  # not RZ
 ok pc_redzone_ref "see docs/decisions/ADR-019-native-quantization-support.md" "src/comfyless/server.py" spec "$repo_root"
 no pc_redzone_ref "no reference at all" "src/comfyless/server.py"     spec   "$repo_root"  # RZ, no ref

@@ -183,7 +183,11 @@ repo's CLAUDE.md, when the claim was checked against the directory instead of
 copied forward. The `src/comfyless/server.py` half was likewise closed by
 ADR-001 + `review-comfyless-server-2026-04-23.md` /
 `review-comfyless-server-hardening-2026-04-23.md`. Both surfaces now live in
-comfyless_diffusion; the reviews are in both repos' `docs/security/`.
+comfyless_diffusion. The resolve-hf-path pair is in both repos'
+`docs/security/`; the comfyless-server pair is NOT — the 2026-09-15 CORE-ONLY
+prune removed it from this side, so it lives only in comfyless_diffusion. (This
+sentence claimed both pairs were in both repos until that prune made it false,
+which is the failure mode this whole paragraph exists to record.)
 
 **Surfaces that become Red Zone on scope change:**
 

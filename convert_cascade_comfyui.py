@@ -11,7 +11,8 @@ writes a clean Würstchen-native safetensors that loads cleanly via
 `from_single_file()` + a diffusers-tree config directory. Bundled VAE
 and text-encoder weights are reported but discarded — comfyless's
 cascade dispatch always uses the scaffolding repo's text_encoder /
-tokenizer / scheduler. (See ADR-010 and docs/comfyless-stable-cascade.md.)
+tokenizer / scheduler. (See ADR-010 and ../comfyless_diffusion/docs/comfyless-stable-cascade.md --
+both moved to the sibling repo; this tool did not.)
 
 Usage:
     python3 convert_cascade_comfyui.py --in <bundle.safetensors> --stage c
