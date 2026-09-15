@@ -109,10 +109,15 @@ no pc_no_floors '+    "bar==2.*",'
 no pc_no_floors "+    'qux != 1.0',"
 
 # --- Red Zone spec (=ADR, per the _lib.sh adaptation) references ---
+# The cited docs below are FIXTURES, not subject matches: pc_redzone_ref only
+# asks whether a doc of the right kind exists in the validated tree, never
+# whether it is about the changed file. They are drawn from the BOTH bucket of
+# docs/README.md, the set this repository keeps permanently, so the 2026-09-15
+# CORE-ONLY prune (and any later one) cannot silently redden these assertions.
 ok pc_redzone_ref "no ref needed" "README.md"                     spec   "$repo_root"  # not RZ
-ok pc_redzone_ref "see docs/decisions/ADR-001-daemon-socket-security.md" "src/comfyless/server.py" spec "$repo_root"
+ok pc_redzone_ref "see docs/decisions/ADR-019-native-quantization-support.md" "src/comfyless/server.py" spec "$repo_root"
 no pc_redzone_ref "no reference at all" "src/comfyless/server.py"     spec   "$repo_root"  # RZ, no ref
-ok pc_redzone_ref "docs/decisions/ADR-011-comfyless-mcp-server.md" "src/comfyless/mcp_server.py" spec "$repo_root"
+ok pc_redzone_ref "docs/decisions/ADR-002-three-tier-lora-fallback.md" "src/comfyless/mcp_server.py" spec "$repo_root"
 # A reference to a NON-existent ADR must NOT satisfy the gate (guards the [ -f ]
 # existence check — the slice-11 HIGH-2 defense).
 no pc_redzone_ref "TODO: write docs/decisions/ADR-999-ghost.md" "src/comfyless/server.py" spec "$repo_root"
@@ -140,7 +145,7 @@ no pc_redzone_ref "no reference" "nodes/eric_diffusion_fp8_ops.py" spec "$repo_r
 
 # --- Red Zone review references (the whole `review` kind was previously untested) ---
 ok pc_redzone_ref "no ref needed" "README.md" review "$repo_root"
-ok pc_redzone_ref "see docs/security/review-comfyless-server-2026-04-23.md" "src/comfyless/server.py" review "$repo_root"
+ok pc_redzone_ref "see docs/security/review-resolve-hf-path-2026-04-23.md" "src/comfyless/server.py" review "$repo_root"
 no pc_redzone_ref "no reference" "src/comfyless/server.py" review "$repo_root"
 no pc_redzone_ref "docs/security/review-ghost.md" "src/comfyless/server.py" review "$repo_root"
 
