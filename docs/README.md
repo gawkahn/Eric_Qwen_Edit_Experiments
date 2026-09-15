@@ -44,7 +44,7 @@ five node files.
 
 | Bucket | Count | This repository |
 |---|---|---|
-| CORE-ONLY | 144 | delete — governs only `src/comfyless/**` in the sibling |
+| CORE-ONLY | 144 | **140 deleted 2026-09-15**; 4 retained by ruling (below) — governs only `src/comfyless/**` in the sibling |
 | BOTH | 33 | **keep in both repos, permanently** |
 | NODE-ONLY | 1 | keep — governs only the ComfyUI node pack |
 | PROCESS | 17 | keep — governs the repository or the way work is done |
@@ -66,6 +66,55 @@ Only the CORE-ONLY boundary is consequential, because CORE-ONLY is the only
 bucket this repository deletes. A document argued between BOTH, NODE-ONLY and
 PROCESS is kept either way — so do not spend review effort there.
 
+
+## Retained despite CORE-ONLY (4) — ruled 2026-09-15
+
+The reachability rule classifies these four CORE-ONLY and that classification
+stands; the decision to keep them anyway is a separate judgement, recorded here
+so the two are not confused. They were the four calls flagged as close when the
+table was first written.
+
+- `docs/decisions/ADR-030-comfyless-2x-upscale-vae-decode.md` — the decision is
+  only the CLI flag, but the decoder helper originated in, and still lives at,
+  `nodes/eric_qwen_upscale_vae.py`. Node-facing guidance for a technique
+  validated as a default recommendation.
+- `docs/decisions/ADR-046-comfyless-owned-lora-adapters.md` — the subsystem is
+  comfyless-owned and the ADR explicitly leaves `nodes/eric_qwen_edit_lora.py`
+  untouched, but this repository keeps the differential test
+  `test_lora_adapters.py` that exists because of it.
+- `docs/security/review-adr-009-cfg-aliasing-2026-07-24.md` and
+  `docs/security/review-parity-slice1-shared-defaults-2026-07-25.md` — both
+  review the applier inside `comfyless/core/family_defaults.py`. The module is
+  node-imported, but `apply_family_defaults` has no node-side caller: nodes read
+  only the `FAMILY_DEFAULTS` dict (`nodes/eric_diffusion_generate.py:428`).
+  Strict reachability says delete; retained because the cost of being wrong is
+  asymmetric.
+
+## Where the deleted documents live
+
+Every one of the 140 was verified present in `comfyless_diffusion` before
+deletion — nothing was lost, only de-duplicated. References to them survive in
+this repository's `TECH_DEBT.md`, `CLAUDE.md`, `implementation_details.md` and
+`systemd/comfyless@.service`; those paths now resolve in the sibling repository,
+not here. `TECH_DEBT.md` is append-only, so its historical citations are
+deliberately left as written.
+
+The Red Zone commit gate is unaffected. Since 2026-09-15 it resolves a cited
+ADR or review against the tree of the commit being checked rather than the
+current working tree, so every commit that cited one of these docs when it was
+made still passes `check-range` — verified at 43 Red Zone blocks over all of
+history, unchanged by this prune. That fix is what made the prune possible at
+all; see `TECH_DEBT.md`.
+
+## Two tracked documents are outside the 195
+
+`git ls-files docs/` returns 197, not 195. The classification pass missed two:
+
+- `docs/README.md` — this file, written by the pass itself.
+- `docs/comfyless-stable-cascade.md` — user-facing comfyless CLI documentation,
+  CORE-ONLY by subject but with **no copy in the sibling repository**, so
+  deleting it would have destroyed it rather than de-duplicated it. Held out of
+  the prune and moved to `comfyless_diffusion` as its own slice.
 
 ## BOTH (33) — Keep — governs both codebases
 
@@ -130,7 +179,11 @@ PROCESS is kept either way — so do not spend review effort there.
 - `docs/vision/slice-0c-cuda-torch-realignment.md` — Bumps torch/diffusers/transformers pins across pyproject.toml, requirements.txt and uv.lock — dependency-pinning policy, no code behavior change.
 
 
-## CORE-ONLY (144) — Delete from this repository — governs the sibling only
+## CORE-ONLY (144) — Deleted from this repository 2026-09-15 — governs the sibling only
+
+140 of the 144 below were removed in one mechanical pass. The four listed
+under "Retained despite CORE-ONLY" above are still present here. The full
+list is kept as the record of what was deleted and on what reasoning.
 
 - `docs/decisions/ADR-001-daemon-socket-security.md` — Socket location, path allowlisting and request schema for the comfyless Unix-socket daemon (src/comfyless/server.py), which has no node-pack surface.
 - `docs/decisions/ADR-006-comfyless-dual-mode-json-bridge.md` — Dual-mode CLI/--json stdin-stdout contract, sidecar replay and --params/--override precedence in comfyless/generate.py only.
