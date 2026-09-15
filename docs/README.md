@@ -114,7 +114,9 @@ all; see `TECH_DEBT.md`.
 - `docs/comfyless-stable-cascade.md` — user-facing comfyless CLI documentation,
   CORE-ONLY by subject but with **no copy in the sibling repository**, so
   deleting it would have destroyed it rather than de-duplicated it. Held out of
-  the prune and moved to `comfyless_diffusion` as its own slice.
+  the prune and moved to `comfyless_diffusion` in its own slice (`14b2edf`
+  there), with its paths corrected for that repository's src layout; removed
+  here afterwards. `git ls-files docs/` now returns 56.
 
 ## BOTH (33) — Keep — governs both codebases
 
