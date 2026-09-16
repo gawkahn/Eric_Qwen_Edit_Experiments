@@ -92,11 +92,16 @@ jobs:
     # to ignore CI. `vars` is used for the gate because the `secrets` context is
     # NOT available in a job-level `if:`.
     #
-    # UNTESTED: the auth step below has never run — these jobs have been
-    # skipped since they were written. Expect to iterate once the flag flips.
-    # Coverage while skipped is LOCAL `just tests` in both repos only; the
-    # sibling still has no CI of its own, so do not read this as "covered
-    # elsewhere". See TECH_DEBT 2026-09-09.
+    # LIVE since 2026-09-14: the repository variable CROSS_REPO_CI was set to
+    # true and COMFYLESS_CORE_TOKEN provided, so this job and its two siblings
+    # run on every push. The auth step below works; the "UNTESTED / has never
+    # run" warning that stood here until 2026-09-16 was true when written and
+    # false for two days before anyone re-read it. Verified across the five
+    # runs since the flag flipped: 3/3 gated jobs green in each.
+    #
+    # Coverage note, also updated: comfyless_diffusion HAS its own CI as of
+    # 2026-09-15 (seven jobs), so its half is no longer covered only by a local
+    # `just tests`.
     if: ${{ vars.CROSS_REPO_CI == 'true' }}
     name: tests (standalone suite battery)
     runs-on: ubuntu-latest
@@ -159,11 +164,16 @@ jobs:
     # to ignore CI. `vars` is used for the gate because the `secrets` context is
     # NOT available in a job-level `if:`.
     #
-    # UNTESTED: the auth step below has never run — these jobs have been
-    # skipped since they were written. Expect to iterate once the flag flips.
-    # Coverage while skipped is LOCAL `just tests` in both repos only; the
-    # sibling still has no CI of its own, so do not read this as "covered
-    # elsewhere". See TECH_DEBT 2026-09-09.
+    # LIVE since 2026-09-14: the repository variable CROSS_REPO_CI was set to
+    # true and COMFYLESS_CORE_TOKEN provided, so this job and its two siblings
+    # run on every push. The auth step below works; the "UNTESTED / has never
+    # run" warning that stood here until 2026-09-16 was true when written and
+    # false for two days before anyone re-read it. Verified across the five
+    # runs since the flag flipped: 3/3 gated jobs green in each.
+    #
+    # Coverage note, also updated: comfyless_diffusion HAS its own CI as of
+    # 2026-09-15 (seven jobs), so its half is no longer covered only by a local
+    # `just tests`.
     if: ${{ vars.CROSS_REPO_CI == 'true' }}
     name: typecheck (pyright ratchet)
     runs-on: ubuntu-latest
@@ -273,11 +283,16 @@ jobs:
     # to ignore CI. `vars` is used for the gate because the `secrets` context is
     # NOT available in a job-level `if:`.
     #
-    # UNTESTED: the auth step below has never run — these jobs have been
-    # skipped since they were written. Expect to iterate once the flag flips.
-    # Coverage while skipped is LOCAL `just tests` in both repos only; the
-    # sibling still has no CI of its own, so do not read this as "covered
-    # elsewhere". See TECH_DEBT 2026-09-09.
+    # LIVE since 2026-09-14: the repository variable CROSS_REPO_CI was set to
+    # true and COMFYLESS_CORE_TOKEN provided, so this job and its two siblings
+    # run on every push. The auth step below works; the "UNTESTED / has never
+    # run" warning that stood here until 2026-09-16 was true when written and
+    # false for two days before anyone re-read it. Verified across the five
+    # runs since the flag flipped: 3/3 gated jobs green in each.
+    #
+    # Coverage note, also updated: comfyless_diffusion HAS its own CI as of
+    # 2026-09-15 (seven jobs), so its half is no longer covered only by a local
+    # `just tests`.
     if: ${{ vars.CROSS_REPO_CI == 'true' }}
     name: supply chain (sources + license + cve)
     runs-on: ubuntu-latest
