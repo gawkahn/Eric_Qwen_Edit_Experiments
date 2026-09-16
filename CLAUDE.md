@@ -14,7 +14,14 @@ Rules for ADRs, security reviews, and the tech debt register are in §12 of
 
 - **Repo:** `docs/decisions/`, `docs/security/`, `docs/vision/`, `TECH_DEBT.md` at project root
 - **Vault mirrors:** `Decisions/`, `Security/`, `Vision/`, `Tech_Debt.md`,
-  `Backlog.md` (all under the Vault project root above)
+  `Backlog.md` (all under the Vault project root above). Since the ADR-045 split
+  there are TWO tech-debt registers and the single mirror name was ambiguous:
+  `Tech_Debt.md` mirrors THIS repo's, `Tech_Debt_Comfyless.md` the sibling's.
+  `Docs_Classification.md` mirrors `docs/README.md`, the per-file table of which
+  codebase each document governs. The `Decisions/` and `Security/` mirrors hold
+  the COMPLETE pre-prune set on purpose — the 2026-09-15 prune removed 140 docs
+  from this repo because they live on in `comfyless_diffusion`, and the vault is
+  the reference copy of both sides, so nothing was pruned there.
 - **Comfyless user docs (vault-ONLY, no repo copy — rewritten 2026-07-09):**
   `Comfyless_Manual.md` (main) + `Comfyless_Models.md` + `Comfyless_MCP.md` +
   `Comfyless_Catalog.md`, under the Vault project root. Obsidian wikilink
