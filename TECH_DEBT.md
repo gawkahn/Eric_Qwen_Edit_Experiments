@@ -3587,3 +3587,17 @@ pip-licenses version bump (do both at once). Fix shape: freeze each tool
 environment to a hash-pinned requirements file and use
 `uv run --no-project --with-requirements <file>`, or move both tools into the
 locked `dev` group. Surfaced by infra-auditor on `69be4bd` (MEDIUM).
+
+Resolved: 2026-09-16 — and the fix shape proposed above turned out to be wrong.
+`uv run --with-requirements` installs a lock whose hashes do NOT match without
+complaint: `uv run` has no `--require-hashes` flag and ignores
+`UV_REQUIRE_HASHES` (both measured). Only `uv pip install --require-hashes`
+verifies, so the environment is built explicitly by
+`scripts/ci-tools/build-tool-env.sh`, shared byte-identical with
+comfyless_diffusion.
+
+This repo had FOUR unpinned invocations, not the two the entry named: semgrep
+(66 unhashed transitives), pip-licenses (3), and pip-audit TWICE inside
+`deps-cve` and `deps-report` (29 packages / 359 hashes once locked). Locks are
+compiled at `--python-version 3.12` here and 3.14 in the sibling; the helper
+reads each repo's `.python-version` rather than hardcoding one.

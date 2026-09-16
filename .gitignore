@@ -54,3 +54,6 @@ tests/output/
 
 # comfyless enhancer registry (real; example is enhancers.example.toml)
 enhancers.toml
+
+# Hash-verified CI tool environments (scripts/ci-tools/) — rebuilt on demand.
+.tool-envs/

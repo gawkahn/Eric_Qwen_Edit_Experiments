@@ -360,11 +360,28 @@ jobs:
       # to any finding. semgrep is a static analyzer over source text and needs
       # none of the project's dependencies; skipping the sync also drops a
       # ~500 MiB torch download from a 10-minute job.
-      - name: semgrep (SAST — 0-baseline)
-        run: >
-          uv run --no-project --with semgrep==1.169.0 semgrep scan
-          --config p/python --config p/security-audit --config p/secrets
-          --error --quiet --metrics=off nodes/ pipelines/ scripts/
+      # The scan now runs from a HASH-VERIFIED tool env via `just sast`, shared
+      # with the local recipe so both run the identical scanner.
+      # `--with semgrep==1.169.0` pinned only the top level: 66 further packages
+      # resolved fresh from PyPI on every run, unhashed. `--with-requirements`
+      # does NOT fix it — measured 2026-09-16, `uv run` installs a lock whose
+      # hashes do not match without complaint (no --require-hashes flag,
+      # UV_REQUIRE_HASHES ignored). Only `uv pip install --require-hashes`
+      # verifies; scripts/ci-tools/build-tool-env.sh does that.
+      #
+      # --no-project is still honoured INSIDE the helper's design: it builds an
+      # isolated venv and never syncs this project, so the private-core clone
+      # that turned this job red on every push since 2026-09-12 still cannot
+      # happen here.
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          version: "2026.5.0" # match dev box; exact pin per §11
+          install: false
+          cache: false
+      - run: mise trust ./mise.toml
+      - run: mise install just
+      - name: semgrep (SAST — 0-baseline, hash-verified tool env)
+        run: mise exec just -- just sast
 
   secrets:
     name: secret scan (gitleaks)

@@ -29,7 +29,8 @@ deps-cve:
     # uv.lock natively and never had the problem.
     uv export --format requirements-txt --no-emit-project \
       --no-emit-package comfyless-diffusion --quiet \
-      | uv run --with pip-audit==2.10.1 pip-audit -r /dev/stdin --progress-spinner=off \
+      | "$(bash scripts/ci-tools/build-tool-env.sh pip-audit)/pip-audit" \
+          -r /dev/stdin --progress-spinner=off \
           --ignore-vuln PYSEC-2026-3447 --ignore-vuln CVE-2025-3000 \
           --ignore-vuln GHSA-4j2p-28q2-5m79 || rc=1
     echo "== osv-scanner (OSV; uv.lock native; ignores from osv-scanner.toml) =="
@@ -53,7 +54,8 @@ deps-report:
       echo
       echo '```'
       uv export --format requirements-txt --no-emit-project --quiet \
-        | uv run --with pip-audit==2.10.1 pip-audit -r /dev/stdin --progress-spinner=off 2>&1
+        | "$(bash scripts/ci-tools/build-tool-env.sh pip-audit)/pip-audit" \
+            -r /dev/stdin --progress-spinner=off 2>&1
       echo '```'
       echo
       echo '## osv-scanner (OSV; uv.lock native)'
@@ -67,7 +69,10 @@ deps-report:
 # Check dep licenses against ADR-031 (docs/decisions/ADR-031-license-policy.md).
 # Exits non-zero on any non-allowlisted license (default-deny). The CI gate.
 deps-licenses:
-    uv run --with pip-licenses==5.5.5 pip-licenses --format=json \
+    #!/usr/bin/env bash
+    set -euo pipefail
+    BIN="$(bash scripts/ci-tools/build-tool-env.sh pip-licenses)"
+    PATH="$BIN:$PATH" pip-licenses --python ./.venv/bin/python --format=json \
       | uv run python scripts/check_licenses.py
 
 # Tier-3 (global §11): assert every uv.lock dep is registry-sourced
@@ -112,6 +117,13 @@ tests:
 # scope is this repo's code roots (no src/). FPs: inline # nosemgrep + comment.
 # Security static analysis (SAST) — semgrep, exact-pinned via uv
 sast:
-    uv run --with semgrep==1.169.0 semgrep scan \
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Hash-verified tool env (§11). `uv run --with semgrep==1.169.0` pinned only
+    # the top level and left 66 transitives to resolve unhashed from PyPI on
+    # every run. See scripts/ci-tools/build-tool-env.sh for why
+    # --with-requirements is NOT a sufficient fix.
+    BIN="$(bash scripts/ci-tools/build-tool-env.sh semgrep)"
+    PATH="$BIN:$PATH" semgrep scan \
       --config p/python --config p/security-audit --config p/secrets \
       --error --quiet --metrics=off nodes/ pipelines/ scripts/
