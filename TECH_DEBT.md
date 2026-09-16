@@ -3261,6 +3261,33 @@ that repo's console script, and re-verify one strict case against
 `manifest-v2a.json` before trusting a full sweep. Do not run `capture` in its
 current state.
 
+Resolved: 2026-09-16 — moved to `comfyless_diffusion/scripts/capture_baseline.py`
+(`c3bc07f` there), which is the fix this entry prescribed. Every path derives
+from `__file__`, so the move alone repointed `PY` at that repo's 3.14 venv and
+`HERE` at the `tests/golden/` that holds the manifests. Added a `_preflight()`
+that checks the golden dir exists and is writable and the interpreter is present
+BEFORE the GPU is touched, and manifest `_meta` now records `comfyless_path`,
+`python` and `from_working_tree`.
+
+Two corrections to this entry, both found while closing it:
+
+1. It says "~18 generations". The case list builds **24** (5 schedule + 5
+   sampler + 6 family + 8 feature) — the same 24 as the pixel matrix. The wrong
+   number was carried forward into the 2026-09-15 session handoff too.
+
+2. Its own trigger says to re-verify "against `manifest-v2a.json`", which is the
+   STALE manifest this register and the Backlog both warn against by name — it
+   has a wrong `fam-qwen-2512` hash and once cost a full bisect. Use
+   `tests/golden/manifest-post3c.json`. An entry that closes a trap by pointing
+   at a different trap is worth catching.
+
+Also understated here: the `PY` problem was not merely "node-repo inertia". That
+interpreter resolves comfyless to site-packages — the installed **v0.1.3**
+release under CPython 3.12, while the sibling's working tree is far past that
+tag and runs 3.14.7. A capture taken during development there would have
+silently baselined the pinned release. The `FileNotFoundError` was loud; this
+half was not.
+
 ## 2026-09-09 — the ComfyUI custom_nodes copies cannot be redeployed yet
 
 **What:** ADR-045 slice 8 lists "redeploy the three stale ComfyUI custom_nodes
