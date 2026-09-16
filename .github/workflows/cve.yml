@@ -1,0 +1,101 @@
+# Daily CVE watch — a SEPARATE workflow from `ci` on purpose.
+#
+# The CVE gate is the one check that can turn red with no change to this
+# repository: §11 makes a newly-published advisory against a pinned dependency
+# fail the build, and that friction IS the rule. Inside `ci` that produced an
+# ambiguous "ci failed" email on a commit that did not cause it. A workflow
+# named `cve` says in the notification subject what went wrong, so a red one is
+# immediately legible as "a new advisory landed", not "your push broke
+# something".
+#
+# It also means `ci` stops being the thing that cries wolf: pushes stay a
+# signal about the push.
+#
+# NOT a mirror of ci's supply-chain job. That job also gates lock SOURCES and
+# LICENSES, which cannot change without a commit and so have nothing to say on
+# a schedule. This runs only the scans whose answer depends on the outside
+# world.
+#
+# Deliberately NO `uv sync`: `uv export` reads uv.lock directly, pip-audit comes
+# from its own hash-verified env, and osv-scanner reads the lockfile natively —
+# so the nightly run needs none of the ~500 MiB CUDA wheel tree the ci job
+# installs. Verified 2026-09-16: `uv export` resolves all 775 requirement lines
+# from the lock with no network fetch of the private core repo, so this job
+# needs no token either.
+#
+# Cron is 11:17 UTC ≈ 07:17 local, so a red result is waiting at the start of
+# the day rather than buried overnight. The odd minute is deliberate — GitHub
+# shreds scheduled jobs queued on the hour.
+#
+# GOTCHA: GitHub disables scheduled workflows after 60 days with no repository
+# activity, silently. If this stops emailing, check that first — a quiet repo
+# looks identical to a clean one from the inbox.
+
+name: cve
+
+on:
+  schedule:
+    - cron: "17 11 * * *"
+  workflow_dispatch: # so it can be run on demand without waiting for the cron
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cve-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cve:
+    name: cve scan (daily; pip-audit + osv-scanner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.11.7" # match dev box; exact pin per §11
+          enable-cache: false
+      # mise provides pinned osv-scanner + just. install:false so `mise trust`
+      # runs FIRST — a repo-local mise.toml is untrusted by default and the pins
+      # silently do not apply without it.
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          version: "2026.5.0" # match dev box; exact pin per §11
+          install: false
+          cache: false
+      - run: mise trust ./mise.toml
+      - run: mise install
+      # Same recipe the ci supply-chain job runs, so a finding here reproduces
+      # locally with `just deps-cve` and nothing diverges between the two.
+      # Documented no-fix ignores live in osv-scanner.toml and the recipe's
+      # --ignore-vuln flags; each names its own re-check trigger.
+      #
+      # Output is echoed into the run summary as well as the log: the point of
+      # this workflow is that someone reads a notification and needs to know
+      # WHICH advisory, against WHAT, without digging through raw job output.
+      - name: cve scan (§11 gate)
+        run: |
+          set -o pipefail
+          rc=0
+          mise exec just -- just deps-cve 2>&1 | tee /tmp/cve.log || rc=$?
+          {
+            echo "## CVE scan — $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo
+            if [ "$rc" -eq 0 ]; then
+              echo "No unignored advisories against the locked dependencies."
+            else
+              echo "**Advisories found (exit $rc).** Not every finding is urgent —"
+              echo "check whether a fixed release actually exists and is reachable"
+              echo "under the current pins before treating it as a drop-everything."
+              echo "A no-fix acceptance goes in \`osv-scanner.toml\` or the"
+              echo "\`deps-cve\` ignore flags WITH a re-check trigger, per §11."
+            fi
+            echo
+            echo '```'
+            cat /tmp/cve.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
