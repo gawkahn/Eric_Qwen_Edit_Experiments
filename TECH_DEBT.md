@@ -3531,3 +3531,32 @@ project environment.
 deliberately whether it needs the project environment; if it does, it belongs
 behind the `CROSS_REPO_CI` gate with the auth step, and if it does not, it wants
 `--no-project`.
+
+
+## 2026-09-15 — CI tool environments resolve their transitive deps unpinned
+
+**What:** two CI steps build a throwaway Python environment with `uv run --with
+<pkg>==<ver>`: the semgrep SAST scan and the `deps-licenses` recipe's
+`pip-licenses`. `--with` pins ONLY the named top-level package. Its transitive
+dependencies are resolved fresh from PyPI on every run, with no lockfile and no
+hashes — the one place in either repository that departs from the
+`uv sync --locked` posture §11 requires everywhere else.
+
+**Why not now:** the pattern predates the sibling's CI and has been running here
+since 2026-07-16 without incident. Fixing it means generating and maintaining a
+hash-pinned requirements file per tool (semgrep's tree is not small), and
+fixing it on one side only would leave the two repositories running the same
+gate under different integrity rules. It wants one slice covering both.
+
+**Blast radius, honestly:** bounded but not nil. The jobs run with
+`permissions: contents: read`, the token is not in the step environment, and
+`persist-credentials: false` keeps it out of `.git/config` — so a malicious
+transitive gets code execution on a runner with the source checked out, and
+source disclosure is the ceiling. That ceiling is worth more in
+comfyless_diffusion, which holds every §12 surface, than in the node pack.
+
+**Trigger:** any tightening pass on CI supply chain, or the next semgrep /
+pip-licenses version bump (do both at once). Fix shape: freeze each tool
+environment to a hash-pinned requirements file and use
+`uv run --no-project --with-requirements <file>`, or move both tools into the
+locked `dev` group. Surfaced by infra-auditor on `69be4bd` (MEDIUM).
