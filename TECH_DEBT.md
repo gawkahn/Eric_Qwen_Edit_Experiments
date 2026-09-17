@@ -3601,3 +3601,40 @@ This repo had FOUR unpinned invocations, not the two the entry named: semgrep
 `deps-cve` and `deps-report` (29 packages / 359 hashes once locked). Locks are
 compiled at `--python-version 3.12` here and 3.14 in the sibling; the helper
 reads each repo's `.python-version` rather than hardcoding one.
+
+## 2026-09-17 — the tier-3 gate's self-package check matches value but not name
+
+**What:** In `scripts/check_lock_sources.py` (BOTH repos — the file is a copy
+taken at the ADR-045 split), the surviving exception for our own project is
+
+    if kind in _LOCAL_SELF and source.get(kind) == ".":
+
+which matches the source KIND (`editable`/`virtual`) and the VALUE (`"."`) but
+never the package NAME. A lock naming `evil-package` with
+`source = { editable = "." }` therefore passes the gate. Reproduced live, exit
+0, during the code review of the sibling-path deletion (2026-09-17).
+
+This is exactly the double-match discipline the branch deleted that same day
+DID have — name AND path both had to match, specifically so it "cannot widen
+into any editable path is fine" — and the same discipline the node repo's
+git+https exception has (name AND exact URL boundary AND 40-hex commit). The
+self-package check is the one admission that never got it.
+
+**Why not now:** it is pre-existing and was not touched by the deletion slice,
+so folding a hardening into that diff would have mixed two decisions into one
+commit (§4: no cleaning up while here). It is also a drift LINT, not a security
+boundary: uv only ever emits source `"."` for the project root, `uv sync
+--locked` rejects a lock inconsistent with pyproject, and an actor who can
+hand-edit `uv.lock` can equally hand-edit the gate script. So the realistic
+failure is a confusing silent pass after a rename or a bad merge, not an
+exploit.
+
+**Fix when taken:** require `pkg["name"]` to equal the project name on that
+branch — read from `pyproject.toml` `[project] name` rather than hardcoded, so
+a rename cannot desync the gate from the project it guards. Apply to BOTH
+copies; they have already drifted once (the sibling-path branch survived in
+comfyless_diffusion three days after the node repo replaced it), so treat
+"changed in one" as a half-done change.
+
+**Trigger:** the next slice that touches `check_lock_sources.py` in either
+repo, or any project/package rename.
